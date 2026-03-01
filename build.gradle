@@ -1,0 +1,117 @@
+group = 'org.eclipse.groovy.ls'
+version = '0.1.0-SNAPSHOT'
+
+subprojects {
+    group = rootProject.group
+    version = rootProject.version
+
+    repositories {
+        mavenCentral()
+        // groovy-eclipse-batch JARs (Groovy 4.x / 5.x) hosted on JFrog
+        maven { url 'https://groovy.jfrog.io/artifactory/plugins-release-local' }
+    }
+}
+
+// ============================================================================
+// Orchestration tasks – replaces the old build.ps1 / build.sh scripts
+// ============================================================================
+
+def extensionDir = file('vscode-extension')
+def serverDestDir = file('vscode-extension/server')
+def productDir = project(':org.eclipse.groovy.ls.product').layout.buildDirectory.dir('product')
+
+/** Detect npm / npx on PATH */
+String findExe(String name) {
+    def isWin = System.getProperty('os.name').toLowerCase().contains('win')
+    return isWin ? "${name}.cmd" : name
+}
+
+// ---- Copy the assembled server product into the VS Code extension ----
+
+tasks.register('copyServerToExtension', Sync) {
+    description = 'Sync the language-server product into vscode-extension/server'
+    group = 'vscode'
+
+    dependsOn ':org.eclipse.groovy.ls.product:assembleProduct'
+    from productDir
+    into serverDestDir
+}
+
+// ---- Copy LICENSE into the VS Code extension so vsce includes it ----
+
+tasks.register('copyLicenseToExtension', Copy) {
+    description = 'Copy LICENSE file into the VS Code extension directory'
+    group = 'vscode'
+
+    from rootProject.file('LICENSE')
+    into extensionDir
+}
+
+// ---- npm install ----
+
+tasks.register('npmInstall', Exec) {
+    description = 'Run npm install inside the VS Code extension'
+    group = 'vscode'
+
+    mustRunAfter 'copyLicenseToExtension'
+    workingDir = extensionDir
+    commandLine findExe('npm'), 'install'
+
+    inputs.file extensionDir.toPath().resolve('package.json').toFile()
+    inputs.files(extensionDir.toPath().resolve('package-lock.json').toFile()).withPropertyName('packageLock').optional()
+    outputs.dir extensionDir.toPath().resolve('node_modules').toFile()
+}
+
+// ---- Compile (webpack) the VS Code extension client ----
+
+tasks.register('compileExtension', Exec) {
+    description = 'Run webpack to compile the VS Code extension client'
+    group = 'vscode'
+
+    dependsOn 'npmInstall'
+    mustRunAfter 'copyLicenseToExtension'
+    workingDir = extensionDir
+    commandLine findExe('npm'), 'run', 'compile'
+
+    inputs.dir extensionDir.toPath().resolve('src').toFile()
+    inputs.file extensionDir.toPath().resolve('tsconfig.json').toFile()
+    inputs.file extensionDir.toPath().resolve('webpack.config.js').toFile()
+    outputs.dir extensionDir.toPath().resolve('dist').toFile()
+}
+
+// ---- Package the .vsix ----
+
+tasks.register('packageVsix', Exec) {
+    description = 'Package the VS Code extension into a .vsix file'
+    group = 'vscode'
+
+    dependsOn 'copyServerToExtension', 'compileExtension', 'copyLicenseToExtension'
+    workingDir = extensionDir
+    commandLine findExe('npx'), '@vscode/vsce', 'package', '--no-dependencies'
+}
+
+// ---- Convenience lifecycle aliases ----
+
+tasks.register('buildServer') {
+    description = 'Build only the language-server product'
+    group = 'build'
+    dependsOn ':org.eclipse.groovy.ls.product:assembleProduct'
+}
+
+tasks.register('buildClient') {
+    description = 'Compile the VS Code extension (npm install + webpack)'
+    group = 'build'
+    dependsOn 'compileExtension'
+}
+
+tasks.register('buildAll') {
+    description = 'Build server, copy it into the extension, and compile the client'
+    group = 'build'
+    dependsOn 'copyServerToExtension', 'compileExtension'
+}
+
+tasks.register('packageExtension') {
+    description = 'Full pipeline: build server + client, then produce a .vsix'
+    group = 'build'
+    dependsOn 'packageVsix'
+}

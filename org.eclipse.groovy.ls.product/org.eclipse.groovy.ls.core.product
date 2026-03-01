@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?pde version="3.5"?>
+<product
+    name="Groovy Language Server"
+    uid="org.eclipse.groovy.ls.core.product"
+    id="org.eclipse.groovy.ls.core.product"
+    application="org.eclipse.groovy.ls.core.id1"
+    version="0.1.0.qualifier"
+    type="bundles"
+    includeLaunchers="false"
+    autoIncludeRequirements="true">
+
+    <configIni use="default">
+        <linux>/org.eclipse.groovy.ls.product/config_linux/config.ini</linux>
+        <macosx>/org.eclipse.groovy.ls.product/config_mac/config.ini</macosx>
+        <win32>/org.eclipse.groovy.ls.product/config_win/config.ini</win32>
+    </configIni>
+
+    <plugins>
+        <!-- Equinox Runtime -->
+        <plugin id="org.eclipse.equinox.launcher"/>
+        <plugin id="org.eclipse.equinox.app"/>
+        <plugin id="org.eclipse.equinox.common"/>
+        <plugin id="org.eclipse.equinox.registry"/>
+        <plugin id="org.eclipse.equinox.preferences"/>
+        <plugin id="org.eclipse.equinox.simpleconfigurator"/>
+
+        <!-- Eclipse Core Platform (headless) -->
+        <plugin id="org.eclipse.core.runtime"/>
+        <plugin id="org.eclipse.core.resources"/>
+        <plugin id="org.eclipse.core.jobs"/>
+        <plugin id="org.eclipse.core.contenttype"/>
+        <plugin id="org.eclipse.core.filesystem"/>
+        <plugin id="org.eclipse.core.expressions"/>
+        <plugin id="org.eclipse.core.commands"/>
+
+        <!-- Text framework -->
+        <plugin id="org.eclipse.text"/>
+
+        <!-- JDT (patched by groovy-eclipse) -->
+        <plugin id="org.eclipse.jdt.core"/>
+        <plugin id="org.eclipse.jdt.core.manipulation"/>
+        <plugin id="org.eclipse.jdt.launching"/>
+
+        <!-- Refactoring -->
+        <plugin id="org.eclipse.ltk.core.refactoring"/>
+
+        <!-- LSP4J -->
+        <plugin id="org.eclipse.lsp4j"/>
+        <plugin id="org.eclipse.lsp4j.jsonrpc"/>
+
+        <!-- Gson (LSP4J dependency) -->
+        <plugin id="com.google.gson"/>
+
+        <!-- Groovy-Eclipse bundles (JDT-Groovy integration) -->
+        <plugin id="org.eclipse.jdt.groovy.core"/>
+        <plugin id="org.codehaus.groovy"/>
+
+        <!-- Our language server -->
+        <plugin id="org.eclipse.groovy.ls.core"/>
+    </plugins>
+</product>

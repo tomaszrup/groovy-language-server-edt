@@ -1,0 +1,153 @@
+{
+    "name": "groovy-language-server",
+    "displayName": "Groovy Language Support",
+    "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
+    "version": "0.1.0",
+    "publisher": "groovy-language-server",
+    "license": "EPL-2.0",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/groovy-language-server/groovy-language-server"
+    },
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Programming Languages",
+        "Linters",
+        "Snippets"
+    ],
+    "keywords": [
+        "groovy",
+        "gradle",
+        "grails",
+        "language server",
+        "LSP"
+    ],
+    "extensionDependencies": [
+        "redhat.java"
+    ],
+    "activationEvents": [
+        "onLanguage:groovy",
+        "workspaceContains:**/*.groovy"
+    ],
+    "main": "./dist/extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "groovy",
+                "aliases": [
+                    "Groovy",
+                    "groovy"
+                ],
+                "extensions": [
+                    ".groovy",
+                    ".gvy",
+                    ".gy",
+                    ".gsh",
+                    ".gradle"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "groovy",
+                "scopeName": "source.groovy",
+                "path": "./syntaxes/groovy.tmLanguage.json"
+            }
+        ],
+        "semanticTokenTypes": [
+            {
+                "id": "typeKeyword",
+                "description": "Type declaration keywords like class, interface, enum, and trait."
+            }
+        ],
+        "semanticTokenScopes": [
+            {
+                "language": "groovy",
+                "scopes": {
+                    "struct": [
+                        "entity.name.type.class.groovy"
+                    ],
+                    "keyword": [
+                        "keyword.control.groovy"
+                    ],
+                    "typeKeyword": [
+                        "storage.type",
+                        "storage.type.groovy"
+                    ]
+                }
+            }
+        ],
+        "configuration": {
+            "title": "Groovy",
+            "properties": {
+                "groovy.java.home": {
+                    "type": "string",
+                    "default": null,
+                    "description": "Path to the JDK installation used to run the Groovy language server. Requires JDK 17 or later. If not set, uses the JAVA_HOME environment variable.",
+                    "scope": "machine-overridable"
+                },
+                "groovy.ls.vmargs": {
+                    "type": "string",
+                    "default": "-Xmx1G",
+                    "description": "Additional JVM arguments for the language server process (e.g., -Xmx2G for more memory).",
+                    "scope": "machine-overridable"
+                },
+                "groovy.trace.server": {
+                    "type": "string",
+                    "enum": [
+                        "off",
+                        "messages",
+                        "verbose"
+                    ],
+                    "default": "off",
+                    "description": "Traces the communication between VS Code and the Groovy language server.",
+                    "scope": "window"
+                },
+                "groovy.format.settingsUrl": {
+                    "type": "string",
+                    "default": null,
+                    "markdownDescription": "Path to an Eclipse formatter profile XML file. Supports absolute paths, workspace-relative paths, and `file://` URIs. This is the same XML format exported by Eclipse IDE's **Java > Code Style > Formatter** preferences.",
+                    "scope": "resource"
+                },
+                "groovy.format.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Enable/disable the Groovy document formatter.",
+                    "scope": "window"
+                }
+            }
+        },
+        "commands": [
+            {
+                "command": "groovy.restartServer",
+                "title": "Groovy: Restart Language Server"
+            },
+            {
+                "command": "groovy.showOutputChannel",
+                "title": "Groovy: Show Output Channel"
+            }
+        ]
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "webpack --mode production",
+        "watch": "webpack --mode development --watch",
+        "lint": "eslint src/**/*.ts",
+        "package": "vsce package"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.85.0",
+        "ts-loader": "^9.5.0",
+        "typescript": "^5.3.0",
+        "webpack": "^5.90.0",
+        "webpack-cli": "^5.1.0",
+        "@vscode/vsce": "^2.22.0"
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    }
+}

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+    <!--
+        Declare the Groovy Language Server as an Eclipse application.
+        This is the entry point when the Equinox OSGi runtime starts headlessly.
+    -->
+    <extension id="id1"
+               point="org.eclipse.core.runtime.applications">
+        <application
+            cardinality="singleton-global"
+            thread="main"
+            visible="true">
+            <run class="org.eclipse.groovy.ls.core.GroovyLanguageServerApplication"/>
+        </application>
+    </extension>
+
+    <!--
+        Declare the Eclipse product so the runtime can find our application.
+    -->
+    <extension id="product"
+               point="org.eclipse.core.runtime.products">
+        <product
+            application="org.eclipse.groovy.ls.core.id1"
+            name="Groovy Language Server">
+            <property name="appName" value="Groovy Language Server"/>
+        </product>
+    </extension>
+
+    <!--
+        Provide a minimal ICodeSelectHelper so that
+        CodeSelectHelperFactory.<clinit> does not throw.
+        The real helper lives in org.codehaus.groovy.eclipse.codeassist
+        which is not available in this headless environment.
+    -->
+    <extension point="org.eclipse.jdt.groovy.core.codeSelectHelper">
+        <helper class="org.eclipse.groovy.ls.core.providers.MinimalCodeSelectHelper"/>
+    </extension>
+</plugin>

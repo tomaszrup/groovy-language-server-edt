@@ -1,0 +1,938 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) 2026 Groovy Language Server Contributors.
+ *  Licensed under the EPL-2.0. See LICENSE in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import * as path from 'path';
+import * as fs from 'fs';
+import * as net from 'net';
+import * as vscode from 'vscode';
+import { workspace, ExtensionContext, window, commands, OutputChannel, StatusBarItem, StatusBarAlignment, ThemeColor } from 'vscode';
+import {
+    LanguageClient,
+    LanguageClientOptions,
+    ServerOptions,
+    Executable,
+    TransportKind,
+} from 'vscode-languageclient/node';
+
+let client: LanguageClient | undefined;
+let outputChannel: OutputChannel;
+let statusBarItem: StatusBarItem;
+
+/** Pre-fetched classpath data from the Java extension (filled before LS starts). */
+let preFetchedClasspathData: Array<{ projectUri: string; entries: string[] }> = [];
+/** Cached Java extension API (obtained during wait phase). */
+let cachedJavaApi: any = null;
+
+/** Scheme for virtual source documents from JARs/JDK. */
+const GROOVY_SOURCE_SCHEME = 'groovy-source';
+
+/**
+ * Content provider for groovy-source:// virtual documents.
+ * When VS Code opens a groovy-source URI (e.g., from go-to-definition on a binary type),
+ * this provider asks the language server to resolve the source content.
+ */
+class GroovySourceContentProvider implements vscode.TextDocumentContentProvider {
+    private _client: LanguageClient
+    private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+    readonly onDidChange = this._onDidChange.event;
+
+    constructor(client: LanguageClient) {
+        this._client = client;
+    }
+
+    async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
+        try {
+            const content = await this._client.sendRequest<string>(
+                'groovy/resolveSource',
+                { uri: uri.toString() }
+            );
+            return content ?? '// Source not available\n';
+        } catch (e) {
+            outputChannel.appendLine(`[groovy-source] Failed to resolve: ${uri.toString()} — ${e}`);
+            return `// Error resolving source: ${e}\n`;
+        }
+    }
+}
+
+/** Server status states */
+type ServerState = 'WaitingForJava' | 'Starting' | 'Importing' | 'Compiling' | 'Ready' | 'Error' | 'Stopped';
+
+interface StatusNotification {
+    state: ServerState;
+    message?: string;
+}
+
+function updateStatusBar(state: ServerState, message?: string): void {
+    switch (state) {
+        case 'WaitingForJava':
+            statusBarItem.text = '$(sync~spin) Groovy: Waiting for Java';
+            statusBarItem.tooltip = message ?? 'Waiting for Red Hat Java extension to finish importing projects...';
+            statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = 'groovy.showOutputChannel';
+            break;
+        case 'Starting':
+            statusBarItem.text = '$(sync~spin) Groovy: Starting';
+            statusBarItem.tooltip = message ?? 'Groovy Language Server is starting...';
+            statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = 'groovy.showOutputChannel';
+            break;
+        case 'Importing':
+            statusBarItem.text = '$(sync~spin) Groovy: Importing';
+            statusBarItem.tooltip = message ?? 'Importing project dependencies...';
+            statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = 'groovy.showOutputChannel';
+            break;
+        case 'Compiling':
+            statusBarItem.text = '$(sync~spin) Groovy: Compiling';
+            statusBarItem.tooltip = message ?? 'Building workspace...';
+            statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = 'groovy.showOutputChannel';
+            break;
+        case 'Ready':
+            statusBarItem.text = '$(check) Groovy: Ready';
+            statusBarItem.tooltip = 'Groovy Language Server is ready';
+            statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = 'groovy.showOutputChannel';
+            break;
+        case 'Error':
+            statusBarItem.text = '$(error) Groovy: Error';
+            statusBarItem.tooltip = message ?? 'Groovy Language Server encountered an error';
+            statusBarItem.backgroundColor = new ThemeColor('statusBarItem.errorBackground');
+            statusBarItem.command = 'groovy.showOutputChannel';
+            break;
+        case 'Stopped':
+            statusBarItem.text = '$(circle-slash) Groovy: Stopped';
+            statusBarItem.tooltip = 'Groovy Language Server is not running';
+            statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = 'groovy.restartServer';
+            break;
+    }
+    statusBarItem.show();
+}
+
+export async function activate(context: ExtensionContext): Promise<void> {
+    outputChannel = window.createOutputChannel('Groovy Language Server');
+    outputChannel.appendLine('Activating Groovy Language Server extension...');
+
+    // Create status bar item (right-aligned, high priority to appear near the left of right section)
+    statusBarItem = window.createStatusBarItem(StatusBarAlignment.Left, 0);
+    statusBarItem.name = 'Groovy Language Server';
+    context.subscriptions.push(statusBarItem);
+
+    // Register show output channel command
+    context.subscriptions.push(
+        commands.registerCommand('groovy.showOutputChannel', () => {
+            outputChannel.show(true);
+        })
+    );
+
+    // Register restart command
+    context.subscriptions.push(
+        commands.registerCommand('groovy.restartServer', async () => {
+            outputChannel.appendLine('Restarting Groovy Language Server...');
+            updateStatusBar('Starting', 'Restarting...');
+            if (client) {
+                await client.stop();
+            }
+            await startLanguageServer(context);
+        })
+    );
+
+    // Wait for the Red Hat Java extension to be fully ready before starting.
+    // This prevents the Groovy LS from processing files before classpath is resolved,
+    // which would show spurious errors for unresolved types/imports.
+    updateStatusBar('WaitingForJava');
+    const javaReady = await waitForJavaExtension();
+    if (!javaReady) {
+        outputChannel.appendLine('Java extension not available — starting Groovy LS without classpath delegation.');
+    }
+
+    await startLanguageServer(context);
+}
+
+/**
+ * Wait for the Red Hat Java extension to activate and finish importing projects.
+ * Returns true if the Java extension is ready, false if it's unavailable or timed out.
+ */
+async function waitForJavaExtension(): Promise<boolean> {
+    const javaExtension = vscode.extensions.getExtension('redhat.java');
+    if (!javaExtension) {
+        outputChannel.appendLine('[java-ext] Red Hat Java extension not installed.');
+        return false;
+    }
+
+    outputChannel.appendLine('[java-ext] Waiting for Red Hat Java extension to be ready...');
+
+    // Activate the Java extension if needed
+    let javaApi: any;
+    try {
+        javaApi = javaExtension.isActive ? javaExtension.exports : await javaExtension.activate();
+    } catch (e) {
+        outputChannel.appendLine(`[java-ext] Failed to activate: ${e}`);
+        return false;
+    }
+
+    if (!javaApi) {
+        outputChannel.appendLine('[java-ext] Java extension API is null.');
+        return false;
+    }
+
+    outputChannel.appendLine('[java-ext] Activated. API version: ' + (javaApi.apiVersion ?? 'unknown'));
+    outputChannel.appendLine('[java-ext] Server mode: ' + (javaApi.serverMode ?? 'unknown'));
+
+    // Wait for Standard mode to be ready (projects imported, indices built)
+    if (typeof javaApi.serverReady === 'function') {
+        outputChannel.appendLine('[java-ext] Waiting for serverReady()...');
+        updateStatusBar('WaitingForJava', 'Waiting for Java: importing projects...');
+        try {
+            await javaApi.serverReady();
+            outputChannel.appendLine('[java-ext] Server is ready (Standard mode, imports done).');
+        } catch (e) {
+            outputChannel.appendLine(`[java-ext] serverReady() failed: ${e}`);
+            return false;
+        }
+    } else {
+        outputChannel.appendLine('[java-ext] serverReady() not available — waiting 10s as fallback.');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+    }
+
+    outputChannel.appendLine('[java-ext] Java extension is ready.');
+
+    // Pre-fetch classpath entries now while LS hasn't started yet.
+    // This way we can send them immediately after client.start() completes,
+    // before the server triggers its initial build.
+    cachedJavaApi = javaApi;
+    await preFetchClasspaths(javaApi);
+
+    return true;
+}
+
+/**
+ * Pre-fetch classpath entries from the Java extension before the Groovy LS starts.
+ * Stores results in preFetchedClasspathData for immediate sending after client.start().
+ */
+async function preFetchClasspaths(javaApi: any): Promise<void> {
+    updateStatusBar('WaitingForJava', 'Waiting for Java: fetching classpath...');
+    outputChannel.appendLine('[java-ext] Pre-fetching classpath entries...');
+
+    const javaHomePath = resolveJavaHome() ?? '';
+    const javaHomeNorm = javaHomePath.replace(/\\/g, '/').toLowerCase();
+
+    function isJdkEntry(entryPath: string): boolean {
+        const norm = entryPath.replace(/\\/g, '/').toLowerCase();
+        if (javaHomeNorm && norm.startsWith(javaHomeNorm)) return true;
+        if ((norm.includes('/jdk-') || norm.includes('/jdk/') || norm.includes('/jre/'))
+            && !norm.includes('.gradle/') && !norm.includes('.m2/')) {
+            return true;
+        }
+        return false;
+    }
+
+    try {
+        const projectUris: string[] =
+            (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
+
+        outputChannel.appendLine(`[java-ext] Pre-fetch: java.project.getAll returned ${projectUris.length} project(s)`);
+
+        const wsRootPath = workspace.workspaceFolders?.[0]?.uri.fsPath
+            ?.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase() ?? '';
+
+        const nonRootProjects = projectUris.filter(uri => {
+            if (uri.includes('jdt_ws')) return false;
+            try {
+                const projPath = vscode.Uri.parse(uri).fsPath
+                    .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                return projPath !== wsRootPath;
+            } catch { return true; }
+        });
+
+        const realProjects = projectUris.filter(uri => {
+            if (uri.includes('jdt_ws')) return false;
+            try {
+                const projPath = vscode.Uri.parse(uri).fsPath
+                    .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                if (projPath === wsRootPath && nonRootProjects.length > 0) return false;
+            } catch { /* ignore */ }
+            return true;
+        });
+
+        for (const projectUri of realProjects) {
+            try {
+                let result: { classpaths: string[]; modulepaths: string[] } | null = null;
+                if (typeof javaApi.getClasspaths === 'function') {
+                    result = await javaApi.getClasspaths(projectUri, { scope: 'test' });
+                }
+
+                let rawEntries: string[] = [];
+                if (result) {
+                    rawEntries = [...(result.classpaths ?? []), ...(result.modulepaths ?? [])];
+                }
+
+                const filteredEntries = rawEntries.filter(e => !isJdkEntry(e));
+
+                if (filteredEntries.length > 0) {
+                    preFetchedClasspathData.push({
+                        projectUri,
+                        entries: filteredEntries,
+                    });
+                    outputChannel.appendLine(
+                        `[java-ext] Pre-fetched ${filteredEntries.length} entries for ${projectUri}`
+                    );
+                }
+            } catch (e) {
+                outputChannel.appendLine(`[java-ext] Pre-fetch failed for ${projectUri}: ${e}`);
+            }
+        }
+
+        outputChannel.appendLine(
+            `[java-ext] Pre-fetch complete: ${preFetchedClasspathData.length} project(s) with classpath data`
+        );
+    } catch (e) {
+        outputChannel.appendLine(`[java-ext] Pre-fetch failed: ${e}`);
+    }
+}
+
+export async function deactivate(): Promise<void> {
+    if (client) {
+        await client.stop();
+        client = undefined;
+    }
+    updateStatusBar('Stopped');
+}
+
+async function startLanguageServer(context: ExtensionContext): Promise<void> {
+    // 1. Resolve JRE
+    const javaHome = resolveJavaHome();
+    if (!javaHome) {
+        updateStatusBar('Error', 'JDK not found');
+        window.showErrorMessage(
+            'Groovy Language Server requires JDK 17+. ' +
+            'Set "groovy.java.home" in settings or the JAVA_HOME environment variable.'
+        );
+        return;
+    }
+
+    const javaExecutable = getJavaExecutable(javaHome);
+    if (!fs.existsSync(javaExecutable)) {
+        updateStatusBar('Error', 'Java executable not found');
+        window.showErrorMessage(
+            `Java executable not found at: ${javaExecutable}. ` +
+            'Please verify your "groovy.java.home" setting or JAVA_HOME.'
+        );
+        return;
+    }
+
+    outputChannel.appendLine(`Using Java: ${javaExecutable}`);
+
+    // 2. Locate the server installation
+    const serverDir = resolveServerDir(context);
+    if (!serverDir) {
+        updateStatusBar('Error', 'Server binaries not found');
+        window.showErrorMessage(
+            'Groovy Language Server: Server binaries not found. ' +
+            'The extension may need to be rebuilt.'
+        );
+        return;
+    }
+
+    outputChannel.appendLine(`Server directory: ${serverDir}`);
+
+    // 3. Find the Equinox launcher JAR
+    const launcherJar = findLauncherJar(serverDir);
+    if (!launcherJar) {
+        updateStatusBar('Error', 'Equinox launcher JAR not found');
+        window.showErrorMessage(
+            'Groovy Language Server: org.eclipse.equinox.launcher JAR not found in server/plugins/.'
+        );
+        return;
+    }
+
+    outputChannel.appendLine(`Launcher JAR: ${launcherJar}`);
+
+    // 4. Determine platform-specific config directory
+    const configDir = getConfigDir(serverDir);
+    outputChannel.appendLine(`Config directory: ${configDir}`);
+
+    // 5. Build the workspace data directory
+    const workspaceStoragePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
+    const dataDir = path.join(workspaceStoragePath, 'groovy_ws');
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    // 6. Build JVM arguments
+    const vmargs = workspace.getConfiguration('groovy').get<string>('ls.vmargs', '-Xmx1G');
+    const args: string[] = [];
+
+    // JVM module access flags (required for JDK 17+)
+    args.push('--add-modules=ALL-SYSTEM');
+    args.push('--add-opens', 'java.base/java.util=ALL-UNNAMED');
+    args.push('--add-opens', 'java.base/java.lang=ALL-UNNAMED');
+
+    // VM args from settings
+    if (vmargs) {
+        args.push(...vmargs.split(/\s+/).filter(a => a.length > 0));
+    }
+
+    // Eclipse / Equinox system properties
+    args.push('-Declipse.application=org.eclipse.groovy.ls.core.id1');
+    args.push('-Declipse.product=org.eclipse.groovy.ls.core.product');
+    args.push('-Dosgi.bundles.defaultStartLevel=4');
+    args.push('-Dosgi.checkConfiguration=true');
+    args.push('-Dfile.encoding=UTF-8');
+
+    // The launcher JAR
+    args.push('-jar', launcherJar);
+
+    // Equinox configuration
+    args.push('-configuration', configDir);
+    args.push('-data', dataDir);
+
+    outputChannel.appendLine(`Launch args: java ${args.join(' ')}`);
+
+    // 7. Define server options
+    const serverOptions: ServerOptions = {
+        command: javaExecutable,
+        args: args,
+        transport: TransportKind.stdio,
+    } as Executable;
+
+    // 8. Define client options
+    const clientOptions: LanguageClientOptions = {
+        documentSelector: [
+            { scheme: 'file', language: 'groovy' },
+            { scheme: 'untitled', language: 'groovy' },
+            { scheme: GROOVY_SOURCE_SCHEME, language: 'groovy' },
+            { scheme: GROOVY_SOURCE_SCHEME, language: 'java' },
+        ],
+        synchronize: {
+            fileEvents: [
+                workspace.createFileSystemWatcher('**/*.groovy'),
+                workspace.createFileSystemWatcher('**/*.java'),
+                workspace.createFileSystemWatcher('**/build.gradle'),
+                workspace.createFileSystemWatcher('**/pom.xml'),
+            ],
+        },
+        outputChannel: outputChannel,
+        traceOutputChannel: outputChannel,
+    };
+
+    // 9. Create and start the language client
+    client = new LanguageClient(
+        'groovy',
+        'Groovy Language Server',
+        serverOptions,
+        clientOptions
+    );
+
+    outputChannel.appendLine('Starting Groovy Language Server...');
+    await client.start();
+    outputChannel.appendLine('Groovy Language Server started successfully.');
+
+    // Register the virtual document content provider for groovy-source:// URIs
+    const sourceProvider = new GroovySourceContentProvider(client);
+    context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider(GROOVY_SOURCE_SCHEME, sourceProvider)
+    );
+    outputChannel.appendLine('Registered groovy-source:// content provider.');
+
+    // Listen for custom status notifications from the server
+    client.onNotification('groovy/status', (params: StatusNotification) => {
+        outputChannel.appendLine(`[status] ${params.state}${params.message ? ': ' + params.message : ''}`);
+        updateStatusBar(params.state, params.message);
+    });
+
+    // Send pre-fetched classpath immediately — before the server's deferred
+    // initial build timer fires. This ensures the first build has full classpath.
+    if (preFetchedClasspathData.length > 0) {
+        outputChannel.appendLine(`[java-ext] Sending ${preFetchedClasspathData.length} pre-fetched classpath(s) to server...`);
+        for (const cp of preFetchedClasspathData) {
+            client.sendNotification('groovy/classpathUpdate', {
+                projectUri: cp.projectUri,
+                entries: cp.entries,
+            });
+            outputChannel.appendLine(`[java-ext]   Sent ${cp.entries.length} entries for ${cp.projectUri}`);
+        }
+        preFetchedClasspathData = []; // clear after sending
+    }
+
+    // Push initial configuration (e.g., formatter profile path) to the server
+    const groovyConfig = workspace.getConfiguration('groovy');
+    client.sendNotification('workspace/didChangeConfiguration', {
+        settings: {
+            groovy: {
+                format: {
+                    settingsUrl: groovyConfig.get<string>('format.settingsUrl') ?? null,
+                    enabled: groovyConfig.get<boolean>('format.enabled', true),
+                },
+            },
+        },
+    });
+
+    // Watch for configuration changes and forward to server
+    context.subscriptions.push(
+        workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration('groovy.format') && client) {
+                const config = workspace.getConfiguration('groovy');
+                client.sendNotification('workspace/didChangeConfiguration', {
+                    settings: {
+                        groovy: {
+                            format: {
+                                settingsUrl: config.get<string>('format.settingsUrl') ?? null,
+                                enabled: config.get<boolean>('format.enabled', true),
+                            },
+                        },
+                    },
+                });
+            }
+        })
+    );
+
+    // ---- Delegate classpath resolution to Red Hat Java extension ----
+    await initJavaExtensionClasspath(context, client);
+}
+
+/**
+ * Hook into the Red Hat Java extension to register event listeners for
+ * ongoing classpath changes. The initial classpath was already pre-fetched
+ * and sent immediately after client.start().
+ */
+async function initJavaExtensionClasspath(
+    context: ExtensionContext,
+    lsClient: LanguageClient
+): Promise<void> {
+    // Use the cached Java API from the wait phase
+    const javaApi = cachedJavaApi;
+    if (!javaApi) {
+        outputChannel.appendLine('[java-ext] No cached Java API. Classpath delegation disabled.');
+        return;
+    }
+
+    outputChannel.appendLine('[java-ext] Setting up classpath change listeners...');
+
+    // Resolve Java home for filtering JDK entries from classpath
+    const javaHomePath = resolveJavaHome() ?? '';
+    const javaHomeNorm = javaHomePath.replace(/\\/g, '/').toLowerCase();
+
+    /** Check if entry is inside a JDK installation (already have JRE_CONTAINER). */
+    function isJdkEntry(entryPath: string): boolean {
+        const norm = entryPath.replace(/\\/g, '/').toLowerCase();
+        if (javaHomeNorm && norm.startsWith(javaHomeNorm)) return true;
+        // Heuristic: JDK-like paths not in dependency caches
+        if ((norm.includes('/jdk-') || norm.includes('/jdk/') || norm.includes('/jre/'))
+            && !norm.includes('.gradle/') && !norm.includes('.m2/')) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Extract JAR paths and output dirs from classpathEntries returned by
+     * java.project.getSettings with the 'org.eclipse.jdt.ls.core.vm.location'
+     * and 'org.eclipse.jdt.ls.core.classpathEntries' keys.
+     * Each entry has: { kind: number, path: string, entryKind: number, ... }
+     * kind 1=source, 2=container, 3=library, 4=output
+     */
+    function extractEntriesFromSettings(
+        settingsResult: any
+    ): { jars: string[]; outputDirs: string[] } {
+        const jars: string[] = [];
+        const outputDirs: string[] = [];
+        const entries: any[] =
+            settingsResult?.['org.eclipse.jdt.ls.core.classpathEntries'] ?? [];
+        for (const entry of entries) {
+            const p: string = entry?.path ?? '';
+            if (!p) continue;
+            if (p.toLowerCase().endsWith('.jar')) {
+                jars.push(p);
+            } else if (entry.kind === 4 || entry.entryKind === 4) {
+                // kind=4 is output
+                outputDirs.push(p);
+            } else if (entry.kind === 3 || entry.entryKind === 3) {
+                // kind=3 is library (could be a folder lib)
+                jars.push(p);
+            }
+        }
+        return { jars, outputDirs };
+    }
+
+    // Function to fetch classpath for a single project URI.
+    // Strategy:
+    //  1. getClasspaths (test scope) — standard API
+    //  2. If no JARs → getProjectSettings with classpathEntries (reads JDT model directly)
+    //  3. Send whatever we get to the Groovy LS
+    const fetchClasspathForProject = async (projectUri: string): Promise<boolean> => {
+        try {
+            outputChannel.appendLine(`[java-ext] Fetching classpath for project: ${projectUri}`);
+
+            // -------- Approach 1: getClasspaths API (test scope) --------
+            let result: { classpaths: string[]; modulepaths: string[] } | null = null;
+
+            if (typeof javaApi.getClasspaths === 'function') {
+                try {
+                    result = await javaApi.getClasspaths(projectUri, { scope: 'test' });
+                } catch (e1: any) {
+                    outputChannel.appendLine(`[java-ext]   getClasspaths(test) failed: ${e1.message ?? e1}`);
+                }
+            }
+
+            outputChannel.appendLine(`[java-ext-tr] ${projectUri} = ${result?.modulepaths}`);
+
+
+            let rawEntries: string[] = [];
+            if (result) {
+                rawEntries = [...(result.classpaths ?? []), ...(result.modulepaths ?? [])];
+            }
+            const hasJars = rawEntries.some(e => e.toLowerCase().endsWith('.jar'));
+
+            outputChannel.appendLine(
+                `[java-ext]   getClasspaths: ${rawEntries.length} entries, hasJars=${hasJars}`
+            );
+            for (const e of rawEntries) {
+                outputChannel.appendLine(`[java-ext]     ${e}`);
+            }
+
+            // -------- Filter and send --------
+            if (rawEntries.length > 0) {
+                const filteredEntries: string[] = [];
+                let skippedJdk = 0;
+
+                for (const entry of rawEntries) {
+                    if (isJdkEntry(entry)) {
+                        skippedJdk++;
+                        continue;
+                    }
+                    filteredEntries.push(entry);
+                }
+
+                if (skippedJdk > 0) {
+                    outputChannel.appendLine(
+                        `[java-ext]   Filtered out ${skippedJdk} JDK entries`
+                    );
+                }
+
+                outputChannel.appendLine(
+                    `[java-ext]   → ${filteredEntries.length} entries after filtering`
+                );
+
+                if (filteredEntries.length > 0) {
+                    const finalHasJars = filteredEntries.some(e => e.toLowerCase().endsWith('.jar'));
+
+                    lsClient.sendNotification('groovy/classpathUpdate', {
+                        projectUri,
+                        entries: filteredEntries,
+                    });
+                    outputChannel.appendLine(
+                        `[java-ext]   Sent ${filteredEntries.length} classpath entries` +
+                        (finalHasJars ? ' (includes JARs)' : ' (output dirs only, no JARs)')
+                    );
+                    return finalHasJars;
+                }
+            }
+
+            outputChannel.appendLine(`[java-ext]   → no usable entries (result: ${JSON.stringify(result)})`);
+            return false;
+        } catch (e) {
+            outputChannel.appendLine(`[java-ext]   → error: ${e}`);
+            return false;
+        }
+    };
+
+    // Fetch classpath for all Java projects known to JDT LS.
+    // Returns the number of projects that had actual JAR entries.
+    const fetchAllClasspaths = async (): Promise<number> => {
+        try {
+            // Use java.project.getAll to discover actual Java projects
+            const projectUris: string[] =
+                (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
+
+            outputChannel.appendLine(
+                `[java-ext] java.project.getAll returned ${projectUris.length} project(s):`
+            );
+            for (const uri of projectUris) {
+                outputChannel.appendLine(`[java-ext]   - ${uri}`);
+            }
+
+            if (projectUris.length === 0) {
+                outputChannel.appendLine('[java-ext] No Java projects found yet. Will retry on events.');
+                return 0;
+            }
+
+            // Filter out JDT LS invisible projects.
+            // Use filesystem path comparison since URI encoding differs between
+            // VS Code (file:///c%3A/...) and Java extension (file:/C:/...)
+            const wsRootPath = workspace.workspaceFolders?.[0]?.uri.fsPath
+                ?.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase() ?? '';
+
+            // Count non-jdt_ws, non-root projects to decide if root should be skipped
+            const nonRootProjects = projectUris.filter(uri => {
+                if (uri.includes('jdt_ws')) return false;
+                try {
+                    const projPath = vscode.Uri.parse(uri).fsPath
+                        .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                    return projPath !== wsRootPath;
+                } catch { return true; }
+            });
+
+            const realProjects = projectUris.filter(uri => {
+                if (uri.includes('jdt_ws')) return false;
+                // Only skip root workspace folder when there are actual subprojects.
+                // For single-project workspaces, the root IS the project.
+                try {
+                    const projPath = vscode.Uri.parse(uri).fsPath
+                        .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                    if (projPath === wsRootPath && nonRootProjects.length > 0) {
+                        outputChannel.appendLine(`[java-ext] Skipping root workspace folder (has ${nonRootProjects.length} subprojects): ${uri}`);
+                        return false;
+                    }
+                } catch { /* ignore parse errors */ }
+                return true;
+            });
+
+            // Also scan for build.gradle/pom.xml files the Java extension might have missed
+            // (Maven projects inside a Gradle workspace are often not detected)
+            const knownPaths = new Set(realProjects.map(uri => {
+                try {
+                    return vscode.Uri.parse(uri).fsPath
+                        .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                } catch { return ''; }
+            }));
+
+            const buildFiles = await vscode.workspace.findFiles(
+                '{**/build.gradle,**/pom.xml}',
+                '{**/node_modules/**,**/build/**,**/.gradle/**}'
+            );
+            for (const buildFile of buildFiles) {
+                const projDir = path.dirname(buildFile.fsPath);
+                const projDirNorm = projDir.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                if (projDirNorm === wsRootPath) continue; // skip root
+                if (!knownPaths.has(projDirNorm)) {
+                    const projUri = vscode.Uri.file(projDir).toString();
+                    outputChannel.appendLine(
+                        `[java-ext] Discovered project not in getAll(): ${projUri} (from ${path.basename(buildFile.fsPath)})`
+                    );
+                    realProjects.push(projUri);
+                    knownPaths.add(projDirNorm);
+                }
+            }
+
+            if (realProjects.length > 0) {
+                outputChannel.appendLine(
+                    `[java-ext] Total ${realProjects.length} project(s) to fetch classpath for`
+                );
+            }
+
+            let fetched = 0;
+            for (const projectUri of realProjects) {
+                const ok = await fetchClasspathForProject(projectUri);
+                if (ok) fetched++;
+            }
+
+            outputChannel.appendLine(
+                `[java-ext] Sent classpath for ${fetched}/${realProjects.length} project(s)`
+            );
+            return fetched;
+
+        } catch (e) {
+            outputChannel.appendLine(`[java-ext] Failed to enumerate projects: ${e}`);
+
+            // Fallback: try workspace folders directly (might work if workspace is a single project)
+            const folders = workspace.workspaceFolders;
+            if (folders) {
+                for (const folder of folders) {
+                    await fetchClasspathForProject(folder.uri.toString());
+                }
+            }
+            return 0;
+        }
+    };
+
+    // Retry wrapper: Java extension may not have finished Gradle/Maven import
+    // when we first fetch. Retry with increasing delays until we get actual JARs.
+    // On first failure, trigger java.projectConfiguration.update to force dependency resolution.
+    const fetchWithRetry = async (attempt: number = 1, maxAttempts: number = 6): Promise<void> => {
+        const fetched = await fetchAllClasspaths();
+        if (fetched === 0 && attempt < maxAttempts) {
+            // On first failure, try forcing project configuration updates
+            if (attempt === 1) {
+                outputChannel.appendLine(
+                    '[java-ext] No JARs on first attempt. Forcing project configuration update...'
+                );
+                try {
+                    // Get all project URIs and force-update each one
+                    const projectUris: string[] =
+                        (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
+                    for (const uri of projectUris) {
+                        if (uri.includes('jdt_ws')) continue;
+                        try {
+                            const parsedUri = vscode.Uri.parse(uri);
+                            outputChannel.appendLine(
+                                `[java-ext]   Requesting config update for: ${uri}`
+                            );
+                            await vscode.commands.executeCommand(
+                                'java.projectConfiguration.update',
+                                parsedUri
+                            );
+                        } catch (e) {
+                            outputChannel.appendLine(
+                                `[java-ext]   Config update failed for ${uri}: ${e}`
+                            );
+                        }
+                    }
+                } catch (e) {
+                    outputChannel.appendLine(`[java-ext] Failed to update configs: ${e}`);
+                }
+            }
+
+            const delay = Math.min(attempt * 5000, 30000); // 5s, 10s, 15s, 20s, 25s
+            outputChannel.appendLine(
+                `[java-ext] No JARs yet (attempt ${attempt}/${maxAttempts}). ` +
+                `Retrying in ${delay / 1000}s...`
+            );
+            setTimeout(() => fetchWithRetry(attempt + 1, maxAttempts), delay);
+        }
+    };
+
+    // Listen for classpath changes from the Java extension
+    if (typeof javaApi.onDidClasspathUpdate === 'function') {
+        context.subscriptions.push(
+            javaApi.onDidClasspathUpdate(async (uri: vscode.Uri) => {
+                outputChannel.appendLine(`[java-ext] Classpath updated for: ${uri.toString()}`);
+                // Re-fetch only the changed project (not all — each project has isolated classpath)
+                await fetchClasspathForProject(uri.toString());
+            })
+        );
+        outputChannel.appendLine('[java-ext] Registered onDidClasspathUpdate listener.');
+    }
+
+    // Listen for project import completion
+    if (typeof javaApi.onDidProjectsImport === 'function') {
+        context.subscriptions.push(
+            javaApi.onDidProjectsImport((_uris: vscode.Uri[]) => {
+                outputChannel.appendLine('[java-ext] Projects imported — refreshing classpath...');
+                fetchAllClasspaths();
+            })
+        );
+        outputChannel.appendLine('[java-ext] Registered onDidProjectsImport listener.');
+    }
+
+    // Also listen for the standard Java extension server ready event
+    if (typeof javaApi.onDidServerModeChange === 'function') {
+        context.subscriptions.push(
+            javaApi.onDidServerModeChange((mode: string) => {
+                outputChannel.appendLine(`[java-ext] Server mode changed: ${mode}`);
+                if (mode === 'Standard') {
+                    // Standard mode is ready — fetch classpath with retries
+                    setTimeout(() => fetchWithRetry(), 3000);
+                }
+            })
+        );
+    }
+
+    // Initial classpath fetch — serverReady() should have ensured the server
+    // is in Standard mode and projects are imported. Fetch with retry as a safety net.
+    fetchWithRetry();
+}
+
+// ---- Helper functions ----
+
+/**
+ * Resolve the Java home directory from settings or environment.
+ */
+function resolveJavaHome(): string | undefined {
+    // 1. Check VS Code setting
+    const configuredHome = workspace.getConfiguration('groovy').get<string>('java.home');
+    if (configuredHome && fs.existsSync(configuredHome)) {
+        return configuredHome;
+    }
+
+    // 2. Check JAVA_HOME environment variable
+    const envHome = process.env['JAVA_HOME'];
+    if (envHome && fs.existsSync(envHome)) {
+        return envHome;
+    }
+
+    // 3. Try to find java on PATH
+    const pathJava = process.env['PATH']?.split(path.delimiter)
+        .find(dir => {
+            const javaBin = path.join(dir, process.platform === 'win32' ? 'java.exe' : 'java');
+            return fs.existsSync(javaBin);
+        });
+
+    if (pathJava) {
+        // Walk up from bin/ to get java home
+        const binDir = pathJava;
+        const home = path.dirname(binDir);
+        if (fs.existsSync(path.join(home, 'bin'))) {
+            return home;
+        }
+        return binDir; // fallback
+    }
+
+    return undefined;
+}
+
+/**
+ * Get the full path to the java executable.
+ */
+function getJavaExecutable(javaHome: string): string {
+    const exe = process.platform === 'win32' ? 'java.exe' : 'java';
+    const binJava = path.join(javaHome, 'bin', exe);
+    if (fs.existsSync(binJava)) {
+        return binJava;
+    }
+    // Maybe javaHome IS the bin directory
+    return path.join(javaHome, exe);
+}
+
+/**
+ * Resolve the server installation directory.
+ * Looks for server/ relative to the extension root.
+ */
+function resolveServerDir(context: ExtensionContext): string | undefined {
+    const candidates = [
+        path.join(context.extensionPath, 'server'),
+        path.join(context.extensionPath, '..', 'org.eclipse.groovy.ls.product', 'target', 'repository'),
+    ];
+
+    for (const candidate of candidates) {
+        const pluginsDir = path.join(candidate, 'plugins');
+        if (fs.existsSync(pluginsDir)) {
+            return candidate;
+        }
+    }
+
+    return undefined;
+}
+
+/**
+ * Find the Equinox launcher JAR in the server's plugins directory.
+ */
+function findLauncherJar(serverDir: string): string | undefined {
+    const pluginsDir = path.join(serverDir, 'plugins');
+    if (!fs.existsSync(pluginsDir)) {
+        return undefined;
+    }
+
+    const entries = fs.readdirSync(pluginsDir);
+    const launcher = entries.find(name => name.startsWith('org.eclipse.equinox.launcher_') && name.endsWith('.jar'));
+    return launcher ? path.join(pluginsDir, launcher) : undefined;
+}
+
+/**
+ * Get the platform-specific Equinox configuration directory.
+ */
+function getConfigDir(serverDir: string): string {
+    let configName: string;
+    switch (process.platform) {
+        case 'win32':
+            configName = 'config_win';
+            break;
+        case 'darwin':
+            configName = 'config_mac';
+            break;
+        default:
+            configName = 'config_linux';
+    }
+    return path.join(serverDir, configName);
+}

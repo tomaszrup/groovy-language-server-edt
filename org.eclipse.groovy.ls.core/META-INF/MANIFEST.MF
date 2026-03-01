@@ -1,0 +1,37 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Name: Groovy Language Server Core
+Bundle-SymbolicName: org.eclipse.groovy.ls.core;singleton:=true
+Bundle-Version: 0.1.0.qualifier
+Bundle-Activator: org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin
+Bundle-Vendor: Groovy Language Server Contributors
+Require-Bundle: org.eclipse.core.runtime;bundle-version="3.29.0",
+ org.eclipse.core.resources;bundle-version="3.20.0",
+ org.eclipse.core.jobs;bundle-version="3.15.0",
+ org.eclipse.core.filesystem;bundle-version="1.10.0",
+ org.eclipse.text;bundle-version="3.14.0",
+ org.eclipse.jdt.core;bundle-version="3.38.0",
+ org.eclipse.jdt.core.manipulation;bundle-version="1.21.0";resolution:=optional,
+ org.eclipse.jdt.launching;bundle-version="3.21.0",
+ org.eclipse.ltk.core.refactoring;bundle-version="3.14.0",
+ org.eclipse.lsp4j;bundle-version="0.23.0",
+ org.eclipse.lsp4j.jsonrpc;bundle-version="0.23.0"
+Bundle-RequiredExecutionEnvironment: JavaSE-17
+Bundle-ActivationPolicy: lazy
+Export-Package: org.eclipse.groovy.ls.core,
+ org.eclipse.groovy.ls.core.providers
+Import-Package: com.google.gson;version="2.10.0",
+ org.eclipse.jface.text;resolution:=optional,
+ org.codehaus.groovy.ast,
+ org.codehaus.groovy.ast.expr,
+ org.codehaus.groovy.ast.stmt,
+ org.codehaus.groovy.control,
+ org.codehaus.groovy.eclipse.codeassist;resolution:=optional,
+ org.codehaus.groovy.eclipse.refactoring;resolution:=optional,
+ org.eclipse.jdt.groovy.core;resolution:=optional,
+ org.codehaus.jdt.groovy.model;resolution:=optional
+DynamicImport-Package: org.eclipse.jdt.groovy.*,
+ org.codehaus.jdt.groovy.*,
+ org.codehaus.groovy.*,
+ groovy.*
+Automatic-Module-Name: org.eclipse.groovy.ls.core

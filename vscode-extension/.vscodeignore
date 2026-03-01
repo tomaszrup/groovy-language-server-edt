@@ -1,0 +1,16 @@
+# VS Code Extension — Ignore files not needed in the VSIX package
+.vscode/**
+src/**
+out/**
+node_modules/**
+tsconfig.json
+webpack.config.js
+*.map
+.gitignore
+
+# Keep the server directory, syntaxes, and license
+!server/**
+!syntaxes/**
+!dist/**
+!language-configuration.json
+!LICENSE

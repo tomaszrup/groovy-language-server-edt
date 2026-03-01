@@ -1,0 +1,25 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-SymbolicName: org.codehaus.groovy.eclipse.core;singleton:=true
+Bundle-Name: Groovy Core
+Bundle-Vendor: Pivotal Software, Inc.
+Bundle-Version: 6.0.0.v202512311626-e2503
+Export-Package: org.codehaus.groovy.eclipse.core,org.codehaus.groovy.ecl
+ ipse.core.builder,org.codehaus.groovy.eclipse.core.compiler,org.codehau
+ s.groovy.eclipse.core.impl,org.codehaus.groovy.eclipse.core.inference,o
+ rg.codehaus.groovy.eclipse.core.launchers,org.codehaus.groovy.eclipse.c
+ ore.model,org.codehaus.groovy.eclipse.core.preferences,org.codehaus.gro
+ ovy.eclipse.core.search,org.codehaus.groovy.eclipse.core.util
+Import-Package: org.eclipse.debug.core;resolution:=optional,org.eclipse.
+ eclemma.core.launching;resolution:=optional,org.eclipse.jdt.launching;r
+ esolution:=optional
+Require-Bundle: org.codehaus.groovy.eclipse.compilerResolver;bundle-vers
+ ion="6.0.0",org.eclipse.jdt.groovy.core;bundle-version="6.0.0";visibili
+ ty:=reexport
+Bundle-ActivationPolicy: lazy
+Bundle-Activator: org.codehaus.groovy.eclipse.core.GroovyCoreActivator
+Eclipse-SourceReferences: scm:git:git://github.com/gitroot/groovy/groovy
+ -eclipse;path="ide/org.codehaus.groovy.eclipse.core";tag="v6.0.0";commi
+ tId=757cc9196c27073dac8ec9c0d09edf3fce968530
+Require-Capability: osgi.ee;filter:="(&(osgi.ee=JavaSE)(version=17))"
+

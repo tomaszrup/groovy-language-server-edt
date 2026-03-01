@@ -1,0 +1,30 @@
+# Build outputs
+**/target/
+**/bin/
+**/build/
+
+# Gradle
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+# VS Code extension build artifacts
+vscode-extension/node_modules/
+vscode-extension/dist/
+vscode-extension/out/
+vscode-extension/server/
+vscode-extension/*.vsix
+
+# IDE files
+.idea/
+.project
+.classpath
+.settings/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Eclipse workspace metadata
+.metadata/

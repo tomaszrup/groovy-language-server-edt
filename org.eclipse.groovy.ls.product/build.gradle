@@ -1,0 +1,195 @@
+plugins {
+    id 'base'
+}
+
+def eclipseEquinoxLauncherVersion = project.property('eclipseEquinoxLauncherVersion')
+def groovyVersion = project.property('groovyVersion')
+
+// ---- Groovy-Eclipse integration settings ----
+// The patched JDT core from groovy-eclipse replaces the standard JDT at runtime
+// to provide native Groovy compilation support inside Eclipse/JDT.
+def groovyEclipseIntegrationVersion = '6.0.0'
+def groovyEclipseBuildQualifier = 'v202512311626-e2503'
+def groovyEclipseP2Base = "https://groovy.jfrog.io/artifactory/plugins-release-local/org/codehaus/groovy/groovy-eclipse-integration/${groovyEclipseIntegrationVersion}/e4.35/plugins"
+
+// Groovy-Eclipse OSGi bundles to download from the p2 update site.
+// Only the essential bundles for JDT-Groovy integration are included.
+// The .eclipse.core/.codeassist/.refactoring bundles require full Eclipse IDE
+// (UI, codebrowsing, compilerResolver) and are not needed for a headless LS.
+def groovyEclipseBundles = [
+    "org.eclipse.jdt.core_3.41.0.${groovyEclipseBuildQualifier}.jar",
+    "org.eclipse.jdt.core.compiler.batch_3.41.0.${groovyEclipseBuildQualifier}.jar",
+    "org.eclipse.jdt.groovy.core_${groovyEclipseIntegrationVersion}.${groovyEclipseBuildQualifier}.jar",
+    "org.codehaus.groovy_5.0.3.${groovyEclipseBuildQualifier}.jar",
+]
+
+// The product output directory
+def productDir = layout.buildDirectory.dir('product')
+def pluginsDir = layout.buildDirectory.dir('product/plugins')
+
+// ============================================================================
+// Task: Collect all runtime JARs (our plugin + all transitive Eclipse deps)
+// ============================================================================
+tasks.register('collectPlugins', Copy) {
+    description = 'Collect all runtime JARs into the product plugins/ directory'
+    group = 'build'
+
+    dependsOn ':org.eclipse.groovy.ls.core:jar'
+
+    // Our language server JAR
+    from project(':org.eclipse.groovy.ls.core').tasks.named('jar')
+
+    // All runtime dependencies (Eclipse platform, JDT, LSP4J, Gson, etc.)
+    from project(':org.eclipse.groovy.ls.core').configurations.named('runtimeClasspath')
+
+    into pluginsDir
+
+    // ---- Exclude JARs replaced by groovy-eclipse patched versions ----
+    // The standard JDT core, ECJ compiler, and Groovy runtime from Maven Central
+    // are replaced by groovy-eclipse patched equivalents (see downloadGroovyEclipsePlugins).
+    exclude '**/groovy-eclipse-batch-*.jar'
+    exclude '**/ecj-*.jar'                                      // standard ECJ -> patched JDT compiler.batch
+    exclude { it.name.startsWith('org.eclipse.jdt.core-') }     // standard JDT core -> patched
+    exclude { it.name.startsWith('groovy-') && !it.name.contains('eclipse') }  // standard Groovy -> OSGi-wrapped
+
+    // Rename our JAR to a clean OSGi-style name (no hyphens before digits)
+    // Must come BEFORE the generic rename rules to prevent double-renaming
+    rename 'org.eclipse.groovy.ls.core-.*\\.jar', 'org.eclipse.groovy.ls.core_0.1.0.jar'
+
+    // ---- OSGi bundle naming convention ----
+    // Maven Central uses hyphens (e.g. org.eclipse.osgi-3.24.0.jar) but the Equinox
+    // launcher expects underscores (e.g. org.eclipse.osgi_3.24.0.jar) to discover the
+    // framework JAR and other bundles.
+    rename '(org\\.eclipse\\.[\\w.]+)-(\\d.*)\\.jar', '$1_$2.jar'
+    rename '(org\\.osgi\\.[\\w.]+)-(\\d.*)\\.jar', '$1_$2.jar'
+    rename '(osgi\\.annotation)-(\\d.*)\\.jar', '$1_$2.jar'
+    // Note: JDT core, ECJ compiler, and Groovy are now provided by groovy-eclipse
+    // bundles (already in correct OSGi naming) via the downloadGroovyEclipsePlugins task.
+}
+
+// ============================================================================
+// Task: Download the Equinox Launcher JAR (the bootstrap entry point)
+// ============================================================================
+tasks.register('downloadEquinoxLauncher') {
+    description = 'Download the Equinox launcher JAR from Maven Central'
+    group = 'build'
+
+    def launcherJar = pluginsDir.map { it.file("org.eclipse.equinox.launcher_${eclipseEquinoxLauncherVersion}.jar") }
+    outputs.file launcherJar
+
+    doLast {
+        def targetFile = launcherJar.get().asFile
+        if (!targetFile.exists()) {
+            targetFile.parentFile.mkdirs()
+            def url = "https://repo1.maven.org/maven2/org/eclipse/platform/org.eclipse.equinox.launcher/${eclipseEquinoxLauncherVersion}/org.eclipse.equinox.launcher-${eclipseEquinoxLauncherVersion}.jar"
+            logger.lifecycle("Downloading Equinox Launcher from ${url}")
+            new URL(url).withInputStream { input ->
+                targetFile.withOutputStream { output ->
+                    output << input
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Task: Download groovy-eclipse patched JDT core + Groovy-Eclipse integration
+// bundles from the groovy-eclipse p2 update site on JFrog.
+//
+// These replace the standard JDT core and Groovy runtime with versions that
+// natively understand .groovy files within the Eclipse/JDT framework.
+// ============================================================================
+tasks.register('downloadGroovyEclipsePlugins') {
+    description = 'Download groovy-eclipse patched JDT and integration bundles from JFrog p2 site'
+    group = 'build'
+
+    def outputFiles = groovyEclipseBundles.collect { name ->
+        pluginsDir.map { it.file(name) }
+    }
+    outputs.files outputFiles
+
+    doLast {
+        def targetDir = pluginsDir.get().asFile
+        targetDir.mkdirs()
+
+        groovyEclipseBundles.each { jarName ->
+            def targetFile = new File(targetDir, jarName)
+            if (!targetFile.exists()) {
+                def url = "${groovyEclipseP2Base}/${jarName}"
+                logger.lifecycle("Downloading groovy-eclipse bundle: ${jarName}")
+                new URL(url).withInputStream { input ->
+                    targetFile.withOutputStream { output ->
+                        output << input
+                    }
+                }
+                logger.lifecycle("  -> ${String.format('%.1f', targetFile.length() / (1024.0 * 1024.0))} MB")
+            } else {
+                logger.lifecycle("Already downloaded: ${jarName}")
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Task: Copy platform-specific config.ini files
+// ============================================================================
+tasks.register('copyConfigs', Copy) {
+    description = 'Copy platform config.ini files to the product directory'
+    group = 'build'
+
+    from('config_win') { into 'config_win' }
+    from('config_linux') { into 'config_linux' }
+    from('config_mac') { into 'config_mac' }
+
+    into productDir
+}
+
+// ============================================================================
+// Task: Assemble the complete product
+// ============================================================================
+tasks.register('assembleProduct') {
+    description = 'Assemble the complete Groovy Language Server product directory'
+    group = 'build'
+
+    dependsOn 'collectPlugins', 'downloadEquinoxLauncher', 'downloadGroovyEclipsePlugins', 'copyConfigs'
+
+    doLast {
+        logger.lifecycle("Product assembled at: ${productDir.get().asFile.absolutePath}")
+        def plugins = pluginsDir.get().asFile.listFiles()
+        logger.lifecycle("Plugins: ${plugins ? plugins.size() : 0} JARs")
+        plugins?.sort()?.each { logger.lifecycle("  - ${it.name}") }
+    }
+}
+
+// ============================================================================
+// Task: Create distribution archives
+// ============================================================================
+tasks.register('distZip', Zip) {
+    description = 'Create a ZIP distribution of the language server'
+    group = 'distribution'
+
+    dependsOn 'assembleProduct'
+
+    from productDir
+    archiveBaseName = 'groovy-language-server'
+    archiveClassifier = ''
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+}
+
+tasks.register('distTar', Tar) {
+    description = 'Create a tar.gz distribution of the language server'
+    group = 'distribution'
+
+    dependsOn 'assembleProduct'
+
+    from productDir
+    archiveBaseName = 'groovy-language-server'
+    archiveClassifier = ''
+    compression = Compression.GZIP
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+}
+
+// Wire into the standard build lifecycle
+tasks.named('assemble') {
+    dependsOn 'assembleProduct'
+}
