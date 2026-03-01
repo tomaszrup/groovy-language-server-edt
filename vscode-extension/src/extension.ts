@@ -5,9 +5,18 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as net from 'net';
+import { execFileSync, ExecFileSyncOptionsWithStringEncoding } from 'child_process';
 import * as vscode from 'vscode';
 import { workspace, ExtensionContext, window, commands, OutputChannel, StatusBarItem, StatusBarAlignment, ThemeColor } from 'vscode';
+import {
+    getConfigNameForPlatform,
+    inferProjectPathFromEntries,
+    isJdtWorkspaceUri,
+    normalizeFsPath,
+    pathStartsWith,
+} from './utils';
 import {
     LanguageClient,
     LanguageClientOptions,
@@ -20,13 +29,27 @@ let client: LanguageClient | undefined;
 let outputChannel: OutputChannel;
 let statusBarItem: StatusBarItem;
 
+interface ClasspathNotificationPayload {
+    projectUri: string;
+    projectPath?: string;
+    entries: string[];
+}
+
+interface JavaClasspathTarget {
+    requestUri: string;
+    projectUri: string;
+    projectPath?: string;
+    source: string;
+}
+
 /** Pre-fetched classpath data from the Java extension (filled before LS starts). */
-let preFetchedClasspathData: Array<{ projectUri: string; entries: string[] }> = [];
+let preFetchedClasspathData: ClasspathNotificationPayload[] = [];
 /** Cached Java extension API (obtained during wait phase). */
 let cachedJavaApi: any = null;
 
 /** Scheme for virtual source documents from JARs/JDK. */
 const GROOVY_SOURCE_SCHEME = 'groovy-source';
+const GRADLE_CLASSPATH_LINE_PREFIX = 'GROOVY_LS_CP::';
 
 /**
  * Content provider for groovy-source:// virtual documents.
@@ -62,6 +85,210 @@ type ServerState = 'WaitingForJava' | 'Starting' | 'Importing' | 'Compiling' | '
 interface StatusNotification {
     state: ServerState;
     message?: string;
+}
+
+function toFileSystemPath(uriValue: string): string | undefined {
+    try {
+        return vscode.Uri.parse(uriValue).fsPath;
+    } catch {
+        return undefined;
+    }
+}
+
+async function collectProjectRootMap(): Promise<Map<string, string>> {
+    const rootMap = new Map<string, string>();
+    const buildFiles = await vscode.workspace.findFiles(
+        '{**/build.gradle,**/pom.xml}',
+        '{**/node_modules/**,**/build/**,**/.gradle/**}'
+    );
+
+    for (const buildFile of buildFiles) {
+        const projectDir = path.dirname(buildFile.fsPath);
+        rootMap.set(normalizeFsPath(projectDir), projectDir);
+    }
+
+    return rootMap;
+}
+
+function resolveProjectPathFromUri(
+    uriValue: string,
+    projectRootMap: Map<string, string>
+): string | undefined {
+    const fsPath = toFileSystemPath(uriValue);
+    if (!fsPath) return undefined;
+
+    const normalizedPath = normalizeFsPath(fsPath);
+    const exact = projectRootMap.get(normalizedPath);
+    if (exact) return exact;
+
+    let bestMatch: string | undefined;
+    for (const [projectNorm] of projectRootMap) {
+        if (pathStartsWith(normalizedPath, projectNorm)) {
+            if (!bestMatch || projectNorm.length > bestMatch.length) {
+                bestMatch = projectNorm;
+            }
+        }
+    }
+
+    return bestMatch ? projectRootMap.get(bestMatch) : undefined;
+}
+
+async function findRepresentativeSourceUri(projectPath: string): Promise<string | undefined> {
+    const projectUri = vscode.Uri.file(projectPath);
+    const patterns = [
+        'src/main/java/**/*.java',
+        'src/main/groovy/**/*.groovy',
+        'src/test/java/**/*.java',
+        'src/test/groovy/**/*.groovy',
+    ];
+
+    for (const pattern of patterns) {
+        const matches = await workspace.findFiles(
+            new vscode.RelativePattern(projectUri, pattern),
+            '**/build/**',
+            1
+        );
+        if (matches.length > 0) {
+            return matches[0].toString();
+        }
+    }
+
+    return undefined;
+}
+
+function findGradleWrapper(startDir: string): string | undefined {
+    const exeName = process.platform === 'win32' ? 'gradlew.bat' : 'gradlew';
+    let currentDir = path.resolve(startDir);
+
+    while (true) {
+        const candidate = path.join(currentDir, exeName);
+        if (fs.existsSync(candidate)) {
+            return candidate;
+        }
+
+        const parent = path.dirname(currentDir);
+        if (parent === currentDir) {
+            return undefined;
+        }
+        currentDir = parent;
+    }
+}
+
+function extractPathFromClasspathEntry(entry: any): string {
+    const rawPath = entry?.path;
+    if (typeof rawPath === 'string') {
+        if (rawPath.startsWith('file:/')) {
+            try {
+                return vscode.Uri.parse(rawPath).fsPath;
+            } catch {
+                return rawPath;
+            }
+        }
+        return rawPath;
+    }
+
+    if (rawPath && typeof rawPath.path === 'string') {
+        return rawPath.path;
+    }
+
+    if (rawPath && typeof rawPath.fsPath === 'string') {
+        return rawPath.fsPath;
+    }
+
+    return '';
+}
+
+function resolveGradleClasspath(projectPath: string): string[] {
+    const normalizedProjectPath = path.resolve(projectPath);
+    const wrapper = findGradleWrapper(normalizedProjectPath);
+    if (!wrapper) {
+        outputChannel.appendLine(`[java-ext]   Gradle fallback skipped (wrapper not found) for ${projectPath}`);
+        return [];
+    }
+
+    const initScriptPath = path.join(
+        os.tmpdir(),
+        `groovy-ls-classpath-${Date.now()}-${Math.random().toString(16).slice(2)}.gradle`
+    );
+
+    const initScript = `allprojects {
+    tasks.register('groovyLsPrintClasspath') {
+        doLast {
+            ['testCompileClasspath', 'testRuntimeClasspath', 'compileClasspath', 'runtimeClasspath'].each { cfgName ->
+                def cfg = project.configurations.findByName(cfgName)
+                if (cfg != null && cfg.canBeResolved) {
+                    try {
+                        cfg.resolve().each { f ->
+                            println('${GRADLE_CLASSPATH_LINE_PREFIX}' + f.absolutePath)
+                        }
+                    } catch (Throwable ignored) {
+                        // ignore and continue with other configs
+                    }
+                }
+            }
+        }
+    }
+}
+`;
+
+    try {
+        fs.writeFileSync(initScriptPath, initScript, { encoding: 'utf8' });
+        const gradleArgs = [
+            '-q',
+            '-I', initScriptPath,
+            '-p', normalizedProjectPath,
+            'groovyLsPrintClasspath',
+        ];
+
+        const execOptions: ExecFileSyncOptionsWithStringEncoding = {
+            cwd: path.dirname(wrapper),
+            encoding: 'utf8',
+            windowsHide: true,
+            timeout: 120000,
+            maxBuffer: 16 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        };
+
+        const stdout = (process.platform === 'win32' && wrapper.toLowerCase().endsWith('.bat'))
+            ? execFileSync(wrapper, gradleArgs, { ...execOptions, shell: true })
+            : execFileSync(wrapper, gradleArgs, execOptions);
+
+        const lines = stdout.split(/\r?\n/)
+            .map(line => line.trim())
+            .filter(line => line.startsWith(GRADLE_CLASSPATH_LINE_PREFIX))
+            .map(line => line.substring(GRADLE_CLASSPATH_LINE_PREFIX.length).trim())
+            .filter(line => line.length > 0 && fs.existsSync(line));
+
+        const unique = Array.from(new Set(lines));
+        outputChannel.appendLine(
+            `[java-ext]   Gradle fallback resolved ${unique.length} entries for ${projectPath}`
+        );
+        return unique;
+    } catch (error: any) {
+        let stderr = '';
+        if (typeof error?.stderr === 'string') {
+            stderr = error.stderr.trim();
+        } else if (error?.stderr && typeof error.stderr.toString === 'function') {
+            stderr = error.stderr.toString('utf8').trim();
+        }
+
+        outputChannel.appendLine(
+            `[java-ext]   Gradle fallback failed for ${projectPath}: ${error?.message ?? error}`
+        );
+        if (stderr.length > 0) {
+            outputChannel.appendLine(`[java-ext]   Gradle fallback stderr: ${stderr}`);
+        }
+        if (error?.status !== undefined && error?.status !== null) {
+            outputChannel.appendLine(`[java-ext]   Gradle fallback exit code: ${error.status}`);
+        }
+        return [];
+    } finally {
+        try {
+            fs.unlinkSync(initScriptPath);
+        } catch {
+            // ignore temp cleanup issues
+        }
+    }
 }
 
 function updateStatusBar(state: ServerState, message?: string): void {
@@ -231,34 +458,17 @@ async function preFetchClasspaths(javaApi: any): Promise<void> {
     }
 
     try {
+        const projectRootMap = await collectProjectRootMap();
         const projectUris: string[] =
             (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
 
         outputChannel.appendLine(`[java-ext] Pre-fetch: java.project.getAll returned ${projectUris.length} project(s)`);
 
-        const wsRootPath = workspace.workspaceFolders?.[0]?.uri.fsPath
-            ?.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase() ?? '';
-
-        const nonRootProjects = projectUris.filter(uri => {
-            if (uri.includes('jdt_ws')) return false;
-            try {
-                const projPath = vscode.Uri.parse(uri).fsPath
-                    .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
-                return projPath !== wsRootPath;
-            } catch { return true; }
-        });
-
-        const realProjects = projectUris.filter(uri => {
-            if (uri.includes('jdt_ws')) return false;
-            try {
-                const projPath = vscode.Uri.parse(uri).fsPath
-                    .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
-                if (projPath === wsRootPath && nonRootProjects.length > 0) return false;
-            } catch { /* ignore */ }
-            return true;
-        });
-
-        for (const projectUri of realProjects) {
+        for (const projectUri of projectUris) {
+            if (isJdtWorkspaceUri(projectUri)) {
+                outputChannel.appendLine(`[java-ext] Pre-fetch: skipping jdt_ws project ${projectUri}`);
+                continue;
+            }
             try {
                 let result: { classpaths: string[]; modulepaths: string[] } | null = null;
                 if (typeof javaApi.getClasspaths === 'function') {
@@ -273,12 +483,17 @@ async function preFetchClasspaths(javaApi: any): Promise<void> {
                 const filteredEntries = rawEntries.filter(e => !isJdkEntry(e));
 
                 if (filteredEntries.length > 0) {
+                    const projectPath = resolveProjectPathFromUri(projectUri, projectRootMap)
+                        ?? inferProjectPathFromEntries(filteredEntries, projectRootMap);
+
                     preFetchedClasspathData.push({
                         projectUri,
+                        projectPath,
                         entries: filteredEntries,
                     });
                     outputChannel.appendLine(
                         `[java-ext] Pre-fetched ${filteredEntries.length} entries for ${projectUri}`
+                        + (projectPath ? ` (projectPath=${projectPath})` : '')
                     );
                 }
             } catch (e) {
@@ -355,9 +570,24 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     const configDir = getConfigDir(serverDir);
     outputChannel.appendLine(`Config directory: ${configDir}`);
 
-    // 5. Build the workspace data directory
+    // 5. Build the workspace data directory.
+    // Wipe the previous Eclipse workspace data on every start so that stale
+    // metadata (linked-folder resource trees, build state, etc.) never
+    // accumulates.  All state is derived at runtime (project structure,
+    // classpath from Java extension) so nothing precious is lost.
+    // This also fixes existing installs where linked folders were created
+    // without resource filters, which caused runaway I/O that could break
+    // other extensions' persisted state (e.g. VS Code Copilot chat history).
     const workspaceStoragePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
     const dataDir = path.join(workspaceStoragePath, 'groovy_ws');
+    try {
+        if (fs.existsSync(dataDir)) {
+            fs.rmSync(dataDir, { recursive: true, force: true });
+            outputChannel.appendLine(`Cleaned stale workspace data: ${dataDir}`);
+        }
+    } catch (e) {
+        outputChannel.appendLine(`Warning: failed to clean workspace data: ${e}`);
+    }
     fs.mkdirSync(dataDir, { recursive: true });
 
     // 6. Build JVM arguments
@@ -449,41 +679,52 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         for (const cp of preFetchedClasspathData) {
             client.sendNotification('groovy/classpathUpdate', {
                 projectUri: cp.projectUri,
+                projectPath: cp.projectPath,
                 entries: cp.entries,
             });
-            outputChannel.appendLine(`[java-ext]   Sent ${cp.entries.length} entries for ${cp.projectUri}`);
+            outputChannel.appendLine(
+                `[java-ext]   Sent ${cp.entries.length} entries for ${cp.projectUri}`
+                + (cp.projectPath ? ` (projectPath=${cp.projectPath})` : '')
+            );
         }
         preFetchedClasspathData = []; // clear after sending
     }
 
-    // Push initial configuration (e.g., formatter profile path) to the server
-    const groovyConfig = workspace.getConfiguration('groovy');
-    client.sendNotification('workspace/didChangeConfiguration', {
-        settings: {
-            groovy: {
-                format: {
-                    settingsUrl: groovyConfig.get<string>('format.settingsUrl') ?? null,
-                    enabled: groovyConfig.get<boolean>('format.enabled', true),
+    // Push initial configuration (formatter + inlay hints) to the server
+    const sendGroovyConfiguration = () => {
+        const config = workspace.getConfiguration('groovy');
+        client?.sendNotification('workspace/didChangeConfiguration', {
+            settings: {
+                groovy: {
+                    format: {
+                        settingsUrl: config.get<string>('format.settingsUrl') ?? null,
+                        enabled: config.get<boolean>('format.enabled', true),
+                    },
+                    inlayHints: {
+                        variableTypes: {
+                            enabled: config.get<boolean>('inlayHints.variableTypes.enabled', true),
+                        },
+                        parameterNames: {
+                            enabled: config.get<boolean>('inlayHints.parameterNames.enabled', true),
+                        },
+                        closureParameterTypes: {
+                            enabled: config.get<boolean>('inlayHints.closureParameterTypes.enabled', true),
+                        },
+                        methodReturnTypes: {
+                            enabled: config.get<boolean>('inlayHints.methodReturnTypes.enabled', true),
+                        },
+                    },
                 },
             },
-        },
-    });
+        });
+    };
+    sendGroovyConfiguration();
 
     // Watch for configuration changes and forward to server
     context.subscriptions.push(
         workspace.onDidChangeConfiguration((e) => {
-            if (e.affectsConfiguration('groovy.format') && client) {
-                const config = workspace.getConfiguration('groovy');
-                client.sendNotification('workspace/didChangeConfiguration', {
-                    settings: {
-                        groovy: {
-                            format: {
-                                settingsUrl: config.get<string>('format.settingsUrl') ?? null,
-                                enabled: config.get<boolean>('format.enabled', true),
-                            },
-                        },
-                    },
-                });
+            if (client && (e.affectsConfiguration('groovy.format') || e.affectsConfiguration('groovy.inlayHints'))) {
+                sendGroovyConfiguration();
             }
         })
     );
@@ -541,7 +782,7 @@ async function initJavaExtensionClasspath(
         const entries: any[] =
             settingsResult?.['org.eclipse.jdt.ls.core.classpathEntries'] ?? [];
         for (const entry of entries) {
-            const p: string = entry?.path ?? '';
+            const p = extractPathFromClasspathEntry(entry);
             if (!p) continue;
             if (p.toLowerCase().endsWith('.jar')) {
                 jars.push(p);
@@ -561,29 +802,62 @@ async function initJavaExtensionClasspath(
     //  1. getClasspaths (test scope) — standard API
     //  2. If no JARs → getProjectSettings with classpathEntries (reads JDT model directly)
     //  3. Send whatever we get to the Groovy LS
-    const fetchClasspathForProject = async (projectUri: string): Promise<boolean> => {
+    const fetchClasspathForProject = async (
+        target: JavaClasspathTarget,
+        projectRootMap: Map<string, string>
+    ): Promise<boolean> => {
         try {
-            outputChannel.appendLine(`[java-ext] Fetching classpath for project: ${projectUri}`);
+            outputChannel.appendLine(
+                `[java-ext] Fetching classpath for project: ${target.projectUri}`
+                + ` (query=${target.requestUri}, source=${target.source})`
+            );
 
             // -------- Approach 1: getClasspaths API (test scope) --------
             let result: { classpaths: string[]; modulepaths: string[] } | null = null;
 
             if (typeof javaApi.getClasspaths === 'function') {
                 try {
-                    result = await javaApi.getClasspaths(projectUri, { scope: 'test' });
+                    result = await javaApi.getClasspaths(target.requestUri, { scope: 'test' });
                 } catch (e1: any) {
                     outputChannel.appendLine(`[java-ext]   getClasspaths(test) failed: ${e1.message ?? e1}`);
                 }
             }
 
-            outputChannel.appendLine(`[java-ext-tr] ${projectUri} = ${result?.modulepaths}`);
+            outputChannel.appendLine(`[java-ext-tr] ${target.requestUri} = ${result?.modulepaths}`);
 
 
             let rawEntries: string[] = [];
             if (result) {
                 rawEntries = [...(result.classpaths ?? []), ...(result.modulepaths ?? [])];
             }
-            const hasJars = rawEntries.some(e => e.toLowerCase().endsWith('.jar'));
+
+            let hasJars = rawEntries.some(e => e.toLowerCase().endsWith('.jar'));
+
+            // -------- Approach 2: getProjectSettings fallback --------
+            if ((rawEntries.length === 0 || !hasJars) && typeof javaApi.getProjectSettings === 'function') {
+                try {
+                    const settingsResult = await javaApi.getProjectSettings(target.requestUri, [
+                        'org.eclipse.jdt.ls.core.classpathEntries',
+                    ]);
+                    const extracted = extractEntriesFromSettings(settingsResult);
+                    const merged = [...rawEntries, ...extracted.jars, ...extracted.outputDirs];
+                    rawEntries = Array.from(new Set(merged));
+                    hasJars = rawEntries.some(e => e.toLowerCase().endsWith('.jar'));
+                    outputChannel.appendLine(
+                        `[java-ext]   getProjectSettings fallback: +${extracted.jars.length} jars, +${extracted.outputDirs.length} output dirs`
+                    );
+                } catch (e2: any) {
+                    outputChannel.appendLine(`[java-ext]   getProjectSettings failed: ${e2.message ?? e2}`);
+                }
+            }
+
+            if ((rawEntries.length === 0 || !hasJars) && target.projectPath) {
+                const gradleEntries = resolveGradleClasspath(target.projectPath);
+                if (gradleEntries.length > 0) {
+                    rawEntries = Array.from(new Set([...rawEntries, ...gradleEntries]));
+                    hasJars = rawEntries.some(e => e.toLowerCase().endsWith('.jar'));
+                }
+            }
 
             outputChannel.appendLine(
                 `[java-ext]   getClasspaths: ${rawEntries.length} entries, hasJars=${hasJars}`
@@ -617,14 +891,20 @@ async function initJavaExtensionClasspath(
 
                 if (filteredEntries.length > 0) {
                     const finalHasJars = filteredEntries.some(e => e.toLowerCase().endsWith('.jar'));
+                    const resolvedProjectPath = target.projectPath
+                        ?? resolveProjectPathFromUri(target.projectUri, projectRootMap)
+                        ?? resolveProjectPathFromUri(target.requestUri, projectRootMap)
+                        ?? inferProjectPathFromEntries(filteredEntries, projectRootMap);
 
                     lsClient.sendNotification('groovy/classpathUpdate', {
-                        projectUri,
+                        projectUri: target.projectUri,
+                        projectPath: resolvedProjectPath,
                         entries: filteredEntries,
                     });
                     outputChannel.appendLine(
                         `[java-ext]   Sent ${filteredEntries.length} classpath entries` +
                         (finalHasJars ? ' (includes JARs)' : ' (output dirs only, no JARs)')
+                        + (resolvedProjectPath ? `, projectPath=${resolvedProjectPath}` : '')
                     );
                     return finalHasJars;
                 }
@@ -642,6 +922,8 @@ async function initJavaExtensionClasspath(
     // Returns the number of projects that had actual JAR entries.
     const fetchAllClasspaths = async (): Promise<number> => {
         try {
+            const projectRootMap = await collectProjectRootMap();
+
             // Use java.project.getAll to discover actual Java projects
             const projectUris: string[] =
                 (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
@@ -658,29 +940,29 @@ async function initJavaExtensionClasspath(
                 return 0;
             }
 
-            // Filter out JDT LS invisible projects.
-            // Use filesystem path comparison since URI encoding differs between
+            // Normalize filesystem paths because URI encodings differ between
             // VS Code (file:///c%3A/...) and Java extension (file:/C:/...)
             const wsRootPath = workspace.workspaceFolders?.[0]?.uri.fsPath
                 ?.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase() ?? '';
 
             // Count non-jdt_ws, non-root projects to decide if root should be skipped
             const nonRootProjects = projectUris.filter(uri => {
-                if (uri.includes('jdt_ws')) return false;
+                if (isJdtWorkspaceUri(uri)) return false;
                 try {
-                    const projPath = vscode.Uri.parse(uri).fsPath
-                        .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                    const projPath = normalizeFsPath(vscode.Uri.parse(uri).fsPath);
                     return projPath !== wsRootPath;
                 } catch { return true; }
             });
 
-            const realProjects = projectUris.filter(uri => {
-                if (uri.includes('jdt_ws')) return false;
+            const javaProjects = projectUris.filter(uri => {
+                if (isJdtWorkspaceUri(uri)) {
+                    outputChannel.appendLine(`[java-ext] Skipping jdt_ws Java project: ${uri}`);
+                    return false;
+                }
                 // Only skip root workspace folder when there are actual subprojects.
                 // For single-project workspaces, the root IS the project.
                 try {
-                    const projPath = vscode.Uri.parse(uri).fsPath
-                        .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                    const projPath = normalizeFsPath(vscode.Uri.parse(uri).fsPath);
                     if (projPath === wsRootPath && nonRootProjects.length > 0) {
                         outputChannel.appendLine(`[java-ext] Skipping root workspace folder (has ${nonRootProjects.length} subprojects): ${uri}`);
                         return false;
@@ -689,47 +971,60 @@ async function initJavaExtensionClasspath(
                 return true;
             });
 
-            // Also scan for build.gradle/pom.xml files the Java extension might have missed
-            // (Maven projects inside a Gradle workspace are often not detected)
-            const knownPaths = new Set(realProjects.map(uri => {
+            const targets: JavaClasspathTarget[] = javaProjects.map(uri => ({
+                requestUri: uri,
+                projectUri: uri,
+                projectPath: resolveProjectPathFromUri(uri, projectRootMap),
+                source: 'java.project.getAll',
+            }));
+
+            // Also scan for build.gradle/pom.xml files and probe using source-file URIs.
+            const knownPaths = new Set(targets.map(target => {
                 try {
-                    return vscode.Uri.parse(uri).fsPath
-                        .replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+                    if (target.projectPath) return normalizeFsPath(target.projectPath);
+                    return normalizeFsPath(vscode.Uri.parse(target.projectUri).fsPath);
                 } catch { return ''; }
             }));
 
-            const buildFiles = await vscode.workspace.findFiles(
-                '{**/build.gradle,**/pom.xml}',
-                '{**/node_modules/**,**/build/**,**/.gradle/**}'
-            );
-            for (const buildFile of buildFiles) {
-                const projDir = path.dirname(buildFile.fsPath);
-                const projDirNorm = projDir.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+            for (const [projDirNorm, projDir] of projectRootMap) {
                 if (projDirNorm === wsRootPath) continue; // skip root
                 if (!knownPaths.has(projDirNorm)) {
+                    const sourceUri = await findRepresentativeSourceUri(projDir);
+                    if (!sourceUri) {
+                        outputChannel.appendLine(
+                            `[java-ext] Skipping probe for ${projDir} (no source file found)`
+                        );
+                        continue;
+                    }
+
                     const projUri = vscode.Uri.file(projDir).toString();
                     outputChannel.appendLine(
-                        `[java-ext] Discovered project not in getAll(): ${projUri} (from ${path.basename(buildFile.fsPath)})`
+                        `[java-ext] Probing project not in getAll(): ${projUri} (query=${sourceUri})`
                     );
-                    realProjects.push(projUri);
+                    targets.push({
+                        requestUri: sourceUri,
+                        projectUri: projUri,
+                        projectPath: projDir,
+                        source: 'build-file-scan',
+                    });
                     knownPaths.add(projDirNorm);
                 }
             }
 
-            if (realProjects.length > 0) {
+            if (targets.length > 0) {
                 outputChannel.appendLine(
-                    `[java-ext] Total ${realProjects.length} project(s) to fetch classpath for`
+                    `[java-ext] Total ${targets.length} project(s) to fetch classpath for`
                 );
             }
 
             let fetched = 0;
-            for (const projectUri of realProjects) {
-                const ok = await fetchClasspathForProject(projectUri);
+            for (const target of targets) {
+                const ok = await fetchClasspathForProject(target, projectRootMap);
                 if (ok) fetched++;
             }
 
             outputChannel.appendLine(
-                `[java-ext] Sent classpath for ${fetched}/${realProjects.length} project(s)`
+                `[java-ext] Sent classpath for ${fetched}/${targets.length} project(s)`
             );
             return fetched;
 
@@ -739,8 +1034,15 @@ async function initJavaExtensionClasspath(
             // Fallback: try workspace folders directly (might work if workspace is a single project)
             const folders = workspace.workspaceFolders;
             if (folders) {
+                const projectRootMap = await collectProjectRootMap();
                 for (const folder of folders) {
-                    await fetchClasspathForProject(folder.uri.toString());
+                    const representativeUri = await findRepresentativeSourceUri(folder.uri.fsPath);
+                    await fetchClasspathForProject({
+                        requestUri: representativeUri ?? folder.uri.toString(),
+                        projectUri: folder.uri.toString(),
+                        projectPath: folder.uri.fsPath,
+                        source: 'workspace-folder-fallback',
+                    }, projectRootMap);
                 }
             }
             return 0;
@@ -763,7 +1065,7 @@ async function initJavaExtensionClasspath(
                     const projectUris: string[] =
                         (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
                     for (const uri of projectUris) {
-                        if (uri.includes('jdt_ws')) continue;
+                        if (isJdtWorkspaceUri(uri)) continue;
                         try {
                             const parsedUri = vscode.Uri.parse(uri);
                             outputChannel.appendLine(
@@ -798,8 +1100,18 @@ async function initJavaExtensionClasspath(
         context.subscriptions.push(
             javaApi.onDidClasspathUpdate(async (uri: vscode.Uri) => {
                 outputChannel.appendLine(`[java-ext] Classpath updated for: ${uri.toString()}`);
+                if (isJdtWorkspaceUri(uri.toString())) {
+                    outputChannel.appendLine('[java-ext] Ignoring classpath update for jdt_ws project.');
+                    return;
+                }
                 // Re-fetch only the changed project (not all — each project has isolated classpath)
-                await fetchClasspathForProject(uri.toString());
+                const projectRootMap = await collectProjectRootMap();
+                await fetchClasspathForProject({
+                    requestUri: uri.toString(),
+                    projectUri: uri.toString(),
+                    projectPath: resolveProjectPathFromUri(uri.toString(), projectRootMap),
+                    source: 'onDidClasspathUpdate',
+                }, projectRootMap);
             })
         );
         outputChannel.appendLine('[java-ext] Registered onDidClasspathUpdate listener.');
@@ -808,9 +1120,27 @@ async function initJavaExtensionClasspath(
     // Listen for project import completion
     if (typeof javaApi.onDidProjectsImport === 'function') {
         context.subscriptions.push(
-            javaApi.onDidProjectsImport((_uris: vscode.Uri[]) => {
-                outputChannel.appendLine('[java-ext] Projects imported — refreshing classpath...');
-                fetchAllClasspaths();
+            javaApi.onDidProjectsImport((uris: vscode.Uri[]) => {
+                outputChannel.appendLine(
+                    `[java-ext] Projects imported (${uris.length}) — refreshing classpath...`
+                );
+                if (uris.length === 0) {
+                    fetchAllClasspaths();
+                    return;
+                }
+
+                (async () => {
+                    const projectRootMap = await collectProjectRootMap();
+                    for (const importedUri of uris) {
+                        if (isJdtWorkspaceUri(importedUri.toString())) continue;
+                        await fetchClasspathForProject({
+                            requestUri: importedUri.toString(),
+                            projectUri: importedUri.toString(),
+                            projectPath: resolveProjectPathFromUri(importedUri.toString(), projectRootMap),
+                            source: 'onDidProjectsImport',
+                        }, projectRootMap);
+                    }
+                })();
             })
         );
         outputChannel.appendLine('[java-ext] Registered onDidProjectsImport listener.');
@@ -923,16 +1253,5 @@ function findLauncherJar(serverDir: string): string | undefined {
  * Get the platform-specific Equinox configuration directory.
  */
 function getConfigDir(serverDir: string): string {
-    let configName: string;
-    switch (process.platform) {
-        case 'win32':
-            configName = 'config_win';
-            break;
-        case 'darwin':
-            configName = 'config_mac';
-            break;
-        default:
-            configName = 'config_linux';
-    }
-    return path.join(serverDir, configName);
+    return path.join(serverDir, getConfigNameForPlatform(process.platform));
 }

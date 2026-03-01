@@ -11,13 +11,19 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
+import java.net.URI;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.lang.reflect.Modifier;
 
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ImportNode;
+import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
+import org.codehaus.groovy.ast.Parameter;
+import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -136,6 +142,14 @@ public class CodeActionProvider {
                         actions.add(Either.forRight(a));
                     }
                 }
+
+                // Implement missing interface members
+                if (isMissingInterfaceMemberDiagnostic(diag)) {
+                    CodeAction implementAction = createImplementMissingInterfaceMembersAction(uri, content, diag);
+                    if (implementAction != null) {
+                        actions.add(Either.forRight(implementAction));
+                    }
+                }
             }
 
             // Surface bulk quick-fix actions whenever quick fixes are requested.
@@ -223,7 +237,7 @@ public class CodeActionProvider {
             if (typeName == null || typeName.isEmpty()) return actions;
 
             // Search the JDT classpath index for matching types
-            List<String> candidates = searchClasspathForType(typeName);
+            List<String> candidates = searchClasspathForType(typeName, uri);
 
             // Also check imports already present to avoid duplicates
             Set<String> existingImports = getExistingImports(uri);
@@ -277,7 +291,7 @@ public class CodeActionProvider {
                     continue;
                 }
 
-                List<String> candidates = searchClasspathForType(typeName);
+                List<String> candidates = searchClasspathForType(typeName, uri);
                 for (String candidate : candidates) {
                     if (!existingImports.contains(candidate) && !importsToAdd.contains(candidate)) {
                         importsToAdd.add(candidate);
@@ -320,31 +334,23 @@ public class CodeActionProvider {
      * Search the JDT classpath index for types matching the given simple name.
      * Returns a list of fully qualified type names found on the project's classpath.
      */
-    private List<String> searchClasspathForType(String simpleName) {
+    private List<String> searchClasspathForType(String simpleName, String uri) {
         List<String> results = new ArrayList<>();
 
         try {
-            // Get the first Java project in the workspace
-            IJavaProject javaProject = null;
-            for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
-                if (project.isOpen()) {
-                    IJavaProject jp = JavaCore.create(project);
-                    if (jp != null && jp.exists()) {
-                        javaProject = jp;
-                        break;
-                    }
-                }
-            }
+            // Prefer the Java project that owns this document to avoid
+            // cross-project classpath bleed in multi-project workspaces.
+            List<IJavaProject> javaProjects = getSearchProjectsForUri(uri);
 
-            if (javaProject == null) {
+            if (javaProjects.isEmpty()) {
                 GroovyLanguageServerPlugin.logInfo(
                         "[codeaction] No Java project found for import search");
                 return results;
             }
 
-            // Create search scope over the project's classpath
+            // Create search scope over all project classpaths
             IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
-                    new IJavaProject[] { javaProject }, IJavaSearchScope.SOURCES
+                    javaProjects.toArray(new IJavaProject[0]), IJavaSearchScope.SOURCES
                             | IJavaSearchScope.APPLICATION_LIBRARIES
                             | IJavaSearchScope.SYSTEM_LIBRARIES
                             | IJavaSearchScope.REFERENCED_PROJECTS);
@@ -408,6 +414,55 @@ public class CodeActionProvider {
         return results;
     }
 
+    private List<IJavaProject> getSearchProjectsForUri(String uri) {
+        List<IJavaProject> scopedProjects = new ArrayList<>();
+        Set<String> seenProjectNames = new HashSet<>();
+
+        try {
+            String normalizedUri = DocumentManager.normalizeUri(uri);
+            URI fileUri = URI.create(normalizedUri);
+            IFile[] files = ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri);
+
+            for (IFile file : files) {
+                IProject project = file.getProject();
+                if (project == null || !project.isOpen()) {
+                    continue;
+                }
+
+                IJavaProject javaProject = JavaCore.create(project);
+                if (javaProject == null || !javaProject.exists()) {
+                    continue;
+                }
+
+                if (seenProjectNames.add(project.getName())) {
+                    scopedProjects.add(javaProject);
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[codeaction] Failed to scope import search by URI; falling back to all projects: "
+                    + e.getMessage());
+        }
+
+        if (!scopedProjects.isEmpty()) {
+            return scopedProjects;
+        }
+
+        // Fallback when the document cannot be mapped to a workspace project.
+        List<IJavaProject> allProjects = new ArrayList<>();
+        for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
+            if (!project.isOpen()) {
+                continue;
+            }
+            IJavaProject javaProject = JavaCore.create(project);
+            if (javaProject != null && javaProject.exists()) {
+                allProjects.add(javaProject);
+            }
+        }
+
+        return allProjects;
+    }
+
     /**
      * Assign a priority score to a package for sorting import suggestions.
      * Lower = better (shown first).
@@ -465,6 +520,441 @@ public class CodeActionProvider {
         return (code != null && code.startsWith(DIAG_CODE_UNRESOLVED_TYPE))
                 || message.contains("unable to resolve class")
                 || message.contains("Groovy:unable to resolve class");
+    }
+
+    // ================================================================
+    // Implement missing interface members
+    // ================================================================
+
+    private boolean isMissingInterfaceMemberDiagnostic(Diagnostic diagnostic) {
+        String message = getDiagnosticMessage(diagnostic);
+        if (message == null || message.isEmpty()) {
+            return false;
+        }
+
+        return (message.contains("must be declared abstract or the method")
+                && message.contains("must be implemented"))
+                || message.contains("must implement the inherited abstract method");
+    }
+
+    private CodeAction createImplementMissingInterfaceMembersAction(String uri, String content,
+            Diagnostic diag) {
+        try {
+            ModuleNode module = documentManager.getGroovyAST(uri);
+            if (module == null) {
+                return null;
+            }
+
+            int targetLine = Math.max(1, diag.getRange().getStart().getLine() + 1);
+            ClassNode targetClass = findEnclosingClass(module, targetLine);
+            if (targetClass == null) {
+                String className = extractClassSimpleNameFromMessage(getDiagnosticMessage(diag));
+                targetClass = findClassBySimpleName(module, className);
+            }
+
+            if (targetClass == null || targetClass.isInterface()) {
+                return null;
+            }
+
+            List<MethodNode> missingMethods = findMissingInterfaceMethods(targetClass, module);
+            if (missingMethods.isEmpty()) {
+                return null;
+            }
+
+            int insertLine = findClassInsertLine(targetClass, content);
+            String insertionText = buildMissingMethodStubsText(targetClass, missingMethods, content, insertLine);
+            if (insertionText.isEmpty()) {
+                return null;
+            }
+
+            TextEdit insertEdit = new TextEdit(
+                    new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
+                    insertionText);
+
+            CodeAction action = new CodeAction(
+                    missingMethods.size() == 1
+                            ? "Implement missing interface member"
+                            : "Implement missing interface members");
+            action.setKind(CodeActionKind.QuickFix);
+            action.setDiagnostics(Collections.singletonList(diag));
+            action.setIsPreferred(true);
+
+            WorkspaceEdit edit = new WorkspaceEdit();
+            edit.setChanges(Collections.singletonMap(uri, Collections.singletonList(insertEdit)));
+            action.setEdit(edit);
+
+            return action;
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to create implement missing members action", e);
+            return null;
+        }
+    }
+
+    private List<MethodNode> findMissingInterfaceMethods(ClassNode targetClass, ModuleNode currentModule) {
+        List<MethodNode> requiredMethods = new ArrayList<>();
+        Set<String> requiredSignatures = new TreeSet<>();
+        Set<String> visitedInterfaces = new HashSet<>();
+
+        ClassNode[] interfaces = targetClass.getInterfaces();
+        if (interfaces == null || interfaces.length == 0) {
+            return Collections.emptyList();
+        }
+
+        for (ClassNode ifaceRef : interfaces) {
+            collectRequiredInterfaceMethodsRecursive(
+                    ifaceRef,
+                    currentModule,
+                    requiredMethods,
+                    requiredSignatures,
+                    visitedInterfaces);
+        }
+
+        List<MethodNode> missingMethods = new ArrayList<>();
+        for (MethodNode required : requiredMethods) {
+            if (!hasConcreteMethodInHierarchy(targetClass, required)) {
+                missingMethods.add(required);
+            }
+        }
+
+        return missingMethods;
+    }
+
+    private void collectRequiredInterfaceMethodsRecursive(ClassNode ifaceRef,
+            ModuleNode currentModule,
+            List<MethodNode> requiredMethods,
+            Set<String> requiredSignatures,
+            Set<String> visitedInterfaces) {
+        if (ifaceRef == null) {
+            return;
+        }
+
+        ClassNode resolved = TraitMemberResolver.resolveTraitClassNode(ifaceRef, currentModule, documentManager);
+        String interfaceName = resolved.getName();
+        if (interfaceName == null || !visitedInterfaces.add(interfaceName)) {
+            return;
+        }
+
+        for (MethodNode method : resolved.getMethods()) {
+            if (!isMethodRequiredForImplementation(method)) {
+                continue;
+            }
+            String signature = methodSignatureKey(method);
+            if (requiredSignatures.add(signature)) {
+                requiredMethods.add(method);
+            }
+        }
+
+        ClassNode[] superInterfaces = resolved.getInterfaces();
+        if (superInterfaces != null) {
+            for (ClassNode superInterface : superInterfaces) {
+                collectRequiredInterfaceMethodsRecursive(
+                        superInterface,
+                        currentModule,
+                        requiredMethods,
+                        requiredSignatures,
+                        visitedInterfaces);
+            }
+        }
+    }
+
+    private boolean isMethodRequiredForImplementation(MethodNode method) {
+        if (method == null) {
+            return false;
+        }
+
+        String name = method.getName();
+        if (name == null || name.isEmpty() || name.startsWith("$")) {
+            return false;
+        }
+
+        int modifiers = method.getModifiers();
+        if (!Modifier.isAbstract(modifiers)
+                || Modifier.isStatic(modifiers)
+                || Modifier.isPrivate(modifiers)) {
+            return false;
+        }
+
+        ClassNode declaringClass = method.getDeclaringClass();
+        if (declaringClass != null) {
+            String declaringName = declaringClass.getName();
+            if ("java.lang.Object".equals(declaringName)
+                    || "groovy.lang.GroovyObject".equals(declaringName)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private boolean hasConcreteMethodInHierarchy(ClassNode targetClass, MethodNode requiredMethod) {
+        for (ClassNode current = targetClass; current != null; current = current.getSuperClass()) {
+            List<MethodNode> candidates = current.getDeclaredMethods(requiredMethod.getName());
+            for (MethodNode candidate : candidates) {
+                if (hasSameParameterTypes(candidate, requiredMethod)
+                        && !Modifier.isAbstract(candidate.getModifiers())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasSameParameterTypes(MethodNode left, MethodNode right) {
+        Parameter[] leftParams = left.getParameters();
+        Parameter[] rightParams = right.getParameters();
+        if (leftParams == null || rightParams == null) {
+            return (leftParams == null || leftParams.length == 0)
+                    && (rightParams == null || rightParams.length == 0);
+        }
+        if (leftParams.length != rightParams.length) {
+            return false;
+        }
+
+        for (int i = 0; i < leftParams.length; i++) {
+            String leftType = normalizeTypeName(leftParams[i].getType());
+            String rightType = normalizeTypeName(rightParams[i].getType());
+            if (!leftType.equals(rightType)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private String methodSignatureKey(MethodNode method) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(method.getName()).append('(');
+        Parameter[] parameters = method.getParameters();
+        if (parameters != null) {
+            for (int i = 0; i < parameters.length; i++) {
+                if (i > 0) {
+                    sb.append(',');
+                }
+                sb.append(normalizeTypeName(parameters[i].getType()));
+            }
+        }
+        sb.append(')');
+        return sb.toString();
+    }
+
+    private String normalizeTypeName(ClassNode type) {
+        if (type == null) {
+            return "def";
+        }
+        if (type.isArray()) {
+            return normalizeTypeName(type.getComponentType()) + "[]";
+        }
+        String name = type.getName();
+        if (name == null || name.isEmpty()) {
+            name = type.getNameWithoutPackage();
+        }
+        return name == null || name.isEmpty() ? "def" : name;
+    }
+
+    private int findClassInsertLine(ClassNode targetClass, String content) {
+        String[] lines = content.split("\\n", -1);
+        if (lines.length == 0) {
+            return 0;
+        }
+
+        int startLine = Math.max(0, targetClass.getLineNumber() - 1);
+        int endLine = Math.max(startLine, targetClass.getLastLineNumber() - 1);
+        endLine = Math.min(endLine, lines.length - 1);
+
+        for (int line = endLine; line >= startLine; line--) {
+            if (lines[line].trim().equals("}")) {
+                return line;
+            }
+        }
+
+        return endLine;
+    }
+
+    private String buildMissingMethodStubsText(ClassNode targetClass,
+            List<MethodNode> missingMethods,
+            String content,
+            int insertLine) {
+        String[] lines = content.split("\\n", -1);
+        int classLine = Math.max(0, targetClass.getLineNumber() - 1);
+
+        String classIndent = classLine < lines.length ? leadingWhitespace(lines[classLine]) : "";
+        String indentUnit = inferIndentUnit(lines, classIndent, classLine, insertLine);
+        String methodIndent = classIndent + indentUnit;
+        String bodyIndent = methodIndent + indentUnit;
+
+        StringBuilder sb = new StringBuilder();
+        if (insertLine > 0 && insertLine - 1 < lines.length && !lines[insertLine - 1].trim().isEmpty()) {
+            sb.append("\n");
+        }
+
+        for (int i = 0; i < missingMethods.size(); i++) {
+            MethodNode method = missingMethods.get(i);
+
+            sb.append(methodIndent).append("@Override\n");
+            sb.append(methodIndent)
+                    .append(renderType(method.getReturnType()))
+                    .append(' ')
+                    .append(method.getName())
+                    .append('(')
+                    .append(renderParameters(method.getParameters()))
+                    .append(") {\n");
+            sb.append(bodyIndent)
+                    .append("throw new UnsupportedOperationException(\"Method '")
+                    .append(method.getName())
+                    .append("' is not implemented\")\n");
+            sb.append(methodIndent).append("}\n");
+
+            if (i + 1 < missingMethods.size()) {
+                sb.append("\n");
+            }
+        }
+
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    private String renderType(ClassNode type) {
+        if (type == null) {
+            return "def";
+        }
+        if (type.isArray()) {
+            return renderType(type.getComponentType()) + "[]";
+        }
+        String simpleName = type.getNameWithoutPackage();
+        if (simpleName == null || simpleName.isEmpty()) {
+            simpleName = type.getName();
+        }
+        return simpleName == null || simpleName.isEmpty() ? "def" : simpleName;
+    }
+
+    private String renderParameters(Parameter[] parameters) {
+        if (parameters == null || parameters.length == 0) {
+            return "";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parameters.length; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            Parameter parameter = parameters[i];
+            String name = sanitizeParameterName(parameter.getName(), i + 1);
+            sb.append(renderType(parameter.getType())).append(' ').append(name);
+        }
+        return sb.toString();
+    }
+
+    private String sanitizeParameterName(String rawName, int position) {
+        if (rawName == null || rawName.isEmpty()) {
+            return "arg" + position;
+        }
+        if (!Character.isJavaIdentifierStart(rawName.charAt(0))) {
+            return "arg" + position;
+        }
+        for (int i = 1; i < rawName.length(); i++) {
+            if (!Character.isJavaIdentifierPart(rawName.charAt(i))) {
+                return "arg" + position;
+            }
+        }
+        return rawName;
+    }
+
+    private String inferIndentUnit(String[] lines, String classIndent, int classLine, int insertLine) {
+        int start = Math.max(0, classLine + 1);
+        int end = Math.min(lines.length - 1, Math.max(classLine, insertLine));
+
+        for (int i = start; i <= end; i++) {
+            String line = lines[i];
+            if (line.trim().isEmpty()) {
+                continue;
+            }
+
+            String indent = leadingWhitespace(line);
+            if (indent.length() > classIndent.length() && indent.startsWith(classIndent)) {
+                String delta = indent.substring(classIndent.length());
+                if (!delta.isEmpty()) {
+                    return delta;
+                }
+            }
+        }
+
+        return "    ";
+    }
+
+    private String leadingWhitespace(String line) {
+        int i = 0;
+        while (i < line.length()) {
+            char c = line.charAt(i);
+            if (c != ' ' && c != '\t') {
+                break;
+            }
+            i++;
+        }
+        return line.substring(0, i);
+    }
+
+    private ClassNode findEnclosingClass(ModuleNode module, int targetLine) {
+        ClassNode best = null;
+        for (ClassNode classNode : module.getClasses()) {
+            int start = classNode.getLineNumber();
+            int end = classNode.getLastLineNumber();
+            if (start > 0 && end >= start && targetLine >= start && targetLine <= end) {
+                if (best == null || start >= best.getLineNumber()) {
+                    best = classNode;
+                }
+            } else if (start > 0 && start <= targetLine) {
+                if (best == null || start >= best.getLineNumber()) {
+                    best = classNode;
+                }
+            }
+        }
+        return best;
+    }
+
+    private ClassNode findClassBySimpleName(ModuleNode module, String simpleName) {
+        if (simpleName == null || simpleName.isEmpty()) {
+            return null;
+        }
+        for (ClassNode classNode : module.getClasses()) {
+            if (simpleName.equals(classNode.getNameWithoutPackage())) {
+                return classNode;
+            }
+        }
+        return null;
+    }
+
+    private String extractClassSimpleNameFromMessage(String message) {
+        if (message == null || message.isEmpty()) {
+            return null;
+        }
+
+        int firstQuote = message.indexOf('\'');
+        if (firstQuote >= 0) {
+            int secondQuote = message.indexOf('\'', firstQuote + 1);
+            if (secondQuote > firstQuote + 1) {
+                String candidate = message.substring(firstQuote + 1, secondQuote).trim();
+                int dot = candidate.lastIndexOf('.');
+                return dot >= 0 ? candidate.substring(dot + 1) : candidate;
+            }
+        }
+
+        String marker = "The type ";
+        int idx = message.indexOf(marker);
+        if (idx >= 0) {
+            String rest = message.substring(idx + marker.length()).trim();
+            int end = 0;
+            while (end < rest.length() &&
+                    (Character.isJavaIdentifierPart(rest.charAt(end)) || rest.charAt(end) == '.')) {
+                end++;
+            }
+            if (end > 0) {
+                String candidate = rest.substring(0, end);
+                int dot = candidate.lastIndexOf('.');
+                return dot >= 0 ? candidate.substring(dot + 1) : candidate;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -601,7 +1091,7 @@ public class CodeActionProvider {
                     continue;
                 }
 
-                List<String> candidates = searchClasspathForType(typeName);
+                List<String> candidates = searchClasspathForType(typeName, uri);
                 for (String candidate : candidates) {
                     if (!existingImports.contains(candidate) && !importsToAdd.contains(candidate)) {
                         importsToAdd.add(candidate);

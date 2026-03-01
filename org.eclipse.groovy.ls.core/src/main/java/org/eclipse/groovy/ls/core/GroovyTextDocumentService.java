@@ -21,6 +21,8 @@ import org.eclipse.groovy.ls.core.providers.DiagnosticsProvider;
 import org.eclipse.groovy.ls.core.providers.DocumentSymbolProvider;
 import org.eclipse.groovy.ls.core.providers.FormattingProvider;
 import org.eclipse.groovy.ls.core.providers.HoverProvider;
+import org.eclipse.groovy.ls.core.providers.InlayHintProvider;
+import org.eclipse.groovy.ls.core.providers.InlayHintSettings;
 import org.eclipse.groovy.ls.core.providers.ReferenceProvider;
 import org.eclipse.groovy.ls.core.providers.RenameProvider;
 import org.eclipse.groovy.ls.core.providers.SemanticTokensProvider;
@@ -55,6 +57,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
     private final FormattingProvider formattingProvider;
     private final DiagnosticsProvider diagnosticsProvider;
     private final CodeActionProvider codeActionProvider;
+    private final InlayHintProvider inlayHintProvider;
+
+    private volatile InlayHintSettings inlayHintSettings = InlayHintSettings.defaults();
 
     public GroovyTextDocumentService(GroovyLanguageServer server, DocumentManager documentManager) {
         this.server = server;
@@ -71,6 +76,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
         this.formattingProvider = new FormattingProvider(documentManager);
         this.diagnosticsProvider = new DiagnosticsProvider(documentManager);
         this.codeActionProvider = new CodeActionProvider(documentManager, diagnosticsProvider);
+        this.inlayHintProvider = new InlayHintProvider(documentManager);
     }
 
     void connect(LanguageClient client) {
@@ -97,6 +103,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public void didChange(DidChangeTextDocumentParams params) {
         String uri = params.getTextDocument().getUri();
+        GroovyLanguageServerPlugin.logInfo(
+            "[diag-trace] didChange uri=" + uri
+            + " changes=" + (params.getContentChanges() != null ? params.getContentChanges().size() : 0));
         documentManager.didChange(uri, params.getContentChanges());
 
         // Re-publish diagnostics after changes
@@ -276,6 +285,20 @@ public class GroovyTextDocumentService implements TextDocumentService {
         });
     }
 
+    // ---- Inlay Hints ----
+
+    @Override
+    public CompletableFuture<List<InlayHint>> inlayHint(InlayHintParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return inlayHintProvider.getInlayHints(params, inlayHintSettings);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Inlay hints failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
     // ---- Code Actions ----
 
     @Override
@@ -325,6 +348,31 @@ public class GroovyTextDocumentService implements TextDocumentService {
         formattingProvider.setFormatterProfilePath(profilePath);
     }
 
+    public void updateInlayHintSettings(InlayHintSettings settings) {
+        if (settings != null) {
+            this.inlayHintSettings = settings;
+        }
+    }
+
+    void publishDiagnosticsIfEnabled(String uri) {
+        if (server.areDiagnosticsEnabled()) {
+            String clientUri = documentManager.getClientUri(uri);
+            GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsIfEnabled uri=" + clientUri);
+            diagnosticsProvider.publishDiagnosticsDebounced(clientUri);
+        }
+    }
+
+    void publishDiagnosticsForOpenDocuments() {
+        if (server.areDiagnosticsEnabled()) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] publishDiagnosticsForOpenDocuments count="
+                    + documentManager.getOpenDocumentUris().size());
+            for (String uri : documentManager.getOpenDocumentUris()) {
+                diagnosticsProvider.publishDiagnosticsDebounced(documentManager.getClientUri(uri));
+            }
+        }
+    }
+
     // ---- Build trigger ----
 
     /**
@@ -334,6 +382,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
     void triggerFullBuild(GroovyLanguageServer languageServer) {
         CompletableFuture.runAsync(() -> {
             GroovyLanguageServerPlugin.logInfo("Triggering full workspace build...");
+            GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerFullBuild start");
             try {
                 ResourcesPlugin.getWorkspace().build(
                         org.eclipse.core.resources.IncrementalProjectBuilder.FULL_BUILD,
@@ -341,8 +390,11 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
                 // Publish diagnostics for all open documents
                 if (server.areDiagnosticsEnabled()) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[diag-trace] triggerFullBuild publish open docs count="
+                            + documentManager.getOpenDocumentUris().size());
                     for (String uri : documentManager.getOpenDocumentUris()) {
-                        diagnosticsProvider.publishDiagnostics(uri);
+                        diagnosticsProvider.publishDiagnostics(documentManager.getClientUri(uri));
                     }
                 }
 

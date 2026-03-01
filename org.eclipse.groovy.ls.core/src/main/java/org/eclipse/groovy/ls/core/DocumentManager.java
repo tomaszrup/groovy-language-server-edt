@@ -53,6 +53,12 @@ public class DocumentManager {
     private final Map<String, StringBuilder> openDocuments = new ConcurrentHashMap<>();
 
     /**
+     * Maps normalized URIs to the latest client-supplied URI form.
+     * This preserves the URI style used by the editor for diagnostics publishing.
+     */
+    private final Map<String, String> clientUris = new ConcurrentHashMap<>();
+
+    /**
      * Tracks JDT working copies for open documents.
      */
     private final Map<String, ICompilationUnit> workingCopies = new ConcurrentHashMap<>();
@@ -175,8 +181,12 @@ public class DocumentManager {
      * Called when a document is opened. Stores the content and creates a JDT working copy.
      */
     public void didOpen(String uri, String text) {
+        String clientUri = uri;
         uri = normalizeUri(uri);
         openDocuments.put(uri, new StringBuilder(text));
+        if (clientUri != null) {
+            clientUris.put(uri, clientUri);
+        }
 
         // Create JDT working copy
         ICompilationUnit cu = findCompilationUnit(uri);
@@ -204,7 +214,11 @@ public class DocumentManager {
      * Called when a document is changed. Applies incremental edits.
      */
     public void didChange(String uri, java.util.List<TextDocumentContentChangeEvent> changes) {
+        String clientUri = uri;
         uri = normalizeUri(uri);
+        if (clientUri != null) {
+            clientUris.put(uri, clientUri);
+        }
         StringBuilder content = openDocuments.get(uri);
         if (content == null) {
             return;
@@ -246,6 +260,7 @@ public class DocumentManager {
     public void didClose(String uri) {
         uri = normalizeUri(uri);
         openDocuments.remove(uri);
+        clientUris.remove(uri);
         compilerService.invalidate(uri);
 
         ICompilationUnit workingCopy = workingCopies.remove(uri);
@@ -278,6 +293,15 @@ public class DocumentManager {
      */
     public java.util.Set<String> getOpenDocumentUris() {
         return openDocuments.keySet();
+    }
+
+    /**
+     * Return the most recent client URI form for a document.
+     * Falls back to the normalized URI when no client form is known.
+     */
+    public String getClientUri(String uri) {
+        String normalized = normalizeUri(uri);
+        return clientUris.getOrDefault(normalized, normalized);
     }
 
     public WorkingCopyOwner getWorkingCopyOwner() {

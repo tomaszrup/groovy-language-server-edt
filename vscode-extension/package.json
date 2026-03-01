@@ -117,6 +117,30 @@
                     "default": true,
                     "description": "Enable/disable the Groovy document formatter.",
                     "scope": "window"
+                },
+                "groovy.inlayHints.variableTypes.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show inferred type hints for variables declared with def.",
+                    "scope": "window"
+                },
+                "groovy.inlayHints.parameterNames.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show parameter name hints at method and constructor call sites.",
+                    "scope": "window"
+                },
+                "groovy.inlayHints.closureParameterTypes.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show inferred types for closure parameters.",
+                    "scope": "window"
+                },
+                "groovy.inlayHints.methodReturnTypes.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show inferred return type hints for methods declared with def.",
+                    "scope": "window"
                 }
             }
         },
@@ -136,11 +160,17 @@
         "compile": "webpack --mode production",
         "watch": "webpack --mode development --watch",
         "lint": "eslint src/**/*.ts",
-        "package": "vsce package"
+        "package": "vsce package",
+        "test": "mocha --require ts-node/register --extension ts \"src/test/**/*.test.ts\""
     },
     "devDependencies": {
         "@types/node": "^20.0.0",
+        "@types/mocha": "^10.0.10",
         "@types/vscode": "^1.85.0",
+        "mocha": "^11.7.1",
+        "sinon": "^21.0.0",
+        "@types/sinon": "^17.0.4",
+        "ts-node": "^10.9.2",
         "ts-loader": "^9.5.0",
         "typescript": "^5.3.0",
         "webpack": "^5.90.0",

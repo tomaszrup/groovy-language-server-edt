@@ -896,8 +896,7 @@ public class CompletionProvider {
 
                     // Check $Trait$FieldHelper — at CONVERSION phase, trait fields
                     // are moved here with mangled names
-                    ClassNode helperNode = TraitMemberResolver.findFieldHelperNode(
-                            resolvedTraitNode, ast);
+                    ClassNode helperNode = findTraitFieldHelperNode(resolvedTraitNode, ast);
                     if (helperNode != null) {
                         for (FieldNode hField : helperNode.getFields()) {
                             String rawName = hField.getName();
@@ -923,6 +922,40 @@ public class CompletionProvider {
                 }
             }
         }
+    }
+
+    /**
+     * Find a trait FieldHelper node, searching in:
+     * 1) current module, 2) trait's own module, 3) other open documents.
+     */
+    private ClassNode findTraitFieldHelperNode(ClassNode traitNode, ModuleNode currentModule) {
+        if (traitNode == null) return null;
+
+        ClassNode helper = TraitMemberResolver.findFieldHelperNode(traitNode, currentModule);
+        if (helper != null) {
+            return helper;
+        }
+
+        ModuleNode traitModule = traitNode.getModule();
+        if (traitModule != null && traitModule != currentModule) {
+            helper = TraitMemberResolver.findFieldHelperNode(traitNode, traitModule);
+            if (helper != null) {
+                return helper;
+            }
+        }
+
+        for (String uri : documentManager.getOpenDocumentUris()) {
+            ModuleNode otherModule = documentManager.getGroovyAST(uri);
+            if (otherModule == null || otherModule == currentModule || otherModule == traitModule) {
+                continue;
+            }
+            helper = TraitMemberResolver.findFieldHelperNode(traitNode, otherModule);
+            if (helper != null) {
+                return helper;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -1131,6 +1164,11 @@ public class CompletionProvider {
         String ifaceSimple = ifaceRef.getNameWithoutPackage();
         if (ifaceSimple == null || ifaceSimple.isEmpty()) return null;
 
+        String ownerPkg = normalizePackageName(owner != null ? owner.getPackageName() : null);
+        if ((ownerPkg == null || ownerPkg.isEmpty()) && module != null) {
+            ownerPkg = normalizePackageName(module.getPackageName());
+        }
+
         try {
             String fqn = ifaceRef.getName();
             // Try FQN directly
@@ -1139,7 +1177,6 @@ public class CompletionProvider {
                 if (t != null) return t;
             }
             // Try same package as owner
-            String ownerPkg = owner.getPackageName();
             if (ownerPkg != null && !ownerPkg.isEmpty()) {
                 IType t = project.findType(ownerPkg + "." + ifaceSimple);
                 if (t != null) return t;
@@ -1155,9 +1192,9 @@ public class CompletionProvider {
                 }
                 // Try star imports
                 for (org.codehaus.groovy.ast.ImportNode starImport : module.getStarImports()) {
-                    String pkgName = starImport.getPackageName();
-                    if (pkgName != null) {
-                        IType t = project.findType(pkgName + ifaceSimple);
+                    String pkgName = normalizePackageName(starImport.getPackageName());
+                    if (pkgName != null && !pkgName.isEmpty()) {
+                        IType t = project.findType(pkgName + "." + ifaceSimple);
                         if (t != null) return t;
                     }
                 }
@@ -1168,9 +1205,86 @@ public class CompletionProvider {
                 IType t = project.findType(pkg + ifaceSimple);
                 if (t != null) return t;
             }
+
+            // Final fallback: search project types by simple name.
+            IType t = searchTypeBySimpleName(project, ifaceSimple, ownerPkg);
+            if (t != null) return t;
         } catch (JavaModelException e) {
             // ignore
         }
+        return null;
+    }
+
+    private String normalizePackageName(String packageName) {
+        if (packageName == null) return null;
+        String normalized = packageName.trim();
+        while (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    private IType searchTypeBySimpleName(IJavaProject project,
+                                          String simpleName,
+                                          String preferredPackage) {
+        if (simpleName == null || simpleName.isEmpty()) return null;
+
+        final String normalizedPreferredPackage = normalizePackageName(preferredPackage);
+        final String[] preferredFqn = new String[1];
+        final String[] firstFqn = new String[1];
+
+        try {
+            SearchEngine engine = new SearchEngine();
+            IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
+                    new IJavaElement[] { project },
+                    IJavaSearchScope.SOURCES
+                            | IJavaSearchScope.APPLICATION_LIBRARIES
+                            | IJavaSearchScope.REFERENCED_PROJECTS);
+
+            engine.searchAllTypeNames(
+                    null,
+                    SearchPattern.R_PATTERN_MATCH,
+                    simpleName.toCharArray(),
+                    SearchPattern.R_EXACT_MATCH,
+                    IJavaSearchConstants.TYPE,
+                    scope,
+                    new TypeNameRequestor() {
+                        @Override
+                        public void acceptType(int modifiers, char[] packageName,
+                                               char[] simpleTypeName,
+                                               char[][] enclosingTypeNames, String path) {
+                            String foundSimpleName = new String(simpleTypeName);
+                            if (!simpleName.equals(foundSimpleName)) {
+                                return;
+                            }
+
+                            String pkg = new String(packageName);
+                            String fqn = pkg.isEmpty() ? foundSimpleName : pkg + "." + foundSimpleName;
+
+                            if (firstFqn[0] == null) {
+                                firstFqn[0] = fqn;
+                            }
+
+                            if (normalizedPreferredPackage != null
+                                    && !normalizedPreferredPackage.isEmpty()
+                                    && normalizedPreferredPackage.equals(pkg)) {
+                                preferredFqn[0] = fqn;
+                            }
+                        }
+                    },
+                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+                    null);
+
+            String chosen = (preferredFqn[0] != null) ? preferredFqn[0] : firstFqn[0];
+            if (chosen != null) {
+                return project.findType(chosen);
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] Trait type search fallback failed for '"
+                            + simpleName + "': " + e.getMessage());
+        }
+
         return null;
     }
 

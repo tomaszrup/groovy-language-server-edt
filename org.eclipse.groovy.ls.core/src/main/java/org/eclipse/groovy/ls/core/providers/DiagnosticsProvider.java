@@ -11,7 +11,11 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.codehaus.groovy.ast.ModuleNode;
 import org.eclipse.core.resources.IFile;
@@ -22,7 +26,10 @@ import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
-import org.eclipse.jdt.core.IProblemRequestor;
+import org.eclipse.jdt.core.IImportDeclaration;
+import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.compiler.IProblem;
 import org.eclipse.lsp4j.*;
@@ -36,6 +43,13 @@ import org.eclipse.lsp4j.services.LanguageClient;
  * We convert these to LSP {@link Diagnostic} objects and publish them to the client.
  */
 public class DiagnosticsProvider {
+
+    private static final int TYPE_COLLISION_PROBLEM_ID = 16777539;
+    private static final String NO_SUCH_CLASS_PREFIX = "No such class: ";
+    private static final String TRANSFORM_LOADER_FRAGMENT =
+            "JDTClassNode.getTypeClass() cannot locate it using transform loader";
+        private static final Pattern UNABLE_TO_RESOLVE_CLASS_PATTERN =
+            Pattern.compile("(?i)unable to resolve class\\s+([\\w.$]+)");
 
     private final DocumentManager documentManager;
     private LanguageClient client;
@@ -64,12 +78,16 @@ public class DiagnosticsProvider {
      * Publish diagnostics for a document immediately.
      */
     public void publishDiagnostics(String uri) {
+        String normalizedUri = DocumentManager.normalizeUri(uri);
         if (client == null) {
+            GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnostics skipped (no client) uri=" + uri);
             return;
         }
 
         List<Diagnostic> diagnostics = collectDiagnostics(uri);
-        latestDiagnosticsByUri.put(uri, diagnostics);
+        latestDiagnosticsByUri.put(normalizedUri, diagnostics);
+        GroovyLanguageServerPlugin.logInfo(
+                "[diag-trace] publishDiagnostics uri=" + uri + " count=" + diagnostics.size());
         client.publishDiagnostics(new PublishDiagnosticsParams(uri, diagnostics));
     }
 
@@ -77,7 +95,7 @@ public class DiagnosticsProvider {
      * Get the latest cached diagnostics for a URI.
      */
     public List<Diagnostic> getLatestDiagnostics(String uri) {
-        List<Diagnostic> diagnostics = latestDiagnosticsByUri.get(uri);
+        List<Diagnostic> diagnostics = latestDiagnosticsByUri.get(DocumentManager.normalizeUri(uri));
         return diagnostics == null ? new ArrayList<>() : new ArrayList<>(diagnostics);
     }
 
@@ -86,7 +104,7 @@ public class DiagnosticsProvider {
      */
     public List<Diagnostic> collectDiagnosticsForCodeActions(String uri) {
         List<Diagnostic> diagnostics = collectDiagnostics(uri);
-        latestDiagnosticsByUri.put(uri, diagnostics);
+        latestDiagnosticsByUri.put(DocumentManager.normalizeUri(uri), diagnostics);
         return diagnostics;
     }
 
@@ -94,7 +112,7 @@ public class DiagnosticsProvider {
      * Clear cached diagnostics for a URI.
      */
     public void clearDiagnostics(String uri) {
-        latestDiagnosticsByUri.remove(uri);
+        latestDiagnosticsByUri.remove(DocumentManager.normalizeUri(uri));
     }
 
     /**
@@ -102,15 +120,18 @@ public class DiagnosticsProvider {
      * Subsequent calls for the same URI cancel the previous scheduled publish.
      */
     public void publishDiagnosticsDebounced(String uri) {
-        java.util.concurrent.ScheduledFuture<?> existing = pendingPublish.remove(uri);
+        GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsDebounced schedule uri=" + uri);
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+        java.util.concurrent.ScheduledFuture<?> existing = pendingPublish.remove(normalizedUri);
         if (existing != null) {
             existing.cancel(false);
+            GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsDebounced cancel previous uri=" + uri);
         }
 
         java.util.concurrent.ScheduledFuture<?> future = scheduler.schedule(
                 () -> publishDiagnostics(uri),
                 500, java.util.concurrent.TimeUnit.MILLISECONDS);
-        pendingPublish.put(uri, future);
+        pendingPublish.put(normalizedUri, future);
     }
 
     /**
@@ -171,12 +192,13 @@ public class DiagnosticsProvider {
 
             if (ast != null) {
                 IProblem[] problems = ast.getProblems();
+                IJavaProject javaProject = workingCopy.getJavaProject();
                 for (IProblem problem : problems) {
-                    // Filter out Groovy-Eclipse false positive: "The type X is already defined"
-                    // (IProblem.TypeCollision = 16777539). When a .groovy file has errors,
-                    // the Groovy compiler wraps the file body in a synthetic script class
-                    // with the same name as the declared class, causing a spurious duplicate.
-                    if (problem.getID() == 16777539) {
+                    if (shouldSkipDiagnostic(
+                            problem.getID(),
+                            problem.getMessage(),
+                            javaProject,
+                            workingCopy)) {
                         continue;
                     }
                     diagnostics.add(toDiagnostic(problem, content));
@@ -193,10 +215,16 @@ public class DiagnosticsProvider {
     private void collectFromMarkers(IFile file, List<Diagnostic> diagnostics, String content) {
         try {
             IMarker[] markers = file.findMarkers(IMarker.PROBLEM, true, IResource.DEPTH_ZERO);
+            IJavaProject javaProject = JavaCore.create(file.getProject());
+            ICompilationUnit contextUnit = null;
+            org.eclipse.jdt.core.IJavaElement element = JavaCore.create(file);
+            if (element instanceof ICompilationUnit) {
+                contextUnit = (ICompilationUnit) element;
+            }
             for (IMarker marker : markers) {
                 // Filter out the same Groovy-Eclipse false positive from markers
                 String msg = marker.getAttribute(IMarker.MESSAGE, "");
-                if (msg.startsWith("The type ") && msg.endsWith(" is already defined")) {
+                if (shouldSkipDiagnostic(-1, msg, javaProject, contextUnit)) {
                     continue;
                 }
                 Diagnostic diagnostic = toDiagnostic(marker, content);
@@ -207,6 +235,153 @@ public class DiagnosticsProvider {
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to collect markers", e);
         }
+    }
+
+    private boolean shouldSkipDiagnostic(
+            int problemId,
+            String message,
+            IJavaProject javaProject,
+            ICompilationUnit contextUnit) {
+        // Filter out Groovy-Eclipse false positive: "The type X is already defined"
+        // (IProblem.TypeCollision = 16777539). When a .groovy file has errors,
+        // the Groovy compiler wraps the file body in a synthetic script class
+        // with the same name as the declared class, causing a spurious duplicate.
+        if (problemId == TYPE_COLLISION_PROBLEM_ID
+                || (message != null
+                        && message.startsWith("The type ")
+                        && message.endsWith(" is already defined"))) {
+            return true;
+        }
+
+        // Filter a known transient Groovy-Eclipse issue: a source type exists in the
+        // project but JDTClassNode.getTypeClass() cannot load it through transform loader.
+        if (isExistingTypeTransformLoaderFailure(message, javaProject, contextUnit)) {
+            return true;
+        }
+
+        // Filter transient unresolved-class diagnostics when the target type
+        // is actually present in the project and resolvable from context.
+        return isResolvableUnableToResolveClassFailure(message, javaProject, contextUnit);
+    }
+
+    private boolean isExistingTypeTransformLoaderFailure(
+            String message,
+            IJavaProject javaProject,
+            ICompilationUnit contextUnit) {
+        if (message == null || javaProject == null || !message.contains(TRANSFORM_LOADER_FRAGMENT)) {
+            return false;
+        }
+
+        String missingType = extractMissingTypeName(message);
+        if (missingType == null || missingType.isBlank()) {
+            return false;
+        }
+
+        return typeExistsInProjectContext(missingType, javaProject, contextUnit);
+    }
+
+    private boolean isResolvableUnableToResolveClassFailure(
+            String message,
+            IJavaProject javaProject,
+            ICompilationUnit contextUnit) {
+        if (message == null || javaProject == null) {
+            return false;
+        }
+
+        Matcher matcher = UNABLE_TO_RESOLVE_CLASS_PATTERN.matcher(message);
+        if (!matcher.find()) {
+            return false;
+        }
+
+        String missingType = matcher.group(1);
+        if (missingType == null || missingType.isBlank()) {
+            return false;
+        }
+
+        return typeExistsInProjectContext(missingType, javaProject, contextUnit);
+    }
+
+    private boolean typeExistsInProjectContext(
+            String missingType,
+            IJavaProject javaProject,
+            ICompilationUnit contextUnit) {
+        Set<String> candidates = new LinkedHashSet<>();
+        candidates.add(missingType.trim());
+
+        try {
+            String simpleName = missingType;
+            int lastDot = missingType.lastIndexOf('.');
+            if (lastDot >= 0 && lastDot < missingType.length() - 1) {
+                simpleName = missingType.substring(lastDot + 1);
+            }
+
+            if (!missingType.contains(".")) {
+                if (contextUnit != null) {
+                    try {
+                        for (var pkg : contextUnit.getPackageDeclarations()) {
+                            String packageName = pkg.getElementName();
+                            if (packageName != null && !packageName.isBlank()) {
+                                candidates.add(packageName + "." + simpleName);
+                            }
+                        }
+                    } catch (JavaModelException e) {
+                        GroovyLanguageServerPlugin.logInfo(
+                                "[diagnostics] Failed to read package declarations: " + e.getMessage());
+                    }
+
+                    try {
+                        for (IImportDeclaration imp : contextUnit.getImports()) {
+                            String importedName = imp.getElementName();
+                            if (importedName == null || importedName.isBlank()) {
+                                continue;
+                            }
+                            if (imp.isOnDemand()) {
+                                candidates.add(importedName + "." + simpleName);
+                            } else if (importedName.endsWith("." + simpleName)) {
+                                candidates.add(importedName);
+                            }
+                        }
+                    } catch (JavaModelException e) {
+                        GroovyLanguageServerPlugin.logInfo(
+                                "[diagnostics] Failed to read import declarations: " + e.getMessage());
+                    }
+                }
+
+                candidates.add("java.lang." + simpleName);
+            }
+
+            for (String candidate : candidates) {
+                if (candidate == null || candidate.isBlank()) {
+                    continue;
+                }
+                IType type = javaProject.findType(candidate);
+                if (type != null && type.exists()) {
+                    return true;
+                }
+            }
+
+            return false;
+        } catch (JavaModelException e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diagnostics] Failed to validate missing type '" + missingType
+                    + "' with candidates=" + candidates + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private String extractMissingTypeName(String message) {
+        int start = message.indexOf(NO_SUCH_CLASS_PREFIX);
+        if (start < 0) {
+            return null;
+        }
+        start += NO_SUCH_CLASS_PREFIX.length();
+
+        int end = message.indexOf(" --", start);
+        if (end < 0) {
+            end = message.length();
+        }
+
+        return message.substring(start, end).trim();
     }
 
     /**
