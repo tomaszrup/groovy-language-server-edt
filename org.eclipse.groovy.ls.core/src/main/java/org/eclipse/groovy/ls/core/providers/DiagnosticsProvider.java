@@ -45,14 +45,30 @@ import org.eclipse.lsp4j.services.LanguageClient;
 public class DiagnosticsProvider {
 
     private static final int TYPE_COLLISION_PROBLEM_ID = 16777539;
+    private static final int GROOVY_RUN_SCRIPT_PROBLEM_ID = 67108964;
+    /** IProblem.PackageIsNotExpectedPackage — false positive when AST has zero classes. */
+    private static final int PACKAGE_IS_NOT_EXPECTED_PROBLEM_ID = 536871240;
+    private static final String GENERAL_CONVERSION_ERROR_PREFIX =
+            "Groovy:General error during conversion:";
     private static final String NO_SUCH_CLASS_PREFIX = "No such class: ";
     private static final String TRANSFORM_LOADER_FRAGMENT =
             "JDTClassNode.getTypeClass() cannot locate it using transform loader";
-        private static final Pattern UNABLE_TO_RESOLVE_CLASS_PATTERN =
+    private static final String DIAGNOSTIC_SOURCE_GROOVY = "groovy";
+    private static final String[] DEFAULT_AUTO_IMPORTED_PACKAGES = {
+        "java.lang.",
+        "java.util.",
+        "java.io.",
+        "java.net.",
+        "java.math.",
+        "groovy.lang.",
+        "groovy.util."
+    };
+    private static final Pattern UNABLE_TO_RESOLVE_CLASS_PATTERN =
             Pattern.compile("(?i)unable to resolve class\\s+([\\w.$]+)");
 
     private final DocumentManager documentManager;
     private LanguageClient client;
+    private volatile java.util.function.Predicate<String> classpathAvailableForUri;
         private final java.util.Map<String, List<Diagnostic>> latestDiagnosticsByUri =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -72,6 +88,16 @@ public class DiagnosticsProvider {
 
     public void connect(LanguageClient client) {
         this.client = client;
+    }
+
+    /**
+     * Set a predicate that checks whether a classpath has been configured
+     * for the project owning a given URI. When the predicate returns {@code false},
+     * only syntax diagnostics are reported and a warning is added at the
+     * package/first line.
+     */
+    public void setClasspathChecker(java.util.function.Predicate<String> checker) {
+        this.classpathAvailableForUri = checker;
     }
 
     /**
@@ -141,6 +167,29 @@ public class DiagnosticsProvider {
         List<Diagnostic> diagnostics = new ArrayList<>();
         String content = documentManager.getContent(uri);
 
+        // When no classpath is available for this project, report only syntax
+        // errors (from the standalone Groovy compiler) and append a warning at
+        // the top of the file so the user knows why full diagnostics are missing.
+        java.util.function.Predicate<String> checker = classpathAvailableForUri;
+        boolean hasClasspath = checker == null || checker.test(uri);
+        GroovyLanguageServerPlugin.logInfo(
+                "[classpath-check] uri=" + uri
+                + " checkerPresent=" + (checker != null)
+                + " hasClasspath=" + hasClasspath);
+
+        if (!hasClasspath) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[classpath-check] No classpath for " + uri + " → syntax-only mode");
+            try {
+                collectFromGroovyCompiler(uri, diagnostics);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                    "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
+            }
+            diagnostics.add(createNoClasspathWarning(content));
+            return diagnostics;
+        }
+
         try {
             // Approach 1: Get problems from the working copy reconciliation
             ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
@@ -164,17 +213,41 @@ public class DiagnosticsProvider {
         // Always check for unused imports via AST analysis
         try {
             ModuleNode ast = documentManager.getGroovyAST(uri);
-            if (ast != null) {
-                if (content != null) {
-                    List<Diagnostic> unusedImports = UnusedImportDetector.detectUnusedImports(ast, content);
-                    diagnostics.addAll(unusedImports);
-                }
+            if (ast != null && content != null) {
+                List<Diagnostic> unusedImports = UnusedImportDetector.detectUnusedImports(ast, content);
+                diagnostics.addAll(unusedImports);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Unused import detection failed for " + uri, e);
         }
 
         return diagnostics;
+    }
+
+    /**
+     * Create a warning diagnostic placed at the first line (package declaration)
+     * informing the user that no classpath is configured for this file's project.
+     */
+    private Diagnostic createNoClasspathWarning(String content) {
+        int firstLineLength = 0;
+        if (content != null) {
+            int idx = content.indexOf('\n');
+            firstLineLength = idx >= 0 ? idx : content.length();
+            if (firstLineLength > 0 && content.charAt(firstLineLength - 1) == '\r') {
+                firstLineLength--;
+            }
+        }
+        Diagnostic warning = new Diagnostic();
+        warning.setRange(new Range(new Position(0, 0), new Position(0, firstLineLength)));
+        warning.setSeverity(DiagnosticSeverity.Warning);
+        warning.setSource(DIAGNOSTIC_SOURCE_GROOVY);
+        warning.setCode("groovy.noClasspath");
+        warning.setMessage(
+            "Classpath is not configured for this project. "
+            + "Only syntax errors are reported. "
+            + "Install the 'Language Support for Java' extension and ensure "
+            + "this project is recognized as a valid Gradle/Maven project.");
+        return warning;
     }
 
     /**
@@ -191,6 +264,13 @@ public class DiagnosticsProvider {
                     null);
 
             if (ast != null) {
+                // Check whether the Groovy AST has zero classes. When the code
+                // is mid-edit and syntactically broken, the parser can produce
+                // an empty module. JDT then reports false positives like
+                // "declared package does not match" because it sees no package
+                // declaration in the empty AST.
+                boolean astHasNoClasses = isGroovyASTEmpty(workingCopy);
+
                 IProblem[] problems = ast.getProblems();
                 IJavaProject javaProject = workingCopy.getJavaProject();
                 for (IProblem problem : problems) {
@@ -198,7 +278,8 @@ public class DiagnosticsProvider {
                             problem.getID(),
                             problem.getMessage(),
                             javaProject,
-                            workingCopy)) {
+                            workingCopy,
+                            astHasNoClasses)) {
                         continue;
                     }
                     diagnostics.add(toDiagnostic(problem, content));
@@ -210,6 +291,23 @@ public class DiagnosticsProvider {
     }
 
     /**
+     * Check if the Groovy ModuleNode for a working copy has zero classes,
+     * indicating a broken parse that produces false-positive diagnostics.
+     */
+    private boolean isGroovyASTEmpty(ICompilationUnit workingCopy) {
+        try {
+            java.lang.reflect.Method getModuleNode = workingCopy.getClass().getMethod("getModuleNode");
+            Object result = getModuleNode.invoke(workingCopy);
+            if (result instanceof ModuleNode module) {
+                return module.getClasses() == null || module.getClasses().isEmpty();
+            }
+        } catch (Exception e) {
+            // Not a GroovyCompilationUnit or reflection failed — assume not empty
+        }
+        return false;
+    }
+
+    /**
      * Collect problems from Eclipse resource markers.
      */
     private void collectFromMarkers(IFile file, List<Diagnostic> diagnostics, String content) {
@@ -218,8 +316,8 @@ public class DiagnosticsProvider {
             IJavaProject javaProject = JavaCore.create(file.getProject());
             ICompilationUnit contextUnit = null;
             org.eclipse.jdt.core.IJavaElement element = JavaCore.create(file);
-            if (element instanceof ICompilationUnit) {
-                contextUnit = (ICompilationUnit) element;
+            if (element instanceof ICompilationUnit compilationUnit) {
+                contextUnit = compilationUnit;
             }
             for (IMarker marker : markers) {
                 // Filter out the same Groovy-Eclipse false positive from markers
@@ -242,6 +340,19 @@ public class DiagnosticsProvider {
             String message,
             IJavaProject javaProject,
             ICompilationUnit contextUnit) {
+        return shouldSkipDiagnostic(problemId, message, javaProject, contextUnit, false);
+    }
+
+    private boolean shouldSkipDiagnostic(
+            int problemId,
+            String message,
+            IJavaProject javaProject,
+            ICompilationUnit contextUnit,
+            boolean astHasNoClasses) {
+        if (problemId == GROOVY_RUN_SCRIPT_PROBLEM_ID) {
+            return true;
+        }
+
         // Filter out Groovy-Eclipse false positive: "The type X is already defined"
         // (IProblem.TypeCollision = 16777539). When a .groovy file has errors,
         // the Groovy compiler wraps the file body in a synthetic script class
@@ -250,6 +361,19 @@ public class DiagnosticsProvider {
                 || (message != null
                         && message.startsWith("The type ")
                         && message.endsWith(" is already defined"))) {
+            return true;
+        }
+
+        // Filter "General error during conversion: ..." messages. These are noisy
+        // wrappers around the underlying parse errors and provide no actionable
+        // information beyond what the actual syntax errors already report.
+        if (message != null && message.startsWith(GENERAL_CONVERSION_ERROR_PREFIX)) {
+            return true;
+        }
+
+        // When the Groovy AST has zero classes (code is mid-edit/broken), JDT
+        // sees no package declaration and reports a spurious package mismatch.
+        if (astHasNoClasses && problemId == PACKAGE_IS_NOT_EXPECTED_PROBLEM_ID) {
             return true;
         }
 
@@ -305,83 +429,132 @@ public class DiagnosticsProvider {
             String missingType,
             IJavaProject javaProject,
             ICompilationUnit contextUnit) {
-        Set<String> candidates = new LinkedHashSet<>();
-        candidates.add(missingType.trim());
+        String normalizedMissingType = missingType.trim();
+        Set<String> candidates = collectTypeCandidates(normalizedMissingType, contextUnit);
 
         try {
-            String simpleName = missingType;
-            int lastDot = missingType.lastIndexOf('.');
-            if (lastDot >= 0 && lastDot < missingType.length() - 1) {
-                simpleName = missingType.substring(lastDot + 1);
-            }
-
-            if (!missingType.contains(".")) {
-                if (contextUnit != null) {
-                    try {
-                        for (var pkg : contextUnit.getPackageDeclarations()) {
-                            String packageName = pkg.getElementName();
-                            if (packageName != null && !packageName.isBlank()) {
-                                candidates.add(packageName + "." + simpleName);
-                            }
-                        }
-                    } catch (JavaModelException e) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[diagnostics] Failed to read package declarations: " + e.getMessage());
-                    }
-
-                    try {
-                        for (IImportDeclaration imp : contextUnit.getImports()) {
-                            String importedName = imp.getElementName();
-                            if (importedName == null || importedName.isBlank()) {
-                                continue;
-                            }
-                            if (imp.isOnDemand()) {
-                                candidates.add(importedName + "." + simpleName);
-                            } else if (importedName.endsWith("." + simpleName)) {
-                                candidates.add(importedName);
-                            }
-                        }
-                    } catch (JavaModelException e) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[diagnostics] Failed to read import declarations: " + e.getMessage());
-                    }
-                }
-
-                candidates.add("java.lang." + simpleName);
-            }
-
-            for (String candidate : candidates) {
-                if (candidate == null || candidate.isBlank()) {
-                    continue;
-                }
-                IType type = javaProject.findType(candidate);
-                if (type != null && type.exists()) {
-                    return true;
-                }
-            }
-
-            return false;
+            return anyCandidateTypeExists(candidates, javaProject);
         } catch (JavaModelException e) {
             GroovyLanguageServerPlugin.logInfo(
-                    "[diagnostics] Failed to validate missing type '" + missingType
+                    "[diagnostics] Failed to validate missing type '" + normalizedMissingType
                     + "' with candidates=" + candidates + ": " + e.getMessage());
             return false;
         }
     }
 
+    private Set<String> collectTypeCandidates(String missingType, ICompilationUnit contextUnit) {
+        Set<String> candidates = new LinkedHashSet<>();
+        candidates.add(missingType);
+
+        if (missingType.contains(".")) {
+            return candidates;
+        }
+
+        String simpleName = extractSimpleTypeName(missingType);
+        addPackageCandidates(candidates, simpleName, contextUnit);
+        addImportCandidates(candidates, simpleName, contextUnit);
+        for (String pkg : DEFAULT_AUTO_IMPORTED_PACKAGES) {
+            candidates.add(pkg + simpleName);
+        }
+
+        return candidates;
+    }
+
+    private String extractSimpleTypeName(String typeName) {
+        int lastDot = typeName.lastIndexOf('.');
+        if (lastDot >= 0 && lastDot < typeName.length() - 1) {
+            return typeName.substring(lastDot + 1);
+        }
+        return typeName;
+    }
+
+    private void addPackageCandidates(Set<String> candidates,
+            String simpleName,
+            ICompilationUnit contextUnit) {
+        if (contextUnit == null) {
+            return;
+        }
+
+        try {
+            for (var pkg : contextUnit.getPackageDeclarations()) {
+                String packageName = pkg.getElementName();
+                if (packageName != null && !packageName.isBlank()) {
+                    candidates.add(packageName + "." + simpleName);
+                }
+            }
+        } catch (JavaModelException e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diagnostics] Failed to read package declarations: " + e.getMessage());
+        }
+    }
+
+    private void addImportCandidates(Set<String> candidates,
+            String simpleName,
+            ICompilationUnit contextUnit) {
+        if (contextUnit == null) {
+            return;
+        }
+
+        try {
+            for (IImportDeclaration imp : contextUnit.getImports()) {
+                String importedName = imp.getElementName();
+                if (importedName == null || importedName.isBlank()) {
+                    continue;
+                }
+                if (imp.isOnDemand()) {
+                    candidates.add(importedName + "." + simpleName);
+                } else if (importedName.endsWith("." + simpleName)) {
+                    candidates.add(importedName);
+                }
+            }
+        } catch (JavaModelException e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diagnostics] Failed to read import declarations: " + e.getMessage());
+        }
+    }
+
+    private boolean anyCandidateTypeExists(Set<String> candidates, IJavaProject javaProject)
+            throws JavaModelException {
+        for (String candidate : candidates) {
+            if (!isValidTypeCandidate(candidate)) {
+                continue;
+            }
+            IType type = javaProject.findType(candidate);
+            if (type != null && type.exists()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isValidTypeCandidate(String candidate) {
+        return candidate != null && !candidate.isBlank();
+    }
+
     private String extractMissingTypeName(String message) {
-        int start = message.indexOf(NO_SUCH_CLASS_PREFIX);
-        if (start < 0) {
+        if (message.isBlank()) {
             return null;
         }
-        start += NO_SUCH_CLASS_PREFIX.length();
 
-        int end = message.indexOf(" --", start);
-        if (end < 0) {
-            end = message.length();
+        int start = message.indexOf(NO_SUCH_CLASS_PREFIX);
+        if (start >= 0) {
+            start += NO_SUCH_CLASS_PREFIX.length();
+
+            int end = message.indexOf(" --", start);
+            if (end < 0) {
+                end = message.length();
+            }
+
+            return message.substring(start, end).trim();
         }
 
-        return message.substring(start, end).trim();
+        Matcher matcher = UNABLE_TO_RESOLVE_CLASS_PATTERN.matcher(message);
+        if (matcher.find()) {
+            String extracted = matcher.group(1);
+            return extracted == null ? null : extracted.trim();
+        }
+
+        return null;
     }
 
     /**
@@ -413,7 +586,7 @@ public class DiagnosticsProvider {
                     new Position(startLine, startCol),
                     new Position(endLine, endCol)));
             diagnostic.setMessage(error.getMessage());
-            diagnostic.setSource("groovy");
+                diagnostic.setSource(DIAGNOSTIC_SOURCE_GROOVY);
 
             diagnostics.add(diagnostic);
         }
@@ -454,7 +627,7 @@ public class DiagnosticsProvider {
 
         diagnostic.setRange(range);
         diagnostic.setMessage(problem.getMessage());
-        diagnostic.setSource("groovy");
+        diagnostic.setSource(DIAGNOSTIC_SOURCE_GROOVY);
         diagnostic.setCode(String.valueOf(problem.getID()));
 
         return diagnostic;
@@ -471,9 +644,12 @@ public class DiagnosticsProvider {
     private Range offsetRangeToLspRange(String content, int start, int end) {
         int line = 0;
         int col = 0;
-        int startLine = 0, startCol = 0;
-        int endLine = 0, endCol = 0;
-        boolean foundStart = false, foundEnd = false;
+        int startLine = 0;
+        int startCol = 0;
+        int endLine = 0;
+        int endCol = 0;
+        boolean foundStart = false;
+        boolean foundEnd = false;
 
         for (int i = 0; i < content.length() && !foundEnd; i++) {
             if (i == start) {
@@ -545,7 +721,7 @@ public class DiagnosticsProvider {
 
             diagnostic.setRange(range);
             diagnostic.setMessage(marker.getAttribute(IMarker.MESSAGE, "Unknown error"));
-            diagnostic.setSource("groovy");
+            diagnostic.setSource(DIAGNOSTIC_SOURCE_GROOVY);
 
             return diagnostic;
         } catch (Exception e) {

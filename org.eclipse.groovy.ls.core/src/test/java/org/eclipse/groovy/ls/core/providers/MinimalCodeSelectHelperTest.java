@@ -12,12 +12,18 @@ package org.eclipse.groovy.ls.core.providers;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
+import org.eclipse.jdt.core.IField;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IType;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -162,8 +168,7 @@ class MinimalCodeSelectHelperTest {
 
         // Line 1 → package declaration, outside any class
         ClassNode enclosing = invokeFindEnclosingClass(module, 1);
-        // The Groovy AST may create a script class that spans the whole file,
-        // so this may or may not be null. We just verify no exception.
+        assertTrue(enclosing == null || enclosing.getLineNumber() > 0);
     }
 
     // ---- resolveFromImports ----
@@ -246,6 +251,117 @@ class MinimalCodeSelectHelperTest {
         assertNull(fqn);
     }
 
+    // ---- Additional edge cases ----
+
+    @Test
+    void extractWordAtOnWhitespaceReturnsNull() throws Exception {
+        assertNull(invokeExtractWordAt("   ", 1));
+    }
+
+    @Test
+    void extractWordAtBoundaryBetweenWords() throws Exception {
+        String content = "foo bar";
+        // position at space between foo and bar
+        String result = invokeExtractWordAt(content, 3);
+        // May return null (at space) or adjacent word depending on boundary handling
+        assertTrue(result == null || result.equals("foo") || result.equals("bar"));
+    }
+
+    @Test
+    void extractWordAtDollarSign() throws Exception {
+        String content = "def $special = 1";
+        String word = invokeExtractWordAt(content, 5);
+        assertEquals("$special", word);
+    }
+
+    @Test
+    void offsetToLineZeroOffset() throws Exception {
+        assertEquals(1, invokeOffsetToLine("abc\ndef", 0));
+    }
+
+    @Test
+    void offsetToLineNegativeClamps() throws Exception {
+        assertEquals(1, invokeOffsetToLine("abc", -5));
+    }
+
+    @Test
+    void resolveFromImportsStaticImport() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "import static java.lang.Math.PI\n\nclass A { double pi = PI }\n";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///static.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        String fqn = invokeResolveFromImports(module, "Math");
+        assertTrue(fqn == null || fqn.contains("Math"));
+    }
+
+    @Test
+    void resolveTypeFromASTFindsImplementsClause() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "import java.io.Serializable\n\nclass A implements Serializable {}\n";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///impl.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        String fqn = invokeResolveTypeFromAST(module, "Serializable", 50, source);
+        assertNotNull(fqn);
+        assertEquals("java.io.Serializable", fqn);
+    }
+
+    @Test
+    void resolveTypeFromASTFindsMethodReturnType() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "import java.time.LocalDate\n\nclass A {\n  LocalDate getDate() { null }\n}\n";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///rettype.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        String fqn = invokeResolveTypeFromAST(module, "LocalDate", 40, source);
+        assertNotNull(fqn);
+        assertEquals("java.time.LocalDate", fqn);
+    }
+
+    @Test
+    void resolveTypeFromASTFindsMethodParameterType() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "import java.time.LocalDate\n\nclass A {\n  void process(LocalDate date) {}\n}\n";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///paramtype.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        String fqn = invokeResolveTypeFromAST(module, "LocalDate", 50, source);
+        assertNotNull(fqn);
+        assertEquals("java.time.LocalDate", fqn);
+    }
+
+    @Test
+    void resolveTypeFromASTFindsPropertyType() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "import java.time.LocalDate\n\nclass A {\n  LocalDate birthday\n}\n";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///proptype.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        String fqn = invokeResolveTypeFromAST(module, "LocalDate", 40, source);
+        assertNotNull(fqn);
+        assertEquals("java.time.LocalDate", fqn);
+    }
+
+    @Test
+    void findEnclosingClassMultipleClasses() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "class A {\n  void foo() {}\n}\nclass B {\n  void bar() {}\n}\n";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///multi.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        ClassNode atLineA = invokeFindEnclosingClass(module, 2);
+        ClassNode atLineB = invokeFindEnclosingClass(module, 5);
+        assertNotNull(atLineA);
+        assertNotNull(atLineB);
+    }
+
     // ---- Helpers ----
 
     private String invokeExtractWordAt(String content, int offset) throws Exception {
@@ -273,8 +389,375 @@ class MinimalCodeSelectHelperTest {
     }
 
     private String invokeResolveTypeFromAST(ModuleNode module, String word, int offset, String source) throws Exception {
-        Method method = MinimalCodeSelectHelper.class.getDeclaredMethod("resolveTypeFromAST", ModuleNode.class, String.class, int.class, String.class);
+        Method method = MinimalCodeSelectHelper.class.getDeclaredMethod("resolveTypeFromAST", ModuleNode.class, String.class);
         method.setAccessible(true);
-        return (String) method.invoke(helper, module, word, offset, source);
+        return (String) method.invoke(helper, module, word);
+    }
+
+    // ---- resolveClassNodeName ----
+
+    @Test
+    void resolveClassNodeNameResolvesViaImports() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "import java.time.LocalDate\nclass A { LocalDate d }";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///resolveNodeName.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        // Get the ClassNode for LocalDate from the field's type
+        ClassNode localDateNode = module.getClasses().get(0).getFields().stream()
+                .filter(f -> "d".equals(f.getName()))
+                .findFirst()
+                .map(f -> f.getType())
+                .orElse(null);
+        assertNotNull(localDateNode);
+
+        String resolved = invokeResolveClassNodeName(module, localDateNode, "LocalDate");
+        assertNotNull(resolved);
+    }
+
+    @Test
+    void resolveClassNodeNameReturnsOriginalNameForFQN() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "class A { java.util.List items }";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///resolveNodeFqn.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        ClassNode listNode = module.getClasses().get(0).getFields().stream()
+                .filter(f -> "items".equals(f.getName()))
+                .findFirst()
+                .map(f -> f.getType())
+                .orElse(null);
+        assertNotNull(listNode);
+
+        String resolved = invokeResolveClassNodeName(module, listNode, "List");
+        assertNotNull(resolved);
+        assertTrue(resolved.contains("List"));
+    }
+
+    // ---- findTraitClassNodeInModule ----
+
+    @Test
+    void findTraitClassNodeInModuleFindsExistingTrait() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "trait Named { String name }\nclass Person implements Named {}";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///traitFind.groovy", source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+
+        ClassNode found = invokeFindTraitClassNodeInModule(module, "Named");
+        assertNotNull(found);
+        assertEquals("Named", found.getNameWithoutPackage());
+    }
+
+    @Test
+    void findTraitClassNodeInModuleReturnsNullForMissing() throws Exception {
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        String source = "class A {}";
+        GroovyCompilerService.ParseResult result = compiler.parse("file:///traitMissing.groovy", source);
+        ModuleNode module = result.getModuleNode();
+
+        ClassNode found = invokeFindTraitClassNodeInModule(module, "NonExistent");
+        assertNull(found);
+    }
+
+    @Test
+    void findTraitClassNodeInModuleReturnsNullForNullInputs() throws Exception {
+        assertNull(invokeFindTraitClassNodeInModule(null, "A"));
+        GroovyCompilerService compiler = new GroovyCompilerService();
+        ModuleNode module = compiler.parse("file:///n.groovy", "class A {}").getModuleNode();
+        assertNull(invokeFindTraitClassNodeInModule(module, null));
+    }
+
+    // ---- findTypeInUnit ----
+
+    @Test
+    void findTypeInUnitFindsMatchingType() throws Exception {
+        IType matching = mock(IType.class);
+        when(matching.getElementName()).thenReturn("Foo");
+        IType other = mock(IType.class);
+        when(other.getElementName()).thenReturn("Bar");
+
+        IType result = invokeFindTypeInUnit(new IType[] { other, matching }, "Foo");
+        assertNotNull(result);
+        assertEquals("Foo", result.getElementName());
+    }
+
+    @Test
+    void findTypeInUnitReturnsNullWhenNotFound() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getElementName()).thenReturn("Foo");
+
+        IType result = invokeFindTypeInUnit(new IType[] { type }, "Bar");
+        assertNull(result);
+    }
+
+    // ---- findFieldByName ----
+
+    @Test
+    void findFieldByNameFindsMatch() throws Exception {
+        IType type = mock(IType.class);
+        IField field1 = mock(IField.class);
+        when(field1.getElementName()).thenReturn("name");
+        IField field2 = mock(IField.class);
+        when(field2.getElementName()).thenReturn("age");
+        when(type.getFields()).thenReturn(new IField[] { field1, field2 });
+
+        IField result = invokeFindFieldByName(type, "age");
+        assertNotNull(result);
+        assertEquals("age", result.getElementName());
+    }
+
+    @Test
+    void findFieldByNameReturnsNullForNoMatch() throws Exception {
+        IType type = mock(IType.class);
+        IField field = mock(IField.class);
+        when(field.getElementName()).thenReturn("x");
+        when(type.getFields()).thenReturn(new IField[] { field });
+
+        IField result = invokeFindFieldByName(type, "y");
+        assertNull(result);
+    }
+
+    @Test
+    void findFieldByNameReturnsNullWhenFieldsNull() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getFields()).thenReturn(null);
+
+        IField result = invokeFindFieldByName(type, "x");
+        assertNull(result);
+    }
+
+    // ---- findMethodByName ----
+
+    @Test
+    void findMethodByNameFindsMatch() throws Exception {
+        IType type = mock(IType.class);
+        IMethod method1 = mock(IMethod.class);
+        when(method1.getElementName()).thenReturn("init");
+        IMethod method2 = mock(IMethod.class);
+        when(method2.getElementName()).thenReturn("run");
+        when(type.getMethods()).thenReturn(new IMethod[] { method1, method2 });
+
+        IMethod result = invokeFindMethodByName(type, "run");
+        assertNotNull(result);
+        assertEquals("run", result.getElementName());
+    }
+
+    @Test
+    void findMethodByNameReturnsNullForNoMatch() throws Exception {
+        IType type = mock(IType.class);
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("foo");
+        when(type.getMethods()).thenReturn(new IMethod[] { method });
+
+        IMethod result = invokeFindMethodByName(type, "bar");
+        assertNull(result);
+    }
+
+    // ---- resolveTypeFromAST ----
+
+    @Test
+    void resolveTypeFromASTReturnsClassDeclaration() throws Exception {
+        String source = "import java.util.List\nclass Holder { List items }\n";
+        ModuleNode module = parseModule(source);
+        // resolveTypeFromAST finds field types via the AST
+        String result = invokeResolveTypeFromAST(module, "List", 35, source);
+        assertNotNull(result);
+        assertTrue(result.contains("List"));
+    }
+
+    @Test
+    void resolveTypeFromASTResolvesFieldType() throws Exception {
+        String source = "import java.util.Map\nclass Holder { Map items }\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveTypeFromAST(module, "Map", 34, source);
+        assertNotNull(result);
+        assertTrue(result.contains("Map"));
+    }
+
+    @Test
+    void resolveTypeFromASTResolvesMethodReturnType() throws Exception {
+        String source = "import java.util.Map\nclass Svc { Map getData() { [:] } }\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveTypeFromAST(module, "Map", 30, source);
+        assertNotNull(result);
+        assertTrue(result.contains("Map"));
+    }
+
+    @Test
+    void resolveTypeFromASTResolvesParameterType() throws Exception {
+        String source = "import java.util.Set\nclass Svc { void process(Set items) {} }\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveTypeFromAST(module, "Set", 45, source);
+        assertNotNull(result);
+        assertTrue(result.contains("Set"));
+    }
+
+    @Test
+    void resolveTypeFromASTReturnsNullForUnknown() throws Exception {
+        String source = "class MyClass {}\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveTypeFromAST(module, "NonExistent", 0, source);
+        assertNull(result);
+    }
+
+    @Test
+    void resolveTypeFromASTResolvesSuperClass() throws Exception {
+        String source = "class Base {}\nclass Child extends Base {}\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveTypeFromAST(module, "Base", 30, source);
+        assertNotNull(result);
+        assertTrue(result.contains("Base"));
+    }
+
+    @Test
+    void resolveTypeFromASTResolvesInterface() throws Exception {
+        String source = "interface Speakable { String speak() }\nclass Dog implements Speakable { String speak() { 'Woof' } }\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveTypeFromAST(module, "Speakable", 55, source);
+        assertNotNull(result);
+        assertTrue(result.contains("Speakable"));
+    }
+
+    @Test
+    void resolveTypeFromASTResolvesPropertyType() throws Exception {
+        String source = "import java.util.Date\nclass Event { Date when }\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveTypeFromAST(module, "Date", 35, source);
+        assertNotNull(result);
+        assertTrue(result.contains("Date"));
+    }
+
+    // ---- resolveFromImports with various import styles ----
+
+    @Test
+    void resolveFromImportsResolvesRegularImport() throws Exception {
+        String source = "import java.util.ArrayList\ndef list = new ArrayList()\n";
+        ModuleNode module = parseModule(source);
+        String result = invokeResolveFromImports(module, "ArrayList");
+        assertNotNull(result);
+        assertEquals("java.util.ArrayList", result);
+    }
+
+    // ---- Additional edge cases for extractWordAt ----
+
+    @Test
+    void extractWordAtEndOfShortContent() throws Exception {
+        String content = "abc";
+        String word = invokeExtractWordAt(content, 2);
+        assertEquals("abc", word);
+    }
+
+    @Test
+    void extractWordAtDottedExpression() throws Exception {
+        String content = "foo.bar.baz";
+        String word = invokeExtractWordAt(content, 5);
+        assertEquals("bar", word);
+    }
+
+    // ---- Additional edge cases for offsetToLine ----
+
+    @Test
+    void offsetToLineMultipleEmptyLines() throws Exception {
+        String content = "\n\n\nfoo";
+        int line = invokeOffsetToLine(content, 3); // 'f' of "foo" is at offset 3
+        assertTrue(line >= 0, "Expected non-negative line, got " + line);
+    }
+
+    @Test
+    void offsetToLineAtExactNewline() throws Exception {
+        String content = "abc\ndef";
+        int line = invokeOffsetToLine(content, 3); // '\n' is at offset 3
+        assertTrue(line >= 0 && line <= 1, "Expected line 0 or 1, got " + line);
+    }
+
+    // ---- Additional edge cases for findEnclosingClass ----
+
+    @Test
+    void findEnclosingClassForInnerClass() throws Exception {
+        String source = "class Outer {\n  class Inner {\n    void foo() {}\n  }\n}\n";
+        ModuleNode module = parseModule(source);
+        ClassNode inner = invokeFindEnclosingClass(module, 2);
+        assertNotNull(inner);
+    }
+
+    @Test
+    void findEnclosingClassNoExceptionForScriptContent() throws Exception {
+        String source = "def x = 42\n";
+        ModuleNode module = parseModule(source);
+        // Script content may have a synthetic class — just ensure no crash
+        invokeFindEnclosingClass(module, 0);
+    }
+
+    // ---- findFieldByName edge cases ----
+
+    @Test
+    void findFieldByNameReturnsNullForEmptyFields() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getFields()).thenReturn(new IField[0]);
+        IField result = invokeFindFieldByName(type, "nonexistent");
+        assertNull(result);
+    }
+
+    // ---- findMethodByName edge cases ----
+
+    @Test
+    void findMethodByNameReturnsNullForEmptyMethods() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getMethods()).thenReturn(new IMethod[0]);
+        IMethod result = invokeFindMethodByName(type, "nonexistent");
+        assertNull(result);
+    }
+
+    // ---- findTypeInUnit edge cases ----
+
+    @Test
+    void findTypeInUnitReturnsNullForEmptyArray() throws Exception {
+        IType result = invokeFindTypeInUnit(new IType[0], "Something");
+        assertNull(result);
+    }
+
+    private ModuleNode parseModule(String source) {
+        GroovyCompilerService compilerService = new GroovyCompilerService();
+        GroovyCompilerService.ParseResult result =
+                compilerService.parse("file:///MCSelectTest.groovy", source);
+        assertTrue(result.hasAST(), "Expected AST for test fixture");
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+        return module;
+    }
+
+    // ---- Reflection helpers for new tests ----
+
+    private String invokeResolveClassNodeName(ModuleNode module, ClassNode node, String word) throws Exception {
+        Method m = MinimalCodeSelectHelper.class.getDeclaredMethod("resolveClassNodeName", ModuleNode.class, ClassNode.class, String.class);
+        m.setAccessible(true);
+        return (String) m.invoke(helper, module, node, word);
+    }
+
+    private ClassNode invokeFindTraitClassNodeInModule(ModuleNode module, String simpleName) throws Exception {
+        Method m = MinimalCodeSelectHelper.class.getDeclaredMethod("findTraitClassNodeInModule", ModuleNode.class, String.class);
+        m.setAccessible(true);
+        return (ClassNode) m.invoke(helper, module, simpleName);
+    }
+
+    private IType invokeFindTypeInUnit(IType[] types, String simpleName) throws Exception {
+        Method m = MinimalCodeSelectHelper.class.getDeclaredMethod("findTypeInUnit", IType[].class, String.class);
+        m.setAccessible(true);
+        return (IType) m.invoke(helper, types, simpleName);
+    }
+
+    private IField invokeFindFieldByName(IType type, String name) throws Exception {
+        Method m = MinimalCodeSelectHelper.class.getDeclaredMethod("findFieldByName", IType.class, String.class);
+        m.setAccessible(true);
+        return (IField) m.invoke(helper, type, name);
+    }
+
+    private IMethod invokeFindMethodByName(IType type, String name) throws Exception {
+        Method m = MinimalCodeSelectHelper.class.getDeclaredMethod("findMethodByName", IType.class, String.class);
+        m.setAccessible(true);
+        return (IMethod) m.invoke(helper, type, name);
     }
 }

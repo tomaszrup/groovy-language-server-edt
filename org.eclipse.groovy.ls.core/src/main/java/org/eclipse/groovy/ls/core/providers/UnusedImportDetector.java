@@ -10,12 +10,13 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
-import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.AnnotationNode;
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
@@ -26,7 +27,6 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
-import org.codehaus.groovy.ast.Variable;
 import org.codehaus.groovy.ast.expr.CastExpression;
 import org.codehaus.groovy.ast.expr.ClassExpression;
 import org.codehaus.groovy.ast.expr.ClosureExpression;
@@ -40,7 +40,6 @@ import org.codehaus.groovy.ast.expr.StaticMethodCallExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.CatchStatement;
-import org.codehaus.groovy.ast.stmt.ForStatement;
 import org.codehaus.groovy.ast.stmt.TryCatchStatement;
 import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.lsp4j.Diagnostic;
@@ -48,9 +47,6 @@ import org.eclipse.lsp4j.DiagnosticSeverity;
 import org.eclipse.lsp4j.DiagnosticTag;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
-
-import java.util.Arrays;
-import java.util.Collections;
 
 /**
  * Detects unused imports in a Groovy source file by walking the AST
@@ -75,6 +71,9 @@ import java.util.Collections;
  * enhancement could flag them differently).
  */
 public class UnusedImportDetector {
+
+    private UnusedImportDetector() {
+    }
 
     /**
      * Packages that Groovy auto-imports — imports from these are always
@@ -101,7 +100,7 @@ public class UnusedImportDetector {
         public final String fullName;
         public final int line;       // 0-based
         public final int column;     // 0-based
-        public boolean used;
+        private boolean used;
 
         ImportInfo(ImportNode node) {
             this.node = node;
@@ -117,6 +116,14 @@ public class UnusedImportDetector {
                 this.fullName = node.getClassName() + "." + node.getFieldName();
             }
         }
+
+        boolean isUsed() {
+            return used;
+        }
+
+        void markUsed() {
+            this.used = true;
+        }
     }
 
     /**
@@ -128,69 +135,94 @@ public class UnusedImportDetector {
      */
     public static List<Diagnostic> detectUnusedImports(ModuleNode ast, String content) {
         List<Diagnostic> diagnostics = new ArrayList<>();
-        if (ast == null) return diagnostics;
-
-        // 1. Collect all explicit imports (skip star imports — can't easily determine usage)
-        List<ImportInfo> imports = new ArrayList<>();
-        for (ImportNode imp : ast.getImports()) {
-            if (imp.getLineNumber() < 1) continue;
-            if (imp.getType() == null) continue;
-            // Skip auto-imported packages
-            String pkg = imp.getType().getPackageName();
-            if (pkg != null && AUTO_IMPORTED_PACKAGES.contains(pkg)) continue;
-            imports.add(new ImportInfo(imp));
+        if (ast == null) {
+            return diagnostics;
         }
 
-        // Also check static imports
-        for (ImportNode imp : ast.getStaticImports().values()) {
-            if (imp.getLineNumber() < 1) continue;
-            imports.add(new ImportInfo(imp));
+        List<ImportInfo> imports = collectImports(ast);
+        if (imports.isEmpty()) {
+            return diagnostics;
         }
 
-        if (imports.isEmpty()) return diagnostics;
-
-        // 2. Collect all type names referenced in the AST
         Set<String> referencedSimpleNames = new HashSet<>();
         Set<String> referencedFullNames = new HashSet<>();
+        collectReferencedTypeNames(ast, referencedSimpleNames, referencedFullNames);
+        markUsedImports(imports, referencedSimpleNames, referencedFullNames);
 
+        String[] lines = content.split("\n", -1);
+        diagnostics.addAll(buildUnusedImportDiagnostics(imports, lines));
+
+        return diagnostics;
+    }
+
+    private static List<ImportInfo> collectImports(ModuleNode ast) {
+        List<ImportInfo> imports = new ArrayList<>();
+        for (ImportNode imp : ast.getImports()) {
+            if (isTrackedRegularImport(imp)) {
+                imports.add(new ImportInfo(imp));
+            }
+        }
+
+        for (ImportNode imp : ast.getStaticImports().values()) {
+            if (imp.getLineNumber() >= 1) {
+                imports.add(new ImportInfo(imp));
+            }
+        }
+        return imports;
+    }
+
+    private static boolean isTrackedRegularImport(ImportNode imp) {
+        if (imp.getLineNumber() < 1 || imp.getType() == null) {
+            return false;
+        }
+        String pkg = imp.getType().getPackageName();
+        return pkg == null || !AUTO_IMPORTED_PACKAGES.contains(pkg);
+    }
+
+    private static void collectReferencedTypeNames(
+            ModuleNode ast,
+            Set<String> referencedSimpleNames,
+            Set<String> referencedFullNames) {
         TypeReferenceCollector collector = new TypeReferenceCollector(referencedSimpleNames, referencedFullNames);
         collector.visitModule(ast);
+    }
 
-        // 3. Check each import against collected references
+    private static void markUsedImports(
+            List<ImportInfo> imports,
+            Set<String> referencedSimpleNames,
+            Set<String> referencedFullNames) {
         for (ImportInfo info : imports) {
             if (referencedSimpleNames.contains(info.simpleName)
                     || referencedFullNames.contains(info.fullName)) {
-                info.used = true;
+                info.markUsed();
             }
         }
+    }
 
-        // 4. Build diagnostics for unused imports
-        String[] lines = content.split("\n", -1);
+    private static List<Diagnostic> buildUnusedImportDiagnostics(List<ImportInfo> imports, String[] lines) {
+        List<Diagnostic> diagnostics = new ArrayList<>();
         for (ImportInfo info : imports) {
-            if (!info.used) {
-                int line = info.line;
-                if (line < 0 || line >= lines.length) continue;
-
-                String lineText = lines[line];
-                int startCol = 0;
-                int endCol = lineText.length();
-
-                Diagnostic diag = new Diagnostic();
-                diag.setRange(new Range(
-                        new Position(line, startCol),
-                        new Position(line, endCol)));
-                diag.setSeverity(DiagnosticSeverity.Warning);
-                diag.setMessage("The import '" + info.fullName + "' is never used");
-                diag.setSource("groovy");
-                diag.setCode(CodeActionProvider.DIAG_CODE_UNUSED_IMPORT);
-                // Mark as unnecessary (VS Code will show it as faded)
-                diag.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
-
-                diagnostics.add(diag);
+            if (info.isUsed() || !isLineInBounds(info.line, lines.length)) {
+                continue;
             }
-        }
 
+            String lineText = lines[info.line];
+            Diagnostic diag = new Diagnostic();
+            diag.setRange(new Range(
+                    new Position(info.line, 0),
+                    new Position(info.line, lineText.length())));
+            diag.setSeverity(DiagnosticSeverity.Warning);
+            diag.setMessage("The import '" + info.fullName + "' is never used");
+            diag.setSource("groovy");
+            diag.setCode(CodeActionProvider.DIAG_CODE_UNUSED_IMPORT);
+            diag.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
+            diagnostics.add(diag);
+        }
         return diagnostics;
+    }
+
+    private static boolean isLineInBounds(int line, int lineCount) {
+        return line >= 0 && line < lineCount;
     }
 
     /**
@@ -246,27 +278,24 @@ public class UnusedImportDetector {
 
         @Override
         public void visitClass(ClassNode node) {
-            // Superclass
-            ClassNode superClass = node.getUnresolvedSuperClass();
-            if (superClass != null) {
-                collectTypeRef(superClass);
-            }
-
-            // Interfaces
-            ClassNode[] interfaces = node.getInterfaces();
-            if (interfaces != null) {
-                for (ClassNode iface : interfaces) {
-                    collectTypeRef(iface);
-                }
-            }
-
-            // Generics on class
+            collectTypeRef(node.getUnresolvedSuperClass());
+            collectInterfaces(node);
             collectGenerics(node.getGenericsTypes());
-
-            // Annotations
             collectAnnotations(node.getAnnotations());
+            collectPropertyDeclarations(node);
+            collectFieldDeclarations(node);
+            visitDeclaredMethods(node);
+            visitDeclaredConstructors(node);
+            visitInnerClasses(node);
+        }
 
-            // Properties
+        private void collectInterfaces(ClassNode node) {
+            for (ClassNode iface : node.getInterfaces()) {
+                collectTypeRef(iface);
+            }
+        }
+
+        private void collectPropertyDeclarations(ClassNode node) {
             for (PropertyNode prop : node.getProperties()) {
                 collectTypeRef(prop.getType());
                 collectAnnotations(prop.getAnnotations());
@@ -274,8 +303,9 @@ public class UnusedImportDetector {
                     collectAnnotations(prop.getField().getAnnotations());
                 }
             }
+        }
 
-            // Fields
+        private void collectFieldDeclarations(ClassNode node) {
             for (FieldNode field : node.getFields()) {
                 collectTypeRef(field.getType());
                 collectAnnotations(field.getAnnotations());
@@ -283,19 +313,23 @@ public class UnusedImportDetector {
                     field.getInitialValueExpression().visit(this);
                 }
             }
+        }
 
-            // Methods
+        private void visitDeclaredMethods(ClassNode node) {
             for (MethodNode method : node.getMethods()) {
-                if (method.getLineNumber() < 1) continue; // skip synthetic
-                visitMethod(method);
+                if (method.getLineNumber() >= 1) {
+                    visitMethod(method);
+                }
             }
+        }
 
-            // Constructors
+        private void visitDeclaredConstructors(ClassNode node) {
             for (var ctor : node.getDeclaredConstructors()) {
                 visitMethod(ctor);
             }
+        }
 
-            // Inner classes
+        private void visitInnerClasses(ClassNode node) {
             java.util.Iterator<org.codehaus.groovy.ast.InnerClassNode> innerIter = node.getInnerClasses();
             while (innerIter.hasNext()) {
                 visitClass(innerIter.next());
@@ -366,8 +400,8 @@ public class UnusedImportDetector {
 
         @Override
         public void visitMethodCallExpression(MethodCallExpression expr) {
-            if (expr.getObjectExpression() instanceof ClassExpression) {
-                collectTypeRef(((ClassExpression) expr.getObjectExpression()).getType());
+            if (expr.getObjectExpression() instanceof ClassExpression classExpression) {
+                collectTypeRef(classExpression.getType());
             }
             super.visitMethodCallExpression(expr);
         }
@@ -382,12 +416,12 @@ public class UnusedImportDetector {
 
         @Override
         public void visitPropertyExpression(PropertyExpression expr) {
-            if (expr.getObjectExpression() instanceof ClassExpression) {
-                collectTypeRef(((ClassExpression) expr.getObjectExpression()).getType());
+            if (expr.getObjectExpression() instanceof ClassExpression classExpression) {
+                collectTypeRef(classExpression.getType());
             }
             // Property name — might match a static import field name
-            if (expr.getProperty() instanceof ConstantExpression) {
-                simpleNames.add(((ConstantExpression) expr.getProperty()).getText());
+            if (expr.getProperty() instanceof ConstantExpression constantExpression) {
+                simpleNames.add(constantExpression.getText());
             }
             super.visitPropertyExpression(expr);
         }
@@ -400,12 +434,6 @@ public class UnusedImportDetector {
                 }
             }
             super.visitClosureExpression(expr);
-        }
-
-        @Override
-        public void visitForLoop(ForStatement stmt) {
-            collectTypeRef(stmt.getVariableType());
-            super.visitForLoop(stmt);
         }
 
         @Override

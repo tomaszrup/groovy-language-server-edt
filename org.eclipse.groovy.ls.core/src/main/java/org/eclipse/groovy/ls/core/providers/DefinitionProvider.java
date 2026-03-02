@@ -10,19 +10,18 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
-import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
-import org.eclipse.core.resources.IResourceVisitor;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -30,11 +29,11 @@ import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.IClassFile;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
-import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
+import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.lsp4j.DefinitionParams;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
@@ -50,6 +49,10 @@ public class DefinitionProvider {
 
     private final DocumentManager documentManager;
 
+    private static final String EXT_JAVA = ".java";
+    private static final String EXT_GROOVY = ".groovy";
+    private static final String STATIC_PREFIX = "static ";
+
     public DefinitionProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
     }
@@ -58,52 +61,15 @@ public class DefinitionProvider {
      * Compute the definition location(s) for the element at the cursor.
      */
     public List<Location> getDefinition(DefinitionParams params) {
-        List<Location> locations = new ArrayList<>();
-
         String uri = params.getTextDocument().getUri();
         Position position = params.getPosition();
 
-        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-        if (workingCopy != null) {
-            try {
-                String content = documentManager.getContent(uri);
-                if (content != null) {
-                    int offset = positionToOffset(content, position);
-                    String word = extractWordAt(content, offset);
-                    GroovyLanguageServerPlugin.logInfo("[definition] codeSelect at offset " + offset
-                            + " word='" + word + "' workingCopy=" + workingCopy.getClass().getName());
-
-                    // Resolve the element at the offset
-                    IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
-                    GroovyLanguageServerPlugin.logInfo("[definition] codeSelect returned "
-                            + (elements != null ? elements.length : 0) + " element(s)");
-                    if (elements != null) {
-                        for (IJavaElement element : elements) {
-                            GroovyLanguageServerPlugin.logInfo("[definition] resolved: "
-                                    + element.getElementName() + " (" + element.getClass().getName() + ")");
-                            Location location = toLocation(element);
-                            if (location != null) {
-                                GroovyLanguageServerPlugin.logInfo("[definition] location: "
-                                        + location.getUri() + " " + location.getRange().getStart().getLine()
-                                        + ":" + location.getRange().getStart().getCharacter());
-                                locations.add(location);
-                            } else {
-                                GroovyLanguageServerPlugin.logInfo("[definition] toLocation returned null for "
-                                        + element.getElementName());
-                            }
-                        }
-                    }
-                }
-                if (!locations.isEmpty()) {
-                    return locations;
-                }
-            } catch (Throwable t) {
-                GroovyLanguageServerPlugin.logError("Definition JDT failed for " + uri + ", falling back to AST", t);
-            }
+        List<Location> jdtLocations = resolveViaJdt(uri, position);
+        if (!jdtLocations.isEmpty()) {
+            return jdtLocations;
         }
 
         // Check if this is a temp source file from a JAR (outside workspace)
-        // If so, resolve types from imports and navigate to their sources
         List<Location> tempLocs = getDefinitionFromTempSourceFile(uri, position);
         if (tempLocs != null && !tempLocs.isEmpty()) {
             return tempLocs;
@@ -114,121 +80,218 @@ public class DefinitionProvider {
     }
 
     /**
+     * Try to resolve definition via JDT codeSelect.
+     */
+    private List<Location> resolveViaJdt(String uri, Position position) {
+        List<Location> locations = new ArrayList<>();
+        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        if (workingCopy == null) {
+            return locations;
+        }
+        try {
+            String content = documentManager.getContent(uri);
+            if (content == null) {
+                return locations;
+            }
+            int offset = positionToOffset(content, position);
+            String word = extractWordAt(content, offset);
+            GroovyLanguageServerPlugin.logInfo("[definition] codeSelect at offset " + offset
+                    + " word='" + word + "' workingCopy=" + workingCopy.getClass().getName());
+
+            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            GroovyLanguageServerPlugin.logInfo("[definition] codeSelect returned "
+                    + (elements != null ? elements.length : 0) + " element(s)");
+            if (elements != null) {
+                resolveElementLocations(elements, locations);
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Definition JDT failed for " + uri + ", falling back to AST", e);
+        }
+        return locations;
+    }
+
+    /**
+     * Convert resolved JDT elements to locations.
+     */
+    private void resolveElementLocations(IJavaElement[] elements, List<Location> locations) {
+        for (IJavaElement element : elements) {
+            GroovyLanguageServerPlugin.logInfo("[definition] resolved: "
+                    + element.getElementName() + " (" + element.getClass().getName() + ")");
+            Location location = toLocation(element);
+            if (location != null) {
+                GroovyLanguageServerPlugin.logInfo("[definition] location: "
+                        + location.getUri() + " " + location.getRange().getStart().getLine()
+                        + ":" + location.getRange().getStart().getCharacter());
+                locations.add(location);
+            } else {
+                GroovyLanguageServerPlugin.logInfo("[definition] toLocation returned null for "
+                        + element.getElementName());
+            }
+        }
+    }
+
+    /**
      * Convert a JDT element to its declaration location.
      * Handles both workspace source files and binary types from JARs.
      */
     private Location toLocation(IJavaElement element) {
         try {
-            // 1. Try workspace resource (source file in the project)
-            IResource resource = element.getResource();
-            if (resource == null) {
-                ICompilationUnit cu = (ICompilationUnit) element.getAncestor(IJavaElement.COMPILATION_UNIT);
-                if (cu != null) {
-                    resource = cu.getResource();
-                }
+            Location resourceLoc = toLocationFromResource(element);
+            if (resourceLoc != null) {
+                return resourceLoc;
             }
 
-            if (resource != null && resource.getLocationURI() != null) {
-                String targetUri = resource.getLocationURI().toString();
-                Range range = new Range(new Position(0, 0), new Position(0, 0));
-                if (element instanceof ISourceReference) {
-                    ISourceRange nameRange = ((ISourceReference) element).getNameRange();
-                    if (nameRange != null && nameRange.getOffset() >= 0) {
-                        range = offsetRangeToLspRange(targetUri, resource, nameRange);
-                    }
-                }
-                return new Location(targetUri, range);
+            IType type = resolveElementType(element);
+            if (type == null) {
+                return null;
             }
 
-            // 2. Binary type (from a JAR) — try to find source in workspace
-            //    or use source attachment from the JAR
-            IType type = null;
-            if (element instanceof IType) {
-                type = (IType) element;
-            } else {
-                // For methods/fields inside a binary type, get their declaring type
-                IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
-                if (ancestor instanceof IType) {
-                    type = (IType) ancestor;
-                }
-            }
-
-            if (type != null) {
-                String fqn = type.getFullyQualifiedName();
-                GroovyLanguageServerPlugin.logInfo("[definition] Binary type: " + fqn
-                        + " — searching workspace for source");
-
-                // 2a. Search for a matching source file in the workspace
-                Location workspaceLoc = findSourceInWorkspace(fqn);
-                if (workspaceLoc != null) {
-                    GroovyLanguageServerPlugin.logInfo("[definition] Found source in workspace: "
-                            + workspaceLoc.getUri());
-                    return workspaceLoc;
-                }
-
-                // 2b. Try to find sources JAR and read source directly from it
-                java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
-                if (sourcesJar != null) {
-                    String source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-                    if (source != null && !source.isEmpty()) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[definition] Read source from JAR for " + fqn
-                                + " (" + source.length() + " chars)");
-
-                        // Determine extension from the entry that was found
-                        String ext = ".java";
-                        String entryPath = fqn.replace('.', '/') + ".groovy";
-                        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(sourcesJar)) {
-                            if (zf.getEntry(entryPath) != null) ext = ".groovy";
-                        } catch (Exception ignore) {}
-
-                        String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                                fqn, ext, sourcesJar.getAbsolutePath(), false, source);
-                        Range range = findClassDeclarationRange(source, type.getElementName());
-                        return new Location(virtualUri, range);
-                    }
-                }
-
-                // 2b-fallback. Try JDT source attachment (might already be set)
-                IClassFile classFile = type.getClassFile();
-                if (classFile != null) {
-                    String source = null;
-                    try {
-                        source = classFile.getSource();
-                    } catch (Exception e) {
-                        // no source available
-                    }
-                    if (source != null && !source.isEmpty()) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[definition] Found source via JDT attachment for " + fqn);
-                        String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                                fqn, ".java", null, false, source);
-                        Range range = findClassDeclarationRange(source, type.getElementName());
-                        return new Location(virtualUri, range);
-                    }
-                }
-
-                // 2c. Last resort: generate a class stub
-                String stub = generateClassStub(type);
-                if (stub != null) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[definition] Generated stub for " + fqn);
-                    String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                            fqn, ".groovy", null, false, stub);
-                    return new Location(virtualUri,
-                            new Range(new Position(0, 0), new Position(0, 0)));
-                }
-
-                GroovyLanguageServerPlugin.logInfo(
-                        "[definition] No source found for binary type " + fqn);
-            }
-
-            return null;
-
+            return resolveLocationForType(type);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to resolve location for " + element.getElementName(), e);
             return null;
         }
+    }
+
+    /**
+     * Try to resolve a location from the element's workspace resource (source file in the project).
+     */
+    private Location toLocationFromResource(IJavaElement element) throws JavaModelException {
+        IResource resource = element.getResource();
+        if (resource == null) {
+            ICompilationUnit cu = (ICompilationUnit) element.getAncestor(IJavaElement.COMPILATION_UNIT);
+            if (cu != null) {
+                resource = cu.getResource();
+            }
+        }
+
+        if (resource != null && resource.getLocationURI() != null) {
+            String targetUri = resource.getLocationURI().toString();
+            Range range = new Range(new Position(0, 0), new Position(0, 0));
+            if (element instanceof ISourceReference sourceRef) {
+                ISourceRange nameRange = sourceRef.getNameRange();
+                if (nameRange != null && nameRange.getOffset() >= 0) {
+                    range = offsetRangeToLspRange(targetUri, resource, nameRange);
+                }
+            }
+            return new Location(targetUri, range);
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract the {@link IType} from an element — either it is a type, or we get its declaring type.
+     */
+    private IType resolveElementType(IJavaElement element) {
+        if (element instanceof IType itype) {
+            return itype;
+        }
+        // For methods/fields inside a binary type, get their declaring type
+        IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
+        if (ancestor instanceof IType ancestorType) {
+            return ancestorType;
+        }
+        return null;
+    }
+
+    /**
+     * Try all strategies to resolve a location for a binary type:
+     * workspace source, sources JAR, JDT attachment, and generated stub.
+     */
+    private Location resolveLocationForType(IType type) {
+        String fqn = type.getFullyQualifiedName();
+        GroovyLanguageServerPlugin.logInfo("[definition] Binary type: " + fqn
+                + " — searching workspace for source");
+
+        Location workspaceLoc = findSourceInWorkspace(fqn);
+        if (workspaceLoc != null) {
+            GroovyLanguageServerPlugin.logInfo("[definition] Found source in workspace: "
+                    + workspaceLoc.getUri());
+            return workspaceLoc;
+        }
+
+        Location jarLoc = toLocationFromSourcesJar(type, fqn);
+        if (jarLoc != null) {
+            return jarLoc;
+        }
+
+        Location jdtLoc = toLocationFromJdtAttachment(type, fqn);
+        if (jdtLoc != null) {
+            return jdtLoc;
+        }
+
+        Location stubLoc = toLocationFromStub(type, fqn);
+        if (stubLoc != null) {
+            return stubLoc;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[definition] No source found for binary type " + fqn);
+        return null;
+    }
+
+    /**
+     * Try to find a sources JAR and read the source directly from it.
+     */
+    private Location toLocationFromSourcesJar(IType type, String fqn) {
+        java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
+        if (sourcesJar != null) {
+            String source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
+            if (source != null && !source.isEmpty()) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[definition] Read source from JAR for " + fqn
+                        + " (" + source.length() + " chars)");
+
+                String ext = determineSourceExtension(sourcesJar, fqn);
+
+                String virtualUri = SourceJarHelper.buildGroovySourceUri(
+                        fqn, ext, sourcesJar.getAbsolutePath(), false, source);
+                Range range = findClassDeclarationRange(source, type.getElementName());
+                return new Location(virtualUri, range);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Try to get source via JDT source attachment (might already be set on the class file).
+     */
+    private Location toLocationFromJdtAttachment(IType type, String fqn) {
+        IClassFile classFile = type.getClassFile();
+        if (classFile != null) {
+            String source = null;
+            try {
+                source = classFile.getSource();
+            } catch (Exception e) {
+                // no source available
+            }
+            if (source != null && !source.isEmpty()) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[definition] Found source via JDT attachment for " + fqn);
+                String virtualUri = SourceJarHelper.buildGroovySourceUri(
+                        fqn, EXT_JAVA, null, false, source);
+                Range range = findClassDeclarationRange(source, type.getElementName());
+                return new Location(virtualUri, range);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Last resort: generate a class stub and build a virtual URI for it.
+     */
+    private Location toLocationFromStub(IType type, String fqn) {
+        String stub = generateClassStub(type);
+        if (stub != null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[definition] Generated stub for " + fqn);
+            String virtualUri = SourceJarHelper.buildGroovySourceUri(
+                    fqn, EXT_GROOVY, null, false, stub);
+            return new Location(virtualUri,
+                    new Range(new Position(0, 0), new Position(0, 0)));
+        }
+        return null;
     }
 
     /**
@@ -237,50 +300,55 @@ public class DefinitionProvider {
      */
     private Location findSourceInWorkspace(String fqn) {
         try {
-            // Convert FQN like "com.example.MyClass" to path suffix "com/example/MyClass"
             String pathSuffix = fqn.replace('.', '/');
-            String[] extensions = {".groovy", ".java"};
-
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject project : projects) {
                 if (!project.isOpen()) continue;
-
-                for (String ext : extensions) {
-                    // Search for the file in standard source directories
-                    String[] srcPrefixes = {
-                        "src/main/groovy/", "src/test/groovy/",
-                        "src/main/java/", "src/test/java/",
-                        "src/"
-                    };
-
-                    for (String srcPrefix : srcPrefixes) {
-                        IFile file = project.getFile(srcPrefix + pathSuffix + ext);
-                        if (file != null && file.exists()) {
-                            String targetUri = file.getLocationURI().toString();
-                            return new Location(targetUri,
-                                    new Range(new Position(0, 0), new Position(0, 0)));
-                        }
-                    }
-
-                    // Also look in subproject directories
-                    IResource[] members = project.members();
-                    for (IResource member : members) {
-                        if (member instanceof org.eclipse.core.resources.IFolder) {
-                            for (String srcPrefix : srcPrefixes) {
-                                IFile file = project.getFile(
-                                        member.getName() + "/" + srcPrefix + pathSuffix + ext);
-                                if (file != null && file.exists()) {
-                                    String targetUri = file.getLocationURI().toString();
-                                    return new Location(targetUri,
-                                            new Range(new Position(0, 0), new Position(0, 0)));
-                                }
-                            }
-                        }
-                    }
+                Location loc = searchProjectForSource(project, pathSuffix);
+                if (loc != null) {
+                    return loc;
                 }
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[definition] Failed to search workspace for " + fqn, e);
+        }
+        return null;
+    }
+
+    private static final String[] SRC_PREFIXES = {
+        "src/main/groovy/", "src/test/groovy/",
+        "src/main/java/", "src/test/java/",
+        "src/"
+    };
+
+    private Location searchProjectForSource(IProject project, String pathSuffix) throws CoreException {
+        String[] extensions = {EXT_GROOVY, EXT_JAVA};
+        for (String ext : extensions) {
+            Location loc = findFileInSourceDirs(project, "", pathSuffix, ext);
+            if (loc != null) {
+                return loc;
+            }
+            // Also look in subproject directories
+            for (IResource member : project.members()) {
+                if (member instanceof org.eclipse.core.resources.IFolder) {
+                    loc = findFileInSourceDirs(project, member.getName() + "/", pathSuffix, ext);
+                    if (loc != null) {
+                        return loc;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private Location findFileInSourceDirs(IProject project, String prefix, String pathSuffix, String ext) {
+        for (String srcPrefix : SRC_PREFIXES) {
+            IFile file = project.getFile(prefix + srcPrefix + pathSuffix + ext);
+            if (file != null && file.exists()) {
+                String targetUri = file.getLocationURI().toString();
+                return new Location(targetUri,
+                        new Range(new Position(0, 0), new Position(0, 0)));
+            }
         }
         return null;
     }
@@ -295,8 +363,8 @@ public class DefinitionProvider {
             String content = documentManager.getContent(uri);
 
             // If not open, read from the file system
-            if (content == null && resource instanceof org.eclipse.core.resources.IFile) {
-                java.io.InputStream is = ((org.eclipse.core.resources.IFile) resource).getContents();
+            if (content == null && resource instanceof org.eclipse.core.resources.IFile ifile) {
+                java.io.InputStream is = ifile.getContents();
                 content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
                 is.close();
             }
@@ -347,7 +415,7 @@ public class DefinitionProvider {
      */
     private List<Location> getDefinitionFromTempSourceFile(String uri, Position position) {
         // Only handle groovy-source: virtual documents (handle any normalization form)
-        if (!uri.startsWith("groovy-source:")) return null;
+        if (!uri.startsWith("groovy-source:")) return Collections.emptyList();
 
         String content = documentManager.getContent(uri);
         if (content == null) {
@@ -357,18 +425,18 @@ public class DefinitionProvider {
                 content = SourceJarHelper.getCachedContent(fqn);
             }
         }
-        if (content == null) return null;
+        if (content == null) return Collections.emptyList();
 
         int offset = positionToOffset(content, position);
         String word = extractWordAt(content, offset);
-        if (word == null || word.isEmpty()) return null;
+        if (word == null || word.isEmpty()) return Collections.emptyList();
 
         GroovyLanguageServerPlugin.logInfo(
                 "[definition] Virtual source navigation: word='" + word + "' in " + uri);
 
         // Try to resolve FQN from imports
         String fqn = resolveTypeFromSource(content, word);
-        if (fqn == null) return null;
+        if (fqn == null) return Collections.emptyList();
 
         GroovyLanguageServerPlugin.logInfo("[definition] Resolved to FQN: " + fqn);
 
@@ -387,40 +455,58 @@ public class DefinitionProvider {
      */
     private String resolveTypeFromSource(String content, String simpleName) {
         String[] lines = content.split("\n");
-        String packageName = null;
+        String packageName = parsePackageName(lines);
 
-        for (String line : lines) {
-            String trimmed = line.trim();
-
-            // Parse package
-            if (trimmed.startsWith("package ")) {
-                packageName = trimmed.substring(8).replace(";", "").trim();
-            }
-
-            // Parse imports: "import foo.bar.SimpleName" or "import foo.bar.*"
-            if (trimmed.startsWith("import ")) {
-                String importLine = trimmed.substring(7).replace(";", "").trim();
-                // Skip static imports
-                if (importLine.startsWith("static ")) continue;
-
-                if (importLine.endsWith("." + simpleName)) {
-                    return importLine;
-                }
-
-                // Star import: check if the type exists in this package
-                if (importLine.endsWith(".*")) {
-                    String pkg = importLine.substring(0, importLine.length() - 2);
-                    String candidateFqn = pkg + "." + simpleName;
-                    // We'll try this as a candidate
-                    // Check if it's a well-known package or if we can find its source
-                    if (canResolveSource(candidateFqn)) {
-                        return candidateFqn;
-                    }
-                }
-            }
+        String fromImports = resolveFromImports(lines, simpleName);
+        if (fromImports != null) {
+            return fromImports;
         }
 
-        // Check if the type is in the same package
+        return resolveFromContext(lines, packageName, simpleName);
+    }
+
+    private String parsePackageName(String[] lines) {
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith("package ")) {
+                return trimmed.substring(8).replace(";", "").trim();
+            }
+        }
+        return null;
+    }
+
+    private String resolveFromImports(String[] lines, String simpleName) {
+        for (String line : lines) {
+            String result = tryResolveImportLine(line.trim(), simpleName);
+            if (result != null) {
+                return result;
+            }
+        }
+        return null;
+    }
+
+    private String tryResolveImportLine(String trimmed, String simpleName) {
+        if (!trimmed.startsWith("import ")) {
+            return null;
+        }
+        String importLine = trimmed.substring(7).replace(";", "").trim();
+        if (importLine.startsWith(STATIC_PREFIX)) {
+            return null;
+        }
+        if (importLine.endsWith("." + simpleName)) {
+            return importLine;
+        }
+        if (importLine.endsWith(".*")) {
+            String pkg = importLine.substring(0, importLine.length() - 2);
+            String candidateFqn = pkg + "." + simpleName;
+            if (canResolveSource(candidateFqn)) {
+                return candidateFqn;
+            }
+        }
+        return null;
+    }
+
+    private String resolveFromContext(String[] lines, String packageName, String simpleName) {
         if (packageName != null) {
             String samePkg = packageName + "." + simpleName;
             if (canResolveSource(samePkg)) {
@@ -428,17 +514,18 @@ public class DefinitionProvider {
             }
         }
 
-        // Check java.lang (auto-imported)
         String javaLang = "java.lang." + simpleName;
         if (canResolveSource(javaLang)) {
             return javaLang;
         }
 
-        // Check extends/implements clauses for FQN references
+        return resolveFromExtendsClause(lines, simpleName);
+    }
+
+    private String resolveFromExtendsClause(String[] lines, String simpleName) {
         for (String line : lines) {
             String trimmed = line.trim();
             if (trimmed.contains("extends ") || trimmed.contains("implements ")) {
-                // Look for FQN like "foo.bar.ClassName" containing our simpleName
                 java.util.regex.Matcher m = java.util.regex.Pattern
                         .compile("\\b([a-z][\\w.]*\\." + java.util.regex.Pattern.quote(simpleName) + ")\\b")
                         .matcher(trimmed);
@@ -447,7 +534,6 @@ public class DefinitionProvider {
                 }
             }
         }
-
         return null;
     }
 
@@ -486,62 +572,93 @@ public class DefinitionProvider {
      * Tries workspace, sources JARs, JDK src.zip, and JDT project types.
      */
     private Location navigateToFqn(String fqn, String simpleName) {
-        // 1. Check workspace source
         Location wsLoc = findSourceInWorkspace(fqn);
-        if (wsLoc != null) return wsLoc;
+        if (wsLoc != null) {
+            return wsLoc;
+        }
 
-        // 2. Try JDT project types (gives us access to SourceJarHelper.findSourcesJar)
+        Location jdtLoc = navigateViaJdtProject(fqn, simpleName);
+        if (jdtLoc != null) {
+            return jdtLoc;
+        }
+
+        return navigateViaJdkSource(fqn, simpleName);
+    }
+
+    private Location navigateViaJdtProject(String fqn, String simpleName) {
         try {
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject project : projects) {
                 if (!project.isOpen()) continue;
-                org.eclipse.jdt.core.IJavaProject javaProject = JavaCore.create(project);
-                if (javaProject == null || !javaProject.exists()) continue;
-
-                IType type = javaProject.findType(fqn);
-                if (type != null) {
-                    // Use the same binary type resolution as toLocation
-                    java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
-                    if (sourcesJar != null) {
-                        String source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-                        if (source != null && !source.isEmpty()) {
-                            String ext = ".java";
-                            String entryPath = fqn.replace('.', '/') + ".groovy";
-                            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(sourcesJar)) {
-                                if (zf.getEntry(entryPath) != null) ext = ".groovy";
-                            } catch (Exception ignore) {}
-
-                            String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                                    fqn, ext, sourcesJar.getAbsolutePath(), false, source);
-                            Range range = findClassDeclarationRange(source, simpleName);
-                            return new Location(virtualUri, range);
-                        }
-                    }
-
-                    // Try stub as last resort
-                    String stub = generateClassStub(type);
-                    if (stub != null) {
-                        String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                                fqn, ".groovy", null, false, stub);
-                        return new Location(virtualUri,
-                                new Range(new Position(0, 0), new Position(0, 0)));
-                    }
+                Location loc = navigateViaProject(project, fqn, simpleName);
+                if (loc != null) {
+                    return loc;
                 }
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[definition] Failed to resolve FQN: " + fqn, e);
         }
+        return null;
+    }
 
-        // 3. Try JDK src.zip
-        String jdkSource = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
-        if (jdkSource != null) {
-            String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                    fqn, ".java", null, true, jdkSource);
-            Range range = findClassDeclarationRange(jdkSource, simpleName);
-            return new Location(virtualUri, range);
+    private Location navigateViaProject(IProject project, String fqn, String simpleName) throws JavaModelException {
+        org.eclipse.jdt.core.IJavaProject javaProject = JavaCore.create(project);
+        if (javaProject == null || !javaProject.exists()) {
+            return null;
+        }
+        IType type = javaProject.findType(fqn);
+        if (type == null) {
+            return null;
         }
 
-        return null;
+        Location sourceLoc = navigateTypeFromSourcesJar(type, fqn, simpleName);
+        if (sourceLoc != null) {
+            return sourceLoc;
+        }
+
+        return toLocationFromStub(type, fqn);
+    }
+
+    private Location navigateTypeFromSourcesJar(IType type, String fqn, String simpleName) {
+        java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
+        if (sourcesJar == null) {
+            return null;
+        }
+        String source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
+        if (source == null || source.isEmpty()) {
+            return null;
+        }
+        String ext = determineSourceExtension(sourcesJar, fqn);
+        String virtualUri = SourceJarHelper.buildGroovySourceUri(
+                fqn, ext, sourcesJar.getAbsolutePath(), false, source);
+        Range range = findClassDeclarationRange(source, simpleName);
+        return new Location(virtualUri, range);
+    }
+
+    private Location navigateViaJdkSource(String fqn, String simpleName) {
+        String jdkSource = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
+        if (jdkSource == null) {
+            return null;
+        }
+        String virtualUri = SourceJarHelper.buildGroovySourceUri(
+                fqn, EXT_JAVA, null, true, jdkSource);
+        Range range = findClassDeclarationRange(jdkSource, simpleName);
+        return new Location(virtualUri, range);
+    }
+
+    /**
+     * Determine whether a source entry in the JAR is Groovy or Java.
+     */
+    private String determineSourceExtension(java.io.File sourcesJar, String fqn) {
+        String entryPath = fqn.replace('.', '/') + EXT_GROOVY;
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(sourcesJar)) {
+            if (zf.getEntry(entryPath) != null) {
+                return EXT_GROOVY;
+            }
+        } catch (Exception e) {
+            // Intentionally ignored — default to .java
+        }
+        return EXT_JAVA;
     }
 
     /**
@@ -593,164 +710,246 @@ public class DefinitionProvider {
                 + " classes=" + (ast.getClasses() != null ? ast.getClasses().size() : 0));
 
         // 1) Prefer the enclosing class and its traits/interfaces for member lookups.
-        ClassNode owner = findEnclosingClass(ast, targetLine);
-        if (owner != null) {
-            GroovyLanguageServerPlugin.logInfo("[definition-ast] Enclosing class: " + owner.getName()
-                    + " (line " + owner.getLineNumber() + "-" + owner.getLastLineNumber() + ")"
-                    + " interfaces=" + (owner.getInterfaces() != null ? owner.getInterfaces().length : 0));
-
-            Location ownerMember = findMemberDeclarationInClass(owner, word, uri);
-            if (ownerMember != null) {
-                GroovyLanguageServerPlugin.logInfo("[definition-ast] Found in owner class: " + ownerMember.getUri());
-                locations.add(ownerMember);
-                return locations;
-            }
-
-            ClassNode[] interfaces = owner.getInterfaces();
-            if (interfaces != null) {
-                for (ClassNode ifaceRef : interfaces) {
-                    GroovyLanguageServerPlugin.logInfo("[definition-ast] Checking interface: "
-                            + ifaceRef.getNameWithoutPackage() + " (name=" + ifaceRef.getName() + ")");
-
-                    // Resolve the trait ClassNode, searching across open files
-                    ClassNode ifaceDecl = TraitMemberResolver.resolveTraitClassNode(
-                            ifaceRef, ast, documentManager);
-                    String traitUri = TraitMemberResolver.findTraitDeclarationUri(
-                            ifaceRef, uri, ast, documentManager);
-                    String memberUri = (traitUri != null) ? traitUri : uri;
-
-                    GroovyLanguageServerPlugin.logInfo("[definition-ast] Resolved iface: "
-                            + ifaceDecl.getName()
-                            + " fields=" + ifaceDecl.getFields().size()
-                            + " props=" + ifaceDecl.getProperties().size()
-                            + " methods=" + ifaceDecl.getMethods().size()
-                            + " uri=" + memberUri);
-
-                    Location traitMember = findMemberDeclarationInClass(ifaceDecl, word, memberUri);
-                    if (traitMember != null) {
-                        GroovyLanguageServerPlugin.logInfo("[definition-ast] Found trait member: " + word
-                                + " at " + traitMember.getRange().getStart().getLine());
-                        locations.add(traitMember);
-                        return locations;
-                    }
-
-                    // Check $Trait$FieldHelper — at CONVERSION phase, trait fields
-                    // are moved here with mangled names like <fqn_underscored>__<fieldName>
-                    ClassNode helperNode = TraitMemberResolver.findFieldHelperNode(ifaceDecl, ast);
-                    if (helperNode != null) {
-                        GroovyLanguageServerPlugin.logInfo("[definition-ast] FieldHelper: "
-                                + helperNode.getName()
-                                + " fields=" + helperNode.getFields().size()
-                                + " methods=" + helperNode.getMethods().size());
-                        // Check fields with demangled matching
-                        for (FieldNode hField : helperNode.getFields()) {
-                            GroovyLanguageServerPlugin.logInfo("[definition-ast]   helper field: " + hField.getName());
-                            if (TraitMemberResolver.isTraitFieldMatch(hField.getName(), word)) {
-                                GroovyLanguageServerPlugin.logInfo("[definition-ast] Found in FieldHelper: "
-                                        + hField.getName() + " matches '" + word + "'");
-                                // Navigate to the original trait declaration, not the helper
-                                // The trait itself is the best target
-                                Location traitLoc = astNodeToLocation(memberUri, ifaceDecl);
-                                if (traitLoc != null) {
-                                    locations.add(traitLoc);
-                                    return locations;
-                                }
-                            }
-                        }
-                        // Check methods (getters/setters)
-                        String cap = Character.toUpperCase(word.charAt(0)) + word.substring(1);
-                        for (MethodNode hMethod : helperNode.getMethods()) {
-                            String mName = hMethod.getName();
-                            if (mName.equals("get" + cap) || mName.equals("set" + cap) || mName.equals("is" + cap)) {
-                                GroovyLanguageServerPlugin.logInfo("[definition-ast] Found accessor in FieldHelper: " + mName);
-                                Location traitLoc = astNodeToLocation(memberUri, ifaceDecl);
-                                if (traitLoc != null) {
-                                    locations.add(traitLoc);
-                                    return locations;
-                                }
-                            }
-                        }
-                    }
-
-                    if (ifaceDecl.getNameWithoutPackage().equals(word)) {
-                        Location ifaceLoc = astNodeToLocation(memberUri, ifaceDecl);
-                        if (ifaceLoc != null) {
-                            locations.add(ifaceLoc);
-                            return locations;
-                        }
-                    }
-                }
-            }
-        } else {
-            GroovyLanguageServerPlugin.logInfo("[definition-ast] No enclosing class found at line " + targetLine);
+        Location ownerResult = resolveInOwnerClass(ast, word, uri, targetLine);
+        if (ownerResult != null) {
+            locations.add(ownerResult);
+            return locations;
         }
 
         // 2) Fallback: whole-file symbol scan
-        for (ClassNode classNode : ast.getClasses()) {
-            // Skip synthetic script class
-            if (classNode.getLineNumber() < 0) continue;
+        Location scanResult = scanAllClassesForSymbol(ast, word, uri);
+        if (scanResult != null) {
+            locations.add(scanResult);
+            return locations;
+        }
 
-            // Check class name
-            if (classNode.getNameWithoutPackage().equals(word)) {
-                Location loc = astNodeToLocation(uri, classNode);
-                if (loc != null) {
-                    locations.add(loc);
-                    return locations;
-                }
+        return locations;
+    }
+
+    /**
+     * Try to resolve the symbol in the enclosing (owner) class and its interfaces/traits.
+     * Returns a Location if found, or null.
+     */
+    private Location resolveInOwnerClass(ModuleNode ast, String word, String uri, int targetLine) {
+        ClassNode owner = findEnclosingClass(ast, targetLine);
+        if (owner == null) {
+            GroovyLanguageServerPlugin.logInfo("[definition-ast] No enclosing class found at line " + targetLine);
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[definition-ast] Enclosing class: " + owner.getName()
+                + " (line " + owner.getLineNumber() + "-" + owner.getLastLineNumber() + ")"
+                + " interfaces=" + (owner.getInterfaces() != null ? owner.getInterfaces().length : 0));
+
+        Location ownerMember = findMemberDeclarationInClass(owner, word, uri);
+        if (ownerMember != null) {
+            GroovyLanguageServerPlugin.logInfo("[definition-ast] Found in owner class: " + ownerMember.getUri());
+            return ownerMember;
+        }
+
+        return resolveInInterfaces(owner, word, uri, ast);
+    }
+
+    /**
+     * Iterate over the owner class's interfaces/traits looking for the symbol.
+     * Returns a Location if found, or null.
+     */
+    private Location resolveInInterfaces(ClassNode owner, String word, String uri, ModuleNode ast) {
+        ClassNode[] interfaces = owner.getInterfaces();
+        if (interfaces == null) {
+            return null;
+        }
+
+        for (ClassNode ifaceRef : interfaces) {
+            GroovyLanguageServerPlugin.logInfo("[definition-ast] Checking interface: "
+                    + ifaceRef.getNameWithoutPackage() + " (name=" + ifaceRef.getName() + ")");
+
+            // Resolve the trait ClassNode, searching across open files
+            ClassNode ifaceDecl = TraitMemberResolver.resolveTraitClassNode(
+                    ifaceRef, ast, documentManager);
+            String traitUri = TraitMemberResolver.findTraitDeclarationUri(
+                    ifaceRef, uri, ast, documentManager);
+            String memberUri = (traitUri != null) ? traitUri : uri;
+
+            GroovyLanguageServerPlugin.logInfo("[definition-ast] Resolved iface: "
+                    + ifaceDecl.getName()
+                    + " fields=" + ifaceDecl.getFields().size()
+                    + " props=" + ifaceDecl.getProperties().size()
+                    + " methods=" + ifaceDecl.getMethods().size()
+                    + " uri=" + memberUri);
+
+            Location traitMember = findMemberDeclarationInClass(ifaceDecl, word, memberUri);
+            if (traitMember != null) {
+                GroovyLanguageServerPlugin.logInfo("[definition-ast] Found trait member: " + word
+                        + " at " + traitMember.getRange().getStart().getLine());
+                return traitMember;
             }
 
-            // Check methods
-            for (MethodNode method : classNode.getMethods()) {
-                if (method.getLineNumber() < 0) continue;
-                if (method.getName().equals(word)) {
-                    Location loc = astNodeToLocation(uri, method);
-                    if (loc != null) {
-                        locations.add(loc);
-                        return locations;
-                    }
-                }
+            // Check $Trait$FieldHelper — at CONVERSION phase, trait fields
+            // are moved here with mangled names like <fqn_underscored>__<fieldName>
+            Location helperResult = resolveInTraitFieldHelper(ifaceDecl, word, memberUri, ast);
+            if (helperResult != null) {
+                return helperResult;
             }
 
-            // Check fields
-            for (FieldNode field : classNode.getFields()) {
-                if (field.getLineNumber() < 0) continue;
-                if (field.getName().equals(word)) {
-                    Location loc = astNodeToLocation(uri, field);
-                    if (loc != null) {
-                        locations.add(loc);
-                        return locations;
-                    }
-                }
-            }
-
-            // Check properties
-            for (PropertyNode prop : classNode.getProperties()) {
-                if (prop.getField() == null || prop.getField().getLineNumber() < 0) continue;
-                if (prop.getName().equals(word)) {
-                    Location loc = astNodeToLocation(uri, prop.getField());
-                    if (loc != null) {
-                        locations.add(loc);
-                        return locations;
-                    }
-                }
-            }
-
-            // Check inner classes
-            java.util.Iterator<org.codehaus.groovy.ast.InnerClassNode> innerIter = classNode.getInnerClasses();
-            while (innerIter.hasNext()) {
-                ClassNode inner = innerIter.next();
-                if (inner.getLineNumber() < 0) continue;
-                if (inner.getNameWithoutPackage().equals(word)) {
-                    Location loc = astNodeToLocation(uri, inner);
-                    if (loc != null) {
-                        locations.add(loc);
-                        return locations;
-                    }
+            if (ifaceDecl.getNameWithoutPackage().equals(word)) {
+                Location ifaceLoc = astNodeToLocation(memberUri, ifaceDecl);
+                if (ifaceLoc != null) {
+                    return ifaceLoc;
                 }
             }
         }
 
-        return locations;
+        return null;
+    }
+
+    /**
+     * Check the $Trait$FieldHelper inner class for trait field declarations and accessors.
+     * Returns a Location pointing to the trait declaration if a match is found, or null.
+     */
+    private Location resolveInTraitFieldHelper(ClassNode ifaceDecl, String word, String memberUri, ModuleNode ast) {
+        ClassNode helperNode = TraitMemberResolver.findFieldHelperNode(ifaceDecl, ast);
+        if (helperNode == null) {
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[definition-ast] FieldHelper: "
+                + helperNode.getName()
+                + " fields=" + helperNode.getFields().size()
+                + " methods=" + helperNode.getMethods().size());
+
+        Location fieldResult = resolveTraitFieldHelper(helperNode, word, memberUri, ifaceDecl);
+        if (fieldResult != null) {
+            return fieldResult;
+        }
+
+        return resolveTraitAccessors(helperNode, word, memberUri, ifaceDecl);
+    }
+
+    /**
+     * Check FieldHelper fields with demangled matching.
+     * Returns a Location to the trait declaration if found, or null.
+     */
+    private Location resolveTraitFieldHelper(ClassNode helperNode, String word, String memberUri, ClassNode ifaceDecl) {
+        for (FieldNode hField : helperNode.getFields()) {
+            GroovyLanguageServerPlugin.logInfo("[definition-ast]   helper field: " + hField.getName());
+            if (TraitMemberResolver.isTraitFieldMatch(hField.getName(), word)) {
+                GroovyLanguageServerPlugin.logInfo("[definition-ast] Found in FieldHelper: "
+                        + hField.getName() + " matches '" + word + "'");
+                // Navigate to the original trait declaration, not the helper
+                // The trait itself is the best target
+                Location traitLoc = astNodeToLocation(memberUri, ifaceDecl);
+                if (traitLoc != null) {
+                    return traitLoc;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Check FieldHelper methods for getter/setter/is-accessor matching.
+     * Returns a Location to the trait declaration if found, or null.
+     */
+    private Location resolveTraitAccessors(ClassNode helperNode, String word, String memberUri, ClassNode ifaceDecl) {
+        String cap = Character.toUpperCase(word.charAt(0)) + word.substring(1);
+        for (MethodNode hMethod : helperNode.getMethods()) {
+            String mName = hMethod.getName();
+            if (mName.equals("get" + cap) || mName.equals("set" + cap) || mName.equals("is" + cap)) {
+                GroovyLanguageServerPlugin.logInfo("[definition-ast] Found accessor in FieldHelper: " + mName);
+                Location traitLoc = astNodeToLocation(memberUri, ifaceDecl);
+                if (traitLoc != null) {
+                    return traitLoc;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whole-file scan: iterate all classes in the AST looking for a symbol matching the word.
+     * Checks class names, methods, fields, properties, and inner classes.
+     * Returns a Location if found, or null.
+     */
+    private Location scanAllClassesForSymbol(ModuleNode ast, String word, String uri) {
+        for (ClassNode classNode : ast.getClasses()) {
+            if (classNode.getLineNumber() < 0) continue;
+            Location loc = scanClassForSymbol(classNode, word, uri);
+            if (loc != null) {
+                return loc;
+            }
+        }
+        return null;
+    }
+
+    private Location scanClassForSymbol(ClassNode classNode, String word, String uri) {
+        if (classNode.getNameWithoutPackage().equals(word)) {
+            Location loc = astNodeToLocation(uri, classNode);
+            if (loc != null) {
+                return loc;
+            }
+        }
+        Location loc = scanMethodsForSymbol(classNode, word, uri);
+        if (loc != null) return loc;
+        loc = scanFieldsForSymbol(classNode, word, uri);
+        if (loc != null) return loc;
+        loc = scanPropertiesForSymbol(classNode, word, uri);
+        if (loc != null) return loc;
+        return scanInnerClassesForSymbol(classNode, word, uri);
+    }
+
+    private Location scanMethodsForSymbol(ClassNode classNode, String word, String uri) {
+        for (MethodNode method : classNode.getMethods()) {
+            if (method.getLineNumber() < 0) continue;
+            if (method.getName().equals(word)) {
+                Location loc = astNodeToLocation(uri, method);
+                if (loc != null) {
+                    return loc;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Location scanFieldsForSymbol(ClassNode classNode, String word, String uri) {
+        for (FieldNode field : classNode.getFields()) {
+            if (field.getLineNumber() < 0) continue;
+            if (field.getName().equals(word)) {
+                Location loc = astNodeToLocation(uri, field);
+                if (loc != null) {
+                    return loc;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Location scanPropertiesForSymbol(ClassNode classNode, String word, String uri) {
+        for (PropertyNode prop : classNode.getProperties()) {
+            if (prop.getField() == null || prop.getField().getLineNumber() < 0) continue;
+            if (prop.getName().equals(word)) {
+                Location loc = astNodeToLocation(uri, prop.getField());
+                if (loc != null) {
+                    return loc;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Location scanInnerClassesForSymbol(ClassNode classNode, String word, String uri) {
+        java.util.Iterator<org.codehaus.groovy.ast.InnerClassNode> innerIter = classNode.getInnerClasses();
+        while (innerIter.hasNext()) {
+            ClassNode inner = innerIter.next();
+            if (inner.getLineNumber() < 0) continue;
+            if (inner.getNameWithoutPackage().equals(word)) {
+                Location loc = astNodeToLocation(uri, inner);
+                if (loc != null) {
+                    return loc;
+                }
+            }
+        }
+        return null;
     }
 
     private ClassNode findEnclosingClass(ModuleNode module, int targetLine) {
@@ -758,21 +957,21 @@ public class DefinitionProvider {
         for (ClassNode classNode : module.getClasses()) {
             int start = classNode.getLineNumber();
             int end = classNode.getLastLineNumber();
-            if (start > 0 && end >= start && targetLine >= start && targetLine <= end) {
-                if (best == null || start >= best.getLineNumber()) {
-                    best = classNode;
-                }
-            } else if (start > 0 && start <= targetLine) {
-                if (best == null || start >= best.getLineNumber()) {
-                    best = classNode;
-                }
+            if (start > 0 && (best == null || start >= best.getLineNumber())
+                    && ((end >= start && targetLine >= start && targetLine <= end)
+                        || start <= targetLine)) {
+                best = classNode;
             }
         }
         return best;
     }
 
+    /**
+     * Find a class declaration by its simple name in the given module's AST.
+     * Returns the first matching {@link ClassNode}, or {@code null} if not found.
+     */
     private ClassNode findClassBySimpleName(ModuleNode module, String simpleName) {
-        if (simpleName == null || simpleName.isEmpty()) {
+        if (module == null || simpleName == null || simpleName.isEmpty()) {
             return null;
         }
         for (ClassNode classNode : module.getClasses()) {
@@ -788,6 +987,18 @@ public class DefinitionProvider {
             return null;
         }
 
+        Location loc = findMethodDeclaration(classNode, word, uri);
+        if (loc != null) {
+            return loc;
+        }
+        loc = findFieldDeclaration(classNode, word, uri);
+        if (loc != null) {
+            return loc;
+        }
+        return findPropertyDeclaration(classNode, word, uri);
+    }
+
+    private Location findMethodDeclaration(ClassNode classNode, String word, String uri) {
         for (MethodNode method : classNode.getMethods()) {
             if (method.getName().equals(word)) {
                 Location loc = astNodeToLocation(uri, method);
@@ -796,7 +1007,10 @@ public class DefinitionProvider {
                 }
             }
         }
+        return null;
+    }
 
+    private Location findFieldDeclaration(ClassNode classNode, String word, String uri) {
         for (FieldNode field : classNode.getFields()) {
             if (field.getName().equals(word)) {
                 Location loc = astNodeToLocation(uri, field);
@@ -805,23 +1019,26 @@ public class DefinitionProvider {
                 }
             }
         }
+        return null;
+    }
 
+    private Location findPropertyDeclaration(ClassNode classNode, String word, String uri) {
         for (PropertyNode prop : classNode.getProperties()) {
             if (prop.getName().equals(word)) {
-                if (prop.getField() != null) {
-                    Location fieldLoc = astNodeToLocation(uri, prop.getField());
-                    if (fieldLoc != null) {
-                        return fieldLoc;
-                    }
-                }
-                Location propLoc = astNodeToLocation(uri, prop);
-                if (propLoc != null) {
-                    return propLoc;
-                }
+                return resolvePropertyLocation(prop, uri);
             }
         }
-
         return null;
+    }
+
+    private Location resolvePropertyLocation(PropertyNode prop, String uri) {
+        if (prop.getField() != null) {
+            Location fieldLoc = astNodeToLocation(uri, prop.getField());
+            if (fieldLoc != null) {
+                return fieldLoc;
+            }
+        }
+        return astNodeToLocation(uri, prop);
     }
 
     /**
@@ -875,89 +1092,122 @@ public class DefinitionProvider {
     private String generateClassStub(IType type) {
         try {
             StringBuilder sb = new StringBuilder();
-            String pkg = type.getPackageFragment().getElementName();
-            if (pkg != null && !pkg.isEmpty()) {
-                sb.append("package ").append(pkg).append("\n\n");
-            }
-
-            // Class declaration
-            int flags = type.getFlags();
-            if (org.eclipse.jdt.core.Flags.isPublic(flags)) sb.append("public ");
-            if (org.eclipse.jdt.core.Flags.isAbstract(flags)) sb.append("abstract ");
-            if (type.isInterface()) {
-                sb.append("interface ");
-            } else if (type.isEnum()) {
-                sb.append("enum ");
-            } else {
-                sb.append("class ");
-            }
-            sb.append(type.getElementName());
-
-            String superclass = type.getSuperclassName();
-            if (superclass != null && !"Object".equals(superclass) && !"java.lang.Object".equals(superclass)) {
-                sb.append(" extends ").append(superclass);
-            }
-
-            String[] interfaces = type.getSuperInterfaceNames();
-            if (interfaces != null && interfaces.length > 0) {
-                sb.append(type.isInterface() ? " extends " : " implements ");
-                sb.append(String.join(", ", interfaces));
-            }
-
+            appendPackageDeclaration(sb, type);
+            appendClassDeclaration(sb, type);
             sb.append(" {\n\n");
-
-            // Fields
-            for (org.eclipse.jdt.core.IField field : type.getFields()) {
-                int fflags = field.getFlags();
-                if (!org.eclipse.jdt.core.Flags.isPublic(fflags)
-                        && !org.eclipse.jdt.core.Flags.isProtected(fflags)) continue;
-                sb.append("    ");
-                if (org.eclipse.jdt.core.Flags.isStatic(fflags)) sb.append("static ");
-                if (org.eclipse.jdt.core.Flags.isFinal(fflags)) sb.append("final ");
-                sb.append(org.eclipse.jdt.core.Signature.toString(field.getTypeSignature()));
-                sb.append(" ").append(field.getElementName()).append("\n");
-            }
-
-            // Methods
-            for (org.eclipse.jdt.core.IMethod method : type.getMethods()) {
-                int mflags = method.getFlags();
-                if (!org.eclipse.jdt.core.Flags.isPublic(mflags)
-                        && !org.eclipse.jdt.core.Flags.isProtected(mflags)) continue;
-                sb.append("\n    ");
-                if (org.eclipse.jdt.core.Flags.isStatic(mflags)) sb.append("static ");
-                if (org.eclipse.jdt.core.Flags.isAbstract(mflags)) sb.append("abstract ");
-
-                String returnType = method.isConstructor() ? "" :
-                        org.eclipse.jdt.core.Signature.toString(method.getReturnType()) + " ";
-                sb.append(returnType).append(method.getElementName()).append("(");
-
-                String[] paramNames = method.getParameterNames();
-                String[] paramTypes = method.getParameterTypes();
-                for (int i = 0; i < paramNames.length; i++) {
-                    if (i > 0) sb.append(", ");
-                    sb.append(org.eclipse.jdt.core.Signature.toString(paramTypes[i]));
-                    sb.append(" ").append(paramNames[i]);
-                }
-                sb.append(")");
-
-                String[] exceptions = method.getExceptionTypes();
-                if (exceptions != null && exceptions.length > 0) {
-                    sb.append(" throws ");
-                    for (int i = 0; i < exceptions.length; i++) {
-                        if (i > 0) sb.append(", ");
-                        sb.append(org.eclipse.jdt.core.Signature.toString(exceptions[i]));
-                    }
-                }
-
-                sb.append(" { /* compiled code */ }\n");
-            }
-
+            appendFieldStubs(sb, type);
+            appendMethodStubs(sb, type);
             sb.append("}\n");
             return sb.toString();
-
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[definition] Failed to generate stub for " + type.getElementName(), e);
             return null;
+        }
+    }
+
+    private void appendPackageDeclaration(StringBuilder sb, IType type) {
+        String pkg = type.getPackageFragment().getElementName();
+        if (pkg != null && !pkg.isEmpty()) {
+            sb.append("package ").append(pkg).append("\n\n");
+        }
+    }
+
+    private void appendClassDeclaration(StringBuilder sb, IType type) throws JavaModelException {
+        int flags = type.getFlags();
+        if (org.eclipse.jdt.core.Flags.isPublic(flags)) sb.append("public ");
+        if (org.eclipse.jdt.core.Flags.isAbstract(flags)) sb.append("abstract ");
+
+        appendStubTypeKind(sb, type);
+        sb.append(type.getElementName());
+        appendStubSuperclass(sb, type);
+        appendStubInterfaces(sb, type);
+    }
+
+    private void appendStubTypeKind(StringBuilder sb, IType type) throws JavaModelException {
+        if (type.isInterface()) {
+            sb.append("interface ");
+        } else if (type.isEnum()) {
+            sb.append("enum ");
+        } else {
+            sb.append("class ");
+        }
+    }
+
+    private void appendStubSuperclass(StringBuilder sb, IType type) throws JavaModelException {
+        String superclass = type.getSuperclassName();
+        if (superclass != null && !"Object".equals(superclass) && !"java.lang.Object".equals(superclass)) {
+            sb.append(" extends ").append(superclass);
+        }
+    }
+
+    private void appendStubInterfaces(StringBuilder sb, IType type) throws JavaModelException {
+        String[] interfaces = type.getSuperInterfaceNames();
+        if (interfaces != null && interfaces.length > 0) {
+            sb.append(type.isInterface() ? " extends " : " implements ");
+            sb.append(String.join(", ", interfaces));
+        }
+    }
+
+    private void appendFieldStubs(StringBuilder sb, IType type) throws JavaModelException {
+        for (org.eclipse.jdt.core.IField field : type.getFields()) {
+            int fflags = field.getFlags();
+            if (!org.eclipse.jdt.core.Flags.isPublic(fflags)
+                    && !org.eclipse.jdt.core.Flags.isProtected(fflags)) {
+                continue;
+            }
+            sb.append("    ");
+            if (org.eclipse.jdt.core.Flags.isStatic(fflags)) sb.append(STATIC_PREFIX);
+            if (org.eclipse.jdt.core.Flags.isFinal(fflags)) sb.append("final ");
+            sb.append(org.eclipse.jdt.core.Signature.toString(field.getTypeSignature()));
+            sb.append(" ").append(field.getElementName()).append("\n");
+        }
+    }
+
+    private void appendMethodStubs(StringBuilder sb, IType type) throws JavaModelException {
+        for (org.eclipse.jdt.core.IMethod method : type.getMethods()) {
+            int mflags = method.getFlags();
+            if (!org.eclipse.jdt.core.Flags.isPublic(mflags)
+                    && !org.eclipse.jdt.core.Flags.isProtected(mflags)) {
+                continue;
+            }
+            appendSingleMethodStub(sb, method, mflags);
+        }
+    }
+
+    private void appendSingleMethodStub(StringBuilder sb, org.eclipse.jdt.core.IMethod method, int mflags)
+            throws JavaModelException {
+        sb.append("\n    ");
+        if (org.eclipse.jdt.core.Flags.isStatic(mflags)) sb.append(STATIC_PREFIX);
+        if (org.eclipse.jdt.core.Flags.isAbstract(mflags)) sb.append("abstract ");
+
+        String returnType = method.isConstructor() ? "" :
+                org.eclipse.jdt.core.Signature.toString(method.getReturnType()) + " ";
+        sb.append(returnType).append(method.getElementName()).append("(");
+
+        appendStubParameters(sb, method);
+        sb.append(")");
+        appendStubExceptions(sb, method);
+        sb.append(" { /* compiled code */ }\n");
+    }
+
+    private void appendStubParameters(StringBuilder sb, org.eclipse.jdt.core.IMethod method) throws JavaModelException {
+        String[] paramNames = method.getParameterNames();
+        String[] paramTypes = method.getParameterTypes();
+        for (int i = 0; i < paramNames.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(org.eclipse.jdt.core.Signature.toString(paramTypes[i]));
+            sb.append(" ").append(paramNames[i]);
+        }
+    }
+
+    private void appendStubExceptions(StringBuilder sb, org.eclipse.jdt.core.IMethod method) throws JavaModelException {
+        String[] exceptions = method.getExceptionTypes();
+        if (exceptions != null && exceptions.length > 0) {
+            sb.append(" throws ");
+            for (int i = 0; i < exceptions.length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(org.eclipse.jdt.core.Signature.toString(exceptions[i]));
+            }
         }
     }
 }

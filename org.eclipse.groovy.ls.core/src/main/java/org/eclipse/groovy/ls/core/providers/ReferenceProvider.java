@@ -23,8 +23,6 @@ import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
-import org.eclipse.jdt.core.ISourceRange;
-import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
 import org.eclipse.jdt.core.search.SearchEngine;
@@ -56,65 +54,68 @@ public class ReferenceProvider {
      * Find all references to the element at the cursor.
      */
     public List<Location> getReferences(ReferenceParams params) {
-        List<Location> locations = new ArrayList<>();
-
         String uri = params.getTextDocument().getUri();
         Position position = params.getPosition();
+        boolean includeDeclaration = params.getContext() != null && params.getContext().isIncludeDeclaration();
 
-        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-        if (workingCopy != null) {
-            try {
-                String content = documentManager.getContent(uri);
-                if (content != null) {
-                    int offset = positionToOffset(content, position);
-
-                    // Resolve the element at the cursor
-                    IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
-                    if (elements != null && elements.length > 0) {
-                        IJavaElement element = elements[0];
-
-                        // Determine search scope
-                        int searchFor = IJavaSearchConstants.REFERENCES;
-                        if (params.getContext() != null && params.getContext().isIncludeDeclaration()) {
-                            searchFor = IJavaSearchConstants.ALL_OCCURRENCES;
-                        }
-
-                        // Create a search pattern for the resolved element
-                        SearchPattern pattern = SearchPattern.createPattern(
-                                element,
-                                searchFor);
-
-                        if (pattern != null) {
-                            // Search across the whole workspace
-                            IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
-                            SearchEngine engine = new SearchEngine();
-
-                            engine.search(pattern,
-                                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                                    scope,
-                                    new SearchRequestor() {
-                                        @Override
-                                        public void acceptSearchMatch(SearchMatch match) {
-                                            Location location = toLocation(match);
-                                            if (location != null) {
-                                                locations.add(location);
-                                            }
-                                        }
-                                    },
-                                    null);
-                        }
-                    }
-                }
-                if (!locations.isEmpty()) {
-                    return locations;
-                }
-            } catch (Throwable t) {
-                GroovyLanguageServerPlugin.logError("Find references JDT failed for " + uri + ", falling back to AST", t);
-            }
+        List<Location> jdtLocations = getReferencesWithJdt(uri, position, includeDeclaration);
+        if (!jdtLocations.isEmpty()) {
+            return jdtLocations;
         }
 
-        // Fallback: find references using text search within the same file
         return getReferencesFromGroovyAST(uri, position);
+    }
+
+    private List<Location> getReferencesWithJdt(String uri, Position position, boolean includeDeclaration) {
+        List<Location> locations = new ArrayList<>();
+
+        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        if (workingCopy == null) {
+            return locations;
+        }
+
+        try {
+            String content = documentManager.getContent(uri);
+            if (content == null) {
+                return locations;
+            }
+
+            int offset = positionToOffset(content, position);
+            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            if (elements == null || elements.length == 0) {
+                return locations;
+            }
+
+            int searchFor = includeDeclaration
+                    ? IJavaSearchConstants.ALL_OCCURRENCES
+                    : IJavaSearchConstants.REFERENCES;
+            SearchPattern pattern = SearchPattern.createPattern(elements[0], searchFor);
+            if (pattern == null) {
+                return locations;
+            }
+
+            IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
+            SearchEngine engine = new SearchEngine();
+            engine.search(pattern,
+                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                    scope,
+                    new SearchRequestor() {
+                        @Override
+                        public void acceptSearchMatch(SearchMatch match) {
+                            Location location = toLocation(match);
+                            if (location != null) {
+                                locations.add(location);
+                            }
+                        }
+                    },
+                    null);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Find references JDT failed for " + uri + ", falling back to AST",
+                    e);
+        }
+
+        return locations;
     }
 
     /**
@@ -130,16 +131,7 @@ public class ReferenceProvider {
             String targetUri = resource.getLocationURI().toString();
 
             // Get content for offset->position conversion
-            String content = documentManager.getContent(targetUri);
-            if (content == null && resource instanceof org.eclipse.core.resources.IFile) {
-                try {
-                    java.io.InputStream is = ((org.eclipse.core.resources.IFile) resource).getContents();
-                    content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                    is.close();
-                } catch (Exception e) {
-                    content = null;
-                }
-            }
+            String content = readContent(targetUri, resource);
 
             int startOffset = match.getOffset();
             int endOffset = startOffset + match.getLength();
@@ -159,6 +151,23 @@ public class ReferenceProvider {
             GroovyLanguageServerPlugin.logError("Failed to convert search match to location", e);
             return null;
         }
+    }
+
+    private String readContent(String targetUri, org.eclipse.core.resources.IResource resource) {
+        String content = documentManager.getContent(targetUri);
+        if (content != null) {
+            return content;
+        }
+
+        if (resource instanceof org.eclipse.core.resources.IFile file) {
+            try (java.io.InputStream is = file.getContents()) {
+                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private Position offsetToPosition(String content, int offset) {
@@ -197,31 +206,8 @@ public class ReferenceProvider {
             return locations;
         }
 
-        // Verify the word is a known symbol in the AST (class, method, field, property)
-        ModuleNode ast = documentManager.getGroovyAST(uri);
-        boolean isKnownSymbol = false;
-        if (ast != null) {
-            for (ClassNode classNode : ast.getClasses()) {
-                if (classNode.getNameWithoutPackage().equals(word)) { isKnownSymbol = true; break; }
-                for (MethodNode m : classNode.getMethods()) {
-                    if (m.getName().equals(word)) { isKnownSymbol = true; break; }
-                }
-                if (isKnownSymbol) break;
-                for (FieldNode f : classNode.getFields()) {
-                    if (f.getName().equals(word)) { isKnownSymbol = true; break; }
-                }
-                if (isKnownSymbol) break;
-                for (PropertyNode p : classNode.getProperties()) {
-                    if (p.getName().equals(word)) { isKnownSymbol = true; break; }
-                }
-                if (isKnownSymbol) break;
-            }
-        }
+        isKnownAstSymbol(documentManager.getGroovyAST(uri), word);
 
-        // If the word isn't a known AST symbol, still search for it (it could be a
-        // local variable or parameter, which are also valid references)
-
-        // Find all word-boundary occurrences in the document
         Pattern pattern = Pattern.compile("\\b" + Pattern.quote(word) + "\\b");
         Matcher matcher = pattern.matcher(content);
         while (matcher.find()) {
@@ -233,6 +219,48 @@ public class ReferenceProvider {
         }
 
         return locations;
+    }
+
+    private boolean isKnownAstSymbol(ModuleNode ast, String word) {
+        if (ast == null) {
+            return false;
+        }
+        for (ClassNode classNode : ast.getClasses()) {
+            if (word.equals(classNode.getNameWithoutPackage())) {
+                return true;
+            }
+            if (hasMethodNamed(classNode, word) || hasFieldNamed(classNode, word) || hasPropertyNamed(classNode, word)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasMethodNamed(ClassNode classNode, String word) {
+        for (MethodNode method : classNode.getMethods()) {
+            if (word.equals(method.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasFieldNamed(ClassNode classNode, String word) {
+        for (FieldNode field : classNode.getFields()) {
+            if (word.equals(field.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasPropertyNamed(ClassNode classNode, String word) {
+        for (PropertyNode property : classNode.getProperties()) {
+            if (word.equals(property.getName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

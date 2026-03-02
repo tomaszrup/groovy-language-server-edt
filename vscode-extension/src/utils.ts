@@ -1,9 +1,9 @@
 export function normalizeFsPath(inputPath: string): string {
-    return inputPath.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    return inputPath.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
 }
 
 export function isJdtWorkspaceUri(uriValue: string): boolean {
-    const normalized = uriValue.toLowerCase().replace(/\\/g, '/');
+    const normalized = uriValue.toLowerCase().replaceAll('\\', '/');
     return normalized.includes('/jdt_ws/');
 }
 
@@ -20,20 +20,34 @@ export function inferProjectPathFromEntries(
     const scores = new Map<string, number>();
     for (const entry of entries) {
         const normalizedEntry = normalizeFsPath(entry);
-        let bestProjectNorm: string | undefined;
-        for (const [projectNorm] of projectRootMap) {
-            if (pathStartsWith(normalizedEntry, projectNorm)) {
-                if (!bestProjectNorm || projectNorm.length > bestProjectNorm.length) {
-                    bestProjectNorm = projectNorm;
-                }
-            }
-        }
+        const bestProjectNorm = findBestProjectForEntry(normalizedEntry, projectRootMap);
 
         if (bestProjectNorm) {
             scores.set(bestProjectNorm, (scores.get(bestProjectNorm) ?? 0) + 1);
         }
     }
 
+    const bestPathNorm = selectBestScoredProject(scores);
+    return bestPathNorm ? projectRootMap.get(bestPathNorm) : undefined;
+}
+
+function findBestProjectForEntry(
+    normalizedEntry: string,
+    projectRootMap: Map<string, string>
+): string | undefined {
+    let bestProjectNorm: string | undefined;
+    for (const [projectNorm] of projectRootMap) {
+        if (!pathStartsWith(normalizedEntry, projectNorm)) {
+            continue;
+        }
+        if (!bestProjectNorm || projectNorm.length > bestProjectNorm.length) {
+            bestProjectNorm = projectNorm;
+        }
+    }
+    return bestProjectNorm;
+}
+
+function selectBestScoredProject(scores: Map<string, number>): string | undefined {
     let bestPathNorm: string | undefined;
     let bestScore = -1;
 
@@ -46,7 +60,7 @@ export function inferProjectPathFromEntries(
         }
     }
 
-    return bestPathNorm ? projectRootMap.get(bestPathNorm) : undefined;
+    return bestPathNorm;
 }
 
 export function getConfigNameForPlatform(platform: NodeJS.Platform): string {

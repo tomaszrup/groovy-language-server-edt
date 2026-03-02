@@ -59,6 +59,11 @@ import org.eclipse.lsp4j.Range;
  */
 public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
+    private static final String VOID_TYPE = "void";
+    private static final String TRAIT_KEYWORD = "trait";
+    private static final int[] NO_POSITION = new int[0];
+
     /**
      * Raw token before delta encoding. Stores absolute position.
      */
@@ -106,35 +111,40 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
      */
     public void visitModule(ModuleNode module) {
         this.sourceUnit = module.getContext();
-
-        // 1. Visit package declaration
         visitPackage(module);
-
-        // 2. Visit imports
         collectImportTokens(module);
+        visitModuleClasses(module);
+        visitModuleStatements(module);
+    }
 
-        // 3. Visit all classes (including inner classes)
+    private void visitModuleClasses(ModuleNode module) {
         for (ClassNode classNode : module.getClasses()) {
-            // Skip synthetic script class that wraps top-level code
-            if (classNode.isScript() && classNode.getLineNumber() < 1) {
-                // Script body — visit the run() method statements directly
-                MethodNode runMethod = classNode.getMethod("run", Parameter.EMPTY_ARRAY);
-                if (runMethod != null && runMethod.getCode() != null) {
-                    runMethod.getCode().visit(this);
-                }
-                // Also visit script-level methods
-                for (MethodNode method : classNode.getMethods()) {
-                    if (!"run".equals(method.getName()) && !"main".equals(method.getName())
-                            && method.getLineNumber() > 0) {
-                        visitMethod(method);
-                    }
-                }
-                continue;
+            if (isSyntheticScriptClass(classNode)) {
+                visitSyntheticScriptClass(classNode);
+            } else {
+                visitClass(classNode);
             }
-            visitClass(classNode);
         }
+    }
 
-        // 4. Visit script-level statements (code outside classes)
+    private boolean isSyntheticScriptClass(ClassNode classNode) {
+        return classNode.isScript() && classNode.getLineNumber() < 1;
+    }
+
+    private void visitSyntheticScriptClass(ClassNode classNode) {
+        MethodNode runMethod = classNode.getMethod("run", Parameter.EMPTY_ARRAY);
+        if (runMethod != null && runMethod.getCode() != null) {
+            runMethod.getCode().visit(this);
+        }
+        for (MethodNode method : classNode.getMethods()) {
+            if (!"run".equals(method.getName()) && !"main".equals(method.getName())
+                    && method.getLineNumber() > 0) {
+                visitMethod(method);
+            }
+        }
+    }
+
+    private void visitModuleStatements(ModuleNode module) {
         BlockStatement statementBlock = module.getStatementBlock();
         if (statementBlock != null) {
             statementBlock.visit(this);
@@ -187,43 +197,49 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     private void visitSingleImport(ImportNode imp) {
         if (imp.getLineNumber() < 1) return;
-
         ClassNode importedType = imp.getType();
-        if (importedType != null && importedType.getLineNumber() > 0) {
-            String className = importedType.getNameWithoutPackage();
-            String fullName = importedType.getName(); // e.g. "spock.lang.Specification"
-            int line = importedType.getLineNumber() - 1;
-            int col = importedType.getColumnNumber() - 1;
+        if (importedType == null || importedType.getLineNumber() <= 0) return;
 
-            if (col >= 0 && className.length() > 0) {
-                // Emit namespace tokens for each package segment in the qualified path.
-                // For "spock.lang.Specification", emit "spock" and "lang" as namespace,
-                // and "Specification" as type — matching Java's semantic token behavior
-                // where the whole qualified path appears in the same color.
-                String packageName = fullName.contains(".")
-                        ? fullName.substring(0, fullName.lastIndexOf('.'))
-                        : null;
-                if (packageName != null && !packageName.isEmpty()) {
-                    // Walk through the package segments on the source line
-                    int cursor = col;
-                    String[] segments = packageName.split("\\.");
-                    for (String segment : segments) {
-                        int segOffset = findNameInLine(line, cursor, segment);
-                        if (segOffset >= 0) {
-                            addToken(line, segOffset, segment.length(),
-                                    SemanticTokensProvider.TYPE_NAMESPACE, 0);
-                            cursor = segOffset + segment.length() + 1; // +1 for the dot
-                        }
-                    }
-                }
+        String className = importedType.getNameWithoutPackage();
+        int line = importedType.getLineNumber() - 1;
+        int col = importedType.getColumnNumber() - 1;
+        if (col < 0 || className.isEmpty()) return;
 
-                // Emit the class name as a type token
-                int nameOffset = findNameInLine(line, col, className);
-                if (nameOffset >= 0) {
-                    addToken(line, nameOffset, className.length(),
-                            SemanticTokensProvider.TYPE_TYPE, 0);
-                }
+        emitImportPackageTokens(importedType.getName(), line, col);
+        emitImportTypeToken(className, line, col);
+    }
+
+    private void emitImportPackageTokens(String fullName, int line, int col) {
+        String packageName = fullName.contains(".")
+                ? fullName.substring(0, fullName.lastIndexOf('.'))
+                : null;
+        if (packageName == null || packageName.isEmpty()) {
+            return;
+        }
+
+        int cursor = col;
+        String[] segments = packageName.split("\\.");
+        for (String segment : segments) {
+            if (segment == null || segment.isEmpty()) {
+                continue;
             }
+            int segOffset = findNameInLine(line, cursor, segment);
+            if (segOffset >= 0) {
+                addToken(line, segOffset, segment.length(),
+                        SemanticTokensProvider.TYPE_NAMESPACE, 0);
+                cursor = segOffset + segment.length() + 1;
+            }
+        }
+    }
+
+    private void emitImportTypeToken(String className, int line, int col) {
+        if (className == null || className.isEmpty()) {
+            return;
+        }
+        int nameOffset = findNameInLine(line, col, className);
+        if (nameOffset >= 0) {
+            addToken(line, nameOffset, className.length(),
+                    SemanticTokensProvider.TYPE_TYPE, 0);
         }
     }
 
@@ -234,20 +250,44 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     @Override
     public void visitClass(ClassNode node) {
         if (node.getLineNumber() < 1) return;
-
-        // Determine the token type
-        int tokenType;
-        if (node.isEnum()) {
-            tokenType = SemanticTokensProvider.TYPE_ENUM;
-        } else if (GroovyTypeKindHelper.isTrait(node)) {
-            tokenType = SemanticTokensProvider.TYPE_STRUCT; // trait → struct
-        } else if (node.isInterface()) {
-            tokenType = SemanticTokensProvider.TYPE_INTERFACE;
-        } else {
-            tokenType = SemanticTokensProvider.TYPE_CLASS;
+        int tokenType = getClassTokenType(node);
+        int modifiers = getClassModifiers(node);
+        String name = node.getNameWithoutPackage();
+        int nameLine = node.getLineNumber() - 1;
+        int nameCol = node.getColumnNumber() - 1;
+        int[] resolved = findNameNear(nameLine, nameCol, name, 10);
+        if (resolved.length > 0) {
+            nameLine = resolved[0];
+            int nameOffset = resolved[1];
+            addToken(nameLine, nameOffset, name.length(), tokenType, modifiers);
+            emitTraitKeywordToken(node, nameLine, nameOffset);
         }
 
-        // Modifiers
+        collectAnnotationTokens(node);
+        visitGenerics(node.getGenericsTypes());
+        ClassNode superClass = node.getUnresolvedSuperClass();
+        if (superClass != null && superClass.getLineNumber() > 0
+                && !JAVA_LANG_OBJECT.equals(superClass.getName())) {
+            emitTypeReference(superClass);
+        }
+        visitInterfaces(node.getInterfaces());
+        super.visitClass(node);
+    }
+
+    private int getClassTokenType(ClassNode node) {
+        if (node.isEnum()) {
+            return SemanticTokensProvider.TYPE_ENUM;
+        }
+        if (GroovyTypeKindHelper.isTrait(node)) {
+            return SemanticTokensProvider.TYPE_STRUCT;
+        }
+        if (node.isInterface()) {
+            return SemanticTokensProvider.TYPE_INTERFACE;
+        }
+        return SemanticTokensProvider.TYPE_CLASS;
+    }
+
+    private int getClassModifiers(ClassNode node) {
         int modifiers = SemanticTokensProvider.MOD_DECLARATION;
         if (java.lang.reflect.Modifier.isAbstract(node.getModifiers())) {
             modifiers |= SemanticTokensProvider.MOD_ABSTRACT;
@@ -255,65 +295,29 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         if (isDeprecated(node)) {
             modifiers |= SemanticTokensProvider.MOD_DEPRECATED;
         }
+        return modifiers;
+    }
 
-        // Emit the class name token
-        String name = node.getNameWithoutPackage();
-        // Find the name position — it follows the keyword (class/interface/enum/trait)
-        int nameLine = node.getLineNumber() - 1;
-        int nameCol = node.getColumnNumber() - 1;
-        // Try to locate the actual name in the source line.
-        // The Groovy AST may report the annotation line for annotated classes,
-        // so if we don't find the name on the reported line, search nearby lines.
-        int nameOffset = findNameInLine(nameLine, nameCol, name);
-        if (nameOffset < 0) {
-            for (int tryLine = nameLine + 1; tryLine <= nameLine + 10; tryLine++) {
-                nameOffset = findNameInLine(tryLine, 0, name);
-                if (nameOffset >= 0) {
-                    nameLine = tryLine;
-                    break;
-                }
+    private void emitTraitKeywordToken(ClassNode node, int line, int nameOffset) {
+        if (!GroovyTypeKindHelper.isTrait(node)) {
+            return;
+        }
+        int kwOffset = findNameInLine(line, 0, TRAIT_KEYWORD);
+        if (kwOffset >= 0 && kwOffset < nameOffset) {
+            addToken(line, kwOffset, TRAIT_KEYWORD.length(),
+                    SemanticTokensProvider.TYPE_TYPE_KEYWORD, 0);
+        }
+    }
+
+    private void visitInterfaces(ClassNode[] interfaces) {
+        if (interfaces == null) {
+            return;
+        }
+        for (ClassNode iface : interfaces) {
+            if (iface.getLineNumber() > 0) {
+                emitTypeReference(iface);
             }
         }
-        if (nameOffset >= 0) {
-            addToken(nameLine, nameOffset, name.length(), tokenType, modifiers);
-
-            // Emit the "trait" keyword as a typeKeyword semantic token so it
-            // gets the storage.type colour (blue) — TextMate does not reliably
-            // colour it in all contexts.
-            if (GroovyTypeKindHelper.isTrait(node)) {
-                int kwOffset = findNameInLine(nameLine, 0, "trait");
-                if (kwOffset >= 0 && kwOffset < nameOffset) {
-                    addToken(nameLine, kwOffset, "trait".length(),
-                            SemanticTokensProvider.TYPE_TYPE_KEYWORD, 0);
-                }
-            }
-        }
-
-        // Visit annotations on the class
-        collectAnnotationTokens(node);
-
-        // Visit generics
-        visitGenerics(node.getGenericsTypes());
-
-        // Visit superclass reference
-        ClassNode superClass = node.getUnresolvedSuperClass();
-        if (superClass != null && superClass.getLineNumber() > 0
-                && !"java.lang.Object".equals(superClass.getName())) {
-            emitTypeReference(superClass);
-        }
-
-        // Visit implemented interfaces
-        ClassNode[] interfaces = node.getInterfaces();
-        if (interfaces != null) {
-            for (ClassNode iface : interfaces) {
-                if (iface.getLineNumber() > 0) {
-                    emitTypeReference(iface);
-                }
-            }
-        }
-
-        // Recurse into class body
-        super.visitClass(node);
     }
 
     // ================================================================
@@ -323,22 +327,37 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     @Override
     public void visitMethod(MethodNode node) {
         if (node.getLineNumber() < 1) return;
-        // Skip synthetic methods (generated by compiler)
         if (node.isSynthetic()) return;
-
-        // Annotations
         collectAnnotationTokens(node);
 
-        // Return type
-        ClassNode returnType = node.getReturnType();
-        if (returnType != null && returnType.getLineNumber() > 0
-                && !"void".equals(returnType.getName())
-                && !"java.lang.Object".equals(returnType.getName())) {
-            emitTypeReference(returnType);
+        emitMethodReturnType(node.getReturnType());
+        String name = node.getName();
+        int modifiers = getMethodModifiers(node);
+
+        int nameLine = node.getLineNumber() - 1;
+        int nameCol = node.getColumnNumber() - 1;
+        int[] resolved = findNameNear(nameLine, nameCol, name, 5);
+        if (resolved.length > 0 && !name.equals("<init>") && !name.equals("<clinit>")
+                && isValidIdentifier(name)) {
+            addToken(resolved[0], resolved[1], name.length(),
+                    SemanticTokensProvider.TYPE_METHOD, modifiers);
         }
 
-        // Method name
-        String name = node.getName();
+        visitMethodParameters(node.getParameters());
+        visitGenerics(node.getGenericsTypes());
+        visitMethodExceptions(node.getExceptions());
+        super.visitMethod(node);
+    }
+
+    private void emitMethodReturnType(ClassNode returnType) {
+        if (returnType != null && returnType.getLineNumber() > 0
+                && !VOID_TYPE.equals(returnType.getName())
+                && !JAVA_LANG_OBJECT.equals(returnType.getName())) {
+            emitTypeReference(returnType);
+        }
+    }
+
+    private int getMethodModifiers(MethodNode node) {
         int modifiers = SemanticTokensProvider.MOD_DECLARATION;
         if (java.lang.reflect.Modifier.isStatic(node.getModifiers())) {
             modifiers |= SemanticTokensProvider.MOD_STATIC;
@@ -349,49 +368,27 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         if (isDeprecated(node)) {
             modifiers |= SemanticTokensProvider.MOD_DEPRECATED;
         }
+        return modifiers;
+    }
 
-        int nameLine = node.getLineNumber() - 1;
-        int nameCol = node.getColumnNumber() - 1;
-        int nameOffset = findNameInLine(nameLine, nameCol, name);
-        // AST may report annotation line; search nearby lines
-        if (nameOffset < 0) {
-            for (int tryLine = nameLine + 1; tryLine <= nameLine + 5; tryLine++) {
-                nameOffset = findNameInLine(tryLine, 0, name);
-                if (nameOffset >= 0) {
-                    nameLine = tryLine;
-                    break;
-                }
+    private void visitMethodParameters(Parameter[] params) {
+        if (params == null) {
+            return;
+        }
+        for (Parameter param : params) {
+            visitParameter(param);
+        }
+    }
+
+    private void visitMethodExceptions(ClassNode[] exceptions) {
+        if (exceptions == null) {
+            return;
+        }
+        for (ClassNode ex : exceptions) {
+            if (ex.getLineNumber() > 0) {
+                emitTypeReference(ex);
             }
         }
-        if (nameOffset >= 0 && !name.equals("<init>") && !name.equals("<clinit>")
-                && isValidIdentifier(name)) {
-            addToken(nameLine, nameOffset, name.length(),
-                    SemanticTokensProvider.TYPE_METHOD, modifiers);
-        }
-
-        // Parameters
-        Parameter[] params = node.getParameters();
-        if (params != null) {
-            for (Parameter param : params) {
-                visitParameter(param);
-            }
-        }
-
-        // Visit generics on method
-        visitGenerics(node.getGenericsTypes());
-
-        // Exceptions
-        ClassNode[] exceptions = node.getExceptions();
-        if (exceptions != null) {
-            for (ClassNode ex : exceptions) {
-                if (ex.getLineNumber() > 0) {
-                    emitTypeReference(ex);
-                }
-            }
-        }
-
-        // Visit body
-        super.visitMethod(node);
     }
 
     private void visitParameter(Parameter param) {
@@ -400,12 +397,16 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         // Parameter type
         ClassNode paramType = param.getType();
         if (paramType != null && paramType.getLineNumber() > 0
-                && !"java.lang.Object".equals(paramType.getName())) {
+                && !JAVA_LANG_OBJECT.equals(paramType.getName())) {
             emitTypeReference(paramType);
         }
 
         // Parameter name
         String name = param.getName();
+        if (name == null || name.isEmpty()) {
+            collectAnnotationTokens(param);
+            return;
+        }
         int line = param.getLineNumber() - 1;
         int col = param.getColumnNumber() - 1;
         int nameOffset = findNameInLine(line, col, name);
@@ -427,22 +428,37 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     public void visitField(FieldNode node) {
         if (node.getLineNumber() < 1) return;
         if (node.isSynthetic()) return;
-
         collectAnnotationTokens(node);
+        emitFieldType(node.getType());
+        emitFieldNameToken(node);
+        visitExpression(node.getInitialExpression());
+    }
 
-        // Field type
-        ClassNode fieldType = node.getType();
+    private void emitFieldType(ClassNode fieldType) {
         if (fieldType != null && fieldType.getLineNumber() > 0) {
             emitTypeReference(fieldType);
         }
+    }
 
-        // Field name
-        int tokenType = SemanticTokensProvider.TYPE_PROPERTY;
-        int modifiers = SemanticTokensProvider.MOD_DECLARATION;
-
-        if (node.isEnum()) {
-            tokenType = SemanticTokensProvider.TYPE_ENUM_MEMBER;
+    private void emitFieldNameToken(FieldNode node) {
+        int[] resolved = findNameNear(node.getLineNumber() - 1, node.getColumnNumber() - 1,
+                node.getName(), 3);
+        if (resolved.length == 0) {
+            return;
         }
+
+        addToken(resolved[0], resolved[1], node.getName().length(), getFieldTokenType(node),
+                getFieldModifiers(node));
+    }
+
+    private int getFieldTokenType(FieldNode node) {
+        return node.isEnum()
+                ? SemanticTokensProvider.TYPE_ENUM_MEMBER
+                : SemanticTokensProvider.TYPE_PROPERTY;
+    }
+
+    private int getFieldModifiers(FieldNode node) {
+        int modifiers = SemanticTokensProvider.MOD_DECLARATION;
         if (java.lang.reflect.Modifier.isStatic(node.getModifiers())) {
             modifiers |= SemanticTokensProvider.MOD_STATIC;
         }
@@ -452,29 +468,12 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         if (isDeprecated(node)) {
             modifiers |= SemanticTokensProvider.MOD_DEPRECATED;
         }
+        return modifiers;
+    }
 
-        String name = node.getName();
-        int line = node.getLineNumber() - 1;
-        int col = node.getColumnNumber() - 1;
-        int nameOffset = findNameInLine(line, col, name);
-        // AST may report annotation line; search nearby lines
-        if (nameOffset < 0) {
-            for (int tryLine = line + 1; tryLine <= line + 3; tryLine++) {
-                nameOffset = findNameInLine(tryLine, 0, name);
-                if (nameOffset >= 0) {
-                    line = tryLine;
-                    break;
-                }
-            }
-        }
-        if (nameOffset >= 0) {
-            addToken(line, nameOffset, name.length(), tokenType, modifiers);
-        }
-
-        // Visit initializer expression
-        Expression init = node.getInitialExpression();
-        if (init != null) {
-            init.visit(this);
+    private void visitExpression(Expression expr) {
+        if (expr != null) {
+            expr.visit(this);
         }
     }
 
@@ -499,7 +498,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             String name = method.getText();
             int line = method.getLineNumber() - 1;
             int col = method.getColumnNumber() - 1;
-            if (col >= 0 && name.length() > 0) {
+            if (col >= 0 && !name.isEmpty()) {
                 int modifiers = 0;
                 addToken(line, col, name.length(),
                         SemanticTokensProvider.TYPE_METHOD, modifiers);
@@ -517,7 +516,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             String name = call.getMethod();
             int line = call.getLineNumber() - 1;
             int col = call.getColumnNumber() - 1;
-            if (col >= 0 && name.length() > 0) {
+            if (col >= 0 && !name.isEmpty()) {
                 addToken(line, col, name.length(),
                         SemanticTokensProvider.TYPE_METHOD,
                         SemanticTokensProvider.MOD_STATIC);
@@ -559,8 +558,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
         if (accessedVar instanceof Parameter) {
             tokenType = SemanticTokensProvider.TYPE_PARAMETER;
-        } else if (accessedVar instanceof FieldNode) {
-            FieldNode field = (FieldNode) accessedVar;
+        } else if (accessedVar instanceof FieldNode field) {
             if (field.isEnum()) {
                 tokenType = SemanticTokensProvider.TYPE_ENUM_MEMBER;
             } else {
@@ -582,39 +580,36 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     @Override
     public void visitDeclarationExpression(DeclarationExpression expr) {
         if (expr.getLineNumber() < 1) return;
-
-        // Visit the type on the left side
         Expression leftExpr = expr.getLeftExpression();
-        if (leftExpr instanceof VariableExpression) {
-            VariableExpression varExpr = (VariableExpression) leftExpr;
-
-            // Emit the type reference if explicitly typed
-            ClassNode declaredType = varExpr.getOriginType();
-            if (declaredType != null && declaredType.getLineNumber() > 0
-                    && !"java.lang.Object".equals(declaredType.getName())) {
-                emitTypeReference(declaredType);
-            }
-
-            // Emit the variable name as a declaration
-            if (varExpr.getLineNumber() > 0) {
-                String name = varExpr.getName();
-                int line = varExpr.getLineNumber() - 1;
-                int col = varExpr.getColumnNumber() - 1;
-                if (col >= 0 && !name.isEmpty()) {
-                    int modifiers = SemanticTokensProvider.MOD_DECLARATION;
-                    if (java.lang.reflect.Modifier.isFinal(varExpr.getModifiers())) {
-                        modifiers |= SemanticTokensProvider.MOD_READONLY;
-                    }
-                    addToken(line, col, name.length(),
-                            SemanticTokensProvider.TYPE_VARIABLE, modifiers);
-                }
-            }
+        if (leftExpr instanceof VariableExpression varExpr) {
+            emitDeclarationType(varExpr);
+            emitDeclarationName(varExpr);
         }
+        visitExpression(expr.getRightExpression());
+    }
 
-        // Visit the right-hand side (initializer)
-        Expression rightExpr = expr.getRightExpression();
-        if (rightExpr != null) {
-            rightExpr.visit(this);
+    private void emitDeclarationType(VariableExpression varExpr) {
+        ClassNode declaredType = varExpr.getOriginType();
+        if (declaredType != null && declaredType.getLineNumber() > 0
+                && !JAVA_LANG_OBJECT.equals(declaredType.getName())) {
+            emitTypeReference(declaredType);
+        }
+    }
+
+    private void emitDeclarationName(VariableExpression varExpr) {
+        if (varExpr.getLineNumber() <= 0) {
+            return;
+        }
+        String name = varExpr.getName();
+        int line = varExpr.getLineNumber() - 1;
+        int col = varExpr.getColumnNumber() - 1;
+        if (col >= 0 && !name.isEmpty()) {
+            int modifiers = SemanticTokensProvider.MOD_DECLARATION;
+            if (java.lang.reflect.Modifier.isFinal(varExpr.getModifiers())) {
+                modifiers |= SemanticTokensProvider.MOD_READONLY;
+            }
+            addToken(line, col, name.length(),
+                    SemanticTokensProvider.TYPE_VARIABLE, modifiers);
         }
     }
 
@@ -666,8 +661,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     public void visitArgumentlistExpression(ArgumentListExpression ale) {
         // Visit each argument — check for named arguments (MapEntryExpression)
         for (Expression expr : ale.getExpressions()) {
-            if (expr instanceof MapEntryExpression) {
-                MapEntryExpression mapEntry = (MapEntryExpression) expr;
+            if (expr instanceof MapEntryExpression mapEntry) {
                 // Named argument key
                 Expression key = mapEntry.getKeyExpression();
                 if (key instanceof ConstantExpression && key.getLineNumber() > 0) {
@@ -700,11 +694,17 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         if (annotations == null || annotations.isEmpty()) return;
 
         for (AnnotationNode ann : annotations) {
-            if (ann == null || ann.getMembers() == null || ann.getMembers().isEmpty()) continue;
-            for (Expression memberValue : ann.getMembers().values()) {
-                if (memberValue != null) {
-                    memberValue.visit(this);
-                }
+            visitAnnotationMemberValues(ann);
+        }
+    }
+
+    private void visitAnnotationMemberValues(AnnotationNode ann) {
+        if (ann == null || ann.getMembers() == null || ann.getMembers().isEmpty()) {
+            return;
+        }
+        for (Expression memberValue : ann.getMembers().values()) {
+            if (memberValue != null) {
+                memberValue.visit(this);
             }
         }
     }
@@ -714,50 +714,55 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         if (annotations == null || annotations.isEmpty()) return;
 
         for (AnnotationNode ann : annotations) {
-            ClassNode annType = ann.getClassNode();
-            if (annType == null) continue;
-            String name = annType.getNameWithoutPackage();
-            if (name == null || name.isEmpty()) continue;
+            emitAnnotationToken(node, ann);
+        }
+    }
 
-            int reportedLine;
-            int reportedCol;
-            if (ann.getLineNumber() > 0) {
-                reportedLine = ann.getLineNumber() - 1;
-                reportedCol = Math.max(0, ann.getColumnNumber() - 1);
-            } else if (node.getLineNumber() > 0) {
-                reportedLine = node.getLineNumber() - 1;
-                reportedCol = Math.max(0, node.getColumnNumber() - 1);
-            } else {
-                continue;
-            }
+    private void emitAnnotationToken(AnnotatedNode node, AnnotationNode ann) {
+        ClassNode annType = ann.getClassNode();
+        if (annType == null) {
+            return;
+        }
+        String name = annType.getNameWithoutPackage();
+        if (name == null || name.isEmpty()) {
+            return;
+        }
 
-            int[] annotationStart = findAnnotationStartNear(reportedLine, reportedCol, name);
-            if (annotationStart == null) {
-                continue;
-            }
+        int[] anchor = getAnnotationAnchor(node, ann);
+        if (anchor.length == 0) {
+            return;
+        }
 
+        int[] annotationStart = findAnnotationStartNear(anchor[0], anchor[1], name);
+        if (annotationStart.length > 0) {
             addToken(annotationStart[0], annotationStart[1], name.length() + 1,
                     SemanticTokensProvider.TYPE_TYPE, 0);
         }
     }
 
-    private int[] findAnnotationStartNear(int line, int startCol, String name) {
-        if (source == null || name == null || name.isEmpty() || line < 0) return null;
+    private int[] getAnnotationAnchor(AnnotatedNode node, AnnotationNode ann) {
+        if (ann.getLineNumber() > 0) {
+            return new int[]{ann.getLineNumber() - 1, Math.max(0, ann.getColumnNumber() - 1)};
+        }
+        if (node.getLineNumber() > 0) {
+            return new int[]{node.getLineNumber() - 1, Math.max(0, node.getColumnNumber() - 1)};
+        }
+        return NO_POSITION;
+    }
 
-        // 1) First try the reported line from the reported column.
+    private int[] findAnnotationStartNear(int line, int startCol, String name) {
+        if (source == null || name == null || name.isEmpty() || line < 0) return NO_POSITION;
+
         int col = findAnnotationStartInLine(line, startCol, name);
         if (col >= 0) {
             return new int[]{line, col};
         }
 
-        // 2) Retry the whole reported line.
         col = findAnnotationStartInLine(line, 0, name);
         if (col >= 0) {
             return new int[]{line, col};
         }
 
-        // 3) AST positions can be off when annotations precede declarations;
-        //    search nearby lines and pick the closest match.
         final int MAX_OFFSET = 4;
         for (int offset = 1; offset <= MAX_OFFSET; offset++) {
             int upLine = line - offset;
@@ -775,21 +780,16 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             }
         }
 
-        return null;
+        return NO_POSITION;
     }
 
     private int findAnnotationStartInLine(int line, int startCol, String name) {
         if (source == null || name == null || name.isEmpty() || line < 0) return -1;
 
-        int lineStart = 0;
-        int currentLine = 0;
-        while (currentLine < line && lineStart < source.length()) {
-            if (source.charAt(lineStart) == '\n') {
-                currentLine++;
-            }
-            lineStart++;
+        int lineStart = findLineStart(line);
+        if (lineStart < 0) {
+            return -1;
         }
-        if (currentLine != line) return -1;
 
         int lineEnd = source.indexOf('\n', lineStart);
         if (lineEnd < 0) lineEnd = source.length();
@@ -824,40 +824,51 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         if (generics == null) return;
 
         for (GenericsType gt : generics) {
-            if (gt.getLineNumber() < 1) continue;
+            visitGenericType(gt);
+        }
+    }
 
-            ClassNode typeNode = gt.getType();
-            if (typeNode != null) {
-                String name = typeNode.getNameWithoutPackage();
-                int line = gt.getLineNumber() - 1;
-                int col = gt.getColumnNumber() - 1;
-                if (col >= 0 && !name.isEmpty()) {
-                    // If it's a placeholder (like T, E, K, V), it's a type parameter
-                    if (gt.isPlaceholder()) {
-                        addToken(line, col, name.length(),
-                                SemanticTokensProvider.TYPE_TYPE_PARAMETER,
-                                SemanticTokensProvider.MOD_DECLARATION);
-                    } else {
-                        addToken(line, col, name.length(),
-                                SemanticTokensProvider.TYPE_TYPE, 0);
-                    }
-                }
-            }
+    private void visitGenericType(GenericsType gt) {
+        if (gt.getLineNumber() < 1) {
+            return;
+        }
 
-            // Visit upper bounds
-            ClassNode[] upperBounds = gt.getUpperBounds();
-            if (upperBounds != null) {
-                for (ClassNode bound : upperBounds) {
-                    if (bound.getLineNumber() > 0) {
-                        emitTypeReference(bound);
-                    }
-                }
-            }
+        emitGenericTypeToken(gt);
+        visitUpperBounds(gt.getUpperBounds());
+        ClassNode lowerBound = gt.getLowerBound();
+        if (lowerBound != null && lowerBound.getLineNumber() > 0) {
+            emitTypeReference(lowerBound);
+        }
+    }
 
-            // Visit lower bound
-            ClassNode lowerBound = gt.getLowerBound();
-            if (lowerBound != null && lowerBound.getLineNumber() > 0) {
-                emitTypeReference(lowerBound);
+    private void emitGenericTypeToken(GenericsType gt) {
+        ClassNode typeNode = gt.getType();
+        if (typeNode == null) {
+            return;
+        }
+        String name = typeNode.getNameWithoutPackage();
+        int line = gt.getLineNumber() - 1;
+        int col = gt.getColumnNumber() - 1;
+        if (col < 0 || name.isEmpty()) {
+            return;
+        }
+
+        if (gt.isPlaceholder()) {
+            addToken(line, col, name.length(),
+                    SemanticTokensProvider.TYPE_TYPE_PARAMETER,
+                    SemanticTokensProvider.MOD_DECLARATION);
+        } else {
+            addToken(line, col, name.length(), SemanticTokensProvider.TYPE_TYPE, 0);
+        }
+    }
+
+    private void visitUpperBounds(ClassNode[] upperBounds) {
+        if (upperBounds == null) {
+            return;
+        }
+        for (ClassNode bound : upperBounds) {
+            if (bound.getLineNumber() > 0) {
+                emitTypeReference(bound);
             }
         }
     }
@@ -927,34 +938,46 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     }
 
     /**
-     * Check if the character at a given line and column in the source is the expected char.
-     */
-    private boolean isCharAt(int line, int col, char expected) {
-        if (source == null || line < 0 || col < 0) return false;
-        int lineStart = 0;
-        int currentLine = 0;
-        while (currentLine < line && lineStart < source.length()) {
-            if (source.charAt(lineStart) == '\n') {
-                currentLine++;
-            }
-            lineStart++;
-        }
-        int pos = lineStart + col;
-        if (pos < 0 || pos >= source.length()) return false;
-        return source.charAt(pos) == expected;
-    }
-
-    /**
      * Try to find the exact column of a name on a given line, searching forward
      * from the given start column. This is needed because AST node positions
      * sometimes point to the start of the whole declaration (e.g., the keyword)
      * rather than the name itself.
      */
     private int findNameInLine(int line, int startCol, String name) {
-        if (source == null || name == null || name.isEmpty()) return -1;
-        if (line < 0 || startCol < 0) return -1;
+        if (source == null || name == null || name.isEmpty() || line < 0 || startCol < 0) {
+            return -1;
+        }
 
-        // Find the beginning of the line in the source
+        int lineStart = findLineStart(line);
+        if (lineStart < 0) {
+            return -1;
+        }
+
+        int searchStart = lineStart + startCol;
+        if (searchStart >= source.length()) return startCol;
+
+        int lineEnd = source.indexOf('\n', lineStart);
+        if (lineEnd < 0) lineEnd = source.length();
+
+        return findWholeWordInRange(name, lineStart, lineEnd, searchStart);
+    }
+
+    private int[] findNameNear(int line, int col, String name, int lookAheadLines) {
+        int offset = findNameInLine(line, col, name);
+        if (offset >= 0) {
+            return new int[]{line, offset};
+        }
+
+        for (int tryLine = line + 1; tryLine <= line + lookAheadLines; tryLine++) {
+            offset = findNameInLine(tryLine, 0, name);
+            if (offset >= 0) {
+                return new int[]{tryLine, offset};
+            }
+        }
+        return NO_POSITION;
+    }
+
+    private int findLineStart(int line) {
         int lineStart = 0;
         int currentLine = 0;
         while (currentLine < line && lineStart < source.length()) {
@@ -963,38 +986,30 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             }
             lineStart++;
         }
+        return currentLine == line ? lineStart : -1;
+    }
 
-        // Search region: from startCol on this line to end of line
-        int searchStart = lineStart + startCol;
-        if (searchStart >= source.length()) return startCol;
-
-        int lineEnd = source.indexOf('\n', lineStart);
-        if (lineEnd < 0) lineEnd = source.length();
-
-        // Search for the name as a whole word
+    private int findWholeWordInRange(String name, int lineStart, int lineEnd, int searchStart) {
         int idx = searchStart;
         while (idx <= lineEnd - name.length()) {
             int found = source.indexOf(name, idx);
-            if (found < 0 || found > lineEnd - name.length()) break;
-
-            // Check word boundaries
-            boolean leftBound = (found == 0) || !Character.isJavaIdentifierPart(source.charAt(found - 1));
-            boolean rightBound = (found + name.length() >= source.length())
-                    || !Character.isJavaIdentifierPart(source.charAt(found + name.length()));
-
-            if (leftBound && rightBound) {
-                return found - lineStart; // return column relative to line start
+            if (found < 0 || found > lineEnd - name.length()) {
+                break;
             }
 
+            if (isWholeWordMatch(found, name.length())) {
+                return found - lineStart;
+            }
             idx = found + 1;
         }
-
-        // Name not found on this line — return -1 to signal failure
-        // (caller must handle this; do NOT fall back to startCol as that
-        // can create phantom tokens at wrong positions, e.g. overlapping
-        // annotation strings when the AST reports the annotation line
-        // for a class declaration)
         return -1;
+    }
+
+    private boolean isWholeWordMatch(int found, int length) {
+        boolean leftBound = (found == 0) || !Character.isJavaIdentifierPart(source.charAt(found - 1));
+        boolean rightBound = (found + length >= source.length())
+                || !Character.isJavaIdentifierPart(source.charAt(found + length));
+        return leftBound && rightBound;
     }
 
     /**
@@ -1030,55 +1045,68 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             return Collections.emptyList();
         }
 
-        // Sort by line, then column
         tokens.sort(Comparator.comparingInt((RawToken t) -> t.line)
                 .thenComparingInt(t -> t.column));
 
-        // Remove duplicate tokens at the same position.
-        // Prefer decorator tokens when clashes happen at the same start.
+        List<RawToken> nonOverlapping = removeOverlappingTokens(deduplicateByPosition(tokens));
+        return deltaEncode(nonOverlapping);
+    }
+
+    private List<RawToken> deduplicateByPosition(List<RawToken> sortedTokens) {
         List<RawToken> deduped = new ArrayList<>();
-        RawToken prev = null;
-        for (RawToken t : tokens) {
-            if (prev == null || t.line != prev.line || t.column != prev.column) {
-                deduped.add(t);
-                prev = t;
-            } else if (t.tokenType == SemanticTokensProvider.TYPE_DECORATOR
-                    && prev.tokenType != SemanticTokensProvider.TYPE_DECORATOR) {
-                deduped.set(deduped.size() - 1, t);
-                prev = t;
+        RawToken previous = null;
+        for (RawToken token : sortedTokens) {
+            if (isNewTokenPosition(previous, token)) {
+                deduped.add(token);
+                previous = token;
+            } else if (isDecoratorPreferred(previous, token)) {
+                deduped.set(deduped.size() - 1, token);
+                previous = token;
             }
         }
+        return deduped;
+    }
 
-        // Remove overlapping tokens on the same line when a decorator already
-        // covers the span (e.g., both '@Name' and 'Name' are emitted).
+    private boolean isNewTokenPosition(RawToken previous, RawToken token) {
+        return previous == null || token.line != previous.line || token.column != previous.column;
+    }
+
+    private boolean isDecoratorPreferred(RawToken previous, RawToken token) {
+        return token.tokenType == SemanticTokensProvider.TYPE_DECORATOR
+                && previous.tokenType != SemanticTokensProvider.TYPE_DECORATOR;
+    }
+
+    private List<RawToken> removeOverlappingTokens(List<RawToken> deduped) {
         List<RawToken> nonOverlapping = new ArrayList<>(deduped.size());
         RawToken last = null;
-        for (RawToken t : deduped) {
-            if (last == null || t.line != last.line || t.column >= last.column + last.length) {
-                nonOverlapping.add(t);
-                last = t;
-                continue;
+        for (RawToken token : deduped) {
+            if (isNonOverlapping(last, token) || !isCoveredByDecorator(last, token)) {
+                nonOverlapping.add(token);
+                last = token;
             }
-
-            boolean tInsideLast = t.column >= last.column
-                    && (t.column + t.length) <= (last.column + last.length);
-            if (tInsideLast && last.tokenType == SemanticTokensProvider.TYPE_DECORATOR
-                    && t.tokenType != SemanticTokensProvider.TYPE_DECORATOR) {
-                continue;
-            }
-
-            nonOverlapping.add(t);
-            last = t;
         }
+        return nonOverlapping;
+    }
 
-        // Delta-encode
+    private boolean isNonOverlapping(RawToken last, RawToken token) {
+        return last == null || token.line != last.line || token.column >= last.column + last.length;
+    }
+
+    private boolean isCoveredByDecorator(RawToken last, RawToken token) {
+        boolean insideLast = token.column >= last.column
+                && (token.column + token.length) <= (last.column + last.length);
+        return insideLast
+                && last.tokenType == SemanticTokensProvider.TYPE_DECORATOR
+                && token.tokenType != SemanticTokensProvider.TYPE_DECORATOR;
+    }
+
+    private List<Integer> deltaEncode(List<RawToken> nonOverlapping) {
         List<Integer> data = new ArrayList<>(nonOverlapping.size() * 5);
         int prevLine = 0;
         int prevCol = 0;
-
         for (RawToken token : nonOverlapping) {
             int deltaLine = token.line - prevLine;
-            int deltaCol = (deltaLine == 0) ? (token.column - prevCol) : token.column;
+            int deltaCol = deltaLine == 0 ? token.column - prevCol : token.column;
 
             data.add(deltaLine);
             data.add(deltaCol);
@@ -1089,7 +1117,6 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             prevLine = token.line;
             prevCol = token.column;
         }
-
         return data;
     }
 }

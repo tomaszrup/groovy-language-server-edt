@@ -30,18 +30,25 @@ import org.eclipse.jdt.core.IType;
  */
 public class SourceJarHelper {
 
+    private static final String GROOVY_SOURCE_SCHEME = "groovy-source:";
+    private static final String JAVA_EXTENSION = ".java";
+    private static final String GROOVY_EXTENSION = ".groovy";
+    private static final String JAR_EXTENSION = ".jar";
+    private static final String SOURCES_SUFFIX = "-sources.jar";
+    private static final String M2_REPOSITORY_SEGMENT = ".m2/repository/";
+    private static final String GRADLE_FILES_SEGMENT = "files-2.1/";
+
+    private SourceJarHelper() {
+    }
+
     /**
      * Cached source entry holding content and metadata for re-resolution.
      */
     private static class CacheEntry {
         final String content;
-        final String jarPath;   // null for JDT attachment or stubs
-        final boolean isJdk;
 
-        CacheEntry(String content, String jarPath, boolean isJdk) {
+        CacheEntry(String content) {
             this.content = content;
-            this.jarPath = jarPath;
-            this.isJdk = isJdk;
         }
     }
 
@@ -67,10 +74,11 @@ public class SourceJarHelper {
         String pathPart = fqn.replace('.', '/') + ext;
         String uriStr = "groovy-source:///" + pathPart;
         if (content != null) {
-            contentCache.put(fqn, new CacheEntry(content, sourcesJarPath, isJdk));
+            contentCache.put(fqn, new CacheEntry(content));
         }
         GroovyLanguageServerPlugin.logInfo("[source] Built virtual URI: " + uriStr
-                + " (cached FQN=" + fqn + ")");
+                + " (cached FQN=" + fqn + ", sourceJar=" + sourcesJarPath
+                + ", isJdk=" + isJdk + ")");
         return uriStr;
     }
 
@@ -84,9 +92,8 @@ public class SourceJarHelper {
      * @return the FQN, or null if not extractable
      */
     public static String extractFqnFromUri(String uriStr) {
-        if (uriStr == null || !uriStr.startsWith("groovy-source:")) return null;
-        // Strip scheme: "groovy-source:" → rest starts with slashes + path
-        String rest = uriStr.substring("groovy-source:".length());
+        if (uriStr == null || !uriStr.startsWith(GROOVY_SOURCE_SCHEME)) return null;
+        String rest = uriStr.substring(GROOVY_SOURCE_SCHEME.length());
         // Strip leading slashes (could be /// or /)
         while (rest.startsWith("/")) rest = rest.substring(1);
         // Strip query/fragment if present (shouldn't be, but be safe)
@@ -94,10 +101,11 @@ public class SourceJarHelper {
         if (qIdx >= 0) rest = rest.substring(0, qIdx);
         int hIdx = rest.indexOf('#');
         if (hIdx >= 0) rest = rest.substring(0, hIdx);
-        // Strip file extension (.java or .groovy)
-        if (rest.endsWith(".java")) rest = rest.substring(0, rest.length() - 5);
-        else if (rest.endsWith(".groovy")) rest = rest.substring(0, rest.length() - 7);
-        // Convert path separators to dots
+        if (rest.endsWith(JAVA_EXTENSION)) {
+            rest = rest.substring(0, rest.length() - JAVA_EXTENSION.length());
+        } else if (rest.endsWith(GROOVY_EXTENSION)) {
+            rest = rest.substring(0, rest.length() - GROOVY_EXTENSION.length());
+        }
         return rest.replace('/', '.');
     }
 
@@ -127,7 +135,7 @@ public class SourceJarHelper {
         // 2. Try JDK src.zip
         String jdkSource = readSourceFromJdkSrcZip(fqn);
         if (jdkSource != null) {
-            contentCache.put(fqn, new CacheEntry(jdkSource, null, true));
+            contentCache.put(fqn, new CacheEntry(jdkSource));
             return jdkSource;
         }
 
@@ -198,47 +206,25 @@ public class SourceJarHelper {
      * @return the sources JAR, or null if not found
      */
     public static File findSourcesJarForBinaryJar(File jarFile) {
-        if (jarFile == null || !jarFile.exists()) return null;
+        if (!isUsableBinaryJar(jarFile)) {
+            return null;
+        }
 
         String jarName = jarFile.getName();
-        if (!jarName.endsWith(".jar")) return null;
 
         GroovyLanguageServerPlugin.logInfo(
                 "[source] Looking for sources JAR for: " + jarFile.getAbsolutePath());
 
-        // Strategy 1: Same directory (Maven convention)
-        String baseName = jarName.substring(0, jarName.length() - 4);
-        String sourcesJarName = baseName + "-sources.jar";
-        File sourcesJar = new File(jarFile.getParentFile(), sourcesJarName);
+        String sourcesJarName = buildSourcesJarName(jarName);
+        File sourcesJar = findSourcesJarInLocalCache(jarFile, sourcesJarName);
 
-        // Strategy 2: Gradle cache sibling hash dirs
-        if (!sourcesJar.exists()) {
-            File hashDir = jarFile.getParentFile();
-            File versionDir = hashDir != null ? hashDir.getParentFile() : null;
-            if (versionDir != null && versionDir.isDirectory()) {
-                File[] siblings = versionDir.listFiles();
-                if (siblings != null) {
-                    for (File sibling : siblings) {
-                        if (sibling.isDirectory()) {
-                            File candidate = new File(sibling, sourcesJarName);
-                            if (candidate.exists()) {
-                                sourcesJar = candidate;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Strategy 3: Cross-cache search (Maven ↔ Gradle)
-        if (!sourcesJar.exists()) {
+        if (sourcesJar == null) {
             GroovyLanguageServerPlugin.logInfo(
                     "[source] Not found locally, searching caches for: " + sourcesJarName);
             sourcesJar = searchCachesForSourcesJar(sourcesJarName, jarFile);
         }
 
-        if (sourcesJar == null || !sourcesJar.exists()) {
+        if (sourcesJar == null) {
             GroovyLanguageServerPlugin.logInfo(
                     "[source] No sources JAR found for " + jarName);
             return null;
@@ -249,13 +235,53 @@ public class SourceJarHelper {
         return sourcesJar;
     }
 
+    private static boolean isUsableBinaryJar(File jarFile) {
+        return jarFile != null && jarFile.exists() && jarFile.getName().endsWith(JAR_EXTENSION);
+    }
+
+    private static String buildSourcesJarName(String jarName) {
+        String baseName = jarName.substring(0, jarName.length() - JAR_EXTENSION.length());
+        return baseName + SOURCES_SUFFIX;
+    }
+
+    private static File findSourcesJarInLocalCache(File jarFile, String sourcesJarName) {
+        File localCandidate = new File(jarFile.getParentFile(), sourcesJarName);
+        if (localCandidate.exists()) {
+            return localCandidate;
+        }
+        return findSourcesJarInSiblingHashDirs(jarFile, sourcesJarName);
+    }
+
+    private static File findSourcesJarInSiblingHashDirs(File jarFile, String sourcesJarName) {
+        File hashDir = jarFile.getParentFile();
+        File versionDir = hashDir != null ? hashDir.getParentFile() : null;
+        if (versionDir == null || !versionDir.isDirectory()) {
+            return null;
+        }
+
+        File[] siblings = versionDir.listFiles();
+        if (siblings == null) {
+            return null;
+        }
+        for (File sibling : siblings) {
+            if (!sibling.isDirectory()) {
+                continue;
+            }
+            File candidate = new File(sibling, sourcesJarName);
+            if (candidate.exists()) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
     /**
      * Read source for a fully-qualified type from a sources JAR.
      * Tries both .groovy and .java extensions.
      */
     public static String readSourceFromJar(File sourcesJar, String fqn) {
         String basePath = fqn.replace('.', '/');
-        String[] extensions = {".groovy", ".java"};
+        String[] extensions = {GROOVY_EXTENSION, JAVA_EXTENSION};
 
         try (ZipFile zf = new ZipFile(sourcesJar)) {
             for (String ext : extensions) {
@@ -314,7 +340,7 @@ public class SourceJarHelper {
             return null;
         }
 
-        String basePath = fqn.replace('.', '/') + ".java";
+        String basePath = fqn.replace('.', '/') + JAVA_EXTENSION;
 
         // JDK 9+ src.zip has module prefixes like java.base/, java.sql/, etc.
         // Try common modules first
@@ -402,47 +428,63 @@ public class SourceJarHelper {
     public static String extractMemberJavadoc(String source, String memberName) {
         if (source == null || memberName == null) return null;
 
-        // Find all occurrences of the member name and look for preceding Javadoc
         int searchFrom = 0;
         while (searchFrom < source.length()) {
             int idx = source.indexOf(memberName, searchFrom);
-            if (idx < 0) break;
-
-            // Check it's a word boundary (not part of a larger identifier)
-            if (idx > 0 && Character.isJavaIdentifierPart(source.charAt(idx - 1))) {
+            if (idx < 0) {
+                searchFrom = source.length();
+            } else {
                 searchFrom = idx + 1;
-                continue;
-            }
-            int afterIdx = idx + memberName.length();
-            if (afterIdx < source.length() && Character.isJavaIdentifierPart(source.charAt(afterIdx))) {
-                searchFrom = idx + 1;
-                continue;
-            }
-
-            // Look backwards for /** ... */
-            String before = source.substring(0, idx).stripTrailing();
-            int docEnd = before.lastIndexOf("*/");
-            if (docEnd >= 0) {
-                int docStart = before.lastIndexOf("/**", docEnd);
-                if (docStart >= 0) {
-                    String between = before.substring(docEnd + 2).strip();
-                    String cleaned = between.replaceAll("@\\w+(\\([^)]*\\))?", "").strip();
-                    cleaned = cleaned.replaceAll("\\b(public|protected|private|abstract|static|final|" +
-                            "synchronized|native|transient|volatile|default|void|" +
-                            "boolean|byte|char|short|int|long|float|double|" +
-                            "[A-Z]\\w*(<[^>]*>)?)\\b", "").strip();
-                    // Allow return types, generics, etc.
-                    cleaned = cleaned.replaceAll("[<>,\\[\\]\\s]", "").strip();
-                    if (cleaned.isEmpty()) {
-                        return cleanJavadoc(before.substring(docStart, docEnd + 2));
+                if (isWordBoundary(source, idx, memberName.length())) {
+                    String rawDoc = findPrecedingMemberDoc(source, idx);
+                    if (rawDoc != null) {
+                        return cleanJavadoc(rawDoc);
                     }
                 }
             }
-
-            searchFrom = idx + 1;
         }
 
         return null;
+    }
+
+    private static boolean isWordBoundary(String text, int idx, int length) {
+        if (idx > 0 && Character.isJavaIdentifierPart(text.charAt(idx - 1))) {
+            return false;
+        }
+        int afterIdx = idx + length;
+        return afterIdx >= text.length() || !Character.isJavaIdentifierPart(text.charAt(afterIdx));
+    }
+
+    private static String findPrecedingMemberDoc(String source, int memberIndex) {
+        String before = source.substring(0, memberIndex).stripTrailing();
+        int docEnd = before.lastIndexOf("*/");
+        if (docEnd < 0) {
+            return null;
+        }
+        int docStart = before.lastIndexOf("/**", docEnd);
+        if (docStart < 0) {
+            return null;
+        }
+        String between = before.substring(docEnd + 2).strip();
+        return isIgnorableMemberPrefix(between) ? before.substring(docStart, docEnd + 2) : null;
+    }
+
+    private static boolean isIgnorableMemberPrefix(String between) {
+        if (between.isEmpty()) {
+            return true;
+        }
+        String cleaned = between.replaceAll("@\\w+(\\([^)]*\\))?", "").strip();
+        cleaned = removeMemberDeclarationNoise(cleaned);
+        return cleaned.isEmpty();
+    }
+
+    private static String removeMemberDeclarationNoise(String text) {
+        String cleaned = text.replaceAll("\\b(public|protected|private|abstract|static|final)\\b", " ");
+        cleaned = cleaned.replaceAll("\\b(synchronized|native|transient|volatile|default)\\b", " ");
+        cleaned = cleaned.replaceAll("\\b(void|boolean|byte|char|short|int|long|float|double)\\b", " ");
+        cleaned = cleaned.replaceAll("\\b[A-Z]\\w*(<[^>]*>)?\\b", " ");
+        cleaned = cleaned.replaceAll("[<>,\\[\\]]", " ");
+        return cleaned.replaceAll("\\s+", "").strip();
     }
 
     /**
@@ -476,12 +518,12 @@ public class SourceJarHelper {
         result = result.replaceAll("\\{@link ([^}]+)}", "`$1`");
         result = result.replaceAll("\\{@literal ([^}]+)}", "$1");
         result = result.replaceAll("@param (\\w+)", "\n**@param** `$1` —");
-        result = result.replaceAll("@return", "\n**@return**");
+        result = result.replace("@return", "\n**@return**");
         result = result.replaceAll("@throws (\\w+)", "\n**@throws** `$1` —");
         result = result.replaceAll("@since ([^\n]+)", "\n*@since $1*");
         result = result.replaceAll("@see ([^\n]+)", "\n*@see* `$1`");
         result = result.replaceAll("@author ([^\n]+)", "\n*@author $1*");
-        result = result.replaceAll("<p>", "\n\n");
+        result = result.replace("<p>", "\n\n");
         result = result.replaceAll("<br\\s*/?>", "\n");
         result = result.replaceAll("</?[a-zA-Z][^>]*>", ""); // strip remaining HTML tags
 
@@ -512,75 +554,125 @@ public class SourceJarHelper {
         String userHome = System.getProperty("user.home");
         String jarAbsPath = jarFile.getAbsolutePath().replace('\\', '/');
 
-        String group = null, artifact = null, version = null;
-
-        // Parse Maven path
-        int m2Idx = jarAbsPath.indexOf(".m2/repository/");
-        if (m2Idx >= 0) {
-            String relPath = jarAbsPath.substring(m2Idx + ".m2/repository/".length());
-            String[] parts = relPath.split("/");
-            if (parts.length >= 4) {
-                version = parts[parts.length - 2];
-                artifact = parts[parts.length - 3];
-                StringBuilder gb = new StringBuilder();
-                for (int i = 0; i < parts.length - 3; i++) {
-                    if (i > 0) gb.append(".");
-                    gb.append(parts[i]);
-                }
-                group = gb.toString();
-            }
-        }
-
-        // Parse Gradle cache path
-        int gradleCacheIdx = jarAbsPath.indexOf("files-2.1/");
-        if (gradleCacheIdx >= 0 && group == null) {
-            String relPath = jarAbsPath.substring(gradleCacheIdx + "files-2.1/".length());
-            String[] parts = relPath.split("/");
-            if (parts.length >= 4) {
-                group = parts[0];
-                artifact = parts[1];
-                version = parts[2];
-            }
-        }
-
-        if (group == null || artifact == null || version == null) {
+        GavCoordinates gav = extractCoordinates(jarAbsPath);
+        if (gav == null) {
             GroovyLanguageServerPlugin.logInfo("[source] Could not extract GAV from: " + jarAbsPath);
             return null;
         }
 
-        GroovyLanguageServerPlugin.logInfo("[source] Extracted GAV: " + group + ":" + artifact + ":" + version);
+        GroovyLanguageServerPlugin.logInfo("[source] Extracted GAV: " + gav.group + ':' + gav.artifact + ':' + gav.version);
+        File gradleCandidate = findInGradleCache(userHome, sourcesJarName, gav);
+        if (gradleCandidate != null) {
+            return gradleCandidate;
+        }
+        return findInMavenCache(userHome, sourcesJarName, gav);
+    }
 
-        // Search Gradle cache
-        File gradleCacheDir = new File(userHome,
-                ".gradle/caches/modules-2/files-2.1/" + group + "/" + artifact + "/" + version);
-        if (gradleCacheDir.isDirectory()) {
-            File[] hashDirs = gradleCacheDir.listFiles();
-            if (hashDirs != null) {
-                for (File hashDir : hashDirs) {
-                    if (hashDir.isDirectory()) {
-                        File candidate = new File(hashDir, sourcesJarName);
-                        if (candidate.exists()) {
-                            GroovyLanguageServerPlugin.logInfo(
-                                    "[source] Found in Gradle cache: " + candidate.getAbsolutePath());
-                            return candidate;
-                        }
-                    }
-                }
+    private static GavCoordinates extractCoordinates(String jarAbsPath) {
+        GavCoordinates fromMaven = parseMavenCoordinates(jarAbsPath);
+        if (fromMaven != null) {
+            return fromMaven;
+        }
+        return parseGradleCoordinates(jarAbsPath);
+    }
+
+    private static GavCoordinates parseMavenCoordinates(String jarAbsPath) {
+        int m2Idx = jarAbsPath.indexOf(M2_REPOSITORY_SEGMENT);
+        if (m2Idx < 0) {
+            return null;
+        }
+        String relPath = jarAbsPath.substring(m2Idx + M2_REPOSITORY_SEGMENT.length());
+        String[] parts = relPath.split("/");
+        if (parts.length < 4) {
+            return null;
+        }
+        String version = parts[parts.length - 2];
+        String artifact = parts[parts.length - 3];
+        String group = buildGroup(parts, parts.length - 3);
+        return new GavCoordinates(group, artifact, version);
+    }
+
+    private static GavCoordinates parseGradleCoordinates(String jarAbsPath) {
+        int gradleCacheIdx = jarAbsPath.indexOf(GRADLE_FILES_SEGMENT);
+        if (gradleCacheIdx < 0) {
+            return null;
+        }
+        String relPath = jarAbsPath.substring(gradleCacheIdx + GRADLE_FILES_SEGMENT.length());
+        String[] parts = relPath.split("/");
+        if (parts.length < 4) {
+            return null;
+        }
+        return new GavCoordinates(parts[0], parts[1], parts[2]);
+    }
+
+    private static String buildGroup(String[] parts, int endExclusive) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < endExclusive; i++) {
+            if (i > 0) {
+                builder.append('.');
             }
+            builder.append(parts[i]);
+        }
+        return builder.toString();
+    }
+
+    private static File findInGradleCache(String userHome, String sourcesJarName, GavCoordinates gav) {
+        File gradleCacheDir = appendSegments(new File(userHome),
+                ".gradle", "caches", "modules-2", "files-2.1", gav.group, gav.artifact, gav.version);
+        if (!gradleCacheDir.isDirectory()) {
+            return null;
         }
 
-        // Search Maven cache
-        String groupPath = group.replace('.', '/');
-        File mavenDir = new File(userHome, ".m2/repository/" + groupPath + "/" + artifact + "/" + version);
-        if (mavenDir.isDirectory()) {
-            File candidate = new File(mavenDir, sourcesJarName);
+        File[] hashDirs = gradleCacheDir.listFiles();
+        if (hashDirs == null) {
+            return null;
+        }
+
+        for (File hashDir : hashDirs) {
+            if (!hashDir.isDirectory()) {
+                continue;
+            }
+            File candidate = new File(hashDir, sourcesJarName);
             if (candidate.exists()) {
-                GroovyLanguageServerPlugin.logInfo(
-                        "[source] Found in Maven cache: " + candidate.getAbsolutePath());
+                GroovyLanguageServerPlugin.logInfo("[source] Found in Gradle cache: " + candidate.getAbsolutePath());
                 return candidate;
             }
         }
-
         return null;
+    }
+
+    private static File findInMavenCache(String userHome, String sourcesJarName, GavCoordinates gav) {
+        String groupPath = gav.group.replace('.', File.separatorChar);
+        File mavenDir = appendSegments(new File(userHome), ".m2", "repository", groupPath, gav.artifact, gav.version);
+        if (!mavenDir.isDirectory()) {
+            return null;
+        }
+
+        File candidate = new File(mavenDir, sourcesJarName);
+        if (candidate.exists()) {
+            GroovyLanguageServerPlugin.logInfo("[source] Found in Maven cache: " + candidate.getAbsolutePath());
+            return candidate;
+        }
+        return null;
+    }
+
+    private static File appendSegments(File base, String... segments) {
+        File current = base;
+        for (String segment : segments) {
+            current = new File(current, segment);
+        }
+        return current;
+    }
+
+    private static final class GavCoordinates {
+        private final String group;
+        private final String artifact;
+        private final String version;
+
+        private GavCoordinates(String group, String artifact, String version) {
+            this.group = group;
+            this.artifact = artifact;
+            this.version = version;
+        }
     }
 }

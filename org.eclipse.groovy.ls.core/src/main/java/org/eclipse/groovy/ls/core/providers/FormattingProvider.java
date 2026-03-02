@@ -11,6 +11,7 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -19,6 +20,7 @@ import java.util.Map;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
@@ -37,6 +39,7 @@ import org.eclipse.text.edits.ReplaceEdit;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
 
 /**
  * Provides document formatting for Groovy files using the Eclipse JDT
@@ -89,7 +92,7 @@ public class FormattingProvider {
         }
 
         Map<String, String> options = buildFormatterOptions(params.getOptions(), uri);
-        return formatSource(source, 0, source.length(), options, uri);
+        return formatSource(source, 0, source.length(), options);
     }
 
     /**
@@ -112,7 +115,7 @@ public class FormattingProvider {
         }
 
         Map<String, String> options = buildFormatterOptions(params.getOptions(), uri);
-        return formatSource(source, offset, length, options, uri);
+        return formatSource(source, offset, length, options);
     }
 
     /**
@@ -134,7 +137,7 @@ public class FormattingProvider {
 
         try {
             Map<String, String> loaded = loadEclipseFormatterProfile(path);
-            if (loaded != null && !loaded.isEmpty()) {
+                if (!loaded.isEmpty()) {
                 profileOptions = loaded;
                 loadedProfilePath = path;
                 GroovyLanguageServerPlugin.logInfo(
@@ -144,7 +147,7 @@ public class FormattingProvider {
                 GroovyLanguageServerPlugin.logWarning(
                         "No formatter settings found in profile: " + path);
             }
-        } catch (Exception e) {
+        } catch (IOException | ParserConfigurationException | SAXException e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to load Eclipse formatter profile from: " + path, e);
         }
@@ -158,8 +161,7 @@ public class FormattingProvider {
      * Format a region of source using the Eclipse JDT CodeFormatter.
      */
     private List<TextEdit> formatSource(String source, int offset, int length,
-                                         Map<String, String> options,
-                                         String uri) {
+                                         Map<String, String> options) {
         List<TextEdit> result = new ArrayList<>();
 
         try {
@@ -282,33 +284,43 @@ public class FormattingProvider {
      * escape sequences, and unterminated strings (stops at newline).
      */
     private void replaceStringLiterals(StringBuilder sb) {
-        boolean inString = false;
-        char stringQuote = 0;
-
-        for (int i = 0; i < sb.length(); i++) {
-            char c = sb.charAt(i);
-
-            if (!inString) {
-                if (c == '"' || c == '\'') {
-                    inString = true;
-                    stringQuote = c;
-                    sb.setCharAt(i, '_');
-                }
+        int index = 0;
+        while (index < sb.length()) {
+            char current = sb.charAt(index);
+            if (current == '"' || current == '\'') {
+                index = maskQuotedLiteral(sb, index, current);
             } else {
-                if (c == '\\' && i + 1 < sb.length()) {
-                    sb.setCharAt(i, '_');
-                    i++;
-                    sb.setCharAt(i, '_');
-                } else if (c == stringQuote) {
-                    inString = false;
-                    sb.setCharAt(i, '_');
-                } else if (c == '\n' || c == '\r') {
-                    inString = false;
-                } else if (!Character.isJavaIdentifierPart(c)) {
-                    sb.setCharAt(i, '_');
-                }
+                index++;
             }
         }
+    }
+
+    private int maskQuotedLiteral(StringBuilder sb, int startIndex, char quote) {
+        sb.setCharAt(startIndex, '_');
+        int index = startIndex + 1;
+
+        while (index < sb.length()) {
+            char current = sb.charAt(index);
+            if (current == '\\' && index + 1 < sb.length()) {
+                sb.setCharAt(index, '_');
+                sb.setCharAt(index + 1, '_');
+                index += 2;
+                continue;
+            }
+            if (current == quote) {
+                sb.setCharAt(index, '_');
+                return index + 1;
+            }
+            if (current == '\n' || current == '\r') {
+                return index;
+            }
+            if (!Character.isJavaIdentifierPart(current)) {
+                sb.setCharAt(index, '_');
+            }
+            index++;
+        }
+
+        return index;
     }
 
     /**
@@ -320,27 +332,36 @@ public class FormattingProvider {
                                                   String keyword,
                                                   String replacement) {
         int kwLen = keyword.length();
-        for (int i = 0; i <= sb.length() - kwLen; i++) {
-            boolean match = true;
-            for (int j = 0; j < kwLen; j++) {
-                if (sb.charAt(i + j) != keyword.charAt(j)) {
-                    match = false;
-                    break;
+        int index = 0;
+        while (index <= sb.length() - kwLen) {
+            if (isKeywordAt(sb, keyword, index, kwLen)
+                    && hasKeywordBoundaries(sb, index, kwLen)) {
+                for (int j = 0; j < kwLen; j++) {
+                    sb.setCharAt(index + j, replacement.charAt(j));
                 }
+                index += kwLen;
+            } else {
+                index++;
             }
-            if (!match) continue;
-
-            // Word boundary before: start-of-string or non-identifier char
-            if (i > 0 && Character.isJavaIdentifierPart(sb.charAt(i - 1))) continue;
-            // Word boundary after: end-of-string or non-identifier char
-            if (i + kwLen < sb.length()
-                    && Character.isJavaIdentifierPart(sb.charAt(i + kwLen))) continue;
-
-            for (int j = 0; j < kwLen; j++) {
-                sb.setCharAt(i + j, replacement.charAt(j));
-            }
-            i += kwLen - 1; // skip past replacement
         }
+    }
+
+    private boolean isKeywordAt(StringBuilder sb, String keyword, int index, int keywordLength) {
+        for (int j = 0; j < keywordLength; j++) {
+            if (sb.charAt(index + j) != keyword.charAt(j)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasKeywordBoundaries(StringBuilder sb, int index, int keywordLength) {
+        boolean validStart = index == 0 || !Character.isJavaIdentifierPart(sb.charAt(index - 1));
+        if (!validStart) {
+            return false;
+        }
+        boolean atEnd = index + keywordLength >= sb.length();
+        return atEnd || !Character.isJavaIdentifierPart(sb.charAt(index + keywordLength));
     }
 
     // ================================================================
@@ -389,6 +410,10 @@ public class FormattingProvider {
         options.put(JavaCore.COMPILER_SOURCE, "17");
         options.put(JavaCore.COMPILER_COMPLIANCE, "17");
         options.put(JavaCore.COMPILER_CODEGEN_TARGET_PLATFORM, "17");
+
+        // Spock blocks (e.g. expect:, when:, then:) are parsed similarly to labels by
+        // the JDT formatter; forcing newline-after-label prevents block flattening.
+        options.put("org.eclipse.jdt.core.formatter.insert_new_line_after_label", "insert");
 
         return options;
     }
@@ -451,7 +476,8 @@ public class FormattingProvider {
      * }</pre>
      * We extract all {@code <setting>} elements and map {@code id → value}.
      */
-    static Map<String, String> loadEclipseFormatterProfile(String path) throws Exception {
+        static Map<String, String> loadEclipseFormatterProfile(String path)
+            throws IOException, ParserConfigurationException, SAXException {
         Map<String, String> settings = new HashMap<>();
         File file = resolveProfilePath(path);
 
@@ -516,6 +542,14 @@ public class FormattingProvider {
     /**
      * Convert an Eclipse {@link org.eclipse.text.edits.TextEdit} tree into
      * a flat list of LSP {@link TextEdit} objects.
+     * <p>
+     * Groovy uses newlines as statement terminators (unlike Java which uses
+     * semicolons). The JDT formatter may produce edits that collapse newlines
+     * — valid for Java but destructive for Groovy when the newline separates
+     * independent statements. Edits that remove newlines are allowed only when
+     * the context indicates a continuation (e.g. chained method calls,
+     * multi-line expressions). Edits that would collapse statement boundaries
+     * are rejected.
      */
     private List<TextEdit> convertEdits(org.eclipse.text.edits.TextEdit eclipseEdit,
                                          String source) {
@@ -526,11 +560,21 @@ public class FormattingProvider {
             for (org.eclipse.text.edits.TextEdit child : eclipseEdit.getChildren()) {
                 lspEdits.addAll(convertEdits(child, source));
             }
-        } else if (eclipseEdit instanceof ReplaceEdit) {
-            ReplaceEdit replace = (ReplaceEdit) eclipseEdit;
+        } else if (eclipseEdit instanceof ReplaceEdit replace) {
             int offset = replace.getOffset();
             int length = replace.getLength();
             String newText = replace.getText();
+
+            // Guard: reject edits that would collapse Groovy statement boundaries.
+            // Continuation-style breaks (chained calls, multi-line args) are fine.
+            String originalSpan = source.substring(offset, Math.min(offset + length, source.length()));
+            long originalNewlines = originalSpan.chars().filter(c -> c == '\n').count();
+            long replacementNewlines = newText.chars().filter(c -> c == '\n').count();
+            if (replacementNewlines < originalNewlines
+                    && !isNewlineRemovalSafe(source, offset, length)) {
+                // Skip — this edit would merge independent Groovy statements
+                return lspEdits;
+            }
 
             Position start = offsetToPosition(source, offset);
             Position end = offsetToPosition(source, offset + length);
@@ -538,6 +582,71 @@ public class FormattingProvider {
         }
 
         return lspEdits;
+    }
+
+    /**
+     * Check whether removing newlines in the given source span is safe.
+     * <p>
+     * Returns {@code true} if every newline in the span sits in a
+     * <em>continuation context</em> — meaning the code before/after it
+     * indicates the expression continues across the line break (e.g.
+     * {@code obj.\n  method()}, {@code foo(a,\n  b)}). Returns {@code false}
+     * if any newline appears to separate two independent statements.
+     */
+    private boolean isNewlineRemovalSafe(String source, int offset, int length) {
+        int end = Math.min(offset + length, source.length());
+
+        for (int i = offset; i < end; i++) {
+            if (source.charAt(i) == '\n') {
+                char before = lastNonWhitespaceBefore(source, i);
+                char after = firstNonWhitespaceAfter(source, i + 1);
+
+                if (!isContinuationContext(before, after)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private char lastNonWhitespaceBefore(String source, int index) {
+        for (int i = index - 1; i >= 0; i--) {
+            char c = source.charAt(i);
+            if (c != ' ' && c != '\t' && c != '\r') {
+                return c;
+            }
+        }
+        return '\0';
+    }
+
+    private char firstNonWhitespaceAfter(String source, int index) {
+        for (int i = index; i < source.length(); i++) {
+            char c = source.charAt(i);
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                return c;
+            }
+        }
+        return '\0';
+    }
+
+    /**
+     * Determine whether a line break between two tokens is a continuation
+     * (safe to remove) rather than a Groovy statement boundary.
+     * <p>
+     * A break is a continuation if the token before ends with an operator or
+     * open delimiter that requires more input, or the token after starts with
+     * a closing delimiter or member-access dot.
+     */
+    private boolean isContinuationContext(char before, char after) {
+        // Line ends with an operator / open delimiter → expression continues
+        if (".,([{+*/-=%?&|\\".indexOf(before) >= 0) {
+            return true;
+        }
+        // Line after starts with dot (chained call) or closing bracket
+        if (".)]},".indexOf(after) >= 0) {
+            return true;
+        }
+        return false;
     }
 
     // ================================================================

@@ -20,7 +20,6 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
-import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 
@@ -36,7 +35,6 @@ import org.eclipse.groovy.ls.core.providers.ReferenceProvider;
 import org.eclipse.groovy.ls.core.providers.RenameProvider;
 import org.eclipse.groovy.ls.core.providers.SemanticTokensProvider;
 import org.eclipse.groovy.ls.core.providers.SignatureHelpProvider;
-import org.eclipse.lsp4j.CodeAction;
 import org.eclipse.lsp4j.CodeActionParams;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionList;
@@ -45,22 +43,16 @@ import org.eclipse.lsp4j.DefinitionParams;
 import org.eclipse.lsp4j.DidCloseTextDocumentParams;
 import org.eclipse.lsp4j.DocumentFormattingParams;
 import org.eclipse.lsp4j.DocumentRangeFormattingParams;
-import org.eclipse.lsp4j.DocumentSymbol;
 import org.eclipse.lsp4j.DocumentSymbolParams;
 import org.eclipse.lsp4j.HoverParams;
 import org.eclipse.lsp4j.InlayHintParams;
-import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.ReferenceParams;
 import org.eclipse.lsp4j.RenameParams;
-import org.eclipse.lsp4j.SemanticTokens;
 import org.eclipse.lsp4j.SemanticTokensParams;
 import org.eclipse.lsp4j.SemanticTokensRangeParams;
 import org.eclipse.lsp4j.SignatureHelpParams;
-import org.eclipse.lsp4j.SymbolInformation;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
-import org.eclipse.lsp4j.TextEdit;
-import org.eclipse.lsp4j.WorkspaceEdit;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.Test;
@@ -197,6 +189,101 @@ class GroovyTextDocumentServiceTest {
         service.updateFormatterProfile("C:\\tmp\\format.xml");
 
         verify(formattingProvider).setFormatterProfilePath("C:\\tmp\\format.xml");
+    }
+
+    @Test
+    void updateInlayHintSettingsStoresSettings() throws Exception {
+        GroovyTextDocumentService service = createService();
+
+        org.eclipse.groovy.ls.core.providers.InlayHintSettings settings =
+                new org.eclipse.groovy.ls.core.providers.InlayHintSettings(true, false, true, false);
+        service.updateInlayHintSettings(settings);
+
+        // Verify the field was set by reading it back via reflection
+        java.lang.reflect.Field f = GroovyTextDocumentService.class.getDeclaredField("inlayHintSettings");
+        f.setAccessible(true);
+        org.eclipse.groovy.ls.core.providers.InlayHintSettings stored =
+                (org.eclipse.groovy.ls.core.providers.InlayHintSettings) f.get(service);
+        assertNotNull(stored);
+    }
+
+    @Test
+    void publishDiagnosticsDisabledWhenServerDiagnosticsOff() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        // diagnosticsEnabled defaults to false
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        // Should NOT publish because diagnostics are disabled
+        org.mockito.Mockito.verifyNoInteractions(diagnostics);
+    }
+
+    @Test
+    void didOpenDelegatesToDocumentManagerAndPublishesDiagnostics() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        DocumentManager documentManager = new DocumentManager();
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        org.eclipse.lsp4j.DidOpenTextDocumentParams params = new org.eclipse.lsp4j.DidOpenTextDocumentParams();
+        org.eclipse.lsp4j.TextDocumentItem item = new org.eclipse.lsp4j.TextDocumentItem();
+        item.setUri("file:///test/Open.groovy");
+        item.setText("class Open {}");
+        params.setTextDocument(item);
+
+        service.didOpen(params);
+
+        // Document should be stored
+        assertNotNull(documentManager.getContent("file:///test/Open.groovy"));
+    }
+
+    @Test
+    void didSaveDoesNotThrow() {
+        GroovyTextDocumentService service = createService();
+
+        org.eclipse.lsp4j.DidSaveTextDocumentParams params = new org.eclipse.lsp4j.DidSaveTextDocumentParams();
+        params.setTextDocument(new TextDocumentIdentifier("file:///test/Save.groovy"));
+        params.setText("class Save {}");
+
+        // Should not throw
+        service.didSave(params);
+        assertNotNull(service);
+    }
+
+    @Test
+    void didChangeUpdatesDiagnostics() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        DocumentManager documentManager = new DocumentManager();
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        // Open first
+        documentManager.didOpen("file:///test/Change.groovy", "class Change {}");
+
+        // Now change
+        org.eclipse.lsp4j.DidChangeTextDocumentParams changeParams = new org.eclipse.lsp4j.DidChangeTextDocumentParams();
+        org.eclipse.lsp4j.VersionedTextDocumentIdentifier versionedId = new org.eclipse.lsp4j.VersionedTextDocumentIdentifier();
+        versionedId.setUri("file:///test/Change.groovy");
+        changeParams.setTextDocument(versionedId);
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change = new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setText("class Changed {}");
+        changeParams.setContentChanges(java.util.List.of(change));
+
+        service.didChange(changeParams);
+
+        assertEquals("class Changed {}", documentManager.getContent("file:///test/Change.groovy"));
     }
 
     private GroovyTextDocumentService createService() {

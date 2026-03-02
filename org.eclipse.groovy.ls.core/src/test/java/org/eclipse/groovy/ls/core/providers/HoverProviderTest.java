@@ -10,9 +10,12 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 
@@ -23,8 +26,17 @@ import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
+import org.eclipse.jdt.core.Flags;
+import org.eclipse.jdt.core.IAnnotation;
+import org.eclipse.jdt.core.IField;
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.ILocalVariable;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IType;
 import org.eclipse.lsp4j.Hover;
+import org.eclipse.lsp4j.HoverParams;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -227,6 +239,116 @@ class HoverProviderTest {
         assertTrue(hover.contains("(property)"));
     }
 
+    // ---- Additional edge cases ----
+
+    @Test
+    void positionToOffsetThirdLine() throws Exception {
+        assertEquals(14, invokePositionToOffset("hello\nworld\nabc", new Position(2, 2)));
+    }
+
+    @Test
+    void positionToOffsetEmptyContent() throws Exception {
+        assertEquals(0, invokePositionToOffset("", new Position(0, 0)));
+    }
+
+    @Test
+    void simpleNameEmptyString() throws Exception {
+        assertEquals("", invokeSimpleName(""));
+    }
+
+    @Test
+    void simpleNameDotOnly() throws Exception {
+        assertEquals("", invokeSimpleName("just."));
+    }
+
+    @Test
+    void extractWordAtWithUnderscore() throws Exception {
+        assertEquals("my_var", invokeExtractWordAt("int my_var = 5", 6));
+    }
+
+    @Test
+    void buildClassHoverTrait() throws Exception {
+        ModuleNode module = parseModule("trait Flyable { void fly() {} }",
+                "file:///TraitHover.groovy");
+        ClassNode cls = findClass(module, "Flyable");
+        String hover = invokeBuildClassHover(cls);
+        assertNotNull(hover);
+        assertTrue(hover.contains("Flyable"));
+    }
+
+    @Test
+    void buildMethodHoverStaticMethod() throws Exception {
+        ModuleNode module = parseModule("class Util { static String encode(String input) { input } }",
+                "file:///StaticHover.groovy");
+        MethodNode method = findMethod(module, "Util", "encode");
+        String hover = invokeBuildMethodHover(method);
+        assertNotNull(hover);
+        assertTrue(hover.contains("encode"));
+        assertTrue(hover.contains("String"));
+    }
+
+    @Test
+    void buildFieldHoverStaticFinal() throws Exception {
+        ModuleNode module = parseModule("class Config { static final String NAME = 'app' }",
+                "file:///StaticFieldHover.groovy");
+        FieldNode field = findField(module, "Config", "NAME");
+        String hover = invokeBuildFieldHover(field);
+        assertNotNull(hover);
+        assertTrue(hover.contains("NAME"));
+    }
+
+    @Test
+    void getHoverFromGroovyASTForFieldInClass() throws Exception {
+        String uri = "file:///HoverASTField.groovy";
+        String content = "class Config {\n  String host = 'localhost'\n}";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
+
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(1, 12));
+        assertNotNull(hover);
+
+        dm.didClose(uri);
+    }
+
+    @Test
+    void getHoverFromGroovyASTReturnsNullForMissingDocument() throws Exception {
+        HoverProvider hp = new HoverProvider(new DocumentManager());
+
+        Hover hover = invokeGetHoverFromGroovyAST(hp, "file:///NonExistent.groovy", new Position(0, 0));
+        assertNull(hover);
+    }
+
+    @Test
+    void getHoverFromGroovyASTForEnum() throws Exception {
+        String uri = "file:///HoverASTEnum.groovy";
+        String content = "enum Status { ACTIVE, INACTIVE }";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
+
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(0, 8));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("Status"));
+
+        dm.didClose(uri);
+    }
+
+    @Test
+    void getHoverFromGroovyASTForInterface() throws Exception {
+        String uri = "file:///HoverASTIface.groovy";
+        String content = "interface Greeter { void greet(String name) }";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
+
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(0, 14));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("Greeter"));
+
+        dm.didClose(uri);
+    }
+
     // ---- buildASTHover ----
 
     @Test
@@ -292,8 +414,337 @@ class HoverProviderTest {
     }
 
     // ================================================================
+    // JDT Mock Tests — buildHoverContent
+    // ================================================================
+
+    @Test
+    void buildHoverContentForMockedType() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getElementType()).thenReturn(IJavaElement.TYPE);
+        when(type.getElementName()).thenReturn("MyService");
+        when(type.getFlags()).thenReturn(Flags.AccPublic);
+        when(type.isInterface()).thenReturn(false);
+        when(type.isEnum()).thenReturn(false);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(type.getSuperclassName()).thenReturn("BaseService");
+        when(type.getSuperInterfaceNames()).thenReturn(new String[]{"Runnable"});
+        when(type.getFullyQualifiedName()).thenReturn("com.example.MyService");
+
+        String hover = invokeBuildHoverContent(type);
+        assertNotNull(hover);
+        assertTrue(hover.contains("class"));
+        assertTrue(hover.contains("MyService"));
+        assertTrue(hover.contains("extends"));
+        assertTrue(hover.contains("BaseService"));
+        assertTrue(hover.contains("implements"));
+        assertTrue(hover.contains("Runnable"));
+        assertTrue(hover.contains("com.example"));
+    }
+
+    @Test
+    void buildHoverContentForMockedInterface() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getElementType()).thenReturn(IJavaElement.TYPE);
+        when(type.getElementName()).thenReturn("Greeter");
+        when(type.getFlags()).thenReturn(Flags.AccPublic | Flags.AccInterface);
+        when(type.isInterface()).thenReturn(true);
+        when(type.isEnum()).thenReturn(false);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(type.getSuperclassName()).thenReturn(null);
+        when(type.getSuperInterfaceNames()).thenReturn(new String[]{"Serializable"});
+        when(type.getFullyQualifiedName()).thenReturn("com.example.Greeter");
+
+        String hover = invokeBuildHoverContent(type);
+        assertNotNull(hover);
+        assertTrue(hover.contains("interface"));
+        assertTrue(hover.contains("Greeter"));
+        assertTrue(hover.contains("Serializable"));
+    }
+
+    @Test
+    void buildHoverContentForMockedEnum() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getElementType()).thenReturn(IJavaElement.TYPE);
+        when(type.getElementName()).thenReturn("Color");
+        when(type.getFlags()).thenReturn(Flags.AccPublic | Flags.AccEnum);
+        when(type.isInterface()).thenReturn(false);
+        when(type.isEnum()).thenReturn(true);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(type.getSuperclassName()).thenReturn("Enum");
+        when(type.getSuperInterfaceNames()).thenReturn(new String[0]);
+        when(type.getFullyQualifiedName()).thenReturn("com.example.Color");
+
+        String hover = invokeBuildHoverContent(type);
+        assertNotNull(hover);
+        assertTrue(hover.contains("enum"));
+        assertTrue(hover.contains("Color"));
+    }
+
+    @Test
+    void buildHoverContentForMockedTraitType() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getElementType()).thenReturn(IJavaElement.TYPE);
+        when(type.getElementName()).thenReturn("Flyable");
+        when(type.getFlags()).thenReturn(Flags.AccPublic);
+        when(type.isInterface()).thenReturn(true);
+        when(type.isEnum()).thenReturn(false);
+        IAnnotation traitAnn = mock(IAnnotation.class);
+        when(traitAnn.getElementName()).thenReturn("Trait");
+        when(type.getAnnotations()).thenReturn(new IAnnotation[]{traitAnn});
+        when(type.getSuperclassName()).thenReturn(null);
+        when(type.getSuperInterfaceNames()).thenReturn(new String[0]);
+        when(type.getFullyQualifiedName()).thenReturn("com.example.Flyable");
+
+        String hover = invokeBuildHoverContent(type);
+        assertNotNull(hover);
+        assertTrue(hover.contains("trait"));
+        assertTrue(hover.contains("Flyable"));
+    }
+
+    @Test
+    void buildHoverContentForMockedMethod() throws Exception {
+        IMethod method = mock(IMethod.class);
+        when(method.getElementType()).thenReturn(IJavaElement.METHOD);
+        when(method.getElementName()).thenReturn("process");
+        when(method.getFlags()).thenReturn(Flags.AccPublic);
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getReturnType()).thenReturn("QString;");
+        when(method.getParameterTypes()).thenReturn(new String[]{"I", "QString;"});
+        when(method.getParameterNames()).thenReturn(new String[]{"count", "name"});
+        when(method.getExceptionTypes()).thenReturn(new String[0]);
+        IType declaringType = mock(IType.class);
+        when(declaringType.getFullyQualifiedName()).thenReturn("com.example.Service");
+        when(method.getDeclaringType()).thenReturn(declaringType);
+
+        String hover = invokeBuildHoverContent(method);
+        assertNotNull(hover);
+        assertTrue(hover.contains("process"));
+        assertTrue(hover.contains("String"));
+        assertTrue(hover.contains("count"));
+        assertTrue(hover.contains("name"));
+        assertTrue(hover.contains("com.example.Service"));
+    }
+
+    @Test
+    void buildHoverContentForMockedConstructor() throws Exception {
+        IMethod method = mock(IMethod.class);
+        when(method.getElementType()).thenReturn(IJavaElement.METHOD);
+        when(method.getElementName()).thenReturn("MyClass");
+        when(method.getFlags()).thenReturn(Flags.AccPublic);
+        when(method.isConstructor()).thenReturn(true);
+        when(method.getParameterTypes()).thenReturn(new String[]{"QString;"});
+        when(method.getParameterNames()).thenReturn(new String[]{"name"});
+        when(method.getExceptionTypes()).thenReturn(new String[0]);
+        IType declaringType = mock(IType.class);
+        when(declaringType.getFullyQualifiedName()).thenReturn("com.example.MyClass");
+        when(method.getDeclaringType()).thenReturn(declaringType);
+
+        String hover = invokeBuildHoverContent(method);
+        assertNotNull(hover);
+        assertTrue(hover.contains("MyClass"));
+        assertTrue(hover.contains("name"));
+    }
+
+    @Test
+    void buildHoverContentForMockedMethodWithExceptions() throws Exception {
+        IMethod method = mock(IMethod.class);
+        when(method.getElementType()).thenReturn(IJavaElement.METHOD);
+        when(method.getElementName()).thenReturn("riskyOp");
+        when(method.getFlags()).thenReturn(Flags.AccPublic);
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getReturnType()).thenReturn("V");
+        when(method.getParameterTypes()).thenReturn(new String[0]);
+        when(method.getParameterNames()).thenReturn(new String[0]);
+        when(method.getExceptionTypes()).thenReturn(new String[]{"QIOException;"});
+        when(method.getDeclaringType()).thenReturn(null);
+
+        String hover = invokeBuildHoverContent(method);
+        assertNotNull(hover);
+        assertTrue(hover.contains("throws"));
+        assertTrue(hover.contains("IOException"));
+    }
+
+    @Test
+    void buildHoverContentForMockedField() throws Exception {
+        IField field = mock(IField.class);
+        when(field.getElementType()).thenReturn(IJavaElement.FIELD);
+        when(field.getElementName()).thenReturn("count");
+        when(field.getFlags()).thenReturn(Flags.AccPrivate);
+        when(field.getTypeSignature()).thenReturn("I");
+        when(field.getConstant()).thenReturn(null);
+        IType declaringType = mock(IType.class);
+        when(declaringType.getFullyQualifiedName()).thenReturn("com.example.Counter");
+        when(field.getDeclaringType()).thenReturn(declaringType);
+
+        String hover = invokeBuildHoverContent(field);
+        assertNotNull(hover);
+        assertTrue(hover.contains("int"));
+        assertTrue(hover.contains("count"));
+        assertTrue(hover.contains("com.example.Counter"));
+    }
+
+    @Test
+    void buildHoverContentForMockedFieldWithConstant() throws Exception {
+        IField field = mock(IField.class);
+        when(field.getElementType()).thenReturn(IJavaElement.FIELD);
+        when(field.getElementName()).thenReturn("MAX");
+        when(field.getFlags()).thenReturn(Flags.AccPublic | Flags.AccStatic | Flags.AccFinal);
+        when(field.getTypeSignature()).thenReturn("I");
+        when(field.getConstant()).thenReturn(100);
+        when(field.getDeclaringType()).thenReturn(null);
+
+        String hover = invokeBuildHoverContent(field);
+        assertNotNull(hover);
+        assertTrue(hover.contains("MAX"));
+        assertTrue(hover.contains("= 100"));
+    }
+
+    @Test
+    void buildHoverContentForMockedLocalVariable() throws Exception {
+        ILocalVariable local = mock(ILocalVariable.class);
+        when(local.getElementType()).thenReturn(IJavaElement.LOCAL_VARIABLE);
+        when(local.getElementName()).thenReturn("temp");
+        when(local.getTypeSignature()).thenReturn("QString;");
+
+        String hover = invokeBuildHoverContent(local);
+        assertNotNull(hover);
+        assertTrue(hover.contains("String"));
+        assertTrue(hover.contains("temp"));
+        assertTrue(hover.contains("local variable"));
+    }
+
+    @Test
+    void buildHoverContentForUnknownElementType() throws Exception {
+        IJavaElement element = mock(IJavaElement.class);
+        when(element.getElementType()).thenReturn(IJavaElement.PACKAGE_FRAGMENT);
+        when(element.getElementName()).thenReturn("com.example");
+
+        String hover = invokeBuildHoverContent(element);
+        assertNotNull(hover);
+        assertTrue(hover.contains("com.example"));
+    }
+
+    // ---- isTrait via mock ----
+
+    @Test
+    void isTraitReturnsTrueForTraitAnnotation() throws Exception {
+        IType type = mock(IType.class);
+        IAnnotation ann = mock(IAnnotation.class);
+        when(ann.getElementName()).thenReturn("groovy.transform.Trait");
+        when(type.getAnnotations()).thenReturn(new IAnnotation[]{ann});
+
+        boolean result = invokeIsTrait(type);
+        assertTrue(result);
+    }
+
+    @Test
+    void isTraitReturnsFalseForNoAnnotations() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+
+        boolean result = invokeIsTrait(type);
+        assertFalse(result);
+    }
+
+    @Test
+    void isTraitReturnsTrueForSimpleTraitAnnotation() throws Exception {
+        IType type = mock(IType.class);
+        IAnnotation ann = mock(IAnnotation.class);
+        when(ann.getElementName()).thenReturn("Trait");
+        when(type.getAnnotations()).thenReturn(new IAnnotation[]{ann});
+
+        boolean result = invokeIsTrait(type);
+        assertTrue(result);
+    }
+
+    // ---- getHover with mock (tests JDT codeSelect path) ----
+
+    @Test
+    void getHoverReturnsFallbackWhenNoWorkingCopy() {
+        DocumentManager dm = new DocumentManager();
+        String uri = "file:///HoverMockNoWC.groovy";
+        dm.didOpen(uri, "class Abc {}");
+        HoverProvider hp = new HoverProvider(dm);
+
+        HoverParams params = new HoverParams(
+                new TextDocumentIdentifier(uri), new Position(0, 8));
+        Hover hover = hp.getHover(params);
+        // Should try AST fallback; class name hover
+        assertNotNull(hover);
+        dm.didClose(uri);
+    }
+
+    @Test
+    void getHoverReturnsNullForNoContent() {
+        DocumentManager dm = new DocumentManager();
+        HoverProvider hp = new HoverProvider(dm);
+
+        HoverParams params = new HoverParams(
+                new TextDocumentIdentifier("file:///Missing.groovy"), new Position(0, 0));
+        Hover hover = hp.getHover(params);
+        assertNull(hover);
+    }
+
+    // ---- resolveTraitMemberHover via AST ----
+
+    @Test
+    void getHoverFromGroovyASTForPropertyInClass() throws Exception {
+        String uri = "file:///HoverASTProp.groovy";
+        String content = "class Config {\n  String host\n}";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
+
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(1, 12));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("host"));
+        dm.didClose(uri);
+    }
+
+    @Test
+    void getHoverFromGroovyASTForTraitMember() throws Exception {
+        String uri = "file:///HoverASTTrait.groovy";
+        String content = "trait Flyable {\n  void fly() {}\n}\nclass Bird implements Flyable {}";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
+
+        // Hover on "fly" in the trait itself
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(1, 9));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("fly"));
+        dm.didClose(uri);
+    }
+
+    @Test
+    void getHoverFromGroovyASTForClassWithExtends() throws Exception {
+        String uri = "file:///HoverASTExtends.groovy";
+        String content = "class Base {}\nclass Child extends Base {}";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
+
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(1, 8));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("Child"));
+        dm.didClose(uri);
+    }
+
+    // ================================================================
     // Reflection helpers
     // ================================================================
+
+    private String invokeBuildHoverContent(IJavaElement element) throws Exception {
+        Method m = HoverProvider.class.getDeclaredMethod("buildHoverContent", IJavaElement.class);
+        m.setAccessible(true);
+        return (String) m.invoke(provider, element);
+    }
+
+    private boolean invokeIsTrait(IType type) throws Exception {
+        Method m = HoverProvider.class.getDeclaredMethod("isTrait", IType.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(provider, type);
+    }
 
     private int invokePositionToOffset(String content, Position position) throws Exception {
         Method m = HoverProvider.class.getDeclaredMethod("positionToOffset", String.class, Position.class);

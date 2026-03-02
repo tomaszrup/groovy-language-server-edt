@@ -34,15 +34,23 @@ public class GroovyLanguageServerPlugin extends Plugin {
     @Override
     public void start(BundleContext context) throws Exception {
         super.start(context);
-        instance = this;
+        setInstance(this);
         logInfo("Groovy Language Server plugin activated.");
     }
 
     @Override
     public void stop(BundleContext context) throws Exception {
+        clearPluginState();
+        super.stop(context);
+    }
+
+    private static void setInstance(GroovyLanguageServerPlugin plugin) {
+        instance = plugin;
+    }
+
+    private static void clearPluginState() {
         instance = null;
         languageServer = null;
-        super.stop(context);
     }
 
     /**

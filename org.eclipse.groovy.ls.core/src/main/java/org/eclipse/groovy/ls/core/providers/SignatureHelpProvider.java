@@ -22,6 +22,7 @@ import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.Signature;
 import org.eclipse.lsp4j.ParameterInformation;
 import org.eclipse.lsp4j.Position;
@@ -54,60 +55,88 @@ public class SignatureHelpProvider {
         Position position = params.getPosition();
 
         ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-        if (workingCopy != null) {
-            try {
-                String content = documentManager.getContent(uri);
-                if (content != null) {
-                    int offset = positionToOffset(content, position);
-
-                    // Walk backwards to find the method name before the '('
-                    int methodNameEnd = findMethodNameEnd(content, offset);
-                    if (methodNameEnd >= 0) {
-                        // Count commas before cursor to determine active parameter
-                        int activeParameter = countCommas(content, methodNameEnd + 1, offset);
-
-                        // Try to resolve the method element at the call site
-                        IJavaElement[] elements = workingCopy.codeSelect(methodNameEnd, 0);
-                        if (elements != null && elements.length > 0) {
-                            List<SignatureInformation> signatures = new ArrayList<>();
-
-                            for (IJavaElement element : elements) {
-                                if (element instanceof IMethod) {
-                                    SignatureInformation sig = toSignatureInformation((IMethod) element);
-                                    if (sig != null) {
-                                        signatures.add(sig);
-                                    }
-                                } else if (element instanceof IType) {
-                                    // Constructor call — enumerate constructors
-                                    IType type = (IType) element;
-                                    for (IMethod constructor : type.getMethods()) {
-                                        if (constructor.isConstructor()) {
-                                            SignatureInformation sig = toSignatureInformation(constructor);
-                                            if (sig != null) {
-                                                signatures.add(sig);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (!signatures.isEmpty()) {
-                                SignatureHelp help = new SignatureHelp();
-                                help.setSignatures(signatures);
-                                help.setActiveSignature(0);
-                                help.setActiveParameter(activeParameter);
-                                return help;
-                            }
-                        }
-                    }
-                }
-            } catch (Throwable t) {
-                GroovyLanguageServerPlugin.logError("Signature help JDT failed for " + uri + ", falling back to AST", t);
-            }
+        SignatureHelp jdtHelp = getSignatureHelpFromJdt(uri, position, workingCopy);
+        if (jdtHelp != null) {
+            return jdtHelp;
         }
 
         // Fallback: use Groovy AST to find method signatures
         return getSignatureHelpFromGroovyAST(uri, position);
+    }
+
+    private SignatureHelp getSignatureHelpFromJdt(String uri,
+            Position position,
+            ICompilationUnit workingCopy) {
+        if (workingCopy == null) {
+            return null;
+        }
+
+        try {
+            String content = documentManager.getContent(uri);
+            SignatureContext context = resolveSignatureContext(content, position);
+            if (context == null) {
+                return null;
+            }
+
+            List<SignatureInformation> signatures = collectJdtSignatures(workingCopy, context.methodNameEnd);
+            return createSignatureHelp(signatures, context.activeParameter);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Signature help JDT failed for " + uri + ", falling back to AST", e);
+            return null;
+        }
+    }
+
+    private SignatureContext resolveSignatureContext(String content, Position position) {
+        if (content == null || position == null) {
+            return null;
+        }
+
+        int offset = positionToOffset(content, position);
+        int methodNameEnd = findMethodNameEnd(content, offset);
+        if (methodNameEnd < 0) {
+            return null;
+        }
+
+        int activeParameter = countCommas(content, methodNameEnd + 1, offset);
+        return new SignatureContext(methodNameEnd, activeParameter);
+    }
+
+    private List<SignatureInformation> collectJdtSignatures(ICompilationUnit workingCopy, int methodNameEnd)
+            throws JavaModelException {
+        List<SignatureInformation> signatures = new ArrayList<>();
+        IJavaElement[] elements = workingCopy.codeSelect(methodNameEnd, 0);
+        if (elements == null || elements.length == 0) {
+            return signatures;
+        }
+
+        for (IJavaElement element : elements) {
+            addJdtSignaturesForElement(signatures, element);
+        }
+        return signatures;
+    }
+
+    private void addJdtSignaturesForElement(List<SignatureInformation> signatures, IJavaElement element)
+            throws JavaModelException {
+        if (element instanceof IMethod methodElement) {
+            addJdtSignature(signatures, methodElement);
+            return;
+        }
+
+        if (element instanceof IType typeElement) {
+            for (IMethod constructor : typeElement.getMethods()) {
+                if (constructor.isConstructor()) {
+                    addJdtSignature(signatures, constructor);
+                }
+            }
+        }
+    }
+
+    private void addJdtSignature(List<SignatureInformation> signatures, IMethod method) {
+        SignatureInformation signature = toSignatureInformation(method);
+        if (signature != null) {
+            signatures.add(signature);
+        }
     }
 
     /**
@@ -214,65 +243,64 @@ public class SignatureHelpProvider {
      */
     private SignatureHelp getSignatureHelpFromGroovyAST(String uri, Position position) {
         String content = documentManager.getContent(uri);
-        if (content == null) {
-            return null;
-        }
-
         ModuleNode ast = documentManager.getGroovyAST(uri);
-        if (ast == null) {
+        SignatureContext context = resolveSignatureContext(content, position);
+        if (ast == null || context == null) {
             return null;
         }
 
-        int offset = positionToOffset(content, position);
-
-        // Walk backwards to find the method name before the '('
-        int methodNameEnd = findMethodNameEnd(content, offset);
-        if (methodNameEnd < 0) {
-            return null;
-        }
-
-        // Count commas to determine active parameter
-        int activeParameter = countCommas(content, methodNameEnd + 1, offset);
-
-        // Extract the method name
-        String methodName = extractWordAt(content, methodNameEnd);
+        String methodName = extractWordAt(content, context.methodNameEnd);
         if (methodName == null || methodName.isEmpty()) {
             return null;
         }
 
-        // Search the AST for methods with this name
+        List<SignatureInformation> signatures = collectAstSignatures(ast, methodName);
+        return createSignatureHelp(signatures, context.activeParameter);
+    }
+
+    private List<SignatureInformation> collectAstSignatures(ModuleNode ast, String methodName) {
         List<SignatureInformation> signatures = new ArrayList<>();
         for (ClassNode classNode : ast.getClasses()) {
-            // Check if it's a constructor call (class name matches)
-            if (classNode.getNameWithoutPackage().equals(methodName)) {
-                // Find declared constructors
-                for (MethodNode method : classNode.getDeclaredConstructors()) {
-                    SignatureInformation sig = astMethodToSignature(method);
-                    if (sig != null) {
-                        signatures.add(sig);
-                    }
-                }
-                // If no explicit constructors, add default
-                if (signatures.isEmpty()) {
-                    SignatureInformation sig = new SignatureInformation();
-                    sig.setLabel(classNode.getNameWithoutPackage() + "()");
-                    sig.setParameters(new ArrayList<>());
-                    signatures.add(sig);
-                }
-            }
+            addAstConstructorSignatures(signatures, classNode, methodName);
+            addAstMethodSignatures(signatures, classNode, methodName);
+        }
+        return signatures;
+    }
 
-            // Check methods
-            for (MethodNode method : classNode.getMethods()) {
-                if (method.getName().equals(methodName)) {
-                    SignatureInformation sig = astMethodToSignature(method);
-                    if (sig != null) {
-                        signatures.add(sig);
-                    }
-                }
-            }
+    private void addAstConstructorSignatures(List<SignatureInformation> signatures,
+            ClassNode classNode,
+            String methodName) {
+        if (!classNode.getNameWithoutPackage().equals(methodName)) {
+            return;
         }
 
-        if (signatures.isEmpty()) {
+        int beforeCount = signatures.size();
+        for (MethodNode constructor : classNode.getDeclaredConstructors()) {
+            SignatureInformation signature = astMethodToSignature(constructor);
+            signatures.add(signature);
+        }
+
+        if (signatures.size() == beforeCount) {
+            SignatureInformation defaultConstructor = new SignatureInformation();
+            defaultConstructor.setLabel(classNode.getNameWithoutPackage() + "()");
+            defaultConstructor.setParameters(new ArrayList<>());
+            signatures.add(defaultConstructor);
+        }
+    }
+
+    private void addAstMethodSignatures(List<SignatureInformation> signatures,
+            ClassNode classNode,
+            String methodName) {
+        for (MethodNode method : classNode.getMethods()) {
+            if (methodName.equals(method.getName())) {
+                SignatureInformation signature = astMethodToSignature(method);
+                signatures.add(signature);
+            }
+        }
+    }
+
+    private SignatureHelp createSignatureHelp(List<SignatureInformation> signatures, int activeParameter) {
+        if (signatures == null || signatures.isEmpty()) {
             return null;
         }
 
@@ -281,6 +309,16 @@ public class SignatureHelpProvider {
         help.setActiveSignature(0);
         help.setActiveParameter(activeParameter);
         return help;
+    }
+
+    private static final class SignatureContext {
+        private final int methodNameEnd;
+        private final int activeParameter;
+
+        private SignatureContext(int methodNameEnd, int activeParameter) {
+            this.methodNameEnd = methodNameEnd;
+            this.activeParameter = activeParameter;
+        }
     }
 
     /**

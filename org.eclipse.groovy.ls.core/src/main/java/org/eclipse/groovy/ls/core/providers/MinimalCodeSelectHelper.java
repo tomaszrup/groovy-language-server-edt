@@ -12,7 +12,6 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
@@ -23,14 +22,10 @@ import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.codehaus.groovy.ast.expr.ClassExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
-import org.codehaus.groovy.ast.expr.MethodCallExpression;
-import org.codehaus.groovy.ast.expr.PropertyExpression;
-import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.control.SourceUnit;
 import org.codehaus.jdt.groovy.model.GroovyCompilationUnit;
 import org.codehaus.jdt.groovy.model.ICodeSelectHelper;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
-import org.eclipse.groovy.ls.core.providers.TraitMemberResolver;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
@@ -51,6 +46,31 @@ import org.eclipse.jdt.core.JavaModelException;
  */
 public class MinimalCodeSelectHelper implements ICodeSelectHelper {
 
+    private static final String LOG_FIELDS = " fields=";
+    private static final String LOG_METHODS = " methods=";
+    private static final String PKG_GROOVY_LANG = "groovy.lang.";
+    private static final String PKG_GROOVY_UTIL = "groovy.util.";
+    private static final String PKG_JAVA_LANG = "java.lang.";
+    private static final String PKG_JAVA_UTIL = "java.util.";
+    private static final String PKG_JAVA_IO = "java.io.";
+    private static final String PKG_JAVA_NET = "java.net.";
+    private static final String PKG_JAVA_MATH = "java.math.";
+    private static final String[] TRAIT_AUTO_PACKAGES = {
+        PKG_GROOVY_LANG,
+        PKG_GROOVY_UTIL,
+        PKG_JAVA_LANG,
+        PKG_JAVA_UTIL
+    };
+    private static final String[] DEFAULT_AUTO_PACKAGES = {
+        PKG_JAVA_LANG,
+        PKG_JAVA_UTIL,
+        PKG_JAVA_IO,
+        PKG_JAVA_NET,
+        PKG_GROOVY_LANG,
+        PKG_GROOVY_UTIL,
+        PKG_JAVA_MATH
+    };
+
     @Override
     public IJavaElement[] select(GroovyCompilationUnit unit, int offset, int length) {
         try {
@@ -65,12 +85,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
 
             // Extract the word at the cursor position
-            String source = null;
-            try {
-                source = unit.getSource();
-            } catch (Exception e) {
-                // ignore
-            }
+            String source = getUnitSource(unit);
             if (source == null) {
                 return new IJavaElement[0];
             }
@@ -96,7 +111,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
 
             // 2. Check if cursor is on a class declaration or type reference in the AST
-            String fqnFromAST = resolveTypeFromAST(module, word, offset, source);
+            String fqnFromAST = resolveTypeFromAST(module, word);
             if (fqnFromAST != null) {
                 IType type = javaProject.findType(fqnFromAST);
                 if (type != null) {
@@ -122,11 +137,19 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
                 return results.toArray(new IJavaElement[0]);
             }
 
-        } catch (Throwable e) {
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[codeSelect] Failed", e);
         }
 
         return new IJavaElement[0];
+    }
+
+    private String getUnitSource(GroovyCompilationUnit unit) {
+        try {
+            return unit.getSource();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -165,97 +188,144 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      * Checks class declarations, extends/implements, field types, method return types,
      * parameter types, constructor calls, class expressions, etc.
      */
-    private String resolveTypeFromAST(ModuleNode module, String word, int offset, String source) {
-        // Check class declarations themselves (extends/implements)
+    private String resolveTypeFromAST(ModuleNode module, String word) {
+        String resolvedFromDeclarations = resolveTypeFromClassDeclarations(module, word);
+        if (resolvedFromDeclarations != null) {
+            return resolvedFromDeclarations;
+        }
+        return resolveTypeFromExpressions(module, word);
+    }
+
+    private String resolveTypeFromClassDeclarations(ModuleNode module, String word) {
         for (ClassNode classNode : module.getClasses()) {
-            if (classNode.getLineNumber() < 0) continue;
-
-            // Extends clause
-            ClassNode superClass = classNode.getUnresolvedSuperClass();
-            if (superClass != null && superClass.getNameWithoutPackage().equals(word)) {
-                String name = superClass.getName();
-                if (!name.contains(".")) {
-                    // Unresolved — try imports first
-                    String fqn = resolveFromImports(module, word);
-                    if (fqn != null) return fqn;
-                    // Try same package
-                    String pkg = module.getPackageName();
-                    if (pkg != null && !pkg.isEmpty()) {
-                        if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
-                        return pkg + "." + word;
-                    }
-                }
-                return name;
+            if (classNode.getLineNumber() < 0) {
+                continue;
             }
 
-            // Implements
-            ClassNode[] interfaces = classNode.getInterfaces();
-            if (interfaces != null) {
-                for (ClassNode iface : interfaces) {
-                    if (iface.getNameWithoutPackage().equals(word)) {
-                        String name = iface.getName();
-                        if (!name.contains(".")) {
-                            // Unresolved — try imports first
-                            String fqn = resolveFromImports(module, word);
-                            if (fqn != null) return fqn;
-                            // Try same package
-                            String pkg = module.getPackageName();
-                            if (pkg != null && !pkg.isEmpty()) {
-                                // Remove trailing dot if present
-                                if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
-                                return pkg + "." + word;
-                            }
-                        }
-                        return name;
-                    }
-                }
+            String resolved = resolveClassHierarchyType(module, classNode, word);
+            if (resolved != null) {
+                return resolved;
             }
 
-            // Check field types
-            for (FieldNode field : classNode.getFields()) {
-                ClassNode fieldType = field.getType();
-                if (fieldType != null && fieldType.getNameWithoutPackage().equals(word)) {
-                    return resolveClassNodeName(module, fieldType, word);
-                }
+            resolved = resolveFieldType(classNode, module, word);
+            if (resolved != null) {
+                return resolved;
             }
 
-            // Check method return types and parameter types
-            for (MethodNode method : classNode.getMethods()) {
-                // Return type
-                ClassNode returnType = method.getReturnType();
-                if (returnType != null && returnType.getNameWithoutPackage().equals(word)) {
-                    return resolveClassNodeName(module, returnType, word);
-                }
-
-                // Parameters
-                for (Parameter param : method.getParameters()) {
-                    ClassNode paramType = param.getType();
-                    if (paramType != null && paramType.getNameWithoutPackage().equals(word)) {
-                        return resolveClassNodeName(module, paramType, word);
-                    }
-                }
+            resolved = resolveMethodType(classNode, module, word);
+            if (resolved != null) {
+                return resolved;
             }
 
-            // Check property types
-            for (PropertyNode prop : classNode.getProperties()) {
-                ClassNode propType = prop.getType();
-                if (propType != null && propType.getNameWithoutPackage().equals(word)) {
-                    return resolveClassNodeName(module, propType, word);
+            resolved = resolvePropertyType(classNode, module, word);
+            if (resolved != null) {
+                return resolved;
+            }
+        }
+        return null;
+    }
+
+    private String resolveClassHierarchyType(ModuleNode module, ClassNode classNode, String word) {
+        String resolved = resolveNamedTypeReference(module, classNode.getUnresolvedSuperClass(), word);
+        if (resolved != null) {
+            return resolved;
+        }
+        for (ClassNode iface : classNode.getInterfaces()) {
+            resolved = resolveNamedTypeReference(module, iface, word);
+            if (resolved != null) {
+                return resolved;
+            }
+        }
+        return null;
+    }
+
+    private String resolveNamedTypeReference(ModuleNode module, ClassNode typeNode, String word) {
+        if (typeNode == null || !word.equals(typeNode.getNameWithoutPackage())) {
+            return null;
+        }
+        String name = typeNode.getName();
+        if (name.contains(".")) {
+            return name;
+        }
+        String fqn = resolveFromImports(module, word);
+        if (fqn != null) {
+            return fqn;
+        }
+        String moduleQualifiedName = qualifyByModulePackage(module, word);
+        if (moduleQualifiedName != null) {
+            return moduleQualifiedName;
+        }
+        return resolveFromModuleClasses(module, word);
+    }
+
+    private String resolveFromModuleClasses(ModuleNode module, String simpleName) {
+        for (ClassNode classNode : module.getClasses()) {
+            if (simpleName.equals(classNode.getNameWithoutPackage())) {
+                return classNode.getName();
+            }
+        }
+        return simpleName;
+    }
+
+    private String resolveFieldType(ClassNode classNode, ModuleNode module, String word) {
+        for (FieldNode field : classNode.getFields()) {
+            ClassNode fieldType = field.getType();
+            if (fieldType != null && word.equals(fieldType.getNameWithoutPackage())) {
+                return resolveClassNodeName(module, fieldType, word);
+            }
+        }
+        return null;
+    }
+
+    private String resolveMethodType(ClassNode classNode, ModuleNode module, String word) {
+        for (MethodNode method : classNode.getMethods()) {
+            ClassNode returnType = method.getReturnType();
+            if (returnType != null && word.equals(returnType.getNameWithoutPackage())) {
+                return resolveClassNodeName(module, returnType, word);
+            }
+            for (Parameter param : method.getParameters()) {
+                ClassNode paramType = param.getType();
+                if (paramType != null && word.equals(paramType.getNameWithoutPackage())) {
+                    return resolveClassNodeName(module, paramType, word);
                 }
             }
         }
+        return null;
+    }
 
-        // Use a visitor to find ClassExpressions and ConstructorCallExpressions
-        TypeAtOffsetFinder finder = new TypeAtOffsetFinder(offset, word, module);
+    private String resolvePropertyType(ClassNode classNode, ModuleNode module, String word) {
+        for (PropertyNode prop : classNode.getProperties()) {
+            ClassNode propType = prop.getType();
+            if (propType != null && word.equals(propType.getNameWithoutPackage())) {
+                return resolveClassNodeName(module, propType, word);
+            }
+        }
+        return null;
+    }
+
+    private String resolveTypeFromExpressions(ModuleNode module, String word) {
+        TypeAtOffsetFinder finder = new TypeAtOffsetFinder(word, module);
         for (ClassNode classNode : module.getClasses()) {
-            if (classNode.getLineNumber() < 0) continue;
+            if (classNode.getLineNumber() < 0) {
+                continue;
+            }
             finder.visitClass(classNode);
             if (finder.resolvedFQN != null) {
                 return finder.resolvedFQN;
             }
         }
-
         return null;
+    }
+
+    private String qualifyByModulePackage(ModuleNode module, String word) {
+        String pkg = module.getPackageName();
+        if (pkg == null || pkg.isEmpty()) {
+            return null;
+        }
+        if (pkg.endsWith(".")) {
+            pkg = pkg.substring(0, pkg.length() - 1);
+        }
+        return pkg + "." + word;
     }
 
     /**
@@ -283,39 +353,47 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
 
             GroovyLanguageServerPlugin.logInfo("[codeSelect] unit has " + types.length + " types");
-            for (IType type : types) {
-                GroovyLanguageServerPlugin.logInfo("[codeSelect]   type: " + type.getElementName()
-                        + " fields=" + type.getFields().length + " methods=" + type.getMethods().length);
-
-                // Check methods
-                IMethod[] methods = type.getMethods();
-                if (methods != null) {
-                    for (IMethod method : methods) {
-                        if (method.getElementName().equals(word)) {
-                            return method;
-                        }
-                    }
-                }
-
-                // Check fields
-                org.eclipse.jdt.core.IField[] fields = type.getFields();
-                if (fields != null) {
-                    for (org.eclipse.jdt.core.IField field : fields) {
-                        if (field.getElementName().equals(word)) {
-                            return field;
-                        }
-                    }
-                }
+            IJavaElement directMember = resolveDirectMemberDeclaration(types, word);
+            if (directMember != null) {
+                return directMember;
             }
 
-            // Check members inherited from traits/interfaces implemented by the enclosing class
-            IJavaElement traitMember = resolveTraitMemberDeclaration(unit, module, types, word, offset, source);
-            if (traitMember != null) {
-                return traitMember;
-            }
+            return resolveTraitMemberDeclaration(unit, module, types, word, offset, source);
         } catch (JavaModelException e) {
             GroovyLanguageServerPlugin.logError("[codeSelect] resolveLocalDeclaration failed", e);
         }
+        return null;
+    }
+
+    private IJavaElement resolveDirectMemberDeclaration(IType[] types, String word) throws JavaModelException {
+        for (IType type : types) {
+            logTypeSummary(type);
+            IJavaElement member = findMemberInType(type, word);
+            if (member != null) {
+                return member;
+            }
+        }
+        return null;
+    }
+
+    private void logTypeSummary(IType type) throws JavaModelException {
+        GroovyLanguageServerPlugin.logInfo("[codeSelect]   type: " + type.getElementName()
+                + LOG_FIELDS + type.getFields().length + LOG_METHODS + type.getMethods().length);
+    }
+
+    private IJavaElement findMemberInType(IType type, String word) throws JavaModelException {
+        for (IMethod method : type.getMethods()) {
+            if (word.equals(method.getElementName())) {
+                return method;
+            }
+        }
+
+        for (org.eclipse.jdt.core.IField field : type.getFields()) {
+            if (word.equals(field.getElementName())) {
+                return field;
+            }
+        }
+
         return null;
     }
 
@@ -349,207 +427,334 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             GroovyLanguageServerPlugin.logInfo("[codeSelect] Checking interface: " + ifaceSimple
                     + " (name=" + iface.getName() + ")");
 
-            IType traitType = findTypeInUnit(types, ifaceSimple);
-            GroovyLanguageServerPlugin.logInfo("[codeSelect] findTypeInUnit(" + ifaceSimple + ") = "
-                    + (traitType != null ? traitType.getElementName() : "null"));
+            IType traitType = resolveTraitType(unit, module, types, owner, iface, ifaceSimple);
 
-            if (traitType == null) {
-                // Cross-file: search the full project for the trait type
-                try {
-                    IJavaProject javaProject = unit.getJavaProject();
-                    if (javaProject != null) {
-                        String fqn = iface.getName();
-                        if (fqn != null && fqn.contains(".")) {
-                            traitType = javaProject.findType(fqn);
-                        }
-                        // Try same package as the owning class
-                        if (traitType == null) {
-                            String ownerPkg = owner.getPackageName();
-                            if (ownerPkg != null && !ownerPkg.isEmpty()) {
-                                traitType = javaProject.findType(ownerPkg + "." + ifaceSimple);
-                            }
-                        }
-                        // Try Groovy auto-import packages
-                        if (traitType == null) {
-                            String[] autoPackages = { "groovy.lang.", "groovy.util.",
-                                    "java.lang.", "java.util." };
-                            for (String pkg : autoPackages) {
-                                traitType = javaProject.findType(pkg + ifaceSimple);
-                                if (traitType != null) break;
-                            }
-                        }
-                        // Try explicit imports from the module
-                        if (traitType == null && module != null) {
-                            for (org.codehaus.groovy.ast.ImportNode imp : module.getImports()) {
-                                ClassNode impType = imp.getType();
-                                if (impType != null && ifaceSimple.equals(impType.getNameWithoutPackage())) {
-                                    traitType = javaProject.findType(impType.getName());
-                                    if (traitType != null) break;
-                                }
-                            }
-                        }
-                        // Try star imports from the module
-                        if (traitType == null && module != null) {
-                            for (org.codehaus.groovy.ast.ImportNode starImport : module.getStarImports()) {
-                                String pkgName = starImport.getPackageName();
-                                if (pkgName != null) {
-                                    traitType = javaProject.findType(pkgName + ifaceSimple);
-                                    if (traitType != null) break;
-                                }
-                            }
-                        }
-                    }
-                } catch (JavaModelException e) {
-                    // ignore
-                }
+            IJavaElement fromTraitType = resolveTraitTypeMember(traitType, word);
+            if (fromTraitType != null) {
+                return fromTraitType;
             }
 
-            if (traitType != null) {
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait IType: " + traitType.getElementName()
-                        + " fields=" + traitType.getFields().length
-                        + " methods=" + traitType.getMethods().length);
-                // Log field names for debugging
-                for (org.eclipse.jdt.core.IField f : traitType.getFields()) {
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect]   field: " + f.getElementName());
-                }
-                for (IMethod m : traitType.getMethods()) {
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect]   method: " + m.getElementName());
-                }
-
-                // Direct field/property by name
-                org.eclipse.jdt.core.IField traitField = findFieldByName(traitType, word);
-                if (traitField != null) {
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait field: " + word);
-                    return traitField;
-                }
-
-                // Property accessor fallback (Groovy trait property may surface as getX()/setX())
-                String cap = Character.toUpperCase(word.charAt(0)) + word.substring(1);
-                IMethod getter = findMethodByName(traitType, "get" + cap);
-                if (getter != null) {
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait getter: get" + cap);
-                    return getter;
-                }
-                IMethod isser = findMethodByName(traitType, "is" + cap);
-                if (isser != null) {
-                    return isser;
-                }
-                IMethod setter = findMethodByName(traitType, "set" + cap);
-                if (setter != null) {
-                    return setter;
-                }
-
-                // JDT IType didn't expose the member — return the IType itself
-                // so callers can at least navigate to the trait
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] JDT IType has no member '" + word
-                        + "', checking AST directly...");
-            }
-
-            // AST-based fallback: check the Groovy AST directly for the trait's members
-            // This is needed because at CONVERSION phase, JDT may not expose trait properties
-            ClassNode resolvedTraitNode = findTraitClassNodeInModule(module, ifaceSimple);
-            if (resolvedTraitNode != null) {
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] AST trait node: " + resolvedTraitNode.getName()
-                        + " fields=" + resolvedTraitNode.getFields().size()
-                        + " props=" + resolvedTraitNode.getProperties().size()
-                        + " methods=" + resolvedTraitNode.getMethods().size());
-
-                // Check properties in the AST
-                for (PropertyNode prop : resolvedTraitNode.getProperties()) {
-                    if (word.equals(prop.getName())) {
-                        GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait property in AST: " + word);
-                        if (traitType != null) {
-                            org.eclipse.jdt.core.IField f = findFieldByName(traitType, word);
-                            if (f != null) return f;
-                            return traitType;
-                        }
-                        IType unitType = findTypeInUnit(types, ifaceSimple);
-                        if (unitType != null) return unitType;
-                        break;
-                    }
-                }
-
-                // Check fields in the AST
-                for (FieldNode field : resolvedTraitNode.getFields()) {
-                    if (word.equals(field.getName())) {
-                        GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait field in AST: " + word);
-                        if (traitType != null) return traitType;
-                        IType unitType = findTypeInUnit(types, ifaceSimple);
-                        if (unitType != null) return unitType;
-                        break;
-                    }
-                }
-
-                // Check methods in the AST
-                for (MethodNode method : resolvedTraitNode.getMethods()) {
-                    if (word.equals(method.getName())) {
-                        GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait method in AST: " + word);
-                        if (traitType != null) return traitType;
-                        IType unitType = findTypeInUnit(types, ifaceSimple);
-                        if (unitType != null) return unitType;
-                        break;
-                    }
-                }
-
-                // Check $Trait$FieldHelper — at CONVERSION phase, trait fields
-                // are moved to this inner class with mangled names
-                ClassNode helperNode = TraitMemberResolver.findFieldHelperNode(resolvedTraitNode, module);
-                if (helperNode != null) {
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect] FieldHelper node: " + helperNode.getName()
-                            + " fields=" + helperNode.getFields().size()
-                            + " methods=" + helperNode.getMethods().size());
-                    for (FieldNode hField : helperNode.getFields()) {
-                        GroovyLanguageServerPlugin.logInfo("[codeSelect]   helper field: " + hField.getName());
-                    }
-                    for (FieldNode hField : helperNode.getFields()) {
-                        if (TraitMemberResolver.isTraitFieldMatch(hField.getName(), word)) {
-                            GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait field in FieldHelper: "
-                                    + hField.getName() + " matches '" + word + "'");
-                            // Try to resolve the field's declared type (e.g., ApplicationContext)
-                            // so that dot-completion can list its members
-                            ClassNode fieldTypeNode = hField.getType();
-                            if (fieldTypeNode != null) {
-                                GroovyLanguageServerPlugin.logInfo("[codeSelect] FieldHelper field type: " + fieldTypeNode.getName());
-                                IType fieldIType = resolveClassNodeToIType(fieldTypeNode, module, unit.getJavaProject());
-                                if (fieldIType != null) {
-                                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved field type IType: " + fieldIType.getFullyQualifiedName());
-                                    return fieldIType;
-                                }
-                            }
-                            // Fallback: return the trait type for navigation
-                            if (traitType != null) return traitType;
-                            IType unitType = findTypeInUnit(types, ifaceSimple);
-                            if (unitType != null) return unitType;
-                            break;
-                        }
-                    }
-                    // Also check FieldHelper methods (getter/setter for the field)
-                    String cap = Character.toUpperCase(word.charAt(0)) + word.substring(1);
-                    for (MethodNode hMethod : helperNode.getMethods()) {
-                        String mName = hMethod.getName();
-                        if (mName.equals("get" + cap) || mName.equals("set" + cap) || mName.equals("is" + cap)) {
-                            GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait accessor in FieldHelper: " + mName);
-                            // Try to resolve the accessor's return type
-                            if (mName.startsWith("get") || mName.startsWith("is")) {
-                                ClassNode retType = hMethod.getReturnType();
-                                if (retType != null) {
-                                    IType retIType = resolveClassNodeToIType(retType, module, unit.getJavaProject());
-                                    if (retIType != null) return retIType;
-                                }
-                            }
-                            if (traitType != null) return traitType;
-                            IType unitType = findTypeInUnit(types, ifaceSimple);
-                            if (unitType != null) return unitType;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] Could not find trait '" + ifaceSimple + "' in AST module");
+            IJavaElement fromAst = resolveTraitAstMember(unit, module, types, ifaceSimple, traitType, word);
+            if (fromAst != null) {
+                return fromAst;
             }
         }
 
         return null;
+    }
+
+    private IType resolveTraitType(GroovyCompilationUnit unit, ModuleNode module, IType[] types,
+            ClassNode owner, ClassNode iface, String ifaceSimple) {
+        IType traitType = findTypeInUnit(types, ifaceSimple);
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] findTypeInUnit(" + ifaceSimple + ") = "
+                + (traitType != null ? traitType.getElementName() : "null"));
+        if (traitType != null) {
+            return traitType;
+        }
+
+        IJavaProject javaProject = unit.getJavaProject();
+        if (javaProject == null) {
+            return null;
+        }
+
+        try {
+            traitType = resolveTraitTypeFromProject(javaProject, module, owner, iface, ifaceSimple);
+        } catch (JavaModelException e) {
+            traitType = null;
+        }
+        return traitType;
+    }
+
+    private IType resolveTraitTypeFromProject(IJavaProject javaProject, ModuleNode module,
+            ClassNode owner, ClassNode iface, String ifaceSimple) throws JavaModelException {
+        IType traitType = resolveTraitTypeByDeclaredName(javaProject, iface);
+        if (traitType != null) {
+            return traitType;
+        }
+
+        traitType = resolveTraitTypeByOwnerPackage(javaProject, owner, ifaceSimple);
+        if (traitType != null) {
+            return traitType;
+        }
+
+        traitType = resolveTypeByPackages(javaProject, ifaceSimple, TRAIT_AUTO_PACKAGES);
+        if (traitType != null) {
+            return traitType;
+        }
+
+        traitType = resolveTraitTypeByExplicitImports(javaProject, module, ifaceSimple);
+        if (traitType != null) {
+            return traitType;
+        }
+
+        return resolveTraitTypeByStarImports(javaProject, module, ifaceSimple);
+    }
+
+    private IType resolveTraitTypeByDeclaredName(IJavaProject javaProject, ClassNode iface) throws JavaModelException {
+        String fqn = iface.getName();
+        if (fqn != null && fqn.contains(".")) {
+            return javaProject.findType(fqn);
+        }
+        return null;
+    }
+
+    private IType resolveTraitTypeByOwnerPackage(IJavaProject javaProject, ClassNode owner, String ifaceSimple)
+            throws JavaModelException {
+        String ownerPkg = owner.getPackageName();
+        if (ownerPkg != null && !ownerPkg.isEmpty()) {
+            return javaProject.findType(ownerPkg + "." + ifaceSimple);
+        }
+        return null;
+    }
+
+    private IType resolveTypeByPackages(IJavaProject javaProject, String simpleName, String[] packages)
+            throws JavaModelException {
+        for (String pkg : packages) {
+            IType type = javaProject.findType(pkg + simpleName);
+            if (type != null) {
+                return type;
+            }
+        }
+        return null;
+    }
+
+    private IType resolveTraitTypeByExplicitImports(IJavaProject javaProject, ModuleNode module, String ifaceSimple)
+            throws JavaModelException {
+        if (module == null) {
+            return null;
+        }
+        for (ImportNode imp : module.getImports()) {
+            ClassNode impType = imp.getType();
+            if (impType != null && ifaceSimple.equals(impType.getNameWithoutPackage())) {
+                IType type = javaProject.findType(impType.getName());
+                if (type != null) {
+                    return type;
+                }
+            }
+        }
+        return null;
+    }
+
+    private IType resolveTraitTypeByStarImports(IJavaProject javaProject, ModuleNode module, String ifaceSimple)
+            throws JavaModelException {
+        if (module == null) {
+            return null;
+        }
+        for (ImportNode starImport : module.getStarImports()) {
+            String pkgName = starImport.getPackageName();
+            if (pkgName != null) {
+                IType type = javaProject.findType(pkgName + ifaceSimple);
+                if (type != null) {
+                    return type;
+                }
+            }
+        }
+        return null;
+    }
+
+    private IJavaElement resolveTraitTypeMember(IType traitType, String word) throws JavaModelException {
+        if (traitType == null) {
+            return null;
+        }
+
+        logTraitTypeDetails(traitType);
+
+        org.eclipse.jdt.core.IField traitField = findFieldByName(traitType, word);
+        if (traitField != null) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait field: " + word);
+            return traitField;
+        }
+
+        String cap = Character.toUpperCase(word.charAt(0)) + word.substring(1);
+        IMethod getter = findMethodByName(traitType, "get" + cap);
+        if (getter != null) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait getter: get" + cap);
+            return getter;
+        }
+
+        IMethod isser = findMethodByName(traitType, "is" + cap);
+        if (isser != null) {
+            return isser;
+        }
+
+        IMethod setter = findMethodByName(traitType, "set" + cap);
+        if (setter != null) {
+            return setter;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] JDT IType has no member '" + word
+                + "', checking AST directly...");
+        return null;
+    }
+
+    private void logTraitTypeDetails(IType traitType) throws JavaModelException {
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait IType: " + traitType.getElementName()
+                + LOG_FIELDS + traitType.getFields().length
+                + LOG_METHODS + traitType.getMethods().length);
+        for (org.eclipse.jdt.core.IField field : traitType.getFields()) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect]   field: " + field.getElementName());
+        }
+        for (IMethod method : traitType.getMethods()) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect]   method: " + method.getElementName());
+        }
+    }
+
+    private IJavaElement resolveTraitAstMember(GroovyCompilationUnit unit, ModuleNode module,
+            IType[] types, String ifaceSimple, IType traitType, String word) throws JavaModelException {
+        ClassNode resolvedTraitNode = findTraitClassNodeInModule(module, ifaceSimple);
+        if (resolvedTraitNode == null) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect] Could not find trait '" + ifaceSimple + "' in AST module");
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] AST trait node: " + resolvedTraitNode.getName()
+                + LOG_FIELDS + resolvedTraitNode.getFields().size()
+                + " props=" + resolvedTraitNode.getProperties().size()
+                + LOG_METHODS + resolvedTraitNode.getMethods().size());
+
+        IJavaElement directMember = resolveDirectTraitAstMember(resolvedTraitNode, types, ifaceSimple, traitType, word);
+        if (directMember != null) {
+            return directMember;
+        }
+
+        return resolveTraitFieldHelperMember(unit, module, resolvedTraitNode, types, ifaceSimple, traitType, word);
+    }
+
+    private IJavaElement resolveDirectTraitAstMember(ClassNode resolvedTraitNode, IType[] types,
+            String ifaceSimple, IType traitType, String word) throws JavaModelException {
+        if (hasPropertyNamed(resolvedTraitNode, word)) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait property in AST: " + word);
+            if (traitType != null) {
+                org.eclipse.jdt.core.IField field = findFieldByName(traitType, word);
+                if (field != null) {
+                    return field;
+                }
+            }
+            return fallbackTraitElement(traitType, types, ifaceSimple);
+        }
+
+        if (hasFieldNamed(resolvedTraitNode, word)) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait field in AST: " + word);
+            return fallbackTraitElement(traitType, types, ifaceSimple);
+        }
+
+        if (hasMethodNamed(resolvedTraitNode, word)) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait method in AST: " + word);
+            return fallbackTraitElement(traitType, types, ifaceSimple);
+        }
+
+        return null;
+    }
+
+    private boolean hasPropertyNamed(ClassNode classNode, String name) {
+        for (PropertyNode prop : classNode.getProperties()) {
+            if (name.equals(prop.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasFieldNamed(ClassNode classNode, String name) {
+        for (FieldNode field : classNode.getFields()) {
+            if (name.equals(field.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasMethodNamed(ClassNode classNode, String name) {
+        for (MethodNode method : classNode.getMethods()) {
+            if (name.equals(method.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private IJavaElement resolveTraitFieldHelperMember(GroovyCompilationUnit unit, ModuleNode module,
+            ClassNode resolvedTraitNode, IType[] types, String ifaceSimple, IType traitType, String word)
+            {
+        ClassNode helperNode = TraitMemberResolver.findFieldHelperNode(resolvedTraitNode, module);
+        if (helperNode == null) {
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] FieldHelper node: " + helperNode.getName()
+                + LOG_FIELDS + helperNode.getFields().size()
+                + LOG_METHODS + helperNode.getMethods().size());
+        for (FieldNode helperField : helperNode.getFields()) {
+            GroovyLanguageServerPlugin.logInfo("[codeSelect]   helper field: " + helperField.getName());
+        }
+
+        IJavaElement fromField = resolveTraitFieldHelperField(unit, module, helperNode, types, ifaceSimple, traitType, word);
+        if (fromField != null) {
+            return fromField;
+        }
+
+        return resolveTraitFieldHelperAccessor(unit, module, helperNode, types, ifaceSimple, traitType, word);
+    }
+
+    private IJavaElement resolveTraitFieldHelperField(GroovyCompilationUnit unit, ModuleNode module,
+            ClassNode helperNode, IType[] types, String ifaceSimple, IType traitType, String word) {
+        for (FieldNode helperField : helperNode.getFields()) {
+            if (TraitMemberResolver.isTraitFieldMatch(helperField.getName(), word)) {
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait field in FieldHelper: "
+                        + helperField.getName() + " matches '" + word + "'");
+                ClassNode fieldTypeNode = helperField.getType();
+                if (fieldTypeNode != null) {
+                    GroovyLanguageServerPlugin.logInfo("[codeSelect] FieldHelper field type: " + fieldTypeNode.getName());
+                    IType fieldIType = resolveClassNodeToIType(fieldTypeNode, module, unit.getJavaProject());
+                    if (fieldIType != null) {
+                        GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved field type IType: " + fieldIType.getFullyQualifiedName());
+                        return fieldIType;
+                    }
+                }
+                return fallbackTraitElement(traitType, types, ifaceSimple);
+            }
+        }
+        return null;
+    }
+
+    private IJavaElement resolveTraitFieldHelperAccessor(GroovyCompilationUnit unit, ModuleNode module,
+            ClassNode helperNode, IType[] types, String ifaceSimple, IType traitType, String word) {
+        String cap = Character.toUpperCase(word.charAt(0)) + word.substring(1);
+        for (MethodNode helperMethod : helperNode.getMethods()) {
+            String methodName = helperMethod.getName();
+            if (isMatchingAccessorName(methodName, cap)) {
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Found trait accessor in FieldHelper: " + methodName);
+                IType returnIType = resolveAccessorReturnType(helperMethod, module, unit);
+                if (returnIType != null) {
+                    return returnIType;
+                }
+                return fallbackTraitElement(traitType, types, ifaceSimple);
+            }
+        }
+        return null;
+    }
+
+    private boolean isMatchingAccessorName(String methodName, String cap) {
+        return methodName.equals("get" + cap) || methodName.equals("set" + cap) || methodName.equals("is" + cap);
+    }
+
+    private IType resolveAccessorReturnType(MethodNode helperMethod, ModuleNode module, GroovyCompilationUnit unit) {
+        String methodName = helperMethod.getName();
+        if (!(methodName.startsWith("get") || methodName.startsWith("is"))) {
+            return null;
+        }
+        ClassNode returnType = helperMethod.getReturnType();
+        if (returnType == null) {
+            return null;
+        }
+        return resolveClassNodeToIType(returnType, module, unit.getJavaProject());
+    }
+
+    private IJavaElement fallbackTraitElement(IType traitType, IType[] types, String ifaceSimple) {
+        if (traitType != null) {
+            return traitType;
+        }
+        return findTypeInUnit(types, ifaceSimple);
     }
 
     /**
@@ -592,57 +797,86 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      * Resolve a Groovy AST ClassNode to a JDT IType using the module's imports and project.
      */
     private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module, IJavaProject project) {
-        if (typeNode == null || project == null) return null;
+        if (typeNode == null || project == null) {
+            return null;
+        }
         try {
             String typeName = typeNode.getName();
-            if (typeName == null || typeName.isEmpty()) return null;
-
-            // Try FQN directly
-            if (typeName.contains(".")) {
-                IType t = project.findType(typeName);
-                if (t != null) return t;
+            if (typeName == null || typeName.isEmpty()) {
+                return null;
             }
 
-            // Try imports
-            if (module != null) {
-                for (ImportNode imp : module.getImports()) {
-                    ClassNode impType = imp.getType();
-                    if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
-                        IType t = project.findType(impType.getName());
-                        if (t != null) return t;
-                    }
-                }
-                // Star imports
-                for (ImportNode starImport : module.getStarImports()) {
-                    String pkgName = starImport.getPackageName();
-                    if (pkgName != null) {
-                        IType t = project.findType(pkgName + typeName);
-                        if (t != null) return t;
-                    }
-                }
+            IType resolved = resolveClassNodeByQualifiedName(project, typeName);
+            if (resolved != null) {
+                return resolved;
             }
 
-            // Try same package
-            if (module != null) {
-                String pkg = module.getPackageName();
-                if (pkg != null && !pkg.isEmpty()) {
-                    if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
-                    IType t = project.findType(pkg + "." + typeName);
-                    if (t != null) return t;
-                }
+            resolved = resolveClassNodeByImports(project, module, typeName);
+            if (resolved != null) {
+                return resolved;
             }
 
-            // Try auto-import packages
-            String[] autoPackages = { "java.lang.", "java.util.", "java.io.", "java.net.",
-                    "groovy.lang.", "groovy.util.", "java.math." };
-            for (String pkg : autoPackages) {
-                IType t = project.findType(pkg + typeName);
-                if (t != null) return t;
+            resolved = resolveClassNodeByModulePackage(project, module, typeName);
+            if (resolved != null) {
+                return resolved;
             }
+
+            return resolveTypeByPackages(project, typeName, DEFAULT_AUTO_PACKAGES);
         } catch (JavaModelException e) {
-            // ignore
+            return null;
+        }
+    }
+
+    private IType resolveClassNodeByQualifiedName(IJavaProject project, String typeName) throws JavaModelException {
+        if (typeName.contains(".")) {
+            return project.findType(typeName);
         }
         return null;
+    }
+
+    private IType resolveClassNodeByImports(IJavaProject project, ModuleNode module, String typeName)
+            throws JavaModelException {
+        if (module == null) {
+            return null;
+        }
+
+        for (ImportNode imp : module.getImports()) {
+            ClassNode impType = imp.getType();
+            if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
+                IType type = project.findType(impType.getName());
+                if (type != null) {
+                    return type;
+                }
+            }
+        }
+
+        for (ImportNode starImport : module.getStarImports()) {
+            String pkgName = starImport.getPackageName();
+            if (pkgName != null) {
+                IType type = project.findType(pkgName + typeName);
+                if (type != null) {
+                    return type;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private IType resolveClassNodeByModulePackage(IJavaProject project, ModuleNode module, String typeName)
+            throws JavaModelException {
+        if (module == null) {
+            return null;
+        }
+
+        String pkg = module.getPackageName();
+        if (pkg == null || pkg.isEmpty()) {
+            return null;
+        }
+        if (pkg.endsWith(".")) {
+            pkg = pkg.substring(0, pkg.length() - 1);
+        }
+        return project.findType(pkg + "." + typeName);
     }
 
     private IMethod findMethodByName(IType type, String name) throws JavaModelException {
@@ -663,10 +897,9 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
         for (ClassNode classNode : module.getClasses()) {
             int start = classNode.getLineNumber();
             int end = classNode.getLastLineNumber();
-            if (start > 0 && end >= start && line1Based >= start && line1Based <= end) {
-                if (best == null || start >= best.getLineNumber()) {
-                    best = classNode;
-                }
+            boolean insideClassRange = start > 0 && end >= start && line1Based >= start && line1Based <= end;
+            if (insideClassRange && (best == null || start >= best.getLineNumber())) {
+                best = classNode;
             }
         }
         return best;
@@ -694,36 +927,24 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
         }
 
         // Check common auto-import packages
-        String[] autoPackages = {
-            "java.lang.",
-            "java.util.",
-            "java.io.",
-            "java.net.",
-            "groovy.lang.",
-            "groovy.util.",
-            "java.math.",
-        };
-
         try {
-            for (String pkg : autoPackages) {
-                IType type = project.findType(pkg + word);
-                if (type != null) {
-                    return type;
-                }
+            IType type = resolveTypeByPackages(project, word, DEFAULT_AUTO_PACKAGES);
+            if (type != null) {
+                return type;
             }
 
             // Check star imports from the module
             for (ImportNode starImport : module.getStarImports()) {
                 String pkgName = starImport.getPackageName();
                 if (pkgName != null) {
-                    IType type = project.findType(pkgName + word);
-                    if (type != null) {
-                        return type;
+                    IType importedType = project.findType(pkgName + word);
+                    if (importedType != null) {
+                        return importedType;
                     }
                 }
             }
         } catch (JavaModelException e) {
-            // ignore
+            return null;
         }
 
         return null;
@@ -733,35 +954,49 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      * Extract the identifier word at the given offset.
      */
     private String extractWordAt(String content, int offset) {
-        if (offset < 0 || offset >= content.length()) {
-            // Check if we're right at the end of an identifier
-            if (offset > 0 && offset <= content.length()
-                    && Character.isJavaIdentifierPart(content.charAt(offset - 1))) {
-                offset = offset - 1;
-            } else {
-                return null;
-            }
+        Integer normalizedOffset = normalizeOffsetToIdentifier(content, offset);
+        if (normalizedOffset == null) {
+            return null;
         }
 
-        // If we're not on an identifier char, try one position back
-        if (!Character.isJavaIdentifierPart(content.charAt(offset))) {
-            if (offset > 0 && Character.isJavaIdentifierPart(content.charAt(offset - 1))) {
-                offset = offset - 1;
-            } else {
-                return null;
-            }
-        }
-
-        int start = offset;
+        int start = normalizedOffset;
         while (start > 0 && Character.isJavaIdentifierPart(content.charAt(start - 1))) {
             start--;
         }
-        int end = offset;
+        int end = normalizedOffset;
         while (end < content.length() && Character.isJavaIdentifierPart(content.charAt(end))) {
             end++;
         }
-        if (start == end) return null;
+        if (start == end) {
+            return null;
+        }
         return content.substring(start, end);
+    }
+
+    private Integer normalizeOffsetToIdentifier(String content, int offset) {
+        if (content == null || content.isEmpty()) {
+            return null;
+        }
+
+        int normalizedOffset = offset;
+        if (normalizedOffset < 0 || normalizedOffset >= content.length()) {
+            if (normalizedOffset > 0 && normalizedOffset <= content.length()
+                    && Character.isJavaIdentifierPart(content.charAt(normalizedOffset - 1))) {
+                normalizedOffset = normalizedOffset - 1;
+            } else {
+                return null;
+            }
+        }
+
+        if (!Character.isJavaIdentifierPart(content.charAt(normalizedOffset))) {
+            if (normalizedOffset > 0 && Character.isJavaIdentifierPart(content.charAt(normalizedOffset - 1))) {
+                normalizedOffset = normalizedOffset - 1;
+            } else {
+                return null;
+            }
+        }
+
+        return normalizedOffset;
     }
 
     /**
@@ -769,13 +1004,11 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      * at a given offset and resolves them to FQNs.
      */
     private static class TypeAtOffsetFinder extends ClassCodeVisitorSupport {
-        private final int targetOffset;
         private final String targetWord;
         private final ModuleNode module;
         String resolvedFQN;
 
-        TypeAtOffsetFinder(int offset, String word, ModuleNode module) {
-            this.targetOffset = offset;
+        TypeAtOffsetFinder(String word, ModuleNode module) {
             this.targetWord = word;
             this.module = module;
         }

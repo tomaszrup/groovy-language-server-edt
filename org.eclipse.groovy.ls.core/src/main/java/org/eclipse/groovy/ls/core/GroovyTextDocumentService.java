@@ -18,17 +18,22 @@ import org.eclipse.groovy.ls.core.providers.CodeActionProvider;
 import org.eclipse.groovy.ls.core.providers.CompletionProvider;
 import org.eclipse.groovy.ls.core.providers.DefinitionProvider;
 import org.eclipse.groovy.ls.core.providers.DiagnosticsProvider;
+import org.eclipse.groovy.ls.core.providers.DocumentHighlightProvider;
 import org.eclipse.groovy.ls.core.providers.DocumentSymbolProvider;
+import org.eclipse.groovy.ls.core.providers.FoldingRangeProvider;
 import org.eclipse.groovy.ls.core.providers.FormattingProvider;
 import org.eclipse.groovy.ls.core.providers.HoverProvider;
+import org.eclipse.groovy.ls.core.providers.ImplementationProvider;
 import org.eclipse.groovy.ls.core.providers.InlayHintProvider;
 import org.eclipse.groovy.ls.core.providers.InlayHintSettings;
 import org.eclipse.groovy.ls.core.providers.ReferenceProvider;
 import org.eclipse.groovy.ls.core.providers.RenameProvider;
 import org.eclipse.groovy.ls.core.providers.SemanticTokensProvider;
 import org.eclipse.groovy.ls.core.providers.SignatureHelpProvider;
+import org.eclipse.groovy.ls.core.providers.TypeDefinitionProvider;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
+import org.eclipse.lsp4j.jsonrpc.messages.Either3;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.eclipse.lsp4j.services.TextDocumentService;
 
@@ -58,8 +63,12 @@ public class GroovyTextDocumentService implements TextDocumentService {
     private final DiagnosticsProvider diagnosticsProvider;
     private final CodeActionProvider codeActionProvider;
     private final InlayHintProvider inlayHintProvider;
+    private final DocumentHighlightProvider documentHighlightProvider;
+    private final FoldingRangeProvider foldingRangeProvider;
+    private final TypeDefinitionProvider typeDefinitionProvider;
+    private final ImplementationProvider implementationProvider;
 
-    private volatile InlayHintSettings inlayHintSettings = InlayHintSettings.defaults();
+    private InlayHintSettings inlayHintSettings = InlayHintSettings.defaults();
 
     public GroovyTextDocumentService(GroovyLanguageServer server, DocumentManager documentManager) {
         this.server = server;
@@ -75,8 +84,16 @@ public class GroovyTextDocumentService implements TextDocumentService {
         this.semanticTokensProvider = new SemanticTokensProvider(documentManager);
         this.formattingProvider = new FormattingProvider(documentManager);
         this.diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        this.diagnosticsProvider.setClasspathChecker(uri -> {
+            String projectName = server.getProjectNameForUri(uri);
+            return projectName != null && server.hasClasspathForProject(projectName);
+        });
         this.codeActionProvider = new CodeActionProvider(documentManager, diagnosticsProvider);
         this.inlayHintProvider = new InlayHintProvider(documentManager);
+        this.documentHighlightProvider = new DocumentHighlightProvider(documentManager);
+        this.foldingRangeProvider = new FoldingRangeProvider(documentManager);
+        this.typeDefinitionProvider = new TypeDefinitionProvider(documentManager);
+        this.implementationProvider = new ImplementationProvider(documentManager);
     }
 
     void connect(LanguageClient client) {
@@ -119,6 +136,10 @@ public class GroovyTextDocumentService implements TextDocumentService {
         String uri = params.getTextDocument().getUri();
         GroovyLanguageServerPlugin.logInfo("Document closed: " + uri);
         documentManager.didClose(uri);
+        // NOTE: we intentionally do NOT invalidate the semantic tokens cache here.
+        // Cached tokens must survive close/reopen cycles so that if a file is
+        // reopened while still broken, the last-known-good tokens are returned
+        // instead of an empty result that wipes all highlighting.
 
         // Clear diagnostics for closed document
         diagnosticsProvider.clearDiagnostics(uri);
@@ -229,7 +250,79 @@ public class GroovyTextDocumentService implements TextDocumentService {
         });
     }
 
+    // ---- Document Highlight ----
+
+    @Override
+    public CompletableFuture<List<? extends DocumentHighlight>> documentHighlight(
+            DocumentHighlightParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return documentHighlightProvider.getDocumentHighlights(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Document highlight failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    // ---- Type Definition ----
+
+    @Override
+    public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> typeDefinition(
+            TypeDefinitionParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return Either.forLeft(typeDefinitionProvider.getTypeDefinition(params));
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Type definition failed", e);
+                return Either.forLeft(new ArrayList<>());
+            }
+        });
+    }
+
+    // ---- Implementation ----
+
+    @Override
+    public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> implementation(
+            ImplementationParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return Either.forLeft(implementationProvider.getImplementations(params));
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Implementation failed", e);
+                return Either.forLeft(new ArrayList<>());
+            }
+        });
+    }
+
+    // ---- Folding Range ----
+
+    @Override
+    public CompletableFuture<List<FoldingRange>> foldingRange(FoldingRangeRequestParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return foldingRangeProvider.getFoldingRanges(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Folding range failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
     // ---- Rename ----
+
+    @Override
+    public CompletableFuture<Either3<Range, PrepareRenameResult, PrepareRenameDefaultBehavior>> prepareRename(
+            PrepareRenameParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return renameProvider.prepareRename(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Prepare rename failed", e);
+                return null;
+            }
+        });
+    }
 
     @Override
     public CompletableFuture<WorkspaceEdit> rename(RenameParams params) {

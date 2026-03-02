@@ -22,13 +22,10 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.core.resources.IResource;
-import org.eclipse.core.runtime.CoreException;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
-import org.eclipse.jdt.core.refactoring.IJavaRefactorings;
-import org.eclipse.jdt.core.refactoring.descriptors.RenameJavaElementDescriptor;
 import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
@@ -36,10 +33,14 @@ import org.eclipse.jdt.core.search.SearchParticipant;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.PrepareRenameDefaultBehavior;
+import org.eclipse.lsp4j.PrepareRenameParams;
+import org.eclipse.lsp4j.PrepareRenameResult;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.RenameParams;
 import org.eclipse.lsp4j.TextEdit;
 import org.eclipse.lsp4j.WorkspaceEdit;
+import org.eclipse.lsp4j.jsonrpc.messages.Either3;
 
 /**
  * Provides rename refactoring for Groovy documents.
@@ -68,54 +69,123 @@ public class RenameProvider {
         Position position = params.getPosition();
         String newName = params.getNewName();
 
+        WorkspaceEdit jdtEdit = renameWithJdt(uri, position, newName);
+        if (jdtEdit != null) {
+            return jdtEdit;
+        }
+
+        return renameFromGroovyAST(uri, position, newName);
+    }
+
+    /**
+     * Validate whether the element at the cursor can be renamed, and return
+     * its range and current name. Returns {@code null} if renaming is not
+     * possible at the given position.
+     */
+    public Either3<Range, PrepareRenameResult, PrepareRenameDefaultBehavior> prepareRename(
+            PrepareRenameParams params) {
+        String uri = params.getTextDocument().getUri();
+        Position position = params.getPosition();
+
+        // Try JDT first
         ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
         if (workingCopy != null) {
             try {
                 String content = documentManager.getContent(uri);
                 if (content != null) {
                     int offset = positionToOffset(content, position);
-
-                    // Resolve the element at cursor
                     IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
                     if (elements != null && elements.length > 0) {
-                        IJavaElement element = elements[0];
-                        String oldName = element.getElementName();
-
-                        // Find ALL occurrences (declarations + references)
-                        SearchPattern pattern = SearchPattern.createPattern(
-                                element,
-                                IJavaSearchConstants.ALL_OCCURRENCES);
-
-                        if (pattern != null) {
-                            Map<String, List<TextEdit>> editsByUri = new HashMap<>();
-                            SearchEngine engine = new SearchEngine();
-
-                            engine.search(pattern,
-                                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                                    SearchEngine.createWorkspaceScope(),
-                                    new SearchRequestor() {
-                                        @Override
-                                        public void acceptSearchMatch(SearchMatch match) {
-                                            addRenameEdit(match, newName, editsByUri);
-                                        }
-                                    },
-                                    null);
-
-                            if (!editsByUri.isEmpty()) {
-                                WorkspaceEdit edit = new WorkspaceEdit();
-                                edit.setChanges(editsByUri);
-                                return edit;
-                            }
+                        String word = extractWordAt(content, offset);
+                        if (word != null && !word.isEmpty()) {
+                            Range range = wordRangeAt(content, offset, word);
+                            PrepareRenameResult result = new PrepareRenameResult(range, word);
+                            return Either3.forSecond(result);
                         }
                     }
                 }
-            } catch (Throwable t) {
-                GroovyLanguageServerPlugin.logError("Rename JDT failed for " + uri + ", falling back to AST", t);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("prepareRename JDT failed for " + uri, e);
             }
         }
 
-        // Fallback: text-based rename within the same file
-        return renameFromGroovyAST(uri, position, newName);
+        // AST fallback — accept rename of any known identifier
+        String content = documentManager.getContent(uri);
+        if (content == null) {
+            return null;
+        }
+        int offset = positionToOffset(content, position);
+        String word = extractWordAt(content, offset);
+        if (word == null || word.isEmpty()) {
+            return null;
+        }
+        Range range = wordRangeAt(content, offset, word);
+        PrepareRenameResult result = new PrepareRenameResult(range, word);
+        return Either3.forSecond(result);
+    }
+
+    /**
+     * Compute the range of the word at the given offset.
+     */
+    Range wordRangeAt(String content, int offset, String word) {
+        int start = offset;
+        while (start > 0 && Character.isJavaIdentifierPart(content.charAt(start - 1))) {
+            start--;
+        }
+        int end = start + word.length();
+        return new Range(offsetToPosition(content, start), offsetToPosition(content, end));
+    }
+
+    private WorkspaceEdit renameWithJdt(String uri, Position position, String newName) {
+        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        if (workingCopy == null) {
+            return null;
+        }
+
+        try {
+            String content = documentManager.getContent(uri);
+            if (content == null) {
+                return null;
+            }
+
+            int offset = positionToOffset(content, position);
+            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            if (elements == null || elements.length == 0) {
+                return null;
+            }
+
+            SearchPattern pattern = SearchPattern.createPattern(
+                    elements[0],
+                    IJavaSearchConstants.ALL_OCCURRENCES);
+            if (pattern == null) {
+                return null;
+            }
+
+            Map<String, List<TextEdit>> editsByUri = new HashMap<>();
+            SearchEngine engine = new SearchEngine();
+
+            engine.search(pattern,
+                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                    SearchEngine.createWorkspaceScope(),
+                    new SearchRequestor() {
+                        @Override
+                        public void acceptSearchMatch(SearchMatch match) {
+                            addRenameEdit(match, newName, editsByUri);
+                        }
+                    },
+                    null);
+
+            if (editsByUri.isEmpty()) {
+                return null;
+            }
+
+            WorkspaceEdit edit = new WorkspaceEdit();
+            edit.setChanges(editsByUri);
+            return edit;
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Rename JDT failed for " + uri + ", falling back to AST", e);
+            return null;
+        }
     }
 
     /**
@@ -134,16 +204,7 @@ public class RenameProvider {
             int endOffset = startOffset + match.getLength();
 
             // Get file content for offset→position conversion
-            String content = documentManager.getContent(targetUri);
-            if (content == null && resource instanceof org.eclipse.core.resources.IFile) {
-                try {
-                    java.io.InputStream is = ((org.eclipse.core.resources.IFile) resource).getContents();
-                    content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                    is.close();
-                } catch (Exception e) {
-                    return;
-                }
-            }
+            String content = readContent(targetUri, resource);
 
             if (content == null) {
                 return;
@@ -159,6 +220,23 @@ public class RenameProvider {
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to create rename edit", e);
         }
+    }
+
+    private String readContent(String targetUri, IResource resource) {
+        String content = documentManager.getContent(targetUri);
+        if (content != null) {
+            return content;
+        }
+
+        if (resource instanceof org.eclipse.core.resources.IFile file) {
+            try (java.io.InputStream is = file.getContents()) {
+                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private Position offsetToPosition(String content, int offset) {
@@ -194,29 +272,7 @@ public class RenameProvider {
             return null;
         }
 
-        // Verify the word is a known symbol in the AST
-        ModuleNode ast = documentManager.getGroovyAST(uri);
-        boolean isKnownSymbol = false;
-        if (ast != null) {
-            for (ClassNode classNode : ast.getClasses()) {
-                if (classNode.getNameWithoutPackage().equals(word)) { isKnownSymbol = true; break; }
-                for (MethodNode m : classNode.getMethods()) {
-                    if (m.getName().equals(word)) { isKnownSymbol = true; break; }
-                }
-                if (isKnownSymbol) break;
-                for (FieldNode f : classNode.getFields()) {
-                    if (f.getName().equals(word)) { isKnownSymbol = true; break; }
-                }
-                if (isKnownSymbol) break;
-                for (PropertyNode p : classNode.getProperties()) {
-                    if (p.getName().equals(word)) { isKnownSymbol = true; break; }
-                }
-                if (isKnownSymbol) break;
-            }
-        }
-
-        // Still allow rename for local variables / parameters not in top-level AST
-        // by proceeding even if not a known top-level symbol
+        isKnownAstSymbol(documentManager.getGroovyAST(uri), word);
 
         // Find all word-boundary occurrences and create text edits
         List<TextEdit> edits = new ArrayList<>();
@@ -239,6 +295,48 @@ public class RenameProvider {
         WorkspaceEdit edit = new WorkspaceEdit();
         edit.setChanges(changes);
         return edit;
+    }
+
+    private boolean isKnownAstSymbol(ModuleNode ast, String word) {
+        if (ast == null) {
+            return false;
+        }
+        for (ClassNode classNode : ast.getClasses()) {
+            if (word.equals(classNode.getNameWithoutPackage())) {
+                return true;
+            }
+            if (hasMethodNamed(classNode, word) || hasFieldNamed(classNode, word) || hasPropertyNamed(classNode, word)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasMethodNamed(ClassNode classNode, String word) {
+        for (MethodNode method : classNode.getMethods()) {
+            if (word.equals(method.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasFieldNamed(ClassNode classNode, String word) {
+        for (FieldNode field : classNode.getFields()) {
+            if (word.equals(field.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasPropertyNamed(ClassNode classNode, String word) {
+        for (PropertyNode property : classNode.getProperties()) {
+            if (word.equals(property.getName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

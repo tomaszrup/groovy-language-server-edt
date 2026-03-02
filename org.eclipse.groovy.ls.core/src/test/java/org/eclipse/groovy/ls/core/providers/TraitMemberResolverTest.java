@@ -158,6 +158,178 @@ class TraitMemberResolverTest {
         assertTrue(methods.isEmpty());
     }
 
+    // ---- Additional coverage tests ----
+
+    @Test
+    void resolveTraitClassNodeReturnsOriginalWhenNotFoundInModule() {
+        ModuleNode module = parseModule("""
+                class Standalone {}
+                """, "file:///TraitNotFoundTest.groovy");
+
+        // Create a reference to a trait that doesn't exist in the module
+        ClassNode fakeRef = new ClassNode("com.example.NonExistent", 0, null);
+
+        ClassNode resolved = TraitMemberResolver.resolveTraitClassNode(fakeRef, module, null);
+
+        // Should return the original ref since it couldn't resolve
+        assertNotNull(resolved);
+        assertEquals("com.example.NonExistent", resolved.getName());
+    }
+
+    @Test
+    void collectTraitFieldsReturnsEmptyForClassWithoutInterfaces() {
+        ModuleNode module = parseModule("""
+                class Simple { int value }
+                """, "file:///TraitFieldsEmpty.groovy");
+
+        ClassNode owner = findClass(module, "Simple");
+
+        List<FieldNode> fields = TraitMemberResolver.collectTraitFields(owner, module, null);
+
+        assertTrue(fields.isEmpty());
+    }
+
+    @Test
+    void collectTraitPropertiesReturnsEmptyForClassWithoutInterfaces() {
+        ModuleNode module = parseModule("""
+                class Simple { int value }
+                """, "file:///TraitPropsEmpty.groovy");
+
+        ClassNode owner = findClass(module, "Simple");
+
+        List<PropertyNode> properties = TraitMemberResolver.collectTraitProperties(owner, module, null);
+
+        assertTrue(properties.isEmpty());
+    }
+
+    @Test
+    void findFieldHelperNodeReturnsNullWhenNoHelper() {
+        ModuleNode module = parseModule("""
+                trait NoHelper { String name }
+                """, "file:///TraitNoHelper.groovy");
+
+        ClassNode traitNode = findClass(module, "NoHelper");
+        assertNull(TraitMemberResolver.findFieldHelperNode(traitNode, module));
+    }
+
+    @Test
+    void findFieldHelperNodeReturnsNullForNullInputs() {
+        assertNull(TraitMemberResolver.findFieldHelperNode(null, null));
+    }
+
+    @Test
+    void demangleTraitFieldNameHandlesNull() {
+        assertNull(TraitMemberResolver.demangleTraitFieldName(null));
+    }
+
+    @Test
+    void demangleTraitFieldNameHandlesMultipleDoubleUnderscores() {
+        assertEquals("field", TraitMemberResolver.demangleTraitFieldName("pkg_Trait__nested__field"));
+    }
+
+    @Test
+    void isTraitFieldMatchHandlesNullTarget() {
+        assertFalse(TraitMemberResolver.isTraitFieldMatch("abc", null));
+    }
+
+    @Test
+    void findTraitFieldReturnsNullForNullInputs() {
+        assertNull(TraitMemberResolver.findTraitField(null, "name", null));
+        ModuleNode module = parseModule("trait T { String name }", "file:///TraitNull.groovy");
+        ClassNode traitNode = findClass(module, "T");
+        assertNull(TraitMemberResolver.findTraitField(traitNode, null, module));
+    }
+
+    @Test
+    void collectAllTraitFieldsFromDirectFields() {
+        ModuleNode module = parseModule("""
+                trait HasFields {
+                    String name
+                    int count
+                }
+                """, "file:///TraitAllFields.groovy");
+
+        ClassNode traitNode = findClass(module, "HasFields");
+
+        List<FieldNode> fields = TraitMemberResolver.collectAllTraitFields(traitNode, module);
+
+        // Should have entries for both fields (may be property-backed)
+        assertNotNull(fields);
+    }
+
+    @Test
+    void collectAllTraitFieldsReturnsEmptyForNull() {
+        List<FieldNode> fields = TraitMemberResolver.collectAllTraitFields(null, null);
+        assertTrue(fields.isEmpty());
+    }
+
+    @Test
+    void findTraitDeclarationUriReturnsNullWhenNotInModule() {
+        ModuleNode module = parseModule("""
+                class NoTrait {}
+                """, "file:///TraitUriNotFound.groovy");
+
+        ClassNode fakeRef = new ClassNode("com.example.SomeTrait", 0, null);
+
+        String uri = TraitMemberResolver.findTraitDeclarationUri(
+                fakeRef, "file:///TraitUriNotFound.groovy", module, null);
+
+        assertNull(uri);
+    }
+
+    @Test
+    void collectTraitMethodsWithMultipleTraitImplementation() {
+        ModuleNode module = parseModule("""
+                trait Auditable {
+                    String getCreatedBy() { 'system' }
+                }
+                trait Timestamped {
+                    long getCreatedAt() { 0L }
+                }
+                class Entity implements Auditable, Timestamped {}
+                """, "file:///TraitMultiImpl.groovy");
+
+        ClassNode owner = findClass(module, "Entity");
+
+        List<MethodNode> methods = TraitMemberResolver.collectTraitMethods(owner, module, null);
+        Set<String> names = methods.stream().map(MethodNode::getName).collect(Collectors.toSet());
+
+        assertTrue(names.contains("getCreatedBy"));
+        assertTrue(names.contains("getCreatedAt"));
+    }
+
+    @Test
+    void collectTraitPropertiesWithMultipleTraits() {
+        ModuleNode module = parseModule("""
+                trait Named { String name }
+                trait Aged { int age }
+                class Person implements Named, Aged {}
+                """, "file:///TraitMultiProps.groovy");
+
+        ClassNode owner = findClass(module, "Person");
+
+        List<PropertyNode> properties = TraitMemberResolver.collectTraitProperties(owner, module, null);
+        Set<String> names = properties.stream().map(PropertyNode::getName).collect(Collectors.toSet());
+
+        assertTrue(names.contains("name"));
+        assertTrue(names.contains("age"));
+    }
+
+    @Test
+    void traitFieldMatchWithExactName() {
+        assertTrue(TraitMemberResolver.isTraitFieldMatch("myField", "myField"));
+        assertFalse(TraitMemberResolver.isTraitFieldMatch("myField", "otherField"));
+    }
+
+    @Test
+    void resolveTraitClassNodeWithEmptySimpleName() {
+        ModuleNode module = parseModule("class A {}", "file:///Empty.groovy");
+        ClassNode emptyRef = new ClassNode("", 0, null);
+
+        ClassNode resolved = TraitMemberResolver.resolveTraitClassNode(emptyRef, module, null);
+        assertEquals(emptyRef, resolved); // Returns original when name is empty
+    }
+
     private ModuleNode parseModule(String source, String uri) {
         GroovyCompilerService.ParseResult result = compilerService.parse(uri, source);
         assertTrue(result.hasAST(), "Expected parser to produce AST for trait fixture");

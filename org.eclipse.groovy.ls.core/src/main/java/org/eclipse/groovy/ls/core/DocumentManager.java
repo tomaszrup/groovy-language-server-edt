@@ -25,6 +25,7 @@ import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IFolder;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IProjectDescription;
+import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.IWorkspace;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.IPath;
@@ -46,6 +47,8 @@ import org.eclipse.lsp4j.TextDocumentContentChangeEvent;
  * latest unsaved content. On close, the working copy is discarded.
  */
 public class DocumentManager {
+
+    private static final String CLASSES_LOG_SEGMENT = " classes=";
 
     /**
      * Tracks open documents: URI → current source text.
@@ -309,53 +312,48 @@ public class DocumentManager {
     }
 
     /**
+     * Temporarily set the buffer contents of a working copy and reconcile.
+     * This is useful for patching the source before operations like codeSelect
+     * that require a parseable AST.
+     */
+    public void reconcileWithContent(ICompilationUnit workingCopy, String content)
+            throws JavaModelException {
+        workingCopy.getBuffer().setContents(content);
+        workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
+    }
+
+    /**
      * Returns the Groovy AST for a document, either from the JDT working copy
      * (if available) or from the standalone Groovy compiler fallback.
      * Returns {@code null} if no AST is available.
      */
     public ModuleNode getGroovyAST(String uri) {
         uri = normalizeUri(uri);
-        // First try to get the AST from the JDT working copy (GroovyCompilationUnit)
         ICompilationUnit workingCopy = workingCopies.get(uri);
         if (workingCopy != null) {
-            try {
-                java.lang.reflect.Method getModuleNode =
-                        workingCopy.getClass().getMethod("getModuleNode");
-                Object result = getModuleNode.invoke(workingCopy);
-                if (result instanceof ModuleNode) {
-                    ModuleNode module = (ModuleNode) result;
-                    GroovyLanguageServerPlugin.logInfo("[ast] JDT module for " + uri
-                            + " classes=" + (module.getClasses() != null ? module.getClasses().size() : 0));
-                    return module;
-                } else {
-                    GroovyLanguageServerPlugin.logInfo("[ast] JDT getModuleNode() returned "
-                            + (result != null ? result.getClass().getName() : "null") + " for " + uri);
-                }
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logInfo("[ast] JDT reflection failed for " + uri + ": " + e.getMessage());
-                // Not a GroovyCompilationUnit, or reflection failed — fall through
+            ModuleNode jdtModule = extractModuleNodeFromWorkingCopy(workingCopy, uri);
+            if (jdtModule != null) {
+                return jdtModule;
             }
         } else {
             GroovyLanguageServerPlugin.logInfo("[ast] No working copy for " + uri);
         }
 
-        // Fallback: get from the standalone Groovy compiler cache
         GroovyCompilerService.ParseResult cached = compilerService.getCachedResult(uri);
         if (cached != null && cached.hasAST()) {
             ModuleNode module = cached.getModuleNode();
             GroovyLanguageServerPlugin.logInfo("[ast] Standalone cache for " + uri
-                    + " classes=" + (module.getClasses() != null ? module.getClasses().size() : 0));
+                    + CLASSES_LOG_SEGMENT + classCount(module));
             return module;
         }
 
-        // If not cached yet, try parsing now
         String content = getContent(uri);
         if (content != null) {
             GroovyCompilerService.ParseResult result = compilerService.parse(uri, content);
             if (result.hasAST()) {
                 ModuleNode module = result.getModuleNode();
                 GroovyLanguageServerPlugin.logInfo("[ast] Parsed on-demand for " + uri
-                        + " classes=" + (module.getClasses() != null ? module.getClasses().size() : 0));
+                        + CLASSES_LOG_SEGMENT + classCount(module));
                 return module;
             }
             GroovyLanguageServerPlugin.logInfo("[ast] Parse failed for " + uri);
@@ -363,6 +361,27 @@ public class DocumentManager {
 
         GroovyLanguageServerPlugin.logInfo("[ast] No AST available for " + uri);
         return null;
+    }
+
+    private ModuleNode extractModuleNodeFromWorkingCopy(ICompilationUnit workingCopy, String uri) {
+        try {
+            java.lang.reflect.Method getModuleNode = workingCopy.getClass().getMethod("getModuleNode");
+            Object result = getModuleNode.invoke(workingCopy);
+            if (result instanceof ModuleNode module) {
+                GroovyLanguageServerPlugin.logInfo("[ast] JDT module for " + uri
+                        + CLASSES_LOG_SEGMENT + classCount(module));
+                return module;
+            }
+            GroovyLanguageServerPlugin.logInfo("[ast] JDT getModuleNode() returned "
+                    + (result != null ? result.getClass().getName() : "null") + " for " + uri);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logInfo("[ast] JDT reflection failed for " + uri + ": " + e.getMessage());
+        }
+        return null;
+    }
+
+    private int classCount(ModuleNode module) {
+        return module.getClasses() != null ? module.getClasses().size() : 0;
     }
 
     /**
@@ -420,11 +439,7 @@ public class DocumentManager {
                 }
             }
 
-        } catch (Throwable e) {
-            // Catch Throwable to handle NoSuchMethodError from jarjar'd types
-            // in groovy-eclipse-batch where JavaCore.create() expects
-            // groovyjarjareclipse.core.resources.IFile instead of
-            // org.eclipse.core.resources.IFile
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to find compilation unit for " + uriString, e);
         }
         return null;
@@ -432,21 +447,103 @@ public class DocumentManager {
 
     /**
      * Look up an {@link ICompilationUnit} in the Eclipse workspace for a URI.
+     * <p>
+     * When multiple Eclipse projects map to the same filesystem path (e.g. a
+     * subproject's linked folder AND an external whole-directory project), we
+     * prefer the most specific project — the one whose effective content root
+     * is the longest prefix of the file's path.
+     * This avoids creating working copies under an external "catch-all" project
+     * with a broken or incomplete classpath.
      */
     private ICompilationUnit lookupCompilationUnit(URI uri) {
         try {
             IFile[] files = ResourcesPlugin.getWorkspace().getRoot()
                     .findFilesForLocationURI(uri);
-            if (files.length > 0) {
+            if (files.length == 0) {
+                return null;
+            }
+
+            // If only one match, use it directly
+            if (files.length == 1) {
                 org.eclipse.jdt.core.IJavaElement element = JavaCore.create(files[0]);
-                if (element instanceof ICompilationUnit) {
-                    return (ICompilationUnit) element;
+                if (element instanceof ICompilationUnit compilationUnit) {
+                    return compilationUnit;
+                }
+                return null;
+            }
+
+            // Multiple matches: prefer the file whose project's effective
+            // content root is the longest (most specific).  This is consistent
+            // with GroovyLanguageServer.findEclipseProjectByPath().
+            ICompilationUnit bestCu = null;
+            int bestContentRootLength = -1;
+
+            for (IFile file : files) {
+                org.eclipse.jdt.core.IJavaElement element = JavaCore.create(file);
+                if (element instanceof ICompilationUnit cu) {
+                    int contentRootLen = getProjectContentRootLength(file.getProject());
+
+                    if (contentRootLen > bestContentRootLength) {
+                        bestContentRootLength = contentRootLen;
+                        bestCu = cu;
+                    }
                 }
             }
-        } catch (Throwable e) {
+
+            return bestCu;
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("lookupCompilationUnit failed for " + uri, e);
         }
         return null;
+    }
+
+    /**
+     * Determine the effective filesystem content root length for a project.
+     * <p>
+     * For linked-folder projects (created by
+     * {@code GroovyLanguageServer.createEclipseProjectFor}), the content root
+     * is the linked folder's target directory (e.g.,
+     * {@code c:\sample\consumer}).
+     * <p>
+     * For external projects (created by {@code importExternalProject} with an
+     * explicit location), the content root is the project's filesystem
+     * location (e.g., {@code c:\sample}).
+     * <p>
+     * A longer content root means a more specific project.
+     */
+    private int getProjectContentRootLength(IProject project) {
+        // 1. Check for a "linked" folder — this is the primary mechanism
+        //    used by on-the-fly subproject setup
+        IResource linkedRoot = project.findMember("linked");
+        if (linkedRoot != null && linkedRoot.isLinked()) {
+            org.eclipse.core.runtime.IPath linkedLocation =
+                    linkedRoot.getLocation();
+            if (linkedLocation != null) {
+                return linkedLocation.toOSString().length();
+            }
+        }
+
+        // 2. For external projects with an explicit filesystem location,
+        //    use the project's location URI.
+        //    (Workspace-internal projects have no explicit locationURI and
+        //    their getLocation() returns a workspace metadata path, which
+        //    is NOT the filesystem content root.)
+        try {
+            java.net.URI locationUri = project.getDescription().getLocationURI();
+            if (locationUri != null) {
+                // Explicit location → external project
+                org.eclipse.core.runtime.IPath projLoc = project.getLocation();
+                if (projLoc != null) {
+                    return projLoc.toOSString().length();
+                }
+            }
+        } catch (org.eclipse.core.runtime.CoreException e) {
+            // Ignore — fall through to default
+        }
+
+        // 3. Fallback: workspace-internal project without linked folder.
+        //    Return 0 so it loses to any project with a real content root.
+        return 0;
     }
 
     /**
@@ -522,7 +619,7 @@ public class DocumentManager {
             // Configure the classpath with detected source folders
             configureExternalProjectClasspath(project);
 
-        } catch (Throwable e) {
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to import external project from " + projectRoot.getAbsolutePath(), e);
         }
@@ -554,11 +651,28 @@ public class DocumentManager {
 
             List<IClasspathEntry> entries = new ArrayList<>();
             boolean foundAny = false;
+            Set<String> addedSrcDirs = new java.util.LinkedHashSet<>();
 
             for (String srcDir : candidateSrcDirs) {
                 IFolder folder = project.getFolder(srcDir);
                 if (folder != null && folder.exists()) {
+                    // Skip generic folders (e.g. "src") if we already added a
+                    // more specific sub-path (e.g. "src/main/java").  JDT does
+                    // not allow nesting source folders.
+                    boolean nestedConflict = false;
+                    for (String existing : addedSrcDirs) {
+                        if (existing.startsWith(srcDir + "/") || srcDir.startsWith(existing + "/")) {
+                            nestedConflict = true;
+                            break;
+                        }
+                    }
+                    if (nestedConflict) {
+                        GroovyLanguageServerPlugin.logInfo(
+                                "[ext] Skipping nested source folder: " + srcDir);
+                        continue;
+                    }
                     entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
+                    addedSrcDirs.add(srcDir);
                     foundAny = true;
                     GroovyLanguageServerPlugin.logInfo(
                             "[ext] Added source folder: " + srcDir);
@@ -587,7 +701,7 @@ public class DocumentManager {
                     "[ext] Configured classpath with " + entries.size()
                     + " entries (source folders + JRE).");
 
-        } catch (Throwable e) {
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to configure classpath for external project "
                     + project.getName() + " (non-fatal): " + e.getMessage(), e);

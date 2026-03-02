@@ -94,40 +94,13 @@ public class GroovyCompilerService {
             config.setTolerance(10); // collect up to 10 errors before giving up
 
             CompilationUnit compilationUnit = new CompilationUnit(config);
-
-            // Derive a simple file name from the URI for error reporting
             String fileName = extractFileName(uri);
-
             compilationUnit.addSource(fileName, source);
 
-            try {
-                // Parse through CONVERSION to get class/method structure.
-                // SEMANTIC_ANALYSIS would give type info but requires classpath.
-                compilationUnit.compile(Phases.CONVERSION);
-            } catch (MultipleCompilationErrorsException e) {
-                collectErrors(e.getErrorCollector(), errors);
-            } catch (Exception e) {
-                // Some parse errors throw other exceptions — treat as syntax error
-                errors.add(new SyntaxException(
-                        "Parse error: " + e.getMessage(), 1, 1));
-            }
+            compileThroughConversion(compilationUnit, errors);
+            moduleNode = extractFirstModuleNode(compilationUnit, uri);
 
-            // Try to extract the module node even if there were errors
-            try {
-                java.util.Iterator<SourceUnit> iter = compilationUnit.iterator();
-                while (iter.hasNext()) {
-                    SourceUnit su = iter.next();
-                    if (su.getAST() != null) {
-                        moduleNode = su.getAST();
-                        break;
-                    }
-                }
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError(
-                        "Failed to extract AST from compilation unit for " + uri, e);
-            }
-
-        } catch (Throwable e) {
+        } catch (Exception e) {
             // Catch everything — we must not crash the language server
             GroovyLanguageServerPlugin.logError(
                     "Groovy compiler service failed for " + uri, e);
@@ -138,6 +111,32 @@ public class GroovyCompilerService {
         ParseResult result = new ParseResult(moduleNode, errors);
         cache.put(uri, result);
         return result;
+    }
+
+    private void compileThroughConversion(CompilationUnit compilationUnit, List<SyntaxException> errors) {
+        try {
+            compilationUnit.compile(Phases.CONVERSION);
+        } catch (MultipleCompilationErrorsException e) {
+            collectErrors(e.getErrorCollector(), errors);
+        } catch (Exception e) {
+            errors.add(new SyntaxException("Parse error: " + e.getMessage(), 1, 1));
+        }
+    }
+
+    private ModuleNode extractFirstModuleNode(CompilationUnit compilationUnit, String uri) {
+        try {
+            java.util.Iterator<SourceUnit> iter = compilationUnit.iterator();
+            while (iter.hasNext()) {
+                SourceUnit sourceUnit = iter.next();
+                if (sourceUnit.getAST() != null) {
+                    return sourceUnit.getAST();
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to extract AST from compilation unit for " + uri, e);
+        }
+        return null;
     }
 
     /**
@@ -166,8 +165,8 @@ public class GroovyCompilerService {
             return;
         }
         for (Message message : messages) {
-            if (message instanceof SyntaxErrorMessage) {
-                SyntaxException cause = ((SyntaxErrorMessage) message).getCause();
+            if (message instanceof SyntaxErrorMessage syntaxErrorMessage) {
+                SyntaxException cause = syntaxErrorMessage.getCause();
                 if (cause != null) {
                     errors.add(cause);
                 }

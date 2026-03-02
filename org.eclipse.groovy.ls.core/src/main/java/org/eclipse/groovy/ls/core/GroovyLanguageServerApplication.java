@@ -9,6 +9,8 @@
  *******************************************************************************/
 package org.eclipse.groovy.ls.core;
 
+import java.io.FileDescriptor;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
@@ -42,7 +44,7 @@ public class GroovyLanguageServerApplication implements IApplication {
         // The JSON-RPC transport uses these exclusively — any stray output
         // to stdout would corrupt the protocol stream.
         InputStream in = System.in;
-        OutputStream out = System.out;
+        OutputStream out = new FileOutputStream(FileDescriptor.out);
 
         // Redirect stdout/stderr to the plugin's log to prevent corruption
         // of the JSON-RPC channel

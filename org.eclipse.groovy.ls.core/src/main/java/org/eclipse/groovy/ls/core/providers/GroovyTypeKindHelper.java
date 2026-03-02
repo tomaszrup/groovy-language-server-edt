@@ -27,7 +27,8 @@ final class GroovyTypeKindHelper {
             if (Traits.isTrait(node)) {
                 return true;
             }
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            // Traits API may fail for partially-resolved AST nodes.
         }
 
         try {
@@ -39,7 +40,8 @@ final class GroovyTypeKindHelper {
                     return true;
                 }
             }
-        } catch (Throwable ignored) {
+        } catch (Exception ignored) {
+            // Annotation resolution may fail while the file is being edited.
         }
 
         return false;

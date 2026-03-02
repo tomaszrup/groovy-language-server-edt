@@ -54,6 +54,14 @@ import org.eclipse.lsp4j.services.WorkspaceService;
  */
 public class GroovyWorkspaceService implements WorkspaceService {
 
+    private static final String JSON_GROOVY = "groovy";
+    private static final String JSON_ENABLED = "enabled";
+    private static final String LOG_NEW_URI = " new=";
+    private static final String LOG_EDITS = " edits=";
+        private static final String IMPORT_PREFIX = "import ";
+        private static final Pattern PACKAGE_DECLARATION_PATTERN = Pattern.compile(
+            "(?m)^\\s*package\\s+([\\w.]+)\\s*;?\\s*$");
+
     private final GroovyLanguageServer server;
     private final DocumentManager documentManager;
 
@@ -95,9 +103,8 @@ public class GroovyWorkspaceService implements WorkspaceService {
                             @Override
                             public void acceptSearchMatch(SearchMatch match) {
                                 Object element = match.getElement();
-                                if (element instanceof IJavaElement) {
-                                    IJavaElement javaElement = (IJavaElement) element;
-                                    SymbolInformation symbol = toSymbolInformation(javaElement, match);
+                                if (element instanceof IJavaElement javaElement) {
+                                    SymbolInformation symbol = toSymbolInformation(javaElement);
                                     if (symbol != null) {
                                         symbols.add(symbol);
                                     }
@@ -117,30 +124,40 @@ public class GroovyWorkspaceService implements WorkspaceService {
     public void didChangeConfiguration(DidChangeConfigurationParams params) {
         GroovyLanguageServerPlugin.logInfo("Configuration changed: " + params.getSettings());
 
-        // Extract formatter settings from the configuration
         Object settings = params.getSettings();
-        if (settings instanceof com.google.gson.JsonObject) {
-            com.google.gson.JsonObject json = (com.google.gson.JsonObject) settings;
-
-            // Navigate: { "groovy": { "format": { "settingsUrl": "..." } } }
-            com.google.gson.JsonObject groovy = json.has("groovy")
-                    ? json.getAsJsonObject("groovy") : null;
-            if (groovy != null) {
-                com.google.gson.JsonObject format = groovy.has("format")
-                        ? groovy.getAsJsonObject("format") : null;
-                if (format != null && format.has("settingsUrl")) {
-                    com.google.gson.JsonElement urlElem = format.get("settingsUrl");
-                    String profilePath = (urlElem != null && !urlElem.isJsonNull())
-                            ? urlElem.getAsString() : null;
-                    server.getGroovyTextDocumentService().updateFormatterProfile(profilePath);
-                }
-
-                com.google.gson.JsonObject inlayHints = groovy.has("inlayHints")
-                        ? groovy.getAsJsonObject("inlayHints") : null;
-                server.getGroovyTextDocumentService().updateInlayHintSettings(
-                        parseInlayHintSettings(inlayHints));
-            }
+        if (!(settings instanceof com.google.gson.JsonObject json)) {
+            return;
         }
+
+        com.google.gson.JsonObject groovy = getChildJson(json, JSON_GROOVY);
+        if (groovy == null) {
+            return;
+        }
+
+        applyFormatterSettings(groovy);
+        com.google.gson.JsonObject inlayHints = getChildJson(groovy, "inlayHints");
+        server.getGroovyTextDocumentService().updateInlayHintSettings(parseInlayHintSettings(inlayHints));
+    }
+
+    private void applyFormatterSettings(com.google.gson.JsonObject groovy) {
+        com.google.gson.JsonObject format = getChildJson(groovy, "format");
+        if (format == null || !format.has("settingsUrl")) {
+            return;
+        }
+
+        com.google.gson.JsonElement urlElem = format.get("settingsUrl");
+        String profilePath = (urlElem != null && !urlElem.isJsonNull())
+                ? urlElem.getAsString()
+                : null;
+        server.getGroovyTextDocumentService().updateFormatterProfile(profilePath);
+    }
+
+    private com.google.gson.JsonObject getChildJson(com.google.gson.JsonObject root, String key) {
+        if (root == null || !root.has(key)) {
+            return null;
+        }
+        com.google.gson.JsonElement child = root.get(key);
+        return child != null && child.isJsonObject() ? child.getAsJsonObject() : null;
     }
 
     private InlayHintSettings parseInlayHintSettings(com.google.gson.JsonObject inlayHints) {
@@ -152,22 +169,22 @@ public class GroovyWorkspaceService implements WorkspaceService {
         boolean variableTypesEnabled = readNestedBoolean(
                 inlayHints,
                 "variableTypes",
-                "enabled",
+            JSON_ENABLED,
                 defaults.isVariableTypesEnabled());
         boolean parameterNamesEnabled = readNestedBoolean(
                 inlayHints,
                 "parameterNames",
-                "enabled",
+            JSON_ENABLED,
                 defaults.isParameterNamesEnabled());
         boolean closureParameterTypesEnabled = readNestedBoolean(
                 inlayHints,
                 "closureParameterTypes",
-                "enabled",
+            JSON_ENABLED,
                 defaults.isClosureParameterTypesEnabled());
         boolean methodReturnTypesEnabled = readNestedBoolean(
                 inlayHints,
                 "methodReturnTypes",
-                "enabled",
+            JSON_ENABLED,
                 defaults.isMethodReturnTypesEnabled());
 
         return new InlayHintSettings(
@@ -205,226 +222,269 @@ public class GroovyWorkspaceService implements WorkspaceService {
     @Override
     public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
         GroovyLanguageServerPlugin.logInfo("Watched files changed: " + params.getChanges().size() + " changes");
+        CompletableFuture.runAsync(() -> handleWatchedFileChanges(params));
+    }
 
-        // Trigger incremental build when files change on disk.
-        // IMPORTANT: Refresh only the individual files that changed instead of
-        // doing DEPTH_INFINITE on the workspace root.  A full recursive refresh
-        // re-traverses every linked folder target, generating heavy I/O inside
-        // VS Code's workspaceStorage area that can break other extensions'
-        // persisted state (e.g. Copilot chat history).
-        CompletableFuture.runAsync(() -> {
-            try {
-                boolean hasSourceChange = false;
-                boolean hasJavaSourceChange = false;
-                for (FileEvent event : params.getChanges()) {
-                    String uri = event.getUri();
-                    if (uri.endsWith(".groovy") || uri.endsWith(".java")) {
-                        hasSourceChange = true;
-                        if (uri.endsWith(".java")) {
-                            hasJavaSourceChange = true;
-                        }
-                        try {
-                            java.net.URI fileUri = java.net.URI.create(uri);
-                            org.eclipse.core.resources.IFile[] files =
-                                    ResourcesPlugin.getWorkspace().getRoot()
-                                            .findFilesForLocationURI(fileUri);
-                            for (org.eclipse.core.resources.IFile file : files) {
-                                file.refreshLocal(
-                                        org.eclipse.core.resources.IResource.DEPTH_ZERO,
-                                        new org.eclipse.core.runtime.NullProgressMonitor());
-                            }
-                        } catch (Exception e) {
-                            GroovyLanguageServerPlugin.logError(
-                                    "Failed to refresh file: " + uri, e);
-                        }
-                    }
-                }
-                // If no individual files could be resolved (e.g. new file not yet
-                // known to Eclipse), fall back to a project-level refresh rather
-                // than a full workspace-root refresh.
-                if (hasSourceChange) {
-                    for (org.eclipse.core.resources.IProject p
-                            : ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
-                        if (p.isOpen()) {
-                            p.refreshLocal(
-                                    org.eclipse.core.resources.IResource.DEPTH_INFINITE,
-                                    new org.eclipse.core.runtime.NullProgressMonitor());
-                        }
-                    }
-
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[diag-trace] didChangeWatchedFiles sourceChanged=true javaChanged="
-                            + hasJavaSourceChange + " -> refresh diagnostics");
-                    if (hasJavaSourceChange) {
-                        server.getGroovyTextDocumentService().triggerFullBuild(server);
-                    } else {
-                        server.getGroovyTextDocumentService().publishDiagnosticsForOpenDocuments();
-                    }
-                }
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError("Failed to handle file changes", e);
+    private void handleWatchedFileChanges(DidChangeWatchedFilesParams params) {
+        try {
+            SourceChangeSummary summary = refreshChangedSourceFiles(params);
+            if (!summary.hasSourceChange) {
+                return;
             }
-        });
+
+            refreshOpenProjects();
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] didChangeWatchedFiles sourceChanged=true javaChanged="
+                            + summary.hasJavaSourceChange + " -> refresh diagnostics");
+            if (summary.hasJavaSourceChange) {
+                server.getGroovyTextDocumentService().triggerFullBuild(server);
+            } else {
+                server.getGroovyTextDocumentService().publishDiagnosticsForOpenDocuments();
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to handle file changes", e);
+        }
+    }
+
+    private SourceChangeSummary refreshChangedSourceFiles(DidChangeWatchedFilesParams params) {
+        boolean hasSourceChange = false;
+        boolean hasJavaSourceChange = false;
+        for (FileEvent event : params.getChanges()) {
+            String uri = event.getUri();
+            if (!isSourceFileUri(uri)) {
+                continue;
+            }
+
+            hasSourceChange = true;
+            if (isJavaFileUri(uri)) {
+                hasJavaSourceChange = true;
+            }
+            refreshWorkspaceFile(uri);
+        }
+        return new SourceChangeSummary(hasSourceChange, hasJavaSourceChange);
+    }
+
+    private void refreshWorkspaceFile(String uri) {
+        try {
+            URI fileUri = URI.create(uri);
+            org.eclipse.core.resources.IFile[] files =
+                    ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri);
+            for (org.eclipse.core.resources.IFile file : files) {
+                file.refreshLocal(
+                        org.eclipse.core.resources.IResource.DEPTH_ZERO,
+                        new org.eclipse.core.runtime.NullProgressMonitor());
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to refresh file: " + uri, e);
+        }
+    }
+
+    private void refreshOpenProjects() throws org.eclipse.core.runtime.CoreException {
+        for (org.eclipse.core.resources.IProject project
+                : ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
+            if (project.isOpen()) {
+                project.refreshLocal(
+                        org.eclipse.core.resources.IResource.DEPTH_INFINITE,
+                        new org.eclipse.core.runtime.NullProgressMonitor());
+            }
+        }
     }
 
     @Override
     public CompletableFuture<WorkspaceEdit> willRenameFiles(RenameFilesParams params) {
-        return CompletableFuture.supplyAsync(() -> {
-            if (params == null || params.getFiles() == null || params.getFiles().isEmpty()) {
-                GroovyLanguageServerPlugin.logInfo("[rename-trace] willRenameFiles: no files");
-                return null;
-            }
+        return CompletableFuture.supplyAsync(() -> buildWillRenameWorkspaceEdit(params));
+    }
 
+    private WorkspaceEdit buildWillRenameWorkspaceEdit(RenameFilesParams params) {
+        if (params == null || params.getFiles() == null || params.getFiles().isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo("[rename-trace] willRenameFiles: no files");
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[rename-trace] willRenameFiles: files=" + params.getFiles().size());
+
+        Map<String, List<TextEdit>> changes = new HashMap<>();
+        for (FileRename fileRename : params.getFiles()) {
+            applyWillRenameForFile(fileRename, changes);
+        }
+
+        if (changes.isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo("[rename-trace] willRenameFiles: returning null (no edits)");
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[rename-trace] willRenameFiles: returning changes uris=" + changes.size()
+                        + LOG_EDITS + countTextEdits(changes));
+
+        WorkspaceEdit edit = new WorkspaceEdit();
+        edit.setChanges(changes);
+        return edit;
+    }
+
+    private void applyWillRenameForFile(FileRename fileRename, Map<String, List<TextEdit>> changes) {
+        if (fileRename == null) {
+            return;
+        }
+
+        String oldUri = DocumentManager.normalizeUri(fileRename.getOldUri());
+        String newUri = DocumentManager.normalizeUri(fileRename.getNewUri());
+        if (!isSourceFileUri(oldUri) || !isSourceFileUri(newUri)) {
+            return;
+        }
+
+        String oldExtension = fileExtensionFromUri(oldUri);
+        String newExtension = fileExtensionFromUri(newUri);
+        if (!sameExtension(oldExtension, newExtension)) {
             GroovyLanguageServerPlugin.logInfo(
-                    "[rename-trace] willRenameFiles: files=" + params.getFiles().size());
+                    "[rename-trace] willRenameFiles: skip ext mismatch old="
+                            + oldUri + LOG_NEW_URI + newUri);
+            return;
+        }
 
-            Map<String, List<TextEdit>> changes = new HashMap<>();
-
-            for (FileRename fileRename : params.getFiles()) {
-                if (fileRename == null) {
-                    continue;
-                }
-
-                String oldUri = DocumentManager.normalizeUri(fileRename.getOldUri());
-                String newUri = DocumentManager.normalizeUri(fileRename.getNewUri());
-
-                if (!isSourceFileUri(oldUri) || !isSourceFileUri(newUri)) {
-                    continue;
-                }
-
-                String oldExtension = fileExtensionFromUri(oldUri);
-                String newExtension = fileExtensionFromUri(newUri);
-                if (oldExtension == null || newExtension == null || !oldExtension.equals(newExtension)) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[rename-trace] willRenameFiles: skip ext mismatch old="
-                            + oldUri + " new=" + newUri);
-                    continue;
-                }
-
-                boolean javaRename = "java".equals(oldExtension);
-
-                String oldTypeName = baseNameFromUri(oldUri);
-                String newTypeName = baseNameFromUri(newUri);
-                if (oldTypeName == null || newTypeName == null) {
-                    GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: invalid type names old="
-                            + oldTypeName + " new=" + newTypeName + " uri=" + oldUri);
-                    continue;
-                }
-
-                TypeMoveContext moveContext =
-                    resolveTypeMoveContext(oldUri, newUri, oldTypeName, newTypeName);
-                if (moveContext == null) {
-                    if (isGroovyFileUri(oldUri)) {
-                        TextEdit fallbackPackageEdit = findGroovyPackageMoveFallbackEdit(oldUri, newUri);
-                        if (fallbackPackageEdit != null) {
-                            changes.computeIfAbsent(oldUri, key -> new ArrayList<>()).add(fallbackPackageEdit);
-                            GroovyLanguageServerPlugin.logInfo(
-                                    "[rename-trace] willRenameFiles: groovy package fallback edit added for "
-                                    + oldUri);
-                        }
-                    }
-                    GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: unable to resolve move context for " + oldUri);
-                    continue;
-                }
-
-                boolean typeNameChanged = !oldTypeName.equals(newTypeName);
-                boolean packageChanged = moveContext.isPackageChanged();
-                if (!typeNameChanged && !packageChanged) {
-                    GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: no type/package change for " + oldUri);
-                    continue;
-                }
-
-                GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: candidate old=" + oldTypeName
-                    + " new=" + newTypeName
-                    + " oldFqn=" + moveContext.oldQualifiedName
-                    + " newFqn=" + moveContext.newQualifiedName
-                    + " packageChanged=" + packageChanged
-                    + " ext=" + oldExtension
-                    + " oldUri=" + oldUri + " newUri=" + newUri);
-
-                Map<String, List<TextEdit>> workspaceRenameEdits = Map.of();
-                if (typeNameChanged) {
-                    workspaceRenameEdits =
-                        buildWorkspaceTypeRenameEdits(oldUri, oldTypeName, newTypeName, javaRename);
-                    if (!workspaceRenameEdits.isEmpty()) {
-                    GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: workspace rename edits uris="
-                        + workspaceRenameEdits.size() + " edits="
-                        + countTextEdits(workspaceRenameEdits));
-                    mergeEdits(changes, workspaceRenameEdits);
-                    }
-                }
-
-                if (packageChanged) {
-                    Map<String, List<TextEdit>> moveEdits = buildGroovyTypeMoveEdits(moveContext);
-                    if (!moveEdits.isEmpty()) {
-                    GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: groovy move edits uris="
-                        + moveEdits.size() + " edits=" + countTextEdits(moveEdits));
-                    mergeEdits(changes, moveEdits);
-                    }
-
-                    if (isGroovyFileUri(oldUri)) {
-                    String source = getSourceText(oldUri);
-                    TextEdit packageEdit = findGroovyPackageDeclarationMoveEdit(
-                        source,
-                        moveContext.newPackageName);
-                    if (packageEdit != null) {
-                        changes.computeIfAbsent(oldUri, k -> new ArrayList<>()).add(packageEdit);
-                        GroovyLanguageServerPlugin.logInfo(
-                            "[rename-trace] willRenameFiles: groovy package declaration edit added for "
-                            + oldUri);
-                    }
-                    }
-                }
-
-                if (!typeNameChanged) {
-                    continue;
-                }
-
-                // For Java file renames, avoid touching Java files ourselves so
-                // the Red Hat Java extension remains the sole owner of Java edits.
-                if (javaRename || !workspaceRenameEdits.isEmpty()) {
-                    GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: skip declaration fallback for "
-                            + oldUri);
-                    continue;
-                }
-
-                String source = getSourceText(oldUri);
-                if (source == null || source.isBlank()) {
-                    continue;
-                }
-
-                TextEdit declarationEdit = findTypeDeclarationRenameEdit(source, oldTypeName, newTypeName);
-                if (declarationEdit == null) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[rename-trace] willRenameFiles: no declaration fallback edit for " + oldUri);
-                    continue;
-                }
-
-                changes.computeIfAbsent(oldUri, k -> new ArrayList<>()).add(declarationEdit);
-                GroovyLanguageServerPlugin.logInfo(
-                        "[rename-trace] willRenameFiles: declaration fallback edit added for " + oldUri);
-            }
-
-            if (changes.isEmpty()) {
-                GroovyLanguageServerPlugin.logInfo("[rename-trace] willRenameFiles: returning null (no edits)");
-                return null;
-            }
-
+        String oldTypeName = baseNameFromUri(oldUri);
+        String newTypeName = baseNameFromUri(newUri);
+        if (oldTypeName == null || newTypeName == null) {
             GroovyLanguageServerPlugin.logInfo(
-                    "[rename-trace] willRenameFiles: returning changes uris=" + changes.size()
-                    + " edits=" + countTextEdits(changes));
+                    "[rename-trace] willRenameFiles: invalid type names old="
+                            + oldTypeName + LOG_NEW_URI + newTypeName + " uri=" + oldUri);
+            return;
+        }
 
-            WorkspaceEdit edit = new WorkspaceEdit();
-            edit.setChanges(changes);
-            return edit;
-        });
+        TypeMoveContext moveContext = resolveTypeMoveContext(oldUri, newUri, oldTypeName, newTypeName);
+        if (moveContext == null) {
+            addGroovyFallbackPackageEdit(oldUri, newUri, changes);
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: unable to resolve move context for " + oldUri);
+            return;
+        }
+
+        applyResolvedMoveContextEdits(moveContext, oldExtension, oldTypeName, newTypeName, changes);
+    }
+
+    private boolean sameExtension(String oldExtension, String newExtension) {
+        return oldExtension != null && newExtension != null && oldExtension.equals(newExtension);
+    }
+
+    private void addGroovyFallbackPackageEdit(
+            String oldUri,
+            String newUri,
+            Map<String, List<TextEdit>> changes) {
+        if (!isGroovyFileUri(oldUri)) {
+            return;
+        }
+        TextEdit fallbackPackageEdit = findGroovyPackageMoveFallbackEdit(oldUri, newUri);
+        if (fallbackPackageEdit != null) {
+            changes.computeIfAbsent(oldUri, key -> new ArrayList<>()).add(fallbackPackageEdit);
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: groovy package fallback edit added for " + oldUri);
+        }
+    }
+
+    private void applyResolvedMoveContextEdits(
+            TypeMoveContext moveContext,
+            String extension,
+            String oldTypeName,
+            String newTypeName,
+            Map<String, List<TextEdit>> changes) {
+        String oldUri = moveContext.oldUri;
+        boolean javaRename = "java".equals(extension);
+        boolean typeNameChanged = !oldTypeName.equals(newTypeName);
+        boolean packageChanged = moveContext.isPackageChanged();
+
+        if (!typeNameChanged && !packageChanged) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: no type/package change for " + oldUri);
+            return;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[rename-trace] willRenameFiles: candidate old=" + oldTypeName
+                        + LOG_NEW_URI + newTypeName
+                        + " oldFqn=" + moveContext.oldQualifiedName
+                        + LOG_NEW_URI + moveContext.newQualifiedName
+                        + " packageChanged=" + packageChanged
+                        + " ext=" + extension
+                        + " oldUri=" + oldUri + LOG_NEW_URI + moveContext.newUri);
+
+        Map<String, List<TextEdit>> workspaceRenameEdits = typeNameChanged
+                ? buildWorkspaceTypeRenameEdits(oldUri, oldTypeName, newTypeName, javaRename)
+                : Map.of();
+        if (!workspaceRenameEdits.isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: workspace rename edits uris="
+                            + workspaceRenameEdits.size() + LOG_EDITS
+                            + countTextEdits(workspaceRenameEdits));
+            mergeEdits(changes, workspaceRenameEdits);
+        }
+
+        if (packageChanged) {
+            addPackageMoveEdits(moveContext, changes);
+        }
+
+        if (typeNameChanged) {
+            addDeclarationFallbackEdit(
+                    moveContext.oldUri,
+                    oldTypeName,
+                    newTypeName,
+                    javaRename,
+                    workspaceRenameEdits,
+                    changes);
+        }
+    }
+
+    private void addPackageMoveEdits(TypeMoveContext moveContext, Map<String, List<TextEdit>> changes) {
+        Map<String, List<TextEdit>> moveEdits = buildGroovyTypeMoveEdits(moveContext);
+        if (!moveEdits.isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: groovy move edits uris="
+                            + moveEdits.size() + LOG_EDITS + countTextEdits(moveEdits));
+            mergeEdits(changes, moveEdits);
+        }
+
+        if (!isGroovyFileUri(moveContext.oldUri)) {
+            return;
+        }
+
+        String source = getSourceText(moveContext.oldUri);
+        TextEdit packageEdit = findGroovyPackageDeclarationMoveEdit(source, moveContext.newPackageName);
+        if (packageEdit != null) {
+            changes.computeIfAbsent(moveContext.oldUri, k -> new ArrayList<>()).add(packageEdit);
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: groovy package declaration edit added for "
+                            + moveContext.oldUri);
+        }
+    }
+
+    private void addDeclarationFallbackEdit(
+            String oldUri,
+            String oldTypeName,
+            String newTypeName,
+            boolean javaRename,
+            Map<String, List<TextEdit>> workspaceRenameEdits,
+            Map<String, List<TextEdit>> changes) {
+        if (javaRename || !workspaceRenameEdits.isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: skip declaration fallback for " + oldUri);
+            return;
+        }
+
+        String source = getSourceText(oldUri);
+        if (source == null || source.isBlank()) {
+            return;
+        }
+
+        TextEdit declarationEdit = findTypeDeclarationRenameEdit(source, oldTypeName, newTypeName);
+        if (declarationEdit == null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[rename-trace] willRenameFiles: no declaration fallback edit for " + oldUri);
+            return;
+        }
+
+        changes.computeIfAbsent(oldUri, k -> new ArrayList<>()).add(declarationEdit);
+        GroovyLanguageServerPlugin.logInfo(
+                "[rename-trace] willRenameFiles: declaration fallback edit added for " + oldUri);
     }
 
     @Override
@@ -437,32 +497,17 @@ public class GroovyWorkspaceService implements WorkspaceService {
         GroovyLanguageServerPlugin.logInfo(
                 "[rename-trace] didRenameFiles: files=" + params.getFiles().size());
 
-        boolean hasSourceRename = false;
-        boolean hasJavaRename = false;
-        for (FileRename rename : params.getFiles()) {
-            if (rename == null) {
-                continue;
-            }
-            String oldUri = DocumentManager.normalizeUri(rename.getOldUri());
-            String newUri = DocumentManager.normalizeUri(rename.getNewUri());
-            if (isSourceFileUri(oldUri) || isSourceFileUri(newUri)) {
-                hasSourceRename = true;
-                if (isJavaFileUri(oldUri) || isJavaFileUri(newUri)) {
-                    hasJavaRename = true;
-                }
-                break;
-            }
-        }
+        RenameSummary summary = summarizeRenames(params.getFiles());
 
-        if (!hasSourceRename) {
+        if (!summary.hasSourceRename) {
             GroovyLanguageServerPlugin.logInfo("[rename-trace] didRenameFiles: no source rename detected");
             return;
         }
 
         GroovyLanguageServerPlugin.logInfo(
-                "[rename-trace] didRenameFiles: hasSourceRename=true hasJavaRename=" + hasJavaRename);
+                "[rename-trace] didRenameFiles: hasSourceRename=true hasJavaRename=" + summary.hasJavaRename);
 
-        final boolean javaRename = hasJavaRename;
+        final boolean javaRename = summary.hasJavaRename;
         CompletableFuture.runAsync(() -> {
             try {
                 if (javaRename) {
@@ -478,6 +523,26 @@ public class GroovyWorkspaceService implements WorkspaceService {
         });
     }
 
+    private RenameSummary summarizeRenames(List<FileRename> renames) {
+        boolean hasSourceRename = false;
+        boolean hasJavaRename = false;
+        for (FileRename rename : renames) {
+            if (rename != null) {
+                String oldUri = DocumentManager.normalizeUri(rename.getOldUri());
+                String newUri = DocumentManager.normalizeUri(rename.getNewUri());
+                boolean sourceRename = isSourceFileUri(oldUri) || isSourceFileUri(newUri);
+                if (sourceRename) {
+                    hasSourceRename = true;
+                    if (isJavaFileUri(oldUri) || isJavaFileUri(newUri)) {
+                        hasJavaRename = true;
+                    }
+                    break;
+                }
+            }
+        }
+        return new RenameSummary(hasSourceRename, hasJavaRename);
+    }
+
     // ---- Private helpers ----
 
     private boolean isSourceFileUri(String uri) {
@@ -485,7 +550,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
     }
 
     private boolean isGroovyFileUri(String uri) {
-        return "groovy".equals(fileExtensionFromUri(uri));
+        return JSON_GROOVY.equals(fileExtensionFromUri(uri));
     }
 
     private boolean isJavaFileUri(String uri) {
@@ -579,9 +644,8 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
             return new TypeMoveContext(
                     oldUri,
+                    newUri,
                     targetType,
-                    oldTypeName,
-                    newTypeName,
                     oldPackageName,
                     newPackageName,
                     oldQualifiedName,
@@ -620,29 +684,37 @@ public class GroovyWorkspaceService implements WorkspaceService {
             }
 
             for (IPackageFragmentRoot root : javaProject.getPackageFragmentRoots()) {
-                if (root.getKind() != IPackageFragmentRoot.K_SOURCE) {
-                    continue;
+                String resolvedPackage = resolvePackageForRoot(root, newParent);
+                if (resolvedPackage != null) {
+                    return resolvedPackage;
                 }
-
-                IResource resource = root.getResource();
-                if (resource == null || resource.getLocationURI() == null) {
-                    continue;
-                }
-
-                Path rootPath = Paths.get(resource.getLocationURI()).normalize();
-                Path normalizedParent = newParent.normalize();
-                if (!normalizedParent.startsWith(rootPath)) {
-                    continue;
-                }
-
-                Path relative = rootPath.relativize(normalizedParent);
-                return packageNameForPath(relative);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to resolve target package for moved file: " + newUri, e);
         }
 
         return fallbackPackage;
+    }
+
+    private String resolvePackageForRoot(IPackageFragmentRoot root, Path newParent)
+            throws JavaModelException {
+        if (root.getKind() != IPackageFragmentRoot.K_SOURCE) {
+            return null;
+        }
+
+        IResource resource = root.getResource();
+        if (resource == null || resource.getLocationURI() == null) {
+            return null;
+        }
+
+        Path rootPath = Paths.get(resource.getLocationURI()).normalize();
+        Path normalizedParent = newParent.normalize();
+        if (!normalizedParent.startsWith(rootPath)) {
+            return null;
+        }
+
+        Path relative = rootPath.relativize(normalizedParent);
+        return packageNameForPath(relative);
     }
 
     private TextEdit findGroovyPackageMoveFallbackEdit(String oldUri, String newUri) {
@@ -717,59 +789,72 @@ public class GroovyWorkspaceService implements WorkspaceService {
                 return Map.of();
             }
 
-            Map<String, List<SearchMatch>> matchesByUri = new HashMap<>();
-            SearchEngine engine = new SearchEngine();
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                    SearchEngine.createWorkspaceScope(),
-                    new SearchRequestor() {
-                        @Override
-                        public void acceptSearchMatch(SearchMatch match) {
-                            try {
-                                IResource resource = match.getResource();
-                                if (resource == null || resource.getLocationURI() == null) {
-                                    return;
-                                }
-
-                                String targetUri =
-                                        DocumentManager.normalizeUri(resource.getLocationURI().toString());
-                                if (!isGroovyFileUri(targetUri)) {
-                                    return;
-                                }
-
-                                matchesByUri.computeIfAbsent(targetUri, key -> new ArrayList<>()).add(match);
-                            } catch (Exception e) {
-                                GroovyLanguageServerPlugin.logError("Failed to collect move match", e);
-                            }
-                        }
-                    },
-                    null);
-
-            Map<String, List<TextEdit>> editsByUri = new HashMap<>();
-            for (Map.Entry<String, List<SearchMatch>> entry : matchesByUri.entrySet()) {
-                String uri = entry.getKey();
-                String content = getSourceText(uri);
-                if (content == null || content.isBlank()) {
-                    continue;
-                }
-
-                List<TextEdit> fileEdits = buildGroovyFileMoveEdits(
-                        uri,
-                        content,
-                        moveContext,
-                        entry.getValue());
-                if (!fileEdits.isEmpty()) {
-                    editsByUri.put(uri, fileEdits);
-                }
-            }
-
-            return editsByUri;
+            Map<String, List<SearchMatch>> matchesByUri = collectGroovyMoveMatches(pattern);
+            return buildMoveEditsFromMatches(matchesByUri, moveContext);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Workspace file move search failed for " + moveContext.oldUri,
                     e);
             return Map.of();
         }
+    }
+
+    private Map<String, List<SearchMatch>> collectGroovyMoveMatches(SearchPattern pattern)
+            {
+        Map<String, List<SearchMatch>> matchesByUri = new HashMap<>();
+        SearchEngine engine = new SearchEngine();
+        try {
+            engine.search(pattern,
+                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                    SearchEngine.createWorkspaceScope(),
+                    new SearchRequestor() {
+                        @Override
+                        public void acceptSearchMatch(SearchMatch match) {
+                            collectGroovyMoveMatch(matchesByUri, match);
+                        }
+                    },
+                    null);
+        } catch (org.eclipse.core.runtime.CoreException e) {
+            GroovyLanguageServerPlugin.logError("Failed to collect Groovy move matches", e);
+        }
+        return matchesByUri;
+    }
+
+    private void collectGroovyMoveMatch(Map<String, List<SearchMatch>> matchesByUri, SearchMatch match) {
+        try {
+            IResource resource = match.getResource();
+            if (resource == null || resource.getLocationURI() == null) {
+                return;
+            }
+
+            String targetUri = DocumentManager.normalizeUri(resource.getLocationURI().toString());
+            if (!isGroovyFileUri(targetUri)) {
+                return;
+            }
+
+            matchesByUri.computeIfAbsent(targetUri, key -> new ArrayList<>()).add(match);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to collect move match", e);
+        }
+    }
+
+    private Map<String, List<TextEdit>> buildMoveEditsFromMatches(
+            Map<String, List<SearchMatch>> matchesByUri,
+            TypeMoveContext moveContext) {
+        Map<String, List<TextEdit>> editsByUri = new HashMap<>();
+        for (Map.Entry<String, List<SearchMatch>> entry : matchesByUri.entrySet()) {
+            String uri = entry.getKey();
+            String content = getSourceText(uri);
+            if (content == null || content.isBlank()) {
+                continue;
+            }
+
+            List<TextEdit> fileEdits = buildGroovyFileMoveEdits(uri, content, moveContext, entry.getValue());
+            if (!fileEdits.isEmpty()) {
+                editsByUri.put(uri, fileEdits);
+            }
+        }
+        return editsByUri;
     }
 
     private List<TextEdit> buildGroovyFileMoveEdits(
@@ -784,32 +869,37 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
         boolean sameAsMovedTypeFile = Objects.equals(uri, moveContext.oldUri);
         if (!sameAsMovedTypeFile) {
-            String documentPackage = extractPackageName(content);
-            boolean sameAsTargetPackage = Objects.equals(documentPackage, moveContext.newPackageName);
-            boolean hasOldImport = hasExactImport(content, moveContext.oldQualifiedName);
-            boolean hasNewImport = hasExactImport(content, moveContext.newQualifiedName);
-            boolean usesSimpleName = hasSimpleTypeUsage(content, matches, moveContext.oldTypeName);
-
-            if (hasOldImport) {
-                TextEdit importEdit = sameAsTargetPackage
-                        ? createImportRemovalEdit(content, moveContext.oldQualifiedName)
-                        : createImportReplaceEdit(
-                                content,
-                                moveContext.oldQualifiedName,
-                                moveContext.newQualifiedName);
-                if (importEdit != null) {
-                    edits.add(importEdit);
-                }
-            } else if (usesSimpleName && !sameAsTargetPackage && !hasNewImport) {
-                TextEdit insertImport = createImportInsertEdit(content, moveContext.newQualifiedName);
-                if (insertImport != null) {
-                    edits.add(insertImport);
-                }
-            }
+            addImportMoveEdits(content, moveContext, matches, edits);
         }
 
         addQualifiedTypeReferenceUpdates(content, matches, moveContext, edits);
         return edits;
+    }
+
+    private void addImportMoveEdits(
+            String content,
+            TypeMoveContext moveContext,
+            List<SearchMatch> matches,
+            List<TextEdit> edits) {
+        String documentPackage = extractPackageName(content);
+        boolean sameAsTargetPackage = Objects.equals(documentPackage, moveContext.newPackageName);
+        boolean hasOldImport = hasExactImport(content, moveContext.oldQualifiedName);
+        boolean hasNewImport = hasExactImport(content, moveContext.newQualifiedName);
+        boolean usesSimpleName = hasSimpleTypeUsage(content, matches, moveContext.oldTypeSimpleName());
+
+        if (hasOldImport) {
+            TextEdit importEdit = sameAsTargetPackage
+                    ? createImportRemovalEdit(content, moveContext.oldQualifiedName)
+                    : createImportReplaceEdit(content, moveContext.oldQualifiedName, moveContext.newQualifiedName);
+            if (importEdit != null) {
+                edits.add(importEdit);
+            }
+            return;
+        }
+
+        if (usesSimpleName && !sameAsTargetPackage && !hasNewImport) {
+            edits.add(createImportInsertEdit(content, moveContext.newQualifiedName));
+        }
     }
 
     private void addQualifiedTypeReferenceUpdates(
@@ -821,48 +911,64 @@ public class GroovyWorkspaceService implements WorkspaceService {
         for (SearchMatch match : matches) {
             int startOffset = match.getOffset();
             int length = match.getLength();
-            if (startOffset < 0 || length <= 0 || !seenOffsets.add(startOffset)) {
-                continue;
-            }
-
             int endOffset = startOffset + length;
-            if (endOffset > content.length()) {
-                continue;
+            if (shouldReplaceQualifiedReference(
+                    content,
+                    seenOffsets,
+                    startOffset,
+                    length,
+                    endOffset,
+                    moveContext.oldQualifiedName)) {
+                Position start = offsetToPosition(content, startOffset);
+                Position end = offsetToPosition(content, endOffset);
+                edits.add(new TextEdit(new Range(start, end), moveContext.newQualifiedName));
             }
-
-            String token = content.substring(startOffset, endOffset);
-            if (!moveContext.oldQualifiedName.equals(token) || isInsideImportLine(content, startOffset)) {
-                continue;
-            }
-
-            Position start = offsetToPosition(content, startOffset);
-            Position end = offsetToPosition(content, endOffset);
-            edits.add(new TextEdit(new Range(start, end), moveContext.newQualifiedName));
         }
+    }
+
+    private boolean shouldReplaceQualifiedReference(
+            String content,
+            Set<Integer> seenOffsets,
+            int startOffset,
+            int length,
+            int endOffset,
+            String expectedToken) {
+        if (startOffset < 0 || length <= 0 || !seenOffsets.add(startOffset)) {
+            return false;
+        }
+        if (endOffset > content.length()) {
+            return false;
+        }
+        String token = content.substring(startOffset, endOffset);
+        return expectedToken.equals(token) && !isInsideImportLine(content, startOffset);
     }
 
     private boolean hasSimpleTypeUsage(String content, List<SearchMatch> matches, String simpleTypeName) {
         for (SearchMatch match : matches) {
             int startOffset = match.getOffset();
             int length = match.getLength();
-            if (startOffset < 0 || length <= 0) {
-                continue;
-            }
             int endOffset = startOffset + length;
-            if (endOffset > content.length()) {
-                continue;
-            }
-
-            if (isInsideImportLine(content, startOffset)) {
-                continue;
-            }
-
-            String token = content.substring(startOffset, endOffset);
-            if (simpleTypeName.equals(token)) {
+            if (isSimpleTypeMatch(content, simpleTypeName, startOffset, length, endOffset)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private boolean isSimpleTypeMatch(
+            String content,
+            String simpleTypeName,
+            int startOffset,
+            int length,
+            int endOffset) {
+        if (startOffset < 0 || length <= 0 || endOffset > content.length()) {
+            return false;
+        }
+        if (isInsideImportLine(content, startOffset)) {
+            return false;
+        }
+        String token = content.substring(startOffset, endOffset);
+        return simpleTypeName.equals(token);
     }
 
     private boolean isInsideImportLine(String content, int offset) {
@@ -876,7 +982,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             lineEnd = content.length();
         }
         String line = content.substring(lineStart, lineEnd).trim();
-        return line.startsWith("import ") || line.startsWith("import static ");
+        return line.startsWith(IMPORT_PREFIX) || line.startsWith("import static ");
     }
 
     private String extractPackageName(String content) {
@@ -884,9 +990,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             return "";
         }
 
-        Pattern packagePattern = Pattern.compile(
-                "(?m)^\\s*package\\s+([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)*)\\s*;?\\s*$");
-        Matcher matcher = packagePattern.matcher(content);
+        Matcher matcher = PACKAGE_DECLARATION_PATTERN.matcher(content);
         if (matcher.find()) {
             return matcher.group(1);
         }
@@ -938,7 +1042,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     private TextEdit createImportInsertEdit(String content, String qualifiedName) {
         int insertLine = findImportInsertLine(content);
-        String importLine = "import " + qualifiedName + "\n";
+        String importLine = IMPORT_PREFIX + qualifiedName + "\n";
         Position insert = new Position(insertLine, 0);
         return new TextEdit(new Range(insert, insert), importLine);
     }
@@ -953,7 +1057,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             if (trimmed.startsWith("package ")) {
                 packageLine = i;
             }
-            if (trimmed.startsWith("import ")) {
+            if (trimmed.startsWith(IMPORT_PREFIX)) {
                 lastImportLine = i;
             }
             if (trimmed.startsWith("class ") || trimmed.startsWith("interface ")
@@ -979,9 +1083,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             return null;
         }
 
-        Pattern packagePattern = Pattern.compile(
-                "(?m)^\\s*package\\s+([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)*)\\s*;?\\s*$");
-        Matcher matcher = packagePattern.matcher(source);
+        Matcher matcher = PACKAGE_DECLARATION_PATTERN.matcher(source);
         if (matcher.find()) {
             if (newPackageName == null || newPackageName.isBlank()) {
                 int lineStart = source.lastIndexOf('\n', Math.max(0, matcher.start() - 1));
@@ -1166,7 +1268,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
     /**
      * Convert a JDT {@link IJavaElement} to an LSP {@link SymbolInformation}.
      */
-    private SymbolInformation toSymbolInformation(IJavaElement element, SearchMatch match) {
+    private SymbolInformation toSymbolInformation(IJavaElement element) {
         try {
             String name = element.getElementName();
             SymbolKind kind = toSymbolKind(element);
@@ -1180,16 +1282,11 @@ public class GroovyWorkspaceService implements WorkspaceService {
             Location location = new Location();
             location.setUri(resource.getLocationURI().toString());
 
-            // Approximate range from the search match offset/length
-            int offset = match.getOffset();
-            int length = match.getLength();
-
             // We need the document content to convert offset to line/column.
             // For workspace symbols, we provide a basic range.
             Range range = new Range(new Position(0, 0), new Position(0, 0));
 
-            if (element instanceof org.eclipse.jdt.core.ISourceReference) {
-                org.eclipse.jdt.core.ISourceReference sourceRef = (org.eclipse.jdt.core.ISourceReference) element;
+            if (element instanceof org.eclipse.jdt.core.ISourceReference sourceRef) {
                 org.eclipse.jdt.core.ISourceRange sourceRange = sourceRef.getNameRange();
                 if (sourceRange != null) {
                     // We'd need to convert offset to line/col — simplified for now
@@ -1227,8 +1324,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
         switch (element.getElementType()) {
             case IJavaElement.TYPE:
                 try {
-                    if (element instanceof IType) {
-                        IType type = (IType) element;
+                    if (element instanceof IType type) {
                         if (type.isInterface()) return SymbolKind.Interface;
                         if (type.isEnum()) return SymbolKind.Enum;
                     }
@@ -1251,9 +1347,8 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     private static final class TypeMoveContext {
         private final String oldUri;
+        private final String newUri;
         private final IType targetType;
-        private final String oldTypeName;
-        private final String newTypeName;
         private final String oldPackageName;
         private final String newPackageName;
         private final String oldQualifiedName;
@@ -1261,25 +1356,51 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
         private TypeMoveContext(
                 String oldUri,
+                String newUri,
                 IType targetType,
-                String oldTypeName,
-                String newTypeName,
                 String oldPackageName,
                 String newPackageName,
                 String oldQualifiedName,
                 String newQualifiedName) {
             this.oldUri = oldUri;
+            this.newUri = newUri;
             this.targetType = targetType;
-            this.oldTypeName = oldTypeName;
-            this.newTypeName = newTypeName;
             this.oldPackageName = oldPackageName;
             this.newPackageName = newPackageName;
             this.oldQualifiedName = oldQualifiedName;
             this.newQualifiedName = newQualifiedName;
         }
 
+        private String oldTypeSimpleName() {
+            int lastDot = oldQualifiedName.lastIndexOf('.');
+            if (lastDot < 0 || lastDot == oldQualifiedName.length() - 1) {
+                return oldQualifiedName;
+            }
+            return oldQualifiedName.substring(lastDot + 1);
+        }
+
         private boolean isPackageChanged() {
             return !Objects.equals(oldPackageName, newPackageName);
+        }
+    }
+
+    private static final class SourceChangeSummary {
+        private final boolean hasSourceChange;
+        private final boolean hasJavaSourceChange;
+
+        private SourceChangeSummary(boolean hasSourceChange, boolean hasJavaSourceChange) {
+            this.hasSourceChange = hasSourceChange;
+            this.hasJavaSourceChange = hasJavaSourceChange;
+        }
+    }
+
+    private static final class RenameSummary {
+        private final boolean hasSourceRename;
+        private final boolean hasJavaRename;
+
+        private RenameSummary(boolean hasSourceRename, boolean hasJavaRename) {
+            this.hasSourceRename = hasSourceRename;
+            this.hasJavaRename = hasJavaRename;
         }
     }
 }

@@ -43,6 +43,11 @@ public class HoverProvider {
 
     private final DocumentManager documentManager;
 
+    private static final String GROOVY_FENCE_OPEN = "```groovy\n";
+    private static final String FENCE_CLOSE = "\n```\n";
+    private static final String EXTENDS_KW = " extends ";
+    private static final String FENCE_CLOSE_BARE = "\n```";
+
     public HoverProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
     }
@@ -75,8 +80,8 @@ public class HoverProvider {
                         }
                     }
                 }
-            } catch (Throwable t) {
-                GroovyLanguageServerPlugin.logError("Hover JDT failed for " + uri + ", falling back to AST", t);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Hover JDT failed for " + uri + ", falling back to AST", e);
             }
         }
 
@@ -89,164 +94,169 @@ public class HoverProvider {
      */
     private String buildHoverContent(IJavaElement element) throws JavaModelException {
         StringBuilder sb = new StringBuilder();
-
-        switch (element.getElementType()) {
-            case IJavaElement.TYPE: {
-                IType type = (IType) element;
-                sb.append("```groovy\n");
-
-                // Modifiers
-                String modifiers = org.eclipse.jdt.core.Flags.toString(type.getFlags());
-                if (!modifiers.isEmpty()) {
-                    sb.append(modifiers).append(' ');
-                }
-
-                // Kind
-                if (isTrait(type)) {
-                    sb.append("trait ");
-                } else if (type.isInterface()) {
-                    sb.append("interface ");
-                } else if (type.isEnum()) {
-                    sb.append("enum ");
-                } else {
-                    sb.append("class ");
-                }
-
-                sb.append(type.getElementName());
-
-                // Superclass
-                String superclass = type.getSuperclassName();
-                if (superclass != null && !"Object".equals(superclass)
-                        && !"java.lang.Object".equals(superclass)) {
-                    sb.append(" extends ").append(simpleName(superclass));
-                }
-
-                // Interfaces
-                String[] interfaces = type.getSuperInterfaceNames();
-                if (interfaces != null && interfaces.length > 0) {
-                    sb.append(type.isInterface() ? " extends " : " implements ");
-                    for (int i = 0; i < interfaces.length; i++) {
-                        if (i > 0) sb.append(", ");
-                        sb.append(simpleName(interfaces[i]));
-                    }
-                }
-
-                sb.append("\n```\n");
-
-                // Package info
-                String pkg = type.getFullyQualifiedName();
-                int lastDot = pkg.lastIndexOf('.');
-                if (lastDot > 0) {
-                    sb.append("\n*Package:* `").append(pkg.substring(0, lastDot)).append("`\n");
-                }
-                break;
-            }
-
-            case IJavaElement.METHOD: {
-                IMethod method = (IMethod) element;
-                sb.append("```groovy\n");
-
-                // Modifiers
-                String modifiers = org.eclipse.jdt.core.Flags.toString(method.getFlags());
-                if (!modifiers.isEmpty()) {
-                    sb.append(modifiers).append(' ');
-                }
-
-                // Return type
-                if (!method.isConstructor()) {
-                    String returnType = Signature.toString(method.getReturnType());
-                    sb.append(returnType).append(' ');
-                }
-
-                // Method name
-                sb.append(method.getElementName());
-
-                // Parameters
-                sb.append('(');
-                String[] paramTypes = method.getParameterTypes();
-                String[] paramNames = method.getParameterNames();
-                for (int i = 0; i < paramTypes.length; i++) {
-                    if (i > 0) sb.append(", ");
-                    sb.append(Signature.toString(paramTypes[i]));
-                    if (paramNames != null && i < paramNames.length) {
-                        sb.append(' ').append(paramNames[i]);
-                    }
-                }
-                sb.append(')');
-
-                // Exceptions
-                String[] exceptions = method.getExceptionTypes();
-                if (exceptions != null && exceptions.length > 0) {
-                    sb.append(" throws ");
-                    for (int i = 0; i < exceptions.length; i++) {
-                        if (i > 0) sb.append(", ");
-                        sb.append(Signature.toString(exceptions[i]));
-                    }
-                }
-
-                sb.append("\n```\n");
-
-                // Declaring type
-                IType declaringType = method.getDeclaringType();
-                if (declaringType != null) {
-                    sb.append("\n*Declared in* `").append(declaringType.getFullyQualifiedName()).append("`\n");
-                }
-                break;
-            }
-
-            case IJavaElement.FIELD: {
-                IField field = (IField) element;
-                sb.append("```groovy\n");
-
-                // Modifiers
-                String modifiers = org.eclipse.jdt.core.Flags.toString(field.getFlags());
-                if (!modifiers.isEmpty()) {
-                    sb.append(modifiers).append(' ');
-                }
-
-                // Type
-                sb.append(Signature.toString(field.getTypeSignature()));
-                sb.append(' ').append(field.getElementName());
-
-                // Constant value
-                Object constant = field.getConstant();
-                if (constant != null) {
-                    sb.append(" = ").append(constant);
-                }
-
-                sb.append("\n```\n");
-
-                // Declaring type
-                IType declaringType = field.getDeclaringType();
-                if (declaringType != null) {
-                    sb.append("\n*Declared in* `").append(declaringType.getFullyQualifiedName()).append("`\n");
-                }
-                break;
-            }
-
-            case IJavaElement.LOCAL_VARIABLE: {
-                ILocalVariable local = (ILocalVariable) element;
-                sb.append("```groovy\n");
-                sb.append(Signature.toString(local.getTypeSignature()));
-                sb.append(' ').append(local.getElementName());
-                sb.append("\n```\n");
-                sb.append("\n*(local variable)*\n");
-                break;
-            }
-
-            default:
-                sb.append("`").append(element.getElementName()).append("`");
-                break;
-        }
+        sb.append(buildSignatureContent(element));
 
         // Try to get Javadoc / Groovydoc
-        if (element instanceof org.eclipse.jdt.core.IMember) {
-            String javadoc = getJavadocForElement(element);
+        if (element instanceof org.eclipse.jdt.core.IMember member) {
+            String javadoc = getJavadocForElement(member);
             if (javadoc != null && !javadoc.isEmpty()) {
                 sb.append("\n---\n").append(javadoc);
             }
         }
 
+        return sb.toString();
+    }
+
+    private String buildSignatureContent(IJavaElement element) throws JavaModelException {
+        switch (element.getElementType()) {
+            case IJavaElement.TYPE:
+                return buildTypeSignature((IType) element);
+            case IJavaElement.METHOD:
+                return buildMethodSignature((IMethod) element);
+            case IJavaElement.FIELD:
+                return buildFieldSignature((IField) element);
+            case IJavaElement.LOCAL_VARIABLE:
+                return buildLocalVarSignature((ILocalVariable) element);
+            default:
+                return "`" + element.getElementName() + "`";
+        }
+    }
+
+    private String buildTypeSignature(IType type) throws JavaModelException {
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
+
+        String modifiers = org.eclipse.jdt.core.Flags.toString(type.getFlags());
+        if (!modifiers.isEmpty()) {
+            sb.append(modifiers).append(' ');
+        }
+
+        appendTypeKind(sb, type);
+        sb.append(type.getElementName());
+        appendSuperclass(sb, type.getSuperclassName());
+        appendInterfaces(sb, type);
+
+        sb.append(FENCE_CLOSE);
+
+        String pkg = type.getFullyQualifiedName();
+        int lastDot = pkg.lastIndexOf('.');
+        if (lastDot > 0) {
+            sb.append("\n*Package:* `").append(pkg.substring(0, lastDot)).append("`\n");
+        }
+        return sb.toString();
+    }
+
+    private void appendTypeKind(StringBuilder sb, IType type) throws JavaModelException {
+        if (isTrait(type)) {
+            sb.append("trait ");
+        } else if (type.isInterface()) {
+            sb.append("interface ");
+        } else if (type.isEnum()) {
+            sb.append("enum ");
+        } else {
+            sb.append("class ");
+        }
+    }
+
+    private void appendSuperclass(StringBuilder sb, String superclass) {
+        if (superclass != null && !"Object".equals(superclass)
+                && !"java.lang.Object".equals(superclass)) {
+            sb.append(EXTENDS_KW).append(simpleName(superclass));
+        }
+    }
+
+    private void appendInterfaces(StringBuilder sb, IType type) throws JavaModelException {
+        String[] interfaces = type.getSuperInterfaceNames();
+        if (interfaces != null && interfaces.length > 0) {
+            sb.append(type.isInterface() ? EXTENDS_KW : " implements ");
+            for (int i = 0; i < interfaces.length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(simpleName(interfaces[i]));
+            }
+        }
+    }
+
+    private String buildMethodSignature(IMethod method) throws JavaModelException {
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
+
+        String modifiers = org.eclipse.jdt.core.Flags.toString(method.getFlags());
+        if (!modifiers.isEmpty()) {
+            sb.append(modifiers).append(' ');
+        }
+
+        if (!method.isConstructor()) {
+            String returnType = Signature.toString(method.getReturnType());
+            sb.append(returnType).append(' ');
+        }
+
+        sb.append(method.getElementName());
+        appendMethodParameters(sb, method);
+        appendExceptions(sb, method);
+
+        sb.append(FENCE_CLOSE);
+
+        IType declaringType = method.getDeclaringType();
+        if (declaringType != null) {
+            sb.append("\n*Declared in* `").append(declaringType.getFullyQualifiedName()).append("`\n");
+        }
+        return sb.toString();
+    }
+
+    private void appendMethodParameters(StringBuilder sb, IMethod method) throws JavaModelException {
+        sb.append('(');
+        String[] paramTypes = method.getParameterTypes();
+        String[] paramNames = method.getParameterNames();
+        for (int i = 0; i < paramTypes.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(Signature.toString(paramTypes[i]));
+            if (paramNames != null && i < paramNames.length) {
+                sb.append(' ').append(paramNames[i]);
+            }
+        }
+        sb.append(')');
+    }
+
+    private void appendExceptions(StringBuilder sb, IMethod method) throws JavaModelException {
+        String[] exceptions = method.getExceptionTypes();
+        if (exceptions != null && exceptions.length > 0) {
+            sb.append(" throws ");
+            for (int i = 0; i < exceptions.length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(Signature.toString(exceptions[i]));
+            }
+        }
+    }
+
+    private String buildFieldSignature(IField field) throws JavaModelException {
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
+
+        String modifiers = org.eclipse.jdt.core.Flags.toString(field.getFlags());
+        if (!modifiers.isEmpty()) {
+            sb.append(modifiers).append(' ');
+        }
+
+        sb.append(Signature.toString(field.getTypeSignature()));
+        sb.append(' ').append(field.getElementName());
+
+        Object constant = field.getConstant();
+        if (constant != null) {
+            sb.append(" = ").append(constant);
+        }
+
+        sb.append(FENCE_CLOSE);
+
+        IType declaringType = field.getDeclaringType();
+        if (declaringType != null) {
+            sb.append("\n*Declared in* `").append(declaringType.getFullyQualifiedName()).append("`\n");
+        }
+        return sb.toString();
+    }
+
+    private String buildLocalVarSignature(ILocalVariable local) {
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
+        sb.append(Signature.toString(local.getTypeSignature()));
+        sb.append(' ').append(local.getElementName());
+        sb.append(FENCE_CLOSE);
+        sb.append("\n*(local variable)*\n");
         return sb.toString();
     }
 
@@ -256,75 +266,77 @@ public class HoverProvider {
      */
     private String getJavadocForElement(IJavaElement element) {
         try {
-            // First try JDT's built-in Javadoc
-            if (element instanceof org.eclipse.jdt.core.IMember) {
-                try {
-                    String jdtDoc = ((org.eclipse.jdt.core.IMember) element).getAttachedJavadoc(null);
-                    if (jdtDoc != null && !jdtDoc.isEmpty()) {
-                        return jdtDoc;
-                    }
-                } catch (JavaModelException e) {
-                    // continue to source JAR approach
-                }
+            String attachedDoc = getJavadocFromAttachment(element);
+            if (attachedDoc != null) {
+                return attachedDoc;
             }
 
-            // Get the type that owns this element
-            IType type = null;
-            if (element instanceof IType) {
-                type = (IType) element;
-            } else {
-                IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
-                if (ancestor instanceof IType) {
-                    type = (IType) ancestor;
-                }
-            }
-
-            if (type == null || type.getClassFile() == null) {
-                // Might be a JDK type (no classFile, source is in src.zip)
-                if (type != null) {
-                    String fqn = type.getFullyQualifiedName();
-                    String jdkSource = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
-                    if (jdkSource != null) {
-                        if (element instanceof IType) {
-                            return SourceJarHelper.extractJavadoc(jdkSource, type.getElementName());
-                        } else {
-                            return SourceJarHelper.extractMemberJavadoc(jdkSource, element.getElementName());
-                        }
-                    }
-                }
+            IType type = resolveOwnerType(element);
+            if (type == null) {
                 return null;
             }
 
-            // Find and read from sources JAR
-            java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
-            String fqn = type.getFullyQualifiedName();
-            String source = null;
-
-            if (sourcesJar != null) {
-                source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-            }
-
-            // Fallback: try JDK src.zip
+            String source = loadSourceForJavadoc(type);
             if (source == null || source.isEmpty()) {
-                source = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
+                return null;
             }
 
-            if (source == null || source.isEmpty()) return null;
-
-            // Extract the appropriate Javadoc
-            if (element instanceof IType) {
-                return SourceJarHelper.extractJavadoc(source, type.getElementName());
-            } else {
-                // For methods/fields, extract member doc
-                String memberName = element.getElementName();
-                String memberDoc = SourceJarHelper.extractMemberJavadoc(source, memberName);
-                return memberDoc;
-            }
-
+            return extractJavadocFromSource(source, element, type);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[hover] Failed to get Javadoc for " + element.getElementName(), e);
             return null;
         }
+    }
+
+    private String getJavadocFromAttachment(IJavaElement element) {
+        if (element instanceof org.eclipse.jdt.core.IMember member) {
+            try {
+                String jdtDoc = member.getAttachedJavadoc(null);
+                if (jdtDoc != null && !jdtDoc.isEmpty()) {
+                    return jdtDoc;
+                }
+            } catch (JavaModelException e) {
+                // continue to source JAR approach
+            }
+        }
+        return null;
+    }
+
+    private IType resolveOwnerType(IJavaElement element) {
+        if (element instanceof IType type) {
+            return type;
+        }
+        IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
+        return ancestor instanceof IType type ? type : null;
+    }
+
+    private String loadSourceForJavadoc(IType type) {
+        String fqn = type.getFullyQualifiedName();
+        if (type.getClassFile() == null) {
+            return SourceJarHelper.readSourceFromJdkSrcZip(fqn);
+        }
+        return loadSourceFromJarOrJdk(type, fqn);
+    }
+
+    private String loadSourceFromJarOrJdk(IType type, String fqn) {
+        java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
+        String source = null;
+
+        if (sourcesJar != null) {
+            source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
+        }
+
+        if (source == null || source.isEmpty()) {
+            source = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
+        }
+        return source;
+    }
+
+    private String extractJavadocFromSource(String source, IJavaElement element, IType type) {
+        if (element instanceof IType) {
+            return SourceJarHelper.extractJavadoc(source, type.getElementName());
+        }
+        return SourceJarHelper.extractMemberJavadoc(source, element.getElementName());
     }
 
     private int positionToOffset(String content, Position position) {
@@ -368,7 +380,6 @@ public class HoverProvider {
 
         // LSP positions are 0-based; Groovy AST is 1-based
         int targetLine = position.getLine() + 1;
-        int targetCol = position.getCharacter() + 1;
 
         // Extract the word under cursor for matching
         int offset = positionToOffset(content, position);
@@ -378,45 +389,69 @@ public class HoverProvider {
         }
 
         for (ClassNode classNode : ast.getClasses()) {
-            // Check class name
-            if (classNode.getNameWithoutPackage().equals(word)
-                    && isInRange(classNode, targetLine)) {
-                return buildASTHover(buildClassHover(classNode));
-            }
-
-            // Check methods
-            for (MethodNode method : classNode.getMethods()) {
-                if (method.getName().equals(word)
-                        && isInRange(method, targetLine)) {
-                    return buildASTHover(buildMethodHover(method));
-                }
-            }
-
-            // Check fields
-            for (FieldNode field : classNode.getFields()) {
-                if (field.getName().equals(word)
-                        && isInRange(field, targetLine)) {
-                    return buildASTHover(buildFieldHover(field));
-                }
-            }
-
-            // Check properties
-            for (PropertyNode prop : classNode.getProperties()) {
-                if (prop.getName().equals(word)
-                        && ((prop.getField() != null && isInRange(prop.getField(), targetLine))
-                                || isInRange(prop, targetLine))) {
-                    return buildASTHover(buildPropertyHover(prop));
-                }
-            }
-
-            // Check members inherited from traits/interfaces
-            Hover traitHover = resolveTraitMemberHover(classNode, ast, word, targetLine);
-            if (traitHover != null) {
-                return traitHover;
+            Hover hover = findHoverInClass(classNode, ast, word, targetLine);
+            if (hover != null) {
+                return hover;
             }
         }
 
         return null;
+    }
+
+    /**
+     * Search a single AST class for hover information matching the given word at the target line.
+     */
+    private Hover findHoverInClass(ClassNode classNode, ModuleNode ast, String word, int targetLine) {
+        // Check class name
+        if (classNode.getNameWithoutPackage().equals(word) && isInRange(classNode, targetLine)) {
+            return buildASTHover(buildClassHover(classNode));
+        }
+
+        Hover memberHover = findMemberHoverInClass(classNode, word, targetLine);
+        if (memberHover != null) {
+            return memberHover;
+        }
+
+        // Check members inherited from traits/interfaces
+        return resolveTraitMemberHover(classNode, ast, word, targetLine);
+    }
+
+    /**
+     * Search direct members (methods, fields, properties) of a class for hover information.
+     */
+    private Hover findMemberHoverInClass(ClassNode classNode, String word, int targetLine) {
+        for (MethodNode method : classNode.getMethods()) {
+            if (method.getName().equals(word) && isInRange(method, targetLine)) {
+                return buildASTHover(buildMethodHover(method));
+            }
+        }
+
+        for (FieldNode field : classNode.getFields()) {
+            if (field.getName().equals(word) && isInRange(field, targetLine)) {
+                return buildASTHover(buildFieldHover(field));
+            }
+        }
+
+        for (PropertyNode prop : classNode.getProperties()) {
+            if (isPropertyMatch(prop, word, targetLine)) {
+                return buildASTHover(buildPropertyHover(prop));
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Check if a property node matches the target word and line.
+     */
+    private boolean isPropertyMatch(PropertyNode prop, String word, int targetLine) {
+        if (!prop.getName().equals(word)) {
+            return false;
+        }
+        if (prop.getField() != null && isInRange(prop.getField(), targetLine)) {
+            return true;
+        }
+        return isInRange(prop, targetLine);
     }
 
     /**
@@ -463,7 +498,7 @@ public class HoverProvider {
     }
 
     private String buildClassHover(ClassNode classNode) {
-        StringBuilder sb = new StringBuilder("```groovy\n");
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
         if (GroovyTypeKindHelper.isTrait(classNode)) {
             sb.append("trait ");
         } else if (classNode.isInterface()) {
@@ -476,7 +511,7 @@ public class HoverProvider {
         sb.append(classNode.getName());
         ClassNode superClass = classNode.getSuperClass();
         if (superClass != null && !"java.lang.Object".equals(superClass.getName())) {
-            sb.append(" extends ").append(superClass.getNameWithoutPackage());
+            sb.append(EXTENDS_KW).append(superClass.getNameWithoutPackage());
         }
         ClassNode[] interfaces = classNode.getInterfaces();
         if (interfaces != null && interfaces.length > 0) {
@@ -486,12 +521,12 @@ public class HoverProvider {
                 sb.append(interfaces[i].getNameWithoutPackage());
             }
         }
-        sb.append("\n```");
+        sb.append(FENCE_CLOSE_BARE);
         return sb.toString();
     }
 
     private String buildMethodHover(MethodNode method) {
-        StringBuilder sb = new StringBuilder("```groovy\n");
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
         sb.append(method.getReturnType().getNameWithoutPackage()).append(' ');
         sb.append(method.getName()).append('(');
         Parameter[] params = method.getParameters();
@@ -501,23 +536,23 @@ public class HoverProvider {
             sb.append(' ').append(params[i].getName());
         }
         sb.append(')');
-        sb.append("\n```");
+        sb.append(FENCE_CLOSE_BARE);
         return sb.toString();
     }
 
     private String buildFieldHover(FieldNode field) {
-        StringBuilder sb = new StringBuilder("```groovy\n");
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
         sb.append(field.getType().getNameWithoutPackage());
         sb.append(' ').append(field.getName());
-        sb.append("\n```");
+        sb.append(FENCE_CLOSE_BARE);
         return sb.toString();
     }
 
     private String buildPropertyHover(PropertyNode prop) {
-        StringBuilder sb = new StringBuilder("```groovy\n");
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
         sb.append(prop.getType().getNameWithoutPackage());
         sb.append(' ').append(prop.getName());
-        sb.append("\n```\n\n*(property)*");
+        sb.append(FENCE_CLOSE_BARE).append("\n\n*(property)*");
         return sb.toString();
     }
 

@@ -27,6 +27,7 @@ import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.Signature;
 import org.eclipse.lsp4j.DocumentSymbol;
 import org.eclipse.lsp4j.DocumentSymbolParams;
@@ -67,7 +68,7 @@ public class DocumentSymbolProvider {
 
         if (workingCopy == null) {
             // Fallback: use Groovy AST for document symbols
-            return getDocumentSymbolsFromGroovyAST(uri, content);
+            return getDocumentSymbolsFromGroovyAST(uri);
         }
 
         try {
@@ -91,76 +92,8 @@ public class DocumentSymbolProvider {
      */
     private DocumentSymbol toDocumentSymbol(IType type, String content) {
         try {
-            DocumentSymbol symbol = new DocumentSymbol();
-            symbol.setName(type.getElementName());
-            symbol.setKind(getTypeKind(type));
-
-            // Detail: superclass info
-            String superclass = type.getSuperclassName();
-            if (superclass != null && !"Object".equals(superclass)) {
-                symbol.setDetail("extends " + superclass);
-            }
-
-            // Ranges
-            setRanges(symbol, type, content);
-
-            // Children: methods, fields, inner types
-            List<DocumentSymbol> children = new ArrayList<>();
-
-            // Fields
-            for (IField field : type.getFields()) {
-                DocumentSymbol fieldSymbol = new DocumentSymbol();
-                fieldSymbol.setName(field.getElementName());
-                fieldSymbol.setKind(org.eclipse.jdt.core.Flags.isEnum(field.getFlags())
-                        ? SymbolKind.EnumMember : SymbolKind.Field);
-
-                try {
-                    fieldSymbol.setDetail(Signature.toString(field.getTypeSignature()));
-                } catch (Exception e) {
-                    // ignore
-                }
-
-                setRanges(fieldSymbol, field, content);
-                children.add(fieldSymbol);
-            }
-
-            // Methods
-            for (IMethod method : type.getMethods()) {
-                DocumentSymbol methodSymbol = new DocumentSymbol();
-                methodSymbol.setName(method.getElementName());
-                methodSymbol.setKind(method.isConstructor() ? SymbolKind.Constructor : SymbolKind.Method);
-
-                // Detail: parameter signature
-                StringBuilder detail = new StringBuilder("(");
-                String[] paramTypes = method.getParameterTypes();
-                String[] paramNames = method.getParameterNames();
-                for (int i = 0; i < paramTypes.length; i++) {
-                    if (i > 0) detail.append(", ");
-                    detail.append(Signature.toString(paramTypes[i]));
-                    if (paramNames != null && i < paramNames.length) {
-                        detail.append(' ').append(paramNames[i]);
-                    }
-                }
-                detail.append(')');
-
-                if (!method.isConstructor()) {
-                    detail.append(": ").append(Signature.toString(method.getReturnType()));
-                }
-
-                methodSymbol.setDetail(detail.toString());
-                setRanges(methodSymbol, method, content);
-                children.add(methodSymbol);
-            }
-
-            // Inner types (recursive)
-            for (IType innerType : type.getTypes()) {
-                DocumentSymbol innerSymbol = toDocumentSymbol(innerType, content);
-                if (innerSymbol != null) {
-                    children.add(innerSymbol);
-                }
-            }
-
-            symbol.setChildren(children);
+            DocumentSymbol symbol = createTypeSymbol(type, content);
+            symbol.setChildren(createTypeChildren(type, content));
             return symbol;
 
         } catch (Exception e) {
@@ -169,13 +102,99 @@ public class DocumentSymbolProvider {
         }
     }
 
+    private DocumentSymbol createTypeSymbol(IType type, String content) throws JavaModelException {
+        DocumentSymbol symbol = new DocumentSymbol();
+        symbol.setName(type.getElementName());
+        symbol.setKind(getTypeKind(type));
+
+        String superclass = type.getSuperclassName();
+        if (superclass != null && !"Object".equals(superclass)) {
+            symbol.setDetail("extends " + superclass);
+        }
+
+        setRanges(symbol, type, content);
+        return symbol;
+    }
+
+    private List<DocumentSymbol> createTypeChildren(IType type, String content) throws JavaModelException {
+        List<DocumentSymbol> children = new ArrayList<>();
+        addFieldSymbols(type, content, children);
+        addMethodSymbols(type, content, children);
+        addInnerTypeSymbols(type, content, children);
+        return children;
+    }
+
+        private void addFieldSymbols(IType type, String content, List<DocumentSymbol> children)
+            throws JavaModelException {
+        for (IField field : type.getFields()) {
+            DocumentSymbol fieldSymbol = new DocumentSymbol();
+            fieldSymbol.setName(field.getElementName());
+            fieldSymbol.setKind(org.eclipse.jdt.core.Flags.isEnum(field.getFlags())
+                    ? SymbolKind.EnumMember : SymbolKind.Field);
+            fieldSymbol.setDetail(resolveFieldDetail(field));
+            setRanges(fieldSymbol, field, content);
+            children.add(fieldSymbol);
+        }
+    }
+
+    private String resolveFieldDetail(IField field) {
+        try {
+            return Signature.toString(field.getTypeSignature());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+        private void addMethodSymbols(IType type, String content, List<DocumentSymbol> children)
+            throws JavaModelException {
+        for (IMethod method : type.getMethods()) {
+            DocumentSymbol methodSymbol = new DocumentSymbol();
+            methodSymbol.setName(method.getElementName());
+            methodSymbol.setKind(method.isConstructor() ? SymbolKind.Constructor : SymbolKind.Method);
+            methodSymbol.setDetail(resolveMethodDetail(method));
+            setRanges(methodSymbol, method, content);
+            children.add(methodSymbol);
+        }
+    }
+
+    private String resolveMethodDetail(IMethod method) throws JavaModelException {
+        StringBuilder detail = new StringBuilder("(");
+        String[] paramTypes = method.getParameterTypes();
+        String[] paramNames = method.getParameterNames();
+
+        for (int i = 0; i < paramTypes.length; i++) {
+            if (i > 0) {
+                detail.append(", ");
+            }
+            detail.append(Signature.toString(paramTypes[i]));
+            if (paramNames != null && i < paramNames.length) {
+                detail.append(' ').append(paramNames[i]);
+            }
+        }
+
+        detail.append(')');
+        if (!method.isConstructor()) {
+            detail.append(": ").append(Signature.toString(method.getReturnType()));
+        }
+        return detail.toString();
+    }
+
+    private void addInnerTypeSymbols(IType type, String content, List<DocumentSymbol> children)
+            throws JavaModelException {
+        for (IType innerType : type.getTypes()) {
+            DocumentSymbol innerSymbol = toDocumentSymbol(innerType, content);
+            if (innerSymbol != null) {
+                children.add(innerSymbol);
+            }
+        }
+    }
+
     /**
      * Set the range and selectionRange on a DocumentSymbol from a JDT source element.
      */
     private void setRanges(DocumentSymbol symbol, org.eclipse.jdt.core.IJavaElement element, String content) {
         try {
-            if (element instanceof ISourceReference) {
-                ISourceReference sourceRef = (ISourceReference) element;
+            if (element instanceof ISourceReference sourceRef) {
 
                 // Full source range
                 ISourceRange sourceRange = sourceRef.getSourceRange();
@@ -262,8 +281,8 @@ public class DocumentSymbolProvider {
     /**
      * Build document symbols from the Groovy AST when JDT is not available.
      */
-    private List<Either<SymbolInformation, DocumentSymbol>> getDocumentSymbolsFromGroovyAST(
-            String uri, String content) {
+        private List<Either<SymbolInformation, DocumentSymbol>> getDocumentSymbolsFromGroovyAST(
+            String uri) {
         List<Either<SymbolInformation, DocumentSymbol>> result = new ArrayList<>();
 
         ModuleNode ast = documentManager.getGroovyAST(uri);
@@ -279,10 +298,7 @@ public class DocumentSymbolProvider {
                     continue;
                 }
 
-                DocumentSymbol classSymbol = toDocumentSymbolFromAST(classNode, content);
-                if (classSymbol != null) {
-                    result.add(Either.forRight(classSymbol));
-                }
+                result.add(Either.forRight(toDocumentSymbolFromAST(classNode)));
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -295,114 +311,127 @@ public class DocumentSymbolProvider {
     /**
      * Convert a Groovy {@link ClassNode} to a {@link DocumentSymbol} with children.
      */
-    private DocumentSymbol toDocumentSymbolFromAST(ClassNode classNode, String content) {
+    private DocumentSymbol toDocumentSymbolFromAST(ClassNode classNode) {
         DocumentSymbol symbol = new DocumentSymbol();
         symbol.setName(classNode.getNameWithoutPackage());
+        symbol.setKind(getAstTypeKind(classNode));
+        setAstSuperclassDetail(symbol, classNode);
+        setRangesFromAST(symbol, classNode);
+        symbol.setChildren(createAstChildren(classNode));
+        return symbol;
+    }
 
-        // Determine kind
+    private SymbolKind getAstTypeKind(ClassNode classNode) {
         if (GroovyTypeKindHelper.isTrait(classNode)) {
-            symbol.setKind(SymbolKind.Struct);
-        } else if (classNode.isInterface()) {
-            symbol.setKind(SymbolKind.Interface);
-        } else if (classNode.isEnum()) {
-            symbol.setKind(SymbolKind.Enum);
-        } else {
-            symbol.setKind(SymbolKind.Class);
+            return SymbolKind.Struct;
         }
+        if (classNode.isInterface()) {
+            return SymbolKind.Interface;
+        }
+        if (classNode.isEnum()) {
+            return SymbolKind.Enum;
+        }
+        return SymbolKind.Class;
+    }
 
-        // Superclass detail
+    private void setAstSuperclassDetail(DocumentSymbol symbol, ClassNode classNode) {
         ClassNode superClass = classNode.getSuperClass();
-        if (superClass != null && !"java.lang.Object".equals(superClass.getName())
+        if (superClass != null
+                && !"java.lang.Object".equals(superClass.getName())
                 && !"groovy.lang.Script".equals(superClass.getName())) {
             symbol.setDetail("extends " + superClass.getNameWithoutPackage());
         }
+    }
 
-        // Set ranges from AST line/column info
-        setRangesFromAST(symbol, classNode, content);
-
-        // Children
+    private List<DocumentSymbol> createAstChildren(ClassNode classNode) {
         List<DocumentSymbol> children = new ArrayList<>();
+        addAstPropertySymbols(classNode, children);
+        addAstFieldSymbols(classNode, children);
+        addAstMethodSymbols(classNode, children);
+        addAstInnerTypeSymbols(classNode, children);
+        return children;
+    }
 
-        // Properties
+    private void addAstPropertySymbols(ClassNode classNode, List<DocumentSymbol> children) {
         for (PropertyNode prop : classNode.getProperties()) {
             DocumentSymbol propSymbol = new DocumentSymbol();
             propSymbol.setName(prop.getName());
             propSymbol.setKind(SymbolKind.Property);
             propSymbol.setDetail(prop.getType().getNameWithoutPackage());
-            setRangesFromAST(propSymbol, prop.getField(), content);
+            setRangesFromAST(propSymbol, prop.getField());
             children.add(propSymbol);
         }
+    }
 
-        // Fields (excluding property-backing fields)
+    private void addAstFieldSymbols(ClassNode classNode, List<DocumentSymbol> children) {
         for (FieldNode field : classNode.getFields()) {
-            if (field.getName().startsWith("$") || field.getName().startsWith("__")) {
-                continue;
+            if (isVisibleNonPropertyField(classNode, field)) {
+                DocumentSymbol fieldSymbol = new DocumentSymbol();
+                fieldSymbol.setName(field.getName());
+                fieldSymbol.setKind(classNode.isEnum() && field.isEnum()
+                        ? SymbolKind.EnumMember : SymbolKind.Field);
+                fieldSymbol.setDetail(field.getType().getNameWithoutPackage());
+                setRangesFromAST(fieldSymbol, field);
+                children.add(fieldSymbol);
             }
-            // Check if this field backs a property
-            boolean isPropertyField = false;
-            for (PropertyNode prop : classNode.getProperties()) {
-                if (prop.getName().equals(field.getName())) {
-                    isPropertyField = true;
-                    break;
-                }
-            }
-            if (isPropertyField) continue;
-
-            DocumentSymbol fieldSymbol = new DocumentSymbol();
-            fieldSymbol.setName(field.getName());
-            fieldSymbol.setKind(classNode.isEnum() && field.isEnum()
-                    ? SymbolKind.EnumMember : SymbolKind.Field);
-            fieldSymbol.setDetail(field.getType().getNameWithoutPackage());
-            setRangesFromAST(fieldSymbol, field, content);
-            children.add(fieldSymbol);
         }
+    }
 
-        // Methods
+    private void addAstMethodSymbols(ClassNode classNode, List<DocumentSymbol> children) {
         for (MethodNode method : classNode.getMethods()) {
-            if (method.getName().startsWith("<") || method.isSynthetic()) {
-                continue;
+            if (isVisibleAstMethod(method)) {
+                DocumentSymbol methodSymbol = createAstMethodSymbol(method);
+                setRangesFromAST(methodSymbol, method);
+                children.add(methodSymbol);
             }
-
-            DocumentSymbol methodSymbol = new DocumentSymbol();
-            methodSymbol.setName(method.getName());
-            methodSymbol.setKind(method.getName().equals("<init>")
-                    ? SymbolKind.Constructor : SymbolKind.Method);
-
-            // Detail: parameters and return type
-            StringBuilder detail = new StringBuilder("(");
-            Parameter[] params = method.getParameters();
-            for (int i = 0; i < params.length; i++) {
-                if (i > 0) detail.append(", ");
-                detail.append(params[i].getType().getNameWithoutPackage());
-                detail.append(' ').append(params[i].getName());
-            }
-            detail.append("): ").append(method.getReturnType().getNameWithoutPackage());
-            methodSymbol.setDetail(detail.toString());
-
-            setRangesFromAST(methodSymbol, method, content);
-            children.add(methodSymbol);
         }
+    }
 
-        // Inner classes
+    private boolean isVisibleAstMethod(MethodNode method) {
+        return !method.getName().startsWith("<") && !method.isSynthetic();
+    }
+
+    private DocumentSymbol createAstMethodSymbol(MethodNode method) {
+        DocumentSymbol methodSymbol = new DocumentSymbol();
+        methodSymbol.setName(method.getName());
+        methodSymbol.setKind(method.getName().equals("<init>")
+                ? SymbolKind.Constructor : SymbolKind.Method);
+        methodSymbol.setDetail(buildAstMethodDetail(method));
+        return methodSymbol;
+    }
+
+    private String buildAstMethodDetail(MethodNode method) {
+        StringBuilder detail = new StringBuilder("(");
+        Parameter[] params = method.getParameters();
+        for (int i = 0; i < params.length; i++) {
+            if (i > 0) {
+                detail.append(", ");
+            }
+            detail.append(params[i].getType().getNameWithoutPackage())
+                    .append(' ')
+                    .append(params[i].getName());
+        }
+        detail.append("): ").append(method.getReturnType().getNameWithoutPackage());
+        return detail.toString();
+    }
+
+    private void addAstInnerTypeSymbols(ClassNode classNode, List<DocumentSymbol> children) {
         java.util.Iterator<org.codehaus.groovy.ast.InnerClassNode> innerIter =
                 classNode.getInnerClasses();
         while (innerIter.hasNext()) {
             ClassNode inner = innerIter.next();
-            DocumentSymbol innerSymbol = toDocumentSymbolFromAST(inner, content);
+            DocumentSymbol innerSymbol = toDocumentSymbolFromAST(inner);
             if (innerSymbol != null) {
                 children.add(innerSymbol);
             }
         }
-
-        symbol.setChildren(children);
-        return symbol;
     }
 
     /**
      * Set ranges from Groovy AST node line/column information.
      */
     private void setRangesFromAST(DocumentSymbol symbol,
-            org.codehaus.groovy.ast.ASTNode node, String content) {
+            org.codehaus.groovy.ast.ASTNode node) {
         if (node == null) {
             Range defaultRange = new Range(new Position(0, 0), new Position(0, 0));
             symbol.setRange(defaultRange);
@@ -425,5 +454,19 @@ public class DocumentSymbolProvider {
                 new Position(startLine, startCol),
                 new Position(startLine, startCol + symbol.getName().length()));
         symbol.setSelectionRange(nameRange);
+    }
+
+    private boolean isVisibleNonPropertyField(ClassNode classNode, FieldNode field) {
+        String fieldName = field.getName();
+        if (fieldName.startsWith("$") || fieldName.startsWith("__")) {
+            return false;
+        }
+
+        for (PropertyNode prop : classNode.getProperties()) {
+            if (fieldName.equals(prop.getName())) {
+                return false;
+            }
+        }
+        return true;
     }
 }

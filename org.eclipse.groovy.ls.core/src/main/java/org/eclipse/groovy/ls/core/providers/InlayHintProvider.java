@@ -170,26 +170,44 @@ public class InlayHintProvider {
             this.sourceUnit = module.getContext();
 
             for (ClassNode classNode : module.getClasses()) {
-                if (classNode.isScript() && classNode.getLineNumber() < 1) {
-                    MethodNode runMethod = classNode.getMethod("run", Parameter.EMPTY_ARRAY);
-                    if (runMethod != null && runMethod.getCode() != null) {
-                        runMethod.getCode().visit(this);
-                    }
-                    for (MethodNode method : classNode.getMethods()) {
-                        if (!"run".equals(method.getName()) && !"main".equals(method.getName())
-                                && method.getLineNumber() > 0) {
-                            visitMethod(method);
-                        }
-                    }
-                    continue;
-                }
-                visitClass(classNode);
+                visitModuleClass(classNode);
             }
 
             BlockStatement statementBlock = module.getStatementBlock();
             if (statementBlock != null) {
                 statementBlock.visit(this);
             }
+        }
+
+        private void visitModuleClass(ClassNode classNode) {
+            if (isSyntheticScriptClass(classNode)) {
+                visitSyntheticScriptMembers(classNode);
+                return;
+            }
+            visitClass(classNode);
+        }
+
+        private boolean isSyntheticScriptClass(ClassNode classNode) {
+            return classNode.isScript() && classNode.getLineNumber() < 1;
+        }
+
+        private void visitSyntheticScriptMembers(ClassNode classNode) {
+            MethodNode runMethod = classNode.getMethod("run", Parameter.EMPTY_ARRAY);
+            if (runMethod != null && runMethod.getCode() != null) {
+                runMethod.getCode().visit(this);
+            }
+
+            for (MethodNode method : classNode.getMethods()) {
+                if (isUserDefinedScriptMethod(method)) {
+                    visitMethod(method);
+                }
+            }
+        }
+
+        private boolean isUserDefinedScriptMethod(MethodNode method) {
+            return !"run".equals(method.getName())
+                    && !"main".equals(method.getName())
+                    && method.getLineNumber() > 0;
         }
 
         @Override
@@ -269,20 +287,18 @@ public class InlayHintProvider {
             int max = Math.min(arguments.size(), parameterNames.length);
             for (int index = 0; index < max; index++) {
                 Expression argument = arguments.get(index);
-                if (argument == null || argument.getLineNumber() < 1 || isNamedArgument(argument)) {
-                    continue;
-                }
-
                 String parameterName = parameterNames[index];
-                if (parameterName == null || parameterName.isBlank()) {
-                    continue;
+                if (isHintableArgument(argument) && parameterName != null && !parameterName.isBlank()) {
+                    Position position = new Position(
+                            Math.max(0, argument.getLineNumber() - 1),
+                            Math.max(0, argument.getColumnNumber() - 1));
+                    addParameterHint(position, parameterName + ":");
                 }
-
-                Position position = new Position(
-                        Math.max(0, argument.getLineNumber() - 1),
-                        Math.max(0, argument.getColumnNumber() - 1));
-                addParameterHint(position, parameterName + ":");
             }
+        }
+
+        private boolean isHintableArgument(Expression argument) {
+            return argument != null && argument.getLineNumber() >= 1 && !isNamedArgument(argument);
         }
 
         private IMethod resolveBestMethodTarget(int offset, String methodName, int argumentCount) {
@@ -291,11 +307,10 @@ public class InlayHintProvider {
                 List<IMethod> methods = new ArrayList<>();
                 if (elements != null) {
                     for (IJavaElement element : elements) {
-                        if (element instanceof IMethod) {
-                            IMethod method = (IMethod) element;
-                            if (!method.isConstructor() && methodName.equals(method.getElementName())) {
-                                methods.add(method);
-                            }
+                        if (element instanceof IMethod method
+                                && !method.isConstructor()
+                                && methodName.equals(method.getElementName())) {
+                            methods.add(method);
                         }
                     }
                 }
@@ -308,27 +323,41 @@ public class InlayHintProvider {
         private IMethod resolveBestConstructorTarget(int offset, int argumentCount) {
             try {
                 IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
-                List<IMethod> constructors = new ArrayList<>();
-                if (elements != null) {
-                    for (IJavaElement element : elements) {
-                        if (element instanceof IMethod) {
-                            IMethod method = (IMethod) element;
-                            if (method.isConstructor()) {
-                                constructors.add(method);
-                            }
-                        } else if (element instanceof IType) {
-                            IType type = (IType) element;
-                            for (IMethod method : type.getMethods()) {
-                                if (method.isConstructor()) {
-                                    constructors.add(method);
-                                }
-                            }
-                        }
-                    }
-                }
+                List<IMethod> constructors = collectConstructorCandidates(elements);
                 return chooseBestMethod(constructors, argumentCount);
             } catch (Exception ignored) {
                 return null;
+            }
+        }
+
+        private List<IMethod> collectConstructorCandidates(IJavaElement[] elements)
+                throws JavaModelException {
+            List<IMethod> constructors = new ArrayList<>();
+            if (elements == null) {
+                return constructors;
+            }
+
+            for (IJavaElement element : elements) {
+                addConstructorCandidates(element, constructors);
+            }
+            return constructors;
+        }
+
+        private void addConstructorCandidates(IJavaElement element, List<IMethod> constructors)
+                throws JavaModelException {
+            if (element instanceof IMethod method) {
+                if (method.isConstructor()) {
+                    constructors.add(method);
+                }
+                return;
+            }
+
+            if (element instanceof IType type) {
+                for (IMethod method : type.getMethods()) {
+                    if (method.isConstructor()) {
+                        constructors.add(method);
+                    }
+                }
             }
         }
 
@@ -395,6 +424,7 @@ public class InlayHintProvider {
                     return names;
                 }
             } catch (Exception ignored) {
+                // Parameter names may be absent when debug metadata is unavailable.
             }
 
             int count = getParameterCount(method);
@@ -441,11 +471,11 @@ public class InlayHintProvider {
         }
 
         private List<Expression> toArgumentExpressions(Expression argsExpression) {
-            if (argsExpression instanceof ArgumentListExpression) {
-                return ((ArgumentListExpression) argsExpression).getExpressions();
+            if (argsExpression instanceof ArgumentListExpression argumentListExpression) {
+                return argumentListExpression.getExpressions();
             }
-            if (argsExpression instanceof TupleExpression) {
-                return ((TupleExpression) argsExpression).getExpressions();
+            if (argsExpression instanceof TupleExpression tupleExpression) {
+                return tupleExpression.getExpressions();
             }
             return Collections.emptyList();
         }

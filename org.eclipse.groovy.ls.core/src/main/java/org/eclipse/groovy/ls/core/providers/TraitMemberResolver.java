@@ -60,25 +60,13 @@ public final class TraitMemberResolver {
             return resolved;
         }
 
-        // 2) Search all other open documents
-        if (documentManager != null) {
-            String fqn = ifaceRef.getName();
-            for (String uri : documentManager.getOpenDocumentUris()) {
-                ModuleNode otherModule = documentManager.getGroovyAST(uri);
-                if (otherModule == null || otherModule == currentModule) {
-                    continue;
-                }
-                for (ClassNode classNode : otherModule.getClasses()) {
-                    if (classNode.getLineNumber() < 0) continue;
-                    // Match by FQN first, then by simple name
-                    if (fqn != null && fqn.contains(".") && fqn.equals(classNode.getName())) {
-                        return classNode;
-                    }
-                    if (simpleName.equals(classNode.getNameWithoutPackage())) {
-                        return classNode;
-                    }
-                }
-            }
+        ClassNode openDocumentMatch = findTraitInOpenDocuments(
+                ifaceRef,
+                simpleName,
+                currentModule,
+                documentManager);
+        if (openDocumentMatch != null) {
+            return openDocumentMatch;
         }
 
         return ifaceRef; // Return the original if we can't resolve it
@@ -182,27 +170,11 @@ public final class TraitMemberResolver {
             return currentUri;
         }
 
-        // Search other open documents
-        if (documentManager != null) {
-            String fqn = ifaceRef.getName();
-            for (String uri : documentManager.getOpenDocumentUris()) {
-                ModuleNode otherModule = documentManager.getGroovyAST(uri);
-                if (otherModule == null || otherModule == currentModule) {
-                    continue;
-                }
-                for (ClassNode classNode : otherModule.getClasses()) {
-                    if (classNode.getLineNumber() < 0) continue;
-                    if (fqn != null && fqn.contains(".") && fqn.equals(classNode.getName())) {
-                        return uri;
-                    }
-                    if (simpleName.equals(classNode.getNameWithoutPackage())) {
-                        return uri;
-                    }
-                }
-            }
-        }
-
-        return null;
+        return findTraitDeclarationUriInOpenDocuments(
+                ifaceRef,
+                simpleName,
+                currentModule,
+                documentManager);
     }
 
     // ---- Trait $Trait$FieldHelper support ----
@@ -378,51 +350,150 @@ public final class TraitMemberResolver {
         }
 
         ClassNode resolved = resolveTraitClassNode(ifaceRef, currentModule, documentManager);
+        addVisibleTraitFields(fields, resolved);
 
-        // Direct fields from the trait ClassNode
-        for (FieldNode field : resolved.getFields()) {
-            if (!field.getName().startsWith("$") && !field.getName().startsWith("__")) {
+        ClassNode helper = findFieldHelperAcrossModules(resolved, currentModule, documentManager);
+        addUniqueHelperFields(fields, helper);
+
+        collectTraitFieldsFromSuperInterfaces(resolved, currentModule, documentManager, fields, visited);
+    }
+
+    private static ClassNode findTraitInOpenDocuments(ClassNode ifaceRef,
+            String simpleName,
+            ModuleNode currentModule,
+            DocumentManager documentManager) {
+        if (documentManager == null) {
+            return null;
+        }
+
+        String fqn = ifaceRef.getName();
+        for (String uri : documentManager.getOpenDocumentUris()) {
+            ModuleNode otherModule = documentManager.getGroovyAST(uri);
+            ClassNode matched = findMatchingClass(otherModule, currentModule, fqn, simpleName);
+            if (matched != null) {
+                return matched;
+            }
+        }
+        return null;
+    }
+
+    private static String findTraitDeclarationUriInOpenDocuments(ClassNode ifaceRef,
+            String simpleName,
+            ModuleNode currentModule,
+            DocumentManager documentManager) {
+        if (documentManager == null) {
+            return null;
+        }
+
+        String fqn = ifaceRef.getName();
+        for (String uri : documentManager.getOpenDocumentUris()) {
+            ModuleNode otherModule = documentManager.getGroovyAST(uri);
+            if (findMatchingClass(otherModule, currentModule, fqn, simpleName) != null) {
+                return uri;
+            }
+        }
+        return null;
+    }
+
+    private static ClassNode findMatchingClass(ModuleNode module,
+            ModuleNode currentModule,
+            String fqn,
+            String simpleName) {
+        if (module == null || module == currentModule) {
+            return null;
+        }
+
+        for (ClassNode classNode : module.getClasses()) {
+            if (classNode.getLineNumber() < 0) {
+                continue;
+            }
+            if (matchesTraitReference(classNode, fqn, simpleName)) {
+                return classNode;
+            }
+        }
+        return null;
+    }
+
+    private static boolean matchesTraitReference(ClassNode classNode, String fqn, String simpleName) {
+        if (fqn != null && fqn.contains(".") && fqn.equals(classNode.getName())) {
+            return true;
+        }
+        return simpleName.equals(classNode.getNameWithoutPackage());
+    }
+
+    private static void addVisibleTraitFields(List<FieldNode> fields, ClassNode traitClass) {
+        for (FieldNode field : traitClass.getFields()) {
+            if (isVisibleTraitField(field.getName())) {
                 fields.add(field);
             }
         }
+    }
 
-        // Also check $Trait$FieldHelper — at CONVERSION phase, trait fields
-        // are moved to this helper class with mangled names
-        ClassNode helper = findFieldHelperNode(resolved, currentModule);
-        if (helper == null && documentManager != null) {
-            // Try other open modules
-            for (String uri : documentManager.getOpenDocumentUris()) {
-                ModuleNode otherModule = documentManager.getGroovyAST(uri);
-                if (otherModule != null && otherModule != currentModule) {
-                    helper = findFieldHelperNode(resolved, otherModule);
-                    if (helper != null) break;
+    private static boolean isVisibleTraitField(String fieldName) {
+        return !fieldName.startsWith("$") && !fieldName.startsWith("__");
+    }
+
+    private static ClassNode findFieldHelperAcrossModules(ClassNode traitNode,
+            ModuleNode currentModule,
+            DocumentManager documentManager) {
+        ClassNode helper = findFieldHelperNode(traitNode, currentModule);
+        if (helper != null || documentManager == null) {
+            return helper;
+        }
+
+        for (String uri : documentManager.getOpenDocumentUris()) {
+            ModuleNode otherModule = documentManager.getGroovyAST(uri);
+            if (otherModule != null && otherModule != currentModule) {
+                helper = findFieldHelperNode(traitNode, otherModule);
+                if (helper != null) {
+                    return helper;
                 }
             }
         }
-        if (helper != null) {
-            for (FieldNode field : helper.getFields()) {
-                String name = field.getName();
-                if (name.startsWith("$") || name.startsWith("__")) continue;
-                // Avoid duplicates (demangled name may match a direct field)
-                String demangled = demangleTraitFieldName(name);
-                boolean alreadyPresent = false;
-                for (FieldNode existing : fields) {
-                    if (demangled.equals(existing.getName()) || demangled.equals(demangleTraitFieldName(existing.getName()))) {
-                        alreadyPresent = true;
-                        break;
-                    }
-                }
-                if (!alreadyPresent) {
-                    fields.add(field);
-                }
-            }
+        return null;
+    }
+
+    private static void addUniqueHelperFields(List<FieldNode> fields, ClassNode helper) {
+        if (helper == null) {
+            return;
         }
 
+        for (FieldNode field : helper.getFields()) {
+            String name = field.getName();
+            if (!isVisibleTraitField(name)) {
+                continue;
+            }
+
+            String demangled = demangleTraitFieldName(name);
+            if (!containsDemangledField(fields, demangled)) {
+                fields.add(field);
+            }
+        }
+    }
+
+    private static boolean containsDemangledField(List<FieldNode> fields, String demangledName) {
+        for (FieldNode existing : fields) {
+            String existingName = existing.getName();
+            if (demangledName.equals(existingName)
+                    || demangledName.equals(demangleTraitFieldName(existingName))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void collectTraitFieldsFromSuperInterfaces(ClassNode resolved,
+            ModuleNode currentModule,
+            DocumentManager documentManager,
+            List<FieldNode> fields,
+            Set<String> visited) {
         ClassNode[] superInterfaces = resolved.getInterfaces();
-        if (superInterfaces != null) {
-            for (ClassNode superIface : superInterfaces) {
-                collectTraitFieldsRecursive(superIface, currentModule, documentManager, fields, visited);
-            }
+        if (superInterfaces == null) {
+            return;
+        }
+
+        for (ClassNode superIface : superInterfaces) {
+            collectTraitFieldsRecursive(superIface, currentModule, documentManager, fields, visited);
         }
     }
 

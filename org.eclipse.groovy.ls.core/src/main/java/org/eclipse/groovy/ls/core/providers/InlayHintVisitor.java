@@ -20,7 +20,6 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ConstructorNode;
@@ -52,6 +51,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
 
     private static final Pattern DEF_METHOD_PATTERN_TEMPLATE =
             Pattern.compile("\\bdef\\s+%s\\s*\\(");
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
 
     private final String source;
     private final Range requestedRange;
@@ -84,20 +84,11 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         indexDeclaredMethods(module);
 
         for (ClassNode classNode : module.getClasses()) {
-            if (classNode.isScript() && classNode.getLineNumber() < 1) {
-                MethodNode runMethod = classNode.getMethod("run", Parameter.EMPTY_ARRAY);
-                if (runMethod != null && runMethod.getCode() != null) {
-                    runMethod.getCode().visit(this);
-                }
-                for (MethodNode method : classNode.getMethods()) {
-                    if (!"run".equals(method.getName()) && !"main".equals(method.getName())
-                            && method.getLineNumber() > 0) {
-                        visitMethod(method);
-                    }
-                }
-                continue;
+            if (isTopLevelScriptClass(classNode)) {
+                visitTopLevelScriptClass(classNode);
+            } else {
+                visitClass(classNode);
             }
-            visitClass(classNode);
         }
 
         BlockStatement statementBlock = module.getStatementBlock();
@@ -220,27 +211,13 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         }
 
         for (Parameter parameter : parameters) {
-            if (parameter == null || parameter.getLineNumber() < 1) {
-                continue;
+            if (isHintableClosureParameter(parameter)) {
+                String name = parameter.getName();
+                Position position = new Position(
+                        Math.max(0, parameter.getLineNumber() - 1),
+                        Math.max(0, parameter.getColumnNumber() - 1) + name.length());
+                addTypeHint(position, ": " + formatType(parameter.getType()));
             }
-            if (!isDefStyleParameter(parameter)) {
-                continue;
-            }
-
-            ClassNode inferredType = parameter.getType();
-            if (isUnhelpfulType(inferredType)) {
-                continue;
-            }
-
-            String name = parameter.getName();
-            if (name == null || name.isEmpty()) {
-                continue;
-            }
-
-            Position position = new Position(
-                    Math.max(0, parameter.getLineNumber() - 1),
-                    Math.max(0, parameter.getColumnNumber() - 1) + name.length());
-            addTypeHint(position, ": " + formatType(inferredType));
         }
     }
 
@@ -268,17 +245,13 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         int max = Math.min(arguments.size(), params.length);
         for (int index = 0; index < max; index++) {
             Expression arg = arguments.get(index);
-            if (arg == null || arg.getLineNumber() < 1 || isNamedArgumentExpression(arg)) {
-                continue;
-            }
             String parameterName = params[index].getName();
-            if (parameterName == null || parameterName.isEmpty()) {
-                continue;
+            if (isHintableParameterArgument(arg, parameterName)) {
+                Position position = new Position(
+                        Math.max(0, arg.getLineNumber() - 1),
+                        Math.max(0, arg.getColumnNumber() - 1));
+                addParameterHint(position, parameterName + ":");
             }
-            Position position = new Position(
-                    Math.max(0, arg.getLineNumber() - 1),
-                    Math.max(0, arg.getColumnNumber() - 1));
-            addParameterHint(position, parameterName + ":");
         }
     }
 
@@ -306,17 +279,13 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         int max = Math.min(arguments.size(), params.length);
         for (int index = 0; index < max; index++) {
             Expression arg = arguments.get(index);
-            if (arg == null || arg.getLineNumber() < 1 || isNamedArgumentExpression(arg)) {
-                continue;
-            }
             String parameterName = params[index].getName();
-            if (parameterName == null || parameterName.isEmpty()) {
-                continue;
+            if (isHintableParameterArgument(arg, parameterName)) {
+                Position position = new Position(
+                        Math.max(0, arg.getLineNumber() - 1),
+                        Math.max(0, arg.getColumnNumber() - 1));
+                addParameterHint(position, parameterName + ":");
             }
-            Position position = new Position(
-                    Math.max(0, arg.getLineNumber() - 1),
-                    Math.max(0, arg.getColumnNumber() - 1));
-            addParameterHint(position, parameterName + ":");
         }
     }
 
@@ -355,13 +324,36 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
     }
 
     private List<Expression> toArgumentExpressions(Expression argumentsExpression) {
-        if (argumentsExpression instanceof ArgumentListExpression) {
-            return ((ArgumentListExpression) argumentsExpression).getExpressions();
+        if (argumentsExpression instanceof ArgumentListExpression argumentListExpression) {
+            return argumentListExpression.getExpressions();
         }
-        if (argumentsExpression instanceof TupleExpression) {
-            return ((TupleExpression) argumentsExpression).getExpressions();
+        if (argumentsExpression instanceof TupleExpression tupleExpression) {
+            return tupleExpression.getExpressions();
         }
         return Collections.emptyList();
+    }
+
+    private boolean isHintableClosureParameter(Parameter parameter) {
+        if (parameter == null || parameter.getLineNumber() < 1) {
+            return false;
+        }
+        if (!isDefStyleParameter(parameter)) {
+            return false;
+        }
+        ClassNode inferredType = parameter.getType();
+        if (isUnhelpfulType(inferredType)) {
+            return false;
+        }
+        String name = parameter.getName();
+        return name != null && !name.isEmpty();
+    }
+
+    private boolean isHintableParameterArgument(Expression arg, String parameterName) {
+        return arg != null
+                && arg.getLineNumber() >= 1
+                && !isNamedArgumentExpression(arg)
+                && parameterName != null
+                && !parameterName.isEmpty();
     }
 
     private MethodNode findMatchingMethod(String methodName, int argumentCount) {
@@ -411,19 +403,39 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         }
     }
 
+    private boolean isTopLevelScriptClass(ClassNode classNode) {
+        return classNode.isScript() && classNode.getLineNumber() < 1;
+    }
+
+    private void visitTopLevelScriptClass(ClassNode classNode) {
+        MethodNode runMethod = classNode.getMethod("run", Parameter.EMPTY_ARRAY);
+        if (runMethod != null && runMethod.getCode() != null) {
+            runMethod.getCode().visit(this);
+        }
+        for (MethodNode method : classNode.getMethods()) {
+            if (!"run".equals(method.getName()) && !"main".equals(method.getName())
+                    && method.getLineNumber() > 0) {
+                visitMethod(method);
+            }
+        }
+    }
+
     private boolean isDefStyleVariable(VariableExpression variable) {
         if (variable == null || variable.getLineNumber() < 1) {
             return false;
         }
+        boolean dynamicTyped = false;
         try {
-            if (variable.isDynamicTyped()) {
-                return true;
-            }
-        } catch (Exception ignored) {
+            dynamicTyped = variable.isDynamicTyped();
+        } catch (Exception e) {
+            dynamicTyped = false;
+        }
+        if (dynamicTyped) {
+            return true;
         }
 
         ClassNode originType = variable.getOriginType();
-        if (originType != null && "java.lang.Object".equals(originType.getName())) {
+        if (originType != null && JAVA_LANG_OBJECT.equals(originType.getName())) {
             return true;
         }
 
@@ -440,19 +452,18 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         if (parameter == null) {
             return false;
         }
+        boolean dynamicTyped = false;
         try {
-            if (parameter.isDynamicTyped()) {
-                return true;
-            }
-        } catch (Exception ignored) {
+            dynamicTyped = parameter.isDynamicTyped();
+        } catch (Exception e) {
+            dynamicTyped = false;
         }
-
-        ClassNode type = parameter.getType();
-        if (type != null && "java.lang.Object".equals(type.getName())) {
+        if (dynamicTyped) {
             return true;
         }
 
-        return false;
+        ClassNode type = parameter.getType();
+        return type != null && JAVA_LANG_OBJECT.equals(type.getName());
     }
 
     private boolean isDefStyleMethod(MethodNode method) {
@@ -473,7 +484,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         }
 
         ClassNode declaredType = method.getReturnType();
-        return declaredType != null && "java.lang.Object".equals(declaredType.getName());
+        return declaredType != null && JAVA_LANG_OBJECT.equals(declaredType.getName());
     }
 
     private boolean isNamedArgumentExpression(Expression expr) {
@@ -487,7 +498,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         String name = type.getName();
         return name == null
                 || name.isBlank()
-                || "java.lang.Object".equals(name)
+            || JAVA_LANG_OBJECT.equals(name)
                 || "groovy.lang.GroovyObject".equals(name)
                 || "void".equals(name)
                 || "java.lang.Void".equals(name);

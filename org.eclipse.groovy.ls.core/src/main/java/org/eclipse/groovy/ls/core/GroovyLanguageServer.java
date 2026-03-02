@@ -24,6 +24,7 @@ import org.eclipse.core.resources.IResourceFilterDescription;
 import org.eclipse.core.resources.IWorkspace;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.IJavaProject;
@@ -39,6 +40,7 @@ import org.eclipse.lsp4j.FileOperationPatternKind;
 import org.eclipse.lsp4j.FileOperationsServerCapabilities;
 import org.eclipse.lsp4j.InitializeParams;
 import org.eclipse.lsp4j.InitializeResult;
+import org.eclipse.lsp4j.RenameOptions;
 import org.eclipse.lsp4j.SemanticTokensWithRegistrationOptions;
 import org.eclipse.lsp4j.ServerCapabilities;
 import org.eclipse.lsp4j.TextDocumentSyncKind;
@@ -65,6 +67,23 @@ import org.eclipse.lsp4j.services.WorkspaceService;
  */
 public class GroovyLanguageServer implements LanguageServer, LanguageClientAware {
 
+    private static final String STATUS_STARTING = "Starting";
+    private static final String STATUS_IMPORTING = "Importing";
+    private static final String STATUS_COMPILING = "Compiling";
+    private static final String STATUS_READY = "Ready";
+    private static final String GROOVY_PROJECT_NAME = "GroovyProject";
+    private static final String GROOVY_PROJECT_PREFIX = "Groovy_";
+    private static final String LINKED_FOLDER_NAME = "linked";
+    private static final String GROOVY_NATURE_ID = "org.eclipse.jdt.groovy.core.groovyNature";
+    private static final String JRE_CONTAINER_ID = "org.eclipse.jdt.launching.JRE_CONTAINER";
+    private static final String RESOURCE_FILTER_PATTERN =
+        "\\..*|node_modules|build|out|target|dist|__pycache__|gradle";
+    private static final String[] DEFAULT_SOURCE_DIR_SUFFIXES = {
+        "src/main/java", "src/main/groovy",
+        "src/test/java", "src/test/groovy",
+        "src/main/resources", "src/test/resources",
+    };
+
     private LanguageClient client;
     private final GroovyTextDocumentService textDocumentService;
     private final GroovyWorkspaceService workspaceService;
@@ -74,15 +93,15 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private int exitCode = 1; // non-zero until clean shutdown
     private Endpoint remoteEndpoint;
 
-    /**
-     * Tracks whether the initial classpath has been received from the client.
-     * The initial full build is deferred until the classpath arrives, to prevent
-     * showing spurious errors while types are still unresolved.
-     */
-    private volatile boolean initialClasspathReceived = false;
     private volatile boolean initialBuildDone = false;
     private volatile boolean diagnosticsEnabled = false;
     private java.util.concurrent.ScheduledFuture<?> initialBuildTimer;
+    private final java.util.concurrent.ScheduledExecutorService initialBuildScheduler =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "initial-build-timer");
+                t.setDaemon(true);
+                return t;
+            });
 
     /**
      * Maps normalized filesystem paths (lowercase, forward slashes, trailing slash)
@@ -90,6 +109,15 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     private final java.util.Map<String, String> subprojectPathToEclipseName
             = new java.util.LinkedHashMap<>();
+
+    /**
+     * Tracks which Eclipse project names have received at least one successful
+     * classpath update. Projects not in this set are considered to have no
+     * classpath configured — diagnostics for their files are limited to
+     * syntax-only errors and a warning is shown at the package declaration.
+     */
+    private final java.util.Set<String> projectsWithClasspath =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public GroovyLanguageServer() {
         this.documentManager = new DocumentManager();
@@ -143,7 +171,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
             if (workspaceRoot != null) {
                 GroovyLanguageServerPlugin.logInfo("Workspace root: " + workspaceRoot);
-                sendStatus("Importing", "Configuring workspace...");
+                sendStatus(STATUS_IMPORTING, "Configuring workspace...");
                 initializeWorkspaceProject();
             }
 
@@ -177,14 +205,22 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             // Find references
             capabilities.setReferencesProvider(true);
 
+            // Document highlight
+            capabilities.setDocumentHighlightProvider(true);
+
             // Document symbols
             capabilities.setDocumentSymbolProvider(true);
 
             // Workspace symbols
             capabilities.setWorkspaceSymbolProvider(true);
 
-            // Rename
-            capabilities.setRenameProvider(true);
+            // Implementation
+            capabilities.setImplementationProvider(true);
+
+            // Rename (with prepare support)
+            RenameOptions renameOptions = new RenameOptions();
+            renameOptions.setPrepareProvider(true);
+            capabilities.setRenameProvider(renameOptions);
 
             // Workspace file operations (rename Groovy/Java source files)
             FileOperationPattern groovyPattern = new FileOperationPattern("**/*.groovy");
@@ -234,6 +270,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             capabilities.setDocumentFormattingProvider(true);
             capabilities.setDocumentRangeFormattingProvider(true);
 
+            // Folding ranges
+            capabilities.setFoldingRangeProvider(true);
+
             GroovyLanguageServerPlugin.logInfo("Groovy Language Server initialized with capabilities.");
 
             return new InitializeResult(capabilities);
@@ -248,40 +287,38 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         // This prevents flashing errors while the classpath is still being resolved.
         // A fallback timer ensures the build happens even if no classpath arrives.
         if (workspaceRoot != null) {
-            sendStatus("Importing", "Waiting for classpath...");
-            try {
-                java.util.concurrent.ScheduledExecutorService scheduler =
-                        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                            Thread t = new Thread(r, "initial-build-timer");
-                            t.setDaemon(true);
-                            return t;
-                        });
-                initialBuildTimer = scheduler.schedule(() -> {
-                    if (!initialBuildDone) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "Initial build timer fired (no classpath received). Building now.");
-                        diagnosticsEnabled = true;
-                        initialBuildDone = true;
-                        sendStatus("Compiling", "Building workspace...");
-                        textDocumentService.triggerFullBuild(this);
-                    }
-                }, 10, java.util.concurrent.TimeUnit.SECONDS);
-            } catch (Exception e) {
-                // Fallback: build immediately if scheduling fails
-                GroovyLanguageServerPlugin.logError("Failed to schedule deferred build", e);
-                diagnosticsEnabled = true;
-                sendStatus("Compiling", "Building workspace...");
-                textDocumentService.triggerFullBuild(this);
-                initialBuildDone = true;
-            }
+            sendStatus(STATUS_IMPORTING, "Waiting for classpath...");
+            scheduleDeferredInitialBuild();
         } else {
-            sendStatus("Ready", null);
+            sendStatus(STATUS_READY, null);
         }
+    }
+
+    private void scheduleDeferredInitialBuild() {
+        try {
+            initialBuildTimer = initialBuildScheduler.schedule(this::runInitialBuildIfNeeded,
+                    10, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to schedule deferred build", e);
+            runInitialBuildIfNeeded();
+        }
+    }
+
+    private void runInitialBuildIfNeeded() {
+        if (initialBuildDone) {
+            return;
+        }
+        GroovyLanguageServerPlugin.logInfo("Initial build timer fired (no classpath received). Building now.");
+        diagnosticsEnabled = true;
+        initialBuildDone = true;
+        sendStatus(STATUS_COMPILING, "Building workspace...");
+        textDocumentService.triggerFullBuild(this);
     }
 
     @Override
     public CompletableFuture<Object> shutdown() {
         GroovyLanguageServerPlugin.logInfo("Shutting down Groovy Language Server...");
+        initialBuildScheduler.shutdownNow();
         exitCode = 0; // clean shutdown
         return CompletableFuture.completedFuture(null);
     }
@@ -349,35 +386,25 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     @JsonNotification("groovy/classpathUpdate")
     public void classpathUpdate(JsonObject params) {
         try {
-            String projectUri = params.has("projectUri")
-                    ? params.get("projectUri").getAsString() : null;
-            String projectPath = params.has("projectPath")
-                    ? params.get("projectPath").getAsString() : null;
-
-            com.google.gson.JsonArray entriesArray = params.getAsJsonArray("entries");
-            if (entriesArray == null || entriesArray.size() == 0) {
+            ClasspathUpdateRequest request = parseClasspathUpdateRequest(params);
+            if (request == null) {
                 GroovyLanguageServerPlugin.logInfo("[classpathUpdate] No entries received.");
                 return;
             }
 
-            List<String> entries = new ArrayList<>();
-            for (int i = 0; i < entriesArray.size(); i++) {
-                entries.add(entriesArray.get(i).getAsString());
-            }
-
             GroovyLanguageServerPlugin.logInfo(
-                    "[classpathUpdate] Received " + entries.size() + " entries"
-                    + (projectUri != null ? " for projectUri: " + projectUri : " (no project URI)")
-                    + (projectPath != null ? ", projectPath: " + projectPath : ""));
+                "[classpathUpdate] Received " + request.entries.size() + " entries"
+                    + (request.projectUri != null
+                        ? " for projectUri: " + request.projectUri : " (no project URI)")
+                    + (request.projectPath != null ? ", projectPath: " + request.projectPath : ""));
 
-            sendStatus("Importing", "Updating classpath...");
+            sendStatus(STATUS_IMPORTING, "Updating classpath...");
 
-            // Find the matching Eclipse project using projectPath first, then URI fallback
-            IProject eclipseProject = findEclipseProjectFor(projectUri, projectPath);
+            IProject eclipseProject = findEclipseProjectFor(request.projectUri, request.projectPath);
             if (eclipseProject == null || !eclipseProject.isOpen()) {
                 GroovyLanguageServerPlugin.logInfo(
-                        "[classpathUpdate] No matching Eclipse project for projectUri=" + projectUri
-                        + ", projectPath=" + projectPath);
+                "[classpathUpdate] No matching Eclipse project for projectUri="
+                    + request.projectUri + ", projectPath=" + request.projectPath);
                 return;
             }
 
@@ -391,67 +418,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             GroovyLanguageServerPlugin.logInfo(
                     "[classpathUpdate] Updating Eclipse project '" + projName + "'");
 
-            // Preserve existing source entries and JRE container
-            IClasspathEntry[] currentEntries = javaProject.getRawClasspath();
-            List<IClasspathEntry> newEntries = new ArrayList<>();
-
-            for (IClasspathEntry entry : currentEntries) {
-                if (entry.getEntryKind() == IClasspathEntry.CPE_SOURCE
-                        || entry.getEntryKind() == IClasspathEntry.CPE_CONTAINER) {
-                    newEntries.add(entry);
-                }
-                // Skip existing library entries — we're replacing them
-            }
-
-            // Add the new library entries from the Java extension
-            String javaHome = System.getProperty("java.home");
-            String javaHomeNorm = javaHome != null
-                    ? javaHome.replace('\\', '/').toLowerCase() : "";
-
-            java.util.Set<String> seenPaths = new java.util.HashSet<>();
-            int sourcesAttached = 0;
-            int directoriesAdded = 0;
-            int skipped = 0;
-            for (String entryPath : entries) {
-                if (!seenPaths.add(entryPath)) continue;
-
-                String entryNorm = entryPath.replace('\\', '/').toLowerCase();
-                if (!javaHomeNorm.isEmpty() && entryNorm.startsWith(javaHomeNorm)) {
-                    skipped++;
-                    continue;
-                }
-
-                java.io.File file = new java.io.File(entryPath);
-                if (!file.exists()) {
-                    skipped++;
-                    continue;
-                }
-
-                boolean isJar = entryNorm.endsWith(".jar");
-                boolean isDirectory = file.isDirectory();
-                if (!isJar && !isDirectory) {
-                    skipped++;
-                    continue;
-                }
-
-                org.eclipse.core.runtime.IPath jarPath =
-                        org.eclipse.core.runtime.Path.fromOSString(file.getAbsolutePath());
-
-                org.eclipse.core.runtime.IPath sourceAttachment = null;
-                if (isJar) {
-                    java.io.File sourcesJar = org.eclipse.groovy.ls.core.providers
-                            .SourceJarHelper.findSourcesJarForBinaryJar(file);
-                    if (sourcesJar != null) {
-                        sourceAttachment = org.eclipse.core.runtime.Path
-                                .fromOSString(sourcesJar.getAbsolutePath());
-                        sourcesAttached++;
-                    }
-                } else {
-                    directoriesAdded++;
-                }
-
-                newEntries.add(JavaCore.newLibraryEntry(jarPath, sourceAttachment, null));
-            }
+            ClasspathComputation classpathComputation =
+                    buildUpdatedClasspath(javaProject.getRawClasspath(), request.entries);
+            List<IClasspathEntry> newEntries = classpathComputation.entries;
 
             javaProject.setRawClasspath(
                     newEntries.toArray(new IClasspathEntry[0]),
@@ -459,34 +428,168 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     new NullProgressMonitor());
 
             GroovyLanguageServerPlugin.logInfo(
-                    "[classpathUpdate] Applied " + (seenPaths.size() - skipped) + " libraries ("
-                    + sourcesAttached + " JARs with source, " + directoriesAdded + " directories) to '"
-                    + projName + "'. Total: "
-                    + newEntries.size() + " entries.");
+                    "[classpathUpdate] Applied " + classpathComputation.appliedLibraries
+                            + " libraries (" + classpathComputation.sourcesAttached
+                            + " JARs with source, " + classpathComputation.directoriesAdded
+                            + " directories) to '" + projName + "'. Total: "
+                            + newEntries.size() + " entries.");
 
-            sendStatus("Ready", null);
+            sendStatus(STATUS_READY, null);
             diagnosticsEnabled = true;
-
-            // If this is the first classpath update, trigger the initial build
-            // that was deferred from initialized(). Cancel the fallback timer.
-            if (!initialBuildDone) {
-                initialBuildDone = true;
-                initialClasspathReceived = true;
-                if (initialBuildTimer != null) {
-                    initialBuildTimer.cancel(false);
-                }
-                GroovyLanguageServerPlugin.logInfo(
-                        "[classpathUpdate] First classpath received. Triggering initial build.");
-            }
-
-            // Re-trigger diagnostics with new classpath
-            if (workspaceRoot != null) {
-                textDocumentService.triggerFullBuild(this);
-            }
+            projectsWithClasspath.add(projName);
+            GroovyLanguageServerPlugin.logInfo(
+                    "[classpath-check] Added '" + projName + "' to projectsWithClasspath. "
+                    + "All projects with classpath: " + projectsWithClasspath);
+            triggerBuildAfterClasspathUpdate();
 
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[classpathUpdate] Failed to apply classpath", e);
             sendStatus("Error", "Classpath update failed: " + e.getMessage());
+        }
+    }
+
+    private ClasspathUpdateRequest parseClasspathUpdateRequest(JsonObject params) {
+        String projectUri = getOptionalJsonString(params, "projectUri");
+        String projectPath = getOptionalJsonString(params, "projectPath");
+
+        com.google.gson.JsonArray entriesArray = params.getAsJsonArray("entries");
+        if (entriesArray == null || entriesArray.size() == 0) {
+            return null;
+        }
+
+        List<String> entries = new ArrayList<>();
+        for (int i = 0; i < entriesArray.size(); i++) {
+            entries.add(entriesArray.get(i).getAsString());
+        }
+        return new ClasspathUpdateRequest(projectUri, projectPath, entries);
+    }
+
+    private String getOptionalJsonString(JsonObject params, String key) {
+        if (!params.has(key)) {
+            return null;
+        }
+        return params.get(key).getAsString();
+    }
+
+    private ClasspathComputation buildUpdatedClasspath(IClasspathEntry[] currentEntries, List<String> requestedEntries) {
+        List<IClasspathEntry> newEntries = new ArrayList<>();
+        addPreservedClasspathEntries(currentEntries, newEntries);
+
+        ClasspathComputation computation = new ClasspathComputation(newEntries);
+        appendLibraryEntries(requestedEntries, newEntries, computation);
+        return computation;
+    }
+
+    private void addPreservedClasspathEntries(IClasspathEntry[] currentEntries, List<IClasspathEntry> target) {
+        for (IClasspathEntry entry : currentEntries) {
+            if (entry.getEntryKind() == IClasspathEntry.CPE_SOURCE
+                    || entry.getEntryKind() == IClasspathEntry.CPE_CONTAINER) {
+                target.add(entry);
+            }
+        }
+    }
+
+    private void appendLibraryEntries(
+            List<String> requestedEntries,
+            List<IClasspathEntry> target,
+            ClasspathComputation computation) {
+        String javaHomeNorm = normalizePath(System.getProperty("java.home"));
+        java.util.Set<String> seenPaths = new java.util.HashSet<>();
+
+        for (String entryPath : requestedEntries) {
+            if (!seenPaths.add(entryPath)) {
+                continue;
+            }
+            IClasspathEntry classpathEntry = toLibraryEntry(entryPath, javaHomeNorm, computation);
+            if (classpathEntry != null) {
+                target.add(classpathEntry);
+            }
+        }
+    }
+
+    private IClasspathEntry toLibraryEntry(
+            String entryPath,
+            String javaHomeNorm,
+            ClasspathComputation computation) {
+        java.io.File file = new java.io.File(entryPath);
+        String entryNorm = normalizePath(entryPath);
+        if (shouldSkipClasspathEntry(file, entryNorm, javaHomeNorm)) {
+            return null;
+        }
+
+        boolean isJar = file.isFile();
+        org.eclipse.core.runtime.IPath libraryPath =
+                org.eclipse.core.runtime.Path.fromOSString(file.getAbsolutePath());
+
+        org.eclipse.core.runtime.IPath sourceAttachment = null;
+        if (isJar) {
+            sourceAttachment = resolveSourceAttachment(file);
+            if (sourceAttachment != null) {
+                computation.sourcesAttached++;
+            }
+        } else {
+            computation.directoriesAdded++;
+        }
+
+        computation.appliedLibraries++;
+        return JavaCore.newLibraryEntry(libraryPath, sourceAttachment, null);
+    }
+
+    private boolean shouldSkipClasspathEntry(java.io.File file, String entryNorm, String javaHomeNorm) {
+        if (entryNorm == null || !file.exists()) {
+            return true;
+        }
+        if (javaHomeNorm != null && !javaHomeNorm.isEmpty() && entryNorm.startsWith(javaHomeNorm)) {
+            return true;
+        }
+        boolean isJar = entryNorm.endsWith(".jar/");
+        return !isJar && !file.isDirectory();
+    }
+
+    private org.eclipse.core.runtime.IPath resolveSourceAttachment(java.io.File binaryJar) {
+        java.io.File sourcesJar = org.eclipse.groovy.ls.core.providers.SourceJarHelper
+                .findSourcesJarForBinaryJar(binaryJar);
+        if (sourcesJar == null) {
+            return null;
+        }
+        return org.eclipse.core.runtime.Path.fromOSString(sourcesJar.getAbsolutePath());
+    }
+
+    private void triggerBuildAfterClasspathUpdate() {
+        if (!initialBuildDone) {
+            initialBuildDone = true;
+            if (initialBuildTimer != null) {
+                initialBuildTimer.cancel(false);
+            }
+            GroovyLanguageServerPlugin.logInfo(
+                    "[classpathUpdate] First classpath received. Triggering initial build.");
+        }
+
+        if (workspaceRoot != null) {
+            textDocumentService.triggerFullBuild(this);
+        }
+    }
+
+    private static final class ClasspathUpdateRequest {
+        private final String projectUri;
+        private final String projectPath;
+        private final List<String> entries;
+
+        private ClasspathUpdateRequest(String projectUri, String projectPath, List<String> entries) {
+            this.projectUri = projectUri;
+            this.projectPath = projectPath;
+            this.entries = entries;
+        }
+    }
+
+    private static final class ClasspathComputation {
+        private final List<IClasspathEntry> entries;
+        private int appliedLibraries;
+        private int sourcesAttached;
+        private int directoriesAdded;
+
+        private ClasspathComputation(List<IClasspathEntry> entries) {
+            this.entries = entries;
         }
     }
 
@@ -502,64 +605,100 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             return fallbackGroovyProject();
         }
 
-        // 1) Prefer an explicit filesystem projectPath from the client.
         IProject byPath = findEclipseProjectByPath(projectPath);
         if (byPath != null) {
             return byPath;
         }
 
-        try {
-            // 2) URI-based fallback. URI may point to a directory or a source file.
-            if (projectUri != null) {
-                java.io.File uriFile = new java.io.File(URI.create(projectUri));
-
-                IProject byUriPath = findEclipseProjectByPath(uriFile.getAbsolutePath());
-                if (byUriPath != null) {
-                    return byUriPath;
-                }
-
-                java.io.File projDir = uriFile.isDirectory()
-                        ? uriFile
-                        : uriFile.getParentFile();
-
-                if (projDir != null) {
-                    String dirName = projDir.getName().toLowerCase();
-                    for (var entry : subprojectPathToEclipseName.entrySet()) {
-                        if (entry.getKey().endsWith("/" + dirName + "/")) {
-                            IProject p = ResourcesPlugin.getWorkspace().getRoot().getProject(entry.getValue());
-                            if (p.exists() && p.isOpen()) return p;
-                        }
-                    }
-
-                    // On-the-fly creation for late-discovered projects
-                    if (projDir.isDirectory()) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[classpathUpdate] Creating on-the-fly project for: " + projDir);
-                        String[] srcDirs = {
-                            "src/main/java", "src/main/groovy",
-                            "src/test/java", "src/test/groovy",
-                            "src/main/resources", "src/test/resources",
-                        };
-                        createEclipseProjectFor(projDir, srcDirs);
-
-                        IProject created = findEclipseProjectByPath(projDir.getAbsolutePath());
-                        if (created != null) {
-                            return created;
-                        }
-                    }
-                }
-            }
-        } catch (Throwable e) {
-            GroovyLanguageServerPlugin.logError(
-                    "[classpathUpdate] Failed to resolve project for projectUri=" + projectUri
-                    + ", projectPath=" + projectPath, e);
+        IProject byUri = resolveProjectFromUri(projectUri);
+        if (byUri != null) {
+            return byUri;
         }
 
         return fallbackGroovyProject();
     }
 
+    private IProject resolveProjectFromUri(String projectUri) {
+        if (projectUri == null) {
+            return null;
+        }
+
+        try {
+            java.io.File uriFile = new java.io.File(URI.create(projectUri));
+            IProject byUriPath = findEclipseProjectByPath(uriFile.getAbsolutePath());
+            if (byUriPath != null) {
+                return byUriPath;
+            }
+
+            java.io.File projectDir = uriFile.isDirectory() ? uriFile : uriFile.getParentFile();
+            if (projectDir == null) {
+                return null;
+            }
+
+            IProject byName = findProjectByDirectoryName(projectDir);
+            if (byName != null) {
+                return byName;
+            }
+
+            return createProjectForDirectoryIfNeeded(projectDir);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[classpathUpdate] Failed to resolve project for projectUri="
+                    + projectUri, e);
+            return null;
+        }
+    }
+
+    private IProject findProjectByDirectoryName(java.io.File projectDir) {
+        String dirName = projectDir.getName().toLowerCase();
+        for (var entry : subprojectPathToEclipseName.entrySet()) {
+            if (!entry.getKey().endsWith("/" + dirName + "/")) {
+                continue;
+            }
+            IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(entry.getValue());
+            if (project.exists() && project.isOpen()) {
+                return project;
+            }
+        }
+        return null;
+    }
+
+    private IProject createProjectForDirectoryIfNeeded(java.io.File projectDir) throws CoreException {
+        if (!projectDir.isDirectory()) {
+            return null;
+        }
+
+        // Check if DocumentManager already imported this path as an ExtGroovy_ project.
+        // If so, reuse it instead of creating a duplicate Groovy_ project.
+        // This ensures the classpath is applied to the project that already holds
+        // working copies for files in this directory.
+        String dirName = projectDir.getName();
+        IWorkspace workspace = ResourcesPlugin.getWorkspace();
+        String extProjectName = "ExtGroovy_" + dirName;
+        IProject extProject = workspace.getRoot().getProject(extProjectName);
+        if (extProject.exists() && extProject.isOpen()) {
+            // Verify it really points to the same directory
+            IPath extLocation = extProject.getLocation();
+            if (extLocation != null) {
+                String extPath = normalizePath(extLocation.toOSString());
+                String targetPath = normalizePath(projectDir.getAbsolutePath());
+                if (extPath != null && extPath.equals(targetPath)) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[classpathUpdate] Reusing existing '" + extProjectName
+                            + "' for: " + projectDir);
+                    putSubprojectMapping(projectDir.getAbsolutePath(), extProjectName);
+                    return extProject;
+                }
+            }
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[classpathUpdate] Creating on-the-fly project for: " + projectDir);
+        createEclipseProjectFor(projectDir, DEFAULT_SOURCE_DIR_SUFFIXES);
+        return findEclipseProjectByPath(projectDir.getAbsolutePath());
+    }
+
     private IProject fallbackGroovyProject() {
-        IProject groovy = ResourcesPlugin.getWorkspace().getRoot().getProject("GroovyProject");
+        IProject groovy = ResourcesPlugin.getWorkspace().getRoot().getProject(GROOVY_PROJECT_NAME);
         return (groovy.exists() && groovy.isOpen()) ? groovy : null;
     }
 
@@ -632,7 +771,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     public void connect(LanguageClient client) {
         this.client = client;
         this.textDocumentService.connect(client);
-        sendStatus("Starting", "Initializing...");
+        sendStatus(STATUS_STARTING, "Initializing...");
     }
 
     public LanguageClient getClient() {
@@ -645,6 +784,42 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     public boolean areDiagnosticsEnabled() {
         return diagnosticsEnabled;
+    }
+
+    /**
+     * Returns {@code true} if the given Eclipse project has received at least
+     * one classpath update from the client.
+     */
+    public boolean hasClasspathForProject(String projectName) {
+        return projectName != null && projectsWithClasspath.contains(projectName);
+    }
+
+    /**
+     * Returns the Eclipse project name that owns the given document URI,
+     * or {@code null} if none is found.
+     */
+    public String getProjectNameForUri(String uri) {
+        if (uri == null) {
+            return null;
+        }
+        try {
+            java.io.File file = new java.io.File(URI.create(uri));
+            String fsPath = file.getAbsolutePath();
+            IProject project = findEclipseProjectByPath(fsPath);
+            String name = project != null ? project.getName() : null;
+            GroovyLanguageServerPlugin.logInfo(
+                    "[classpath-check] getProjectNameForUri uri=" + uri
+                    + " fsPath=" + fsPath
+                    + " project=" + name
+                    + " hasClasspath=" + (name != null && projectsWithClasspath.contains(name))
+                    + " projectsWithClasspath=" + projectsWithClasspath);
+            return name;
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[classpath-check] getProjectNameForUri EXCEPTION for uri=" + uri
+                    + " error=" + e.getMessage());
+            return null;
+        }
     }
 
     // ---- Private helpers ----
@@ -662,59 +837,64 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     private void initializeWorkspaceProject() {
         try {
-            // Clean up stale projects from previous runs to avoid name collisions
-            // and leftover setLocation() project descriptions.
             cleanupStaleProjects();
 
-            java.io.File workspaceDir;
-            try {
-                workspaceDir = new java.io.File(URI.create(workspaceRoot));
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError("Failed to resolve workspace root URI", e);
+            java.io.File workspaceDir = resolveWorkspaceDirectory();
+            if (workspaceDir == null) {
                 return;
             }
 
-            String[] srcDirSuffixes = {
-                "src/main/java", "src/main/groovy",
-                "src/test/java", "src/test/groovy",
-                "src/main/resources", "src/test/resources",
-            };
-
-            // Look for subprojects with source folders
-            List<java.io.File> subprojects = findSubprojectsWithSources(workspaceDir, srcDirSuffixes);
-
-            if (!subprojects.isEmpty()) {
-                // ---- Multi-project workspace ----
-                GroovyLanguageServerPlugin.logInfo(
-                        "[workspace] Found " + subprojects.size() + " subproject(s). "
-                        + "Creating isolated Eclipse projects for classpath separation.");
-
-                for (java.io.File subDir : subprojects) {
-                    try {
-                        createEclipseProjectFor(subDir, srcDirSuffixes);
-                    } catch (Throwable e) {
-                        GroovyLanguageServerPlugin.logError(
-                                "[workspace] Skipped " + subDir.getName() + ": " + e.getMessage(), e);
-                    }
-                }
-
-                if (subprojectPathToEclipseName.isEmpty()) {
-                    // All creations failed — fall back to single root project
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[workspace] Multi-project setup failed. Falling back to single root project.");
-                    createSingleRootProject(workspaceDir, srcDirSuffixes);
-                } else {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[workspace] Created " + subprojectPathToEclipseName.size()
-                            + " Eclipse project(s): " + subprojectPathToEclipseName.values());
-                }
-            } else {
-                // ---- Single-project workspace ----
-                createSingleRootProject(workspaceDir, srcDirSuffixes);
+            List<java.io.File> subprojects =
+                    findSubprojectsWithSources(workspaceDir, DEFAULT_SOURCE_DIR_SUFFIXES);
+            if (subprojects.isEmpty()) {
+                createSingleRootProject(workspaceDir, DEFAULT_SOURCE_DIR_SUFFIXES);
+                return;
             }
 
-        } catch (Throwable e) {
+            initializeMultiProjectWorkspace(workspaceDir, subprojects);
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to initialize workspace project", e);
+        }
+    }
+
+    private java.io.File resolveWorkspaceDirectory() {
+        try {
+            return new java.io.File(URI.create(workspaceRoot));
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to resolve workspace root URI", e);
+            return null;
+        }
+    }
+
+    private void initializeMultiProjectWorkspace(
+            java.io.File workspaceDir,
+            List<java.io.File> subprojects) {
+        GroovyLanguageServerPlugin.logInfo(
+                "[workspace] Found " + subprojects.size() + " subproject(s). "
+                        + "Creating isolated Eclipse projects for classpath separation.");
+
+        for (java.io.File subDir : subprojects) {
+            createSubprojectSafely(subDir);
+        }
+
+        if (subprojectPathToEclipseName.isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[workspace] Multi-project setup failed. Falling back to single root project.");
+            createSingleRootProject(workspaceDir, DEFAULT_SOURCE_DIR_SUFFIXES);
+            return;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[workspace] Created " + subprojectPathToEclipseName.size()
+                        + " Eclipse project(s): " + subprojectPathToEclipseName.values());
+    }
+
+    private void createSubprojectSafely(java.io.File subDir) {
+        try {
+            createEclipseProjectFor(subDir, DEFAULT_SOURCE_DIR_SUFFIXES);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "[workspace] Skipped " + subDir.getName() + ": " + e.getMessage(), e);
         }
     }
 
@@ -735,83 +915,38 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             throws CoreException {
         IWorkspace workspace = ResourcesPlugin.getWorkspace();
         String baseName = subDir.getName();
-        String projectName = "Groovy_" + baseName;
+        String projectName = GROOVY_PROJECT_PREFIX + baseName;
 
         int counter = 1;
         while (workspace.getRoot().getProject(projectName).exists()) {
-            projectName = "Groovy_" + baseName + "_" + counter++;
+            projectName = GROOVY_PROJECT_PREFIX + baseName + "_" + counter++;
         }
 
         IProject project = workspace.getRoot().getProject(projectName);
         IProjectDescription description = workspace.newProjectDescription(projectName);
-        // NO setLocation — project lives in Eclipse metadata area (flat, no nesting)
         description.setNatureIds(new String[]{
                 JavaCore.NATURE_ID,
-                "org.eclipse.jdt.groovy.core.groovyNature"
+            GROOVY_NATURE_ID
         });
 
         project.create(description, new NullProgressMonitor());
         project.open(new NullProgressMonitor());
 
-        // Create a linked folder pointing to the subproject's actual filesystem location.
-        // This lets Eclipse treat each subproject independently while all projects
-        // live in the flat metadata area (no nesting issues).
-        IFolder linkedRoot = project.getFolder("linked");
+        IFolder linkedRoot = project.getFolder(LINKED_FOLDER_NAME);
         linkedRoot.createLink(
                 org.eclipse.core.runtime.Path.fromOSString(subDir.getAbsolutePath()),
                 IResource.ALLOW_MISSING_LOCAL,
                 new NullProgressMonitor());
-
-        // Exclude non-source directories from Eclipse indexing through the linked
-        // folder.  Without this filter Eclipse traverses the ENTIRE project tree
-        // (including .git, .vscode, node_modules, build outputs, etc.) on every
-        // refresh/build.  The resulting I/O storm inside VS Code's workspaceStorage
-        // area can overwhelm VS Code's file-system watchers and corrupt other
-        // extensions' persisted state — notably Copilot chat history.
-        try {
-            linkedRoot.createFilter(
-                    IResourceFilterDescription.EXCLUDE_ALL
-                            | IResourceFilterDescription.FOLDERS
-                            | IResourceFilterDescription.INHERITABLE,
-                    new FileInfoMatcherDescription(
-                            "org.eclipse.core.resources.regexFilterMatcher",
-                            "\\..*|node_modules|build|out|target|dist|__pycache__|gradle"),
-                    IResource.BACKGROUND_REFRESH,
-                    new NullProgressMonitor());
-        } catch (CoreException e) {
-            GroovyLanguageServerPlugin.logError(
-                    "[" + projectName + "] Failed to set resource filter (non-fatal)", e);
-        }
+        applyLinkedResourceFilter(linkedRoot, "[" + projectName + "]");
 
         GroovyLanguageServerPlugin.logInfo(
                 "[" + projectName + "] Linked folder → " + subDir.getAbsolutePath());
 
         // Configure source folders (relative to the linked root)
         IJavaProject javaProject = JavaCore.create(project);
-        List<IClasspathEntry> entries = new ArrayList<>();
-        boolean foundAny = false;
-
-        for (String suffix : srcDirSuffixes) {
-            IFolder srcFolder = linkedRoot.getFolder(suffix);
-            if (srcFolder != null && srcFolder.exists()) {
-                entries.add(JavaCore.newSourceEntry(srcFolder.getFullPath()));
-                foundAny = true;
-                GroovyLanguageServerPlugin.logInfo(
-                        "[" + projectName + "] Source folder: linked/" + suffix);
-            }
-        }
-
-        if (!foundAny) {
-            IFolder srcFolder = linkedRoot.getFolder("src");
-            if (srcFolder != null && srcFolder.exists()) {
-                entries.add(JavaCore.newSourceEntry(srcFolder.getFullPath()));
-            } else {
-                entries.add(JavaCore.newSourceEntry(linkedRoot.getFullPath()));
-            }
-        }
-
-        entries.add(JavaCore.newContainerEntry(
-                new org.eclipse.core.runtime.Path("org.eclipse.jdt.launching.JRE_CONTAINER")));
+        List<IClasspathEntry> entries = createSourceEntries(linkedRoot, srcDirSuffixes,
+                "[" + projectName + "] Source folder: linked/");
+        entries.add(JavaCore.newContainerEntry(new org.eclipse.core.runtime.Path(JRE_CONTAINER_ID)));
 
         javaProject.setRawClasspath(
                 entries.toArray(new IClasspathEntry[0]),
@@ -819,9 +954,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 new NullProgressMonitor());
 
         // Store mapping: normalized filesystem path → Eclipse project name
-        String normalizedPath = subDir.getAbsolutePath().replace('\\', '/').toLowerCase();
-        if (!normalizedPath.endsWith("/")) normalizedPath += "/";
-        subprojectPathToEclipseName.put(normalizedPath, projectName);
+        putSubprojectMapping(subDir.getAbsolutePath(), projectName);
 
         GroovyLanguageServerPlugin.logInfo(
                 "[workspace] Created '" + projectName + "' (linked folder) at "
@@ -835,90 +968,21 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private void createSingleRootProject(java.io.File workspaceDir, String[] srcDirSuffixes) {
         try {
             IWorkspace workspace = ResourcesPlugin.getWorkspace();
-            IProject project = workspace.getRoot().getProject("GroovyProject");
-
-            if (!project.exists()) {
-                IProjectDescription description = workspace.newProjectDescription("GroovyProject");
-                // NO setLocation — project lives in Eclipse metadata area.
-                // A linked folder will point to the real workspace dir.
-                // This avoids creating .project / .classpath in the user's workspace.
-                description.setNatureIds(new String[]{
-                        JavaCore.NATURE_ID,
-                        "org.eclipse.jdt.groovy.core.groovyNature"
-                });
-                project.create(description, new NullProgressMonitor());
-                project.open(new NullProgressMonitor());
-                GroovyLanguageServerPlugin.logInfo("Created Eclipse project 'GroovyProject' (linked folder).");
-            } else if (!project.isOpen()) {
-                project.open(new NullProgressMonitor());
-            }
-
-            // Create a linked folder pointing to the actual workspace directory.
-            IFolder linkedRoot = project.getFolder("linked");
-            if (!linkedRoot.exists()) {
-                linkedRoot.createLink(
-                        org.eclipse.core.runtime.Path.fromOSString(workspaceDir.getAbsolutePath()),
-                        IResource.ALLOW_MISSING_LOCAL,
-                        new NullProgressMonitor());
-
-                // Exclude non-source directories so Eclipse does not traverse the
-                // entire workspace tree through the linked folder.  Heavy I/O in
-                // VS Code's workspaceStorage area can corrupt persisted state of
-                // other extensions (e.g. Copilot chat history).
-                try {
-                    linkedRoot.createFilter(
-                            IResourceFilterDescription.EXCLUDE_ALL
-                                    | IResourceFilterDescription.FOLDERS
-                                    | IResourceFilterDescription.INHERITABLE,
-                            new FileInfoMatcherDescription(
-                                    "org.eclipse.core.resources.regexFilterMatcher",
-                                    "\\..*|node_modules|build|out|target|dist|__pycache__|gradle"),
-                            IResource.BACKGROUND_REFRESH,
-                            new NullProgressMonitor());
-                } catch (CoreException e) {
-                    GroovyLanguageServerPlugin.logError(
-                            "[GroovyProject] Failed to set resource filter (non-fatal)", e);
-                }
-            }
+            IProject project = ensureGroovyRootProject(workspace);
+            IFolder linkedRoot = ensureLinkedRoot(project, workspaceDir, "[GroovyProject]");
             GroovyLanguageServerPlugin.logInfo(
                     "[GroovyProject] Linked folder → " + workspaceDir.getAbsolutePath());
 
-            // Configure source folders (relative to the linked root)
             IJavaProject javaProject = JavaCore.create(project);
             if (javaProject == null) {
                 GroovyLanguageServerPlugin.logError("[classpath] JavaCore.create returned null", null);
                 return;
             }
 
-            List<IClasspathEntry> entries = new ArrayList<>();
-            boolean foundAny = false;
-
-            for (String srcDir : srcDirSuffixes) {
-                IFolder folder = linkedRoot.getFolder(srcDir);
-                if (folder != null && folder.exists()) {
-                    entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
-                    foundAny = true;
-                    GroovyLanguageServerPlugin.logInfo("[classpath] Added source folder: linked/" + srcDir);
-                }
-            }
-
-            if (!foundAny) {
-                IFolder srcFolder = linkedRoot.getFolder("src");
-                if (srcFolder != null && srcFolder.exists()) {
-                    entries.add(JavaCore.newSourceEntry(srcFolder.getFullPath()));
-                    foundAny = true;
-                } else {
-                    entries.add(JavaCore.newSourceEntry(linkedRoot.getFullPath()));
-                }
-            }
-
-            entries.add(JavaCore.newContainerEntry(
-                    new org.eclipse.core.runtime.Path("org.eclipse.jdt.launching.JRE_CONTAINER")));
-
-            // Store mapping so classpathUpdate can find this project
-            String normalizedPath = workspaceDir.getAbsolutePath().replace('\\', '/').toLowerCase();
-            if (!normalizedPath.endsWith("/")) normalizedPath += "/";
-            subprojectPathToEclipseName.put(normalizedPath, "GroovyProject");
+            List<IClasspathEntry> entries = createSourceEntries(
+                    linkedRoot, srcDirSuffixes, "[classpath] Added source folder: linked/");
+            entries.add(JavaCore.newContainerEntry(new org.eclipse.core.runtime.Path(JRE_CONTAINER_ID)));
+            putSubprojectMapping(workspaceDir.getAbsolutePath(), GROOVY_PROJECT_NAME);
 
             GroovyLanguageServerPlugin.logInfo(
                     "[classpath] Initial classpath with " + entries.size()
@@ -929,9 +993,101 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     project.getFullPath().append("bin"),
                     new NullProgressMonitor());
 
-        } catch (Throwable e) {
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[classpath] Failed to configure classpath (non-fatal): "
                     + e.getMessage(), e);
+        }
+    }
+
+    private IProject ensureGroovyRootProject(IWorkspace workspace) throws CoreException {
+        IProject project = workspace.getRoot().getProject(GROOVY_PROJECT_NAME);
+        if (!project.exists()) {
+            IProjectDescription description = workspace.newProjectDescription(GROOVY_PROJECT_NAME);
+            description.setNatureIds(new String[] { JavaCore.NATURE_ID, GROOVY_NATURE_ID });
+            project.create(description, new NullProgressMonitor());
+            project.open(new NullProgressMonitor());
+            GroovyLanguageServerPlugin.logInfo("Created Eclipse project 'GroovyProject' (linked folder).");
+            return project;
+        }
+
+        if (!project.isOpen()) {
+            project.open(new NullProgressMonitor());
+        }
+        return project;
+    }
+
+    private IFolder ensureLinkedRoot(IProject project, java.io.File dir, String projectTag)
+            throws CoreException {
+        IFolder linkedRoot = project.getFolder(LINKED_FOLDER_NAME);
+        if (!linkedRoot.exists()) {
+            linkedRoot.createLink(
+                    org.eclipse.core.runtime.Path.fromOSString(dir.getAbsolutePath()),
+                    IResource.ALLOW_MISSING_LOCAL,
+                    new NullProgressMonitor());
+            applyLinkedResourceFilter(linkedRoot, projectTag);
+        }
+        return linkedRoot;
+    }
+
+    private void applyLinkedResourceFilter(IFolder linkedRoot, String projectTag) {
+        try {
+            linkedRoot.createFilter(
+                    IResourceFilterDescription.EXCLUDE_ALL
+                            | IResourceFilterDescription.FOLDERS
+                            | IResourceFilterDescription.INHERITABLE,
+                    new FileInfoMatcherDescription(
+                            "org.eclipse.core.resources.regexFilterMatcher",
+                            RESOURCE_FILTER_PATTERN),
+                    IResource.BACKGROUND_REFRESH,
+                    new NullProgressMonitor());
+        } catch (CoreException e) {
+            GroovyLanguageServerPlugin.logError(
+                    projectTag + " Failed to set resource filter (non-fatal)", e);
+        }
+    }
+
+    private List<IClasspathEntry> createSourceEntries(
+            IFolder linkedRoot,
+            String[] srcDirSuffixes,
+            String logPrefix) {
+        List<IClasspathEntry> entries = new ArrayList<>();
+        boolean configuredSourceFound = addConfiguredSourceEntries(linkedRoot, srcDirSuffixes, logPrefix, entries);
+        if (!configuredSourceFound) {
+            addFallbackSourceEntry(linkedRoot, entries);
+        }
+        return entries;
+    }
+
+    private boolean addConfiguredSourceEntries(
+            IFolder linkedRoot,
+            String[] srcDirSuffixes,
+            String logPrefix,
+            List<IClasspathEntry> entries) {
+        boolean found = false;
+        for (String srcDir : srcDirSuffixes) {
+            IFolder folder = linkedRoot.getFolder(srcDir);
+            if (folder != null && folder.exists()) {
+                entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
+                GroovyLanguageServerPlugin.logInfo(logPrefix + srcDir);
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    private void addFallbackSourceEntry(IFolder linkedRoot, List<IClasspathEntry> entries) {
+        IFolder srcFolder = linkedRoot.getFolder("src");
+        if (srcFolder != null && srcFolder.exists()) {
+            entries.add(JavaCore.newSourceEntry(srcFolder.getFullPath()));
+            return;
+        }
+        entries.add(JavaCore.newSourceEntry(linkedRoot.getFullPath()));
+    }
+
+    private void putSubprojectMapping(String filesystemPath, String projectName) {
+        String normalizedPath = normalizePath(filesystemPath);
+        if (normalizedPath != null) {
+            subprojectPathToEclipseName.put(normalizedPath, projectName);
         }
     }
 
@@ -945,7 +1101,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject p : projects) {
                 String name = p.getName();
-                if (name.startsWith("Groovy_") || name.equals("GroovyProject")) {
+                if (name.startsWith(GROOVY_PROJECT_PREFIX) || name.equals(GROOVY_PROJECT_NAME)) {
                     GroovyLanguageServerPlugin.logInfo(
                             "[workspace] Deleting stale project: " + name);
                     // IMPORTANT: first arg=false means do NOT delete disk contents.
@@ -954,7 +1110,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     p.delete(false, true, new NullProgressMonitor());
                 }
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "[workspace] Failed to clean up stale projects: " + e.getMessage(), e);
         }

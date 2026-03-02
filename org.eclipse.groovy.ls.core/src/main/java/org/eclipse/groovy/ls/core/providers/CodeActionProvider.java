@@ -63,6 +63,9 @@ public class CodeActionProvider {
 
     /** Maximum number of import suggestions to return per unresolved type. */
     private static final int MAX_IMPORT_SUGGESTIONS = 10;
+    private static final String IMPORT_PREFIX = "import ";
+    private static final String LINE_SEPARATOR = "\n";
+    private static final String TYPE_MESSAGE_MARKER = "The type ";
 
     private final DocumentManager documentManager;
     private final DiagnosticsProvider diagnosticsProvider;
@@ -84,107 +87,132 @@ public class CodeActionProvider {
      * Compute code actions for the given request.
      */
     public List<Either<Command, CodeAction>> getCodeActions(CodeActionParams params) {
-        String uri = params.getTextDocument().getUri();
-        List<Diagnostic> diagnostics = params.getContext().getDiagnostics();
-        if (diagnostics == null) {
-            diagnostics = new ArrayList<>();
+        CodeActionRequest request = buildCodeActionRequest(params);
+        if (request == null) {
+            return new ArrayList<>();
         }
-        List<Either<Command, CodeAction>> actions = new ArrayList<>();
 
+        List<Either<Command, CodeAction>> actions = new ArrayList<>();
+        if (request.wantQuickfix) {
+            addQuickFixActions(actions, request);
+        }
+        if (request.wantSource) {
+            addSourceActions(actions, request);
+        }
+        return actions;
+    }
+
+    private CodeActionRequest buildCodeActionRequest(CodeActionParams params) {
+        String uri = params.getTextDocument().getUri();
         String content = documentManager.getContent(uri);
         if (content == null) {
-            return actions;
+            return null;
         }
 
-        // Collect action types requested by the client
-        List<String> onlyKinds = null;
-        if (params.getContext().getOnly() != null) {
-            onlyKinds = params.getContext().getOnly();
+        List<String> onlyKinds = params.getContext().getOnly() != null
+                ? params.getContext().getOnly()
+                : null;
+        boolean wantQuickfix = wantsQuickFix(onlyKinds);
+        boolean wantSource = wantsSource(onlyKinds);
+
+        List<Diagnostic> diagnostics = params.getContext().getDiagnostics();
+        List<Diagnostic> requestDiagnostics = diagnostics != null ? diagnostics : new ArrayList<>();
+        requestDiagnostics = ensureDiagnosticsForRequest(uri, requestDiagnostics, wantQuickfix, wantSource);
+
+        List<Diagnostic> allDiagnostics = getLatestOrCollectedDiagnostics(uri);
+        return new CodeActionRequest(uri, content, onlyKinds, requestDiagnostics,
+                allDiagnostics, wantQuickfix, wantSource);
+    }
+
+    private boolean wantsQuickFix(List<String> onlyKinds) {
+        return onlyKinds == null || onlyKinds.contains(CodeActionKind.QuickFix);
+    }
+
+    private boolean wantsSource(List<String> onlyKinds) {
+        return onlyKinds == null
+                || onlyKinds.contains(CodeActionKind.Source)
+                || onlyKinds.contains(CodeActionKind.SourceOrganizeImports)
+                || onlyKinds.contains(SOURCE_KIND_ADD_MISSING_IMPORTS)
+                || onlyKinds.contains(SOURCE_KIND_REMOVE_UNUSED_IMPORTS);
+    }
+
+    private List<Diagnostic> ensureDiagnosticsForRequest(String uri,
+            List<Diagnostic> diagnostics,
+            boolean wantQuickfix,
+            boolean wantSource) {
+        if ((!wantQuickfix && !wantSource) || !diagnostics.isEmpty()) {
+            return diagnostics;
+        }
+        return getLatestOrCollectedDiagnostics(uri);
+    }
+
+    private List<Diagnostic> getLatestOrCollectedDiagnostics(String uri) {
+        List<Diagnostic> latest = diagnosticsProvider.getLatestDiagnostics(uri);
+        if (!latest.isEmpty()) {
+            return latest;
+        }
+        return diagnosticsProvider.collectDiagnosticsForCodeActions(uri);
+    }
+
+    private void addQuickFixActions(List<Either<Command, CodeAction>> actions, CodeActionRequest request) {
+        for (Diagnostic diagnostic : request.requestDiagnostics) {
+            addPerDiagnosticQuickFixes(actions, request.uri, request.content, diagnostic);
         }
 
-        boolean wantQuickfix = onlyKinds == null || onlyKinds.contains(CodeActionKind.QuickFix);
-        boolean wantSource = onlyKinds == null || onlyKinds.contains(CodeActionKind.Source)
-            || onlyKinds.contains(CodeActionKind.SourceOrganizeImports)
-            || onlyKinds.contains(SOURCE_KIND_ADD_MISSING_IMPORTS)
-            || onlyKinds.contains(SOURCE_KIND_REMOVE_UNUSED_IMPORTS);
+        addAction(actions,
+                createRemoveAllUnusedImportsQuickFixAction(
+                        request.uri,
+                        request.content,
+                        request.requestDiagnostics));
+        addAction(actions,
+                createAddAllMissingImportsQuickFixAction(
+                        request.uri,
+                        request.content,
+                        request.allDiagnostics));
+    }
 
-        // Some clients send an empty diagnostics list for source actions or broad
-        // quick-fix requests. Fall back to the latest/captured document diagnostics.
-        if ((wantSource || wantQuickfix) && diagnostics.isEmpty()) {
-            diagnostics = diagnosticsProvider.getLatestDiagnostics(uri);
-            if (diagnostics.isEmpty()) {
-                diagnostics = diagnosticsProvider.collectDiagnosticsForCodeActions(uri);
-            }
+    private void addPerDiagnosticQuickFixes(List<Either<Command, CodeAction>> actions,
+            String uri,
+            String content,
+            Diagnostic diagnostic) {
+        String code = getDiagnosticCode(diagnostic);
+        if (DIAG_CODE_UNUSED_IMPORT.equals(code)) {
+            addAction(actions, createRemoveImportAction(uri, content, diagnostic));
         }
 
-        // "All missing imports" must always operate on full-document diagnostics,
-        // not only the diagnostics attached to the current cursor range.
-        List<Diagnostic> allDiagnostics = diagnosticsProvider.getLatestDiagnostics(uri);
-        if (allDiagnostics.isEmpty()) {
-            allDiagnostics = diagnosticsProvider.collectDiagnosticsForCodeActions(uri);
+        if (isUnresolvedTypeDiagnostic(diagnostic)) {
+            addActions(actions, createAddImportActions(uri, content, diagnostic));
         }
 
-        if (wantQuickfix) {
-            for (Diagnostic diag : diagnostics) {
-                String code = getDiagnosticCode(diag);
-                // Remove unused import
-                if (DIAG_CODE_UNUSED_IMPORT.equals(code)) {
-                    CodeAction removeAction = createRemoveImportAction(uri, content, diag);
-                    if (removeAction != null) {
-                        actions.add(Either.forRight(removeAction));
-                    }
-                }
-
-                // Add import for unresolved type — match on code OR message text
-                if (isUnresolvedTypeDiagnostic(diag)) {
-                    List<CodeAction> importActions = createAddImportActions(uri, content, diag);
-                    for (CodeAction a : importActions) {
-                        actions.add(Either.forRight(a));
-                    }
-                }
-
-                // Implement missing interface members
-                if (isMissingInterfaceMemberDiagnostic(diag)) {
-                    CodeAction implementAction = createImplementMissingInterfaceMembersAction(uri, content, diag);
-                    if (implementAction != null) {
-                        actions.add(Either.forRight(implementAction));
-                    }
-                }
-            }
-
-            // Surface bulk quick-fix actions whenever quick fixes are requested.
-            CodeAction removeAllUnusedImportsQuickFix =
-                    createRemoveAllUnusedImportsQuickFixAction(uri, content, diagnostics);
-            if (removeAllUnusedImportsQuickFix != null) {
-                actions.add(Either.forRight(removeAllUnusedImportsQuickFix));
-            }
-
-            CodeAction addAllMissingImportsQuickFix =
-                    createAddAllMissingImportsQuickFixAction(uri, content, allDiagnostics);
-            if (addAllMissingImportsQuickFix != null) {
-                actions.add(Either.forRight(addAllMissingImportsQuickFix));
-            }
+        if (isMissingInterfaceMemberDiagnostic(diagnostic)) {
+            addAction(actions,
+                    createImplementMissingInterfaceMembersAction(uri, content, diagnostic));
         }
+    }
 
-        if (wantSource) {
-            // "Organize imports" — removes all unused imports
-            CodeAction organizeImports = createOrganizeImportsAction(uri, content, onlyKinds);
-            if (organizeImports != null) {
-                actions.add(Either.forRight(organizeImports));
-            }
+    private void addSourceActions(List<Either<Command, CodeAction>> actions, CodeActionRequest request) {
+        addAction(actions,
+                createOrganizeImportsAction(request.uri, request.content, request.onlyKinds));
+        addAction(actions,
+                createRemoveAllUnusedImportsAction(request.uri, request.content, request.onlyKinds));
+        addAction(actions,
+                createAddAllMissingImportsAction(
+                        request.uri,
+                        request.content,
+                        request.allDiagnostics,
+                        request.onlyKinds));
+    }
 
-            CodeAction removeAllUnusedImports = createRemoveAllUnusedImportsAction(uri, content, onlyKinds);
-            if (removeAllUnusedImports != null) {
-                actions.add(Either.forRight(removeAllUnusedImports));
-            }
-
-            CodeAction addAllMissingImports = createAddAllMissingImportsAction(uri, content, allDiagnostics, onlyKinds);
-            if (addAllMissingImports != null) {
-                actions.add(Either.forRight(addAllMissingImports));
-            }
+    private void addAction(List<Either<Command, CodeAction>> actions, CodeAction action) {
+        if (action != null) {
+            actions.add(Either.forRight(action));
         }
+    }
 
-        return actions;
+    private void addActions(List<Either<Command, CodeAction>> actions, List<CodeAction> codeActions) {
+        for (CodeAction action : codeActions) {
+            actions.add(Either.forRight(action));
+        }
     }
 
     // ================================================================
@@ -248,7 +276,7 @@ public class CodeActionProvider {
             for (String fqn : candidates) {
                 if (existingImports.contains(fqn)) continue;
 
-                String importStatement = "import " + fqn + "\n";
+                String importStatement = IMPORT_PREFIX + fqn + LINE_SEPARATOR;
                 TextEdit insertEdit = new TextEdit(
                         new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
                         importStatement);
@@ -278,42 +306,21 @@ public class CodeActionProvider {
 
         try {
             Set<String> existingImports = getExistingImports(uri);
-            Set<String> importsToAdd = new TreeSet<>();
-            List<Diagnostic> matchedDiagnostics = new ArrayList<>();
-
-            for (Diagnostic diag : diagnostics) {
-                if (!isUnresolvedTypeDiagnostic(diag)) {
-                    continue;
-                }
-
-                String typeName = extractTypeNameFromMessage(getDiagnosticMessage(diag));
-                if (typeName == null || typeName.isEmpty()) {
-                    continue;
-                }
-
-                List<String> candidates = searchClasspathForType(typeName, uri);
-                for (String candidate : candidates) {
-                    if (!existingImports.contains(candidate) && !importsToAdd.contains(candidate)) {
-                        importsToAdd.add(candidate);
-                        matchedDiagnostics.add(diag);
-                        break;
-                    }
-                }
-            }
+            MissingImportsResult missingImports =
+                    collectMissingImports(uri, diagnostics, existingImports);
+            Set<String> importsToAdd = missingImports.importsToAdd;
+            List<Diagnostic> matchedDiagnostics = missingImports.matchedDiagnostics;
 
             if (importsToAdd.size() < 2) {
                 return null;
             }
 
             int insertLine = findImportInsertLine(content);
-            StringBuilder importBlock = new StringBuilder();
-            for (String fqn : importsToAdd) {
-                importBlock.append("import ").append(fqn).append("\n");
-            }
+            String importBlock = buildImportBlock(importsToAdd);
 
             TextEdit insertEdit = new TextEdit(
                     new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
-                    importBlock.toString());
+                    importBlock);
 
             CodeAction action = new CodeAction("Add all missing imports");
             action.setKind(SOURCE_KIND_ADD_MISSING_IMPORTS);
@@ -380,18 +387,12 @@ public class CodeActionProvider {
             // Convert matches to FQNs, filtering out internal/synthetic types
             for (TypeNameMatch match : matches) {
                 String fqn = match.getFullyQualifiedName();
-                if (fqn == null || fqn.isEmpty()) continue;
-
-                // Skip internal types (containing $ for inner classes accessed by outer name)
-                if (fqn.contains("$")) continue;
-
-                // Skip sun.* and com.sun.* internal packages
-                if (fqn.startsWith("sun.") || fqn.startsWith("com.sun.")
-                        || fqn.startsWith("jdk.internal.")) continue;
-
-                results.add(fqn);
-
-                if (results.size() >= MAX_IMPORT_SUGGESTIONS) break;
+                if (isImportSearchCandidate(fqn)) {
+                    results.add(fqn);
+                    if (results.size() >= MAX_IMPORT_SUGGESTIONS) {
+                        break;
+                    }
+                }
             }
 
             // Sort: prefer shorter package paths (more common types first)
@@ -424,17 +425,8 @@ public class CodeActionProvider {
             IFile[] files = ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri);
 
             for (IFile file : files) {
-                IProject project = file.getProject();
-                if (project == null || !project.isOpen()) {
-                    continue;
-                }
-
-                IJavaProject javaProject = JavaCore.create(project);
-                if (javaProject == null || !javaProject.exists()) {
-                    continue;
-                }
-
-                if (seenProjectNames.add(project.getName())) {
+                IJavaProject javaProject = asSearchProject(file);
+                if (javaProject != null && seenProjectNames.add(javaProject.getElementName())) {
                     scopedProjects.add(javaProject);
                 }
             }
@@ -898,14 +890,12 @@ public class CodeActionProvider {
         for (ClassNode classNode : module.getClasses()) {
             int start = classNode.getLineNumber();
             int end = classNode.getLastLineNumber();
-            if (start > 0 && end >= start && targetLine >= start && targetLine <= end) {
-                if (best == null || start >= best.getLineNumber()) {
-                    best = classNode;
-                }
-            } else if (start > 0 && start <= targetLine) {
-                if (best == null || start >= best.getLineNumber()) {
-                    best = classNode;
-                }
+            boolean enclosesTarget = start > 0 && end >= start
+                    && targetLine >= start && targetLine <= end;
+            boolean declaredBeforeTarget = start > 0 && start <= targetLine;
+            if ((enclosesTarget || declaredBeforeTarget)
+                    && (best == null || start >= best.getLineNumber())) {
+                best = classNode;
             }
         }
         return best;
@@ -928,30 +918,14 @@ public class CodeActionProvider {
             return null;
         }
 
-        int firstQuote = message.indexOf('\'');
-        if (firstQuote >= 0) {
-            int secondQuote = message.indexOf('\'', firstQuote + 1);
-            if (secondQuote > firstQuote + 1) {
-                String candidate = message.substring(firstQuote + 1, secondQuote).trim();
-                int dot = candidate.lastIndexOf('.');
-                return dot >= 0 ? candidate.substring(dot + 1) : candidate;
-            }
+        String quotedCandidate = extractQuotedTypeCandidate(message);
+        if (quotedCandidate != null) {
+            return simpleTypeName(quotedCandidate);
         }
 
-        String marker = "The type ";
-        int idx = message.indexOf(marker);
-        if (idx >= 0) {
-            String rest = message.substring(idx + marker.length()).trim();
-            int end = 0;
-            while (end < rest.length() &&
-                    (Character.isJavaIdentifierPart(rest.charAt(end)) || rest.charAt(end) == '.')) {
-                end++;
-            }
-            if (end > 0) {
-                String candidate = rest.substring(0, end);
-                int dot = candidate.lastIndexOf('.');
-                return dot >= 0 ? candidate.substring(dot + 1) : candidate;
-            }
+        String markerCandidate = extractTypeCandidateAfterMarker(message, TYPE_MESSAGE_MARKER);
+        if (markerCandidate != null) {
+            return simpleTypeName(markerCandidate);
         }
 
         return null;
@@ -988,7 +962,7 @@ public class CodeActionProvider {
             if (trimmed.startsWith("package ")) {
                 packageLine = i;
             }
-            if (trimmed.startsWith("import ")) {
+            if (trimmed.startsWith(IMPORT_PREFIX)) {
                 lastImportLine = i;
             }
             // Stop scanning after first class/interface/enum/trait/def
@@ -1078,42 +1052,21 @@ public class CodeActionProvider {
             List<Diagnostic> diagnostics) {
         try {
             Set<String> existingImports = getExistingImports(uri);
-            Set<String> importsToAdd = new TreeSet<>();
-            List<Diagnostic> matchedDiagnostics = new ArrayList<>();
-
-            for (Diagnostic diag : diagnostics) {
-                if (!isUnresolvedTypeDiagnostic(diag)) {
-                    continue;
-                }
-
-                String typeName = extractTypeNameFromMessage(getDiagnosticMessage(diag));
-                if (typeName == null || typeName.isEmpty()) {
-                    continue;
-                }
-
-                List<String> candidates = searchClasspathForType(typeName, uri);
-                for (String candidate : candidates) {
-                    if (!existingImports.contains(candidate) && !importsToAdd.contains(candidate)) {
-                        importsToAdd.add(candidate);
-                        matchedDiagnostics.add(diag);
-                        break;
-                    }
-                }
-            }
+            MissingImportsResult missingImports =
+                    collectMissingImports(uri, diagnostics, existingImports);
+            Set<String> importsToAdd = missingImports.importsToAdd;
+            List<Diagnostic> matchedDiagnostics = missingImports.matchedDiagnostics;
 
             if (importsToAdd.size() < 2) {
                 return null;
             }
 
             int insertLine = findImportInsertLine(content);
-            StringBuilder importBlock = new StringBuilder();
-            for (String fqn : importsToAdd) {
-                importBlock.append("import ").append(fqn).append("\n");
-            }
+            String importBlock = buildImportBlock(importsToAdd);
 
             TextEdit insertEdit = new TextEdit(
                     new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
-                    importBlock.toString());
+                    importBlock);
 
             CodeAction action = new CodeAction("Add all missing imports");
             action.setKind(CodeActionKind.QuickFix);
@@ -1150,6 +1103,153 @@ public class CodeActionProvider {
         }
 
         return edits;
+    }
+
+    private IJavaProject asSearchProject(IFile file) {
+        IProject project = file.getProject();
+        if (project == null || !project.isOpen()) {
+            return null;
+        }
+
+        IJavaProject javaProject = JavaCore.create(project);
+        if (javaProject == null || !javaProject.exists()) {
+            return null;
+        }
+        return javaProject;
+    }
+
+    private boolean isImportSearchCandidate(String fqn) {
+        if (fqn == null || fqn.isEmpty()) {
+            return false;
+        }
+        if (fqn.contains("$")) {
+            return false;
+        }
+        return !fqn.startsWith("sun.")
+                && !fqn.startsWith("com.sun.")
+                && !fqn.startsWith("jdk.internal.");
+    }
+
+    private MissingImportsResult collectMissingImports(String uri,
+            List<Diagnostic> diagnostics,
+            Set<String> existingImports) {
+        Set<String> importsToAdd = new TreeSet<>();
+        List<Diagnostic> matchedDiagnostics = new ArrayList<>();
+
+        for (Diagnostic diag : diagnostics) {
+            String candidate = resolveMissingImportCandidate(uri, diag, existingImports, importsToAdd);
+            if (candidate != null) {
+                importsToAdd.add(candidate);
+                matchedDiagnostics.add(diag);
+            }
+        }
+
+        return new MissingImportsResult(importsToAdd, matchedDiagnostics);
+    }
+
+    private String resolveMissingImportCandidate(String uri,
+            Diagnostic diag,
+            Set<String> existingImports,
+            Set<String> importsToAdd) {
+        if (!isUnresolvedTypeDiagnostic(diag)) {
+            return null;
+        }
+
+        String typeName = extractTypeNameFromMessage(getDiagnosticMessage(diag));
+        if (typeName == null || typeName.isEmpty()) {
+            return null;
+        }
+
+        List<String> candidates = searchClasspathForType(typeName, uri);
+        for (String candidate : candidates) {
+            if (!existingImports.contains(candidate) && !importsToAdd.contains(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private String buildImportBlock(Set<String> importsToAdd) {
+        StringBuilder importBlock = new StringBuilder();
+        for (String fqn : importsToAdd) {
+            importBlock.append(IMPORT_PREFIX).append(fqn).append(LINE_SEPARATOR);
+        }
+        return importBlock.toString();
+    }
+
+    private String extractQuotedTypeCandidate(String message) {
+        int firstQuote = message.indexOf('\'');
+        if (firstQuote < 0) {
+            return null;
+        }
+
+        int secondQuote = message.indexOf('\'', firstQuote + 1);
+        if (secondQuote <= firstQuote + 1) {
+            return null;
+        }
+
+        return message.substring(firstQuote + 1, secondQuote).trim();
+    }
+
+    private String extractTypeCandidateAfterMarker(String message, String marker) {
+        int markerIndex = message.indexOf(marker);
+        if (markerIndex < 0) {
+            return null;
+        }
+
+        String rest = message.substring(markerIndex + marker.length()).trim();
+        int end = 0;
+        while (end < rest.length()
+                && (Character.isJavaIdentifierPart(rest.charAt(end)) || rest.charAt(end) == '.')) {
+            end++;
+        }
+
+        if (end == 0) {
+            return null;
+        }
+        return rest.substring(0, end);
+    }
+
+    private String simpleTypeName(String fqnOrSimple) {
+        int dot = fqnOrSimple.lastIndexOf('.');
+        return dot >= 0 ? fqnOrSimple.substring(dot + 1) : fqnOrSimple;
+    }
+
+    private static final class CodeActionRequest {
+        private final String uri;
+        private final String content;
+        private final List<String> onlyKinds;
+        private final List<Diagnostic> requestDiagnostics;
+        private final List<Diagnostic> allDiagnostics;
+        private final boolean wantQuickfix;
+        private final boolean wantSource;
+
+        private CodeActionRequest(String uri,
+                String content,
+                List<String> onlyKinds,
+                List<Diagnostic> requestDiagnostics,
+                List<Diagnostic> allDiagnostics,
+                boolean wantQuickfix,
+                boolean wantSource) {
+            this.uri = uri;
+            this.content = content;
+            this.onlyKinds = onlyKinds;
+            this.requestDiagnostics = requestDiagnostics;
+            this.allDiagnostics = allDiagnostics;
+            this.wantQuickfix = wantQuickfix;
+            this.wantSource = wantSource;
+        }
+    }
+
+    private static final class MissingImportsResult {
+        private final Set<String> importsToAdd;
+        private final List<Diagnostic> matchedDiagnostics;
+
+        private MissingImportsResult(Set<String> importsToAdd,
+                List<Diagnostic> matchedDiagnostics) {
+            this.importsToAdd = importsToAdd;
+            this.matchedDiagnostics = matchedDiagnostics;
+        }
     }
 
     private boolean wantsKind(List<String> onlyKinds, String... expectedKinds) {

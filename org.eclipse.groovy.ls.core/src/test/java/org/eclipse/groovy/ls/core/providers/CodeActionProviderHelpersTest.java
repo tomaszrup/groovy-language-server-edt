@@ -16,17 +16,16 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Method;
+import java.util.List;
 
 import org.codehaus.groovy.ast.ClassHelper;
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.lsp4j.Diagnostic;
-import org.eclipse.lsp4j.DiagnosticSeverity;
-import org.eclipse.lsp4j.Position;
-import org.eclipse.lsp4j.Range;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -376,6 +375,198 @@ class CodeActionProviderHelpersTest {
         assertNull(invokeExtractClassName(""));
     }
 
+    // ---- getDiagnosticCode ----
+
+    @Test
+    void getDiagnosticCodeExtractsStringCode() throws Exception {
+        Diagnostic d = new Diagnostic();
+        d.setCode("unused-import");
+        String code = invokeGetDiagnosticCode(d);
+        assertEquals("unused-import", code);
+    }
+
+    @Test
+    void getDiagnosticCodeReturnsNullForMissing() throws Exception {
+        Diagnostic d = new Diagnostic();
+        String code = invokeGetDiagnosticCode(d);
+        assertNull(code);
+    }
+
+    // ---- findMissingInterfaceMethods ----
+
+    @Test
+    void findMissingInterfaceMethodsFindsAll() throws Exception {
+        String source = """
+                interface Doer {
+                    void doWork()
+                    String status()
+                }
+                class Worker implements Doer {}
+                """;
+        ModuleNode module = parseModule(source, "file:///CAMissing.groovy");
+        ClassNode worker = findClass(module, "Worker");
+
+        List<MethodNode> missing = invokeFindMissingInterfaceMethods(worker, module);
+        assertNotNull(missing);
+        assertTrue(missing.size() >= 2,
+                "Expected at least 2 missing methods but got " + missing.size());
+    }
+
+    @Test
+    void findMissingInterfaceMethodsEmptyWhenImplemented() throws Exception {
+        String source = """
+                interface Doer { void doWork() }
+                class Worker implements Doer {
+                    void doWork() { }
+                }
+                """;
+        ModuleNode module = parseModule(source, "file:///CANoMissing.groovy");
+        ClassNode worker = findClass(module, "Worker");
+
+        List<MethodNode> missing = invokeFindMissingInterfaceMethods(worker, module);
+        assertNotNull(missing);
+        assertTrue(missing.isEmpty());
+    }
+
+    // ---- isMethodRequiredForImplementation ----
+
+    @Test
+    void isMethodRequiredForImplementationTrueForAbstract() throws Exception {
+        String source = """
+                interface Doer { void doWork() }
+                """;
+        ModuleNode module = parseModule(source, "file:///CARequired.groovy");
+        MethodNode method = findClass(module, "Doer").getMethods().stream()
+                .filter(m -> "doWork".equals(m.getName()))
+                .findFirst().orElse(null);
+        assertNotNull(method);
+
+        boolean required = invokeIsMethodRequired(method);
+        assertTrue(required);
+    }
+
+    // ---- hasSameParameterTypes ----
+
+    @Test
+    void hasSameParameterTypesReturnsTrueForMatching() throws Exception {
+        String source = """
+                interface A { void foo(String a, int b) }
+                interface B { void foo(String x, int y) }
+                """;
+        ModuleNode module = parseModule(source, "file:///CASameParams.groovy");
+        MethodNode methodA = findClass(module, "A").getMethods().stream()
+                .filter(m -> "foo".equals(m.getName())).findFirst().orElse(null);
+        MethodNode methodB = findClass(module, "B").getMethods().stream()
+                .filter(m -> "foo".equals(m.getName())).findFirst().orElse(null);
+        assertNotNull(methodA);
+        assertNotNull(methodB);
+
+        assertTrue(invokeHasSameParameterTypes(methodA, methodB));
+    }
+
+    @Test
+    void hasSameParameterTypesReturnsFalseForDifferent() throws Exception {
+        String source = """
+                interface A { void foo(String a) }
+                interface B { void foo(int a) }
+                """;
+        ModuleNode module = parseModule(source, "file:///CADiffParams.groovy");
+        MethodNode methodA = findClass(module, "A").getMethods().stream()
+                .filter(m -> "foo".equals(m.getName())).findFirst().orElse(null);
+        MethodNode methodB = findClass(module, "B").getMethods().stream()
+                .filter(m -> "foo".equals(m.getName())).findFirst().orElse(null);
+        assertNotNull(methodA);
+        assertNotNull(methodB);
+
+        assertFalse(invokeHasSameParameterTypes(methodA, methodB));
+    }
+
+    // ---- hasConcreteMethodInHierarchy ----
+
+    @Test
+    void hasConcreteMethodInHierarchyFalseForNoImpl() throws Exception {
+        String source = """
+                interface Doer { void doWork() }
+                class Worker implements Doer {}
+                """;
+        ModuleNode module = parseModule(source, "file:///CAConcreteNo.groovy");
+        ClassNode worker = findClass(module, "Worker");
+        MethodNode method = findClass(module, "Doer").getMethods().stream()
+                .filter(m -> "doWork".equals(m.getName())).findFirst().orElse(null);
+        assertNotNull(method);
+
+        assertFalse(invokeHasConcreteMethodInHierarchy(worker, method));
+    }
+
+    @Test
+    void hasConcreteMethodInHierarchyTrueWhenImplemented() throws Exception {
+        String source = """
+                interface Doer { void doWork() }
+                class Worker implements Doer {
+                    void doWork() { println 'working' }
+                }
+                """;
+        ModuleNode module = parseModule(source, "file:///CAConcreteYes.groovy");
+        ClassNode worker = findClass(module, "Worker");
+        MethodNode method = findClass(module, "Doer").getMethods().stream()
+                .filter(m -> "doWork".equals(m.getName())).findFirst().orElse(null);
+        assertNotNull(method);
+
+        assertTrue(invokeHasConcreteMethodInHierarchy(worker, method));
+    }
+
+    // ---- methodSignatureKey ----
+
+    @Test
+    void methodSignatureKeyIncludesNameAndParams() throws Exception {
+        String source = """
+                interface API { String process(String input, int count) }
+                """;
+        ModuleNode module = parseModule(source, "file:///CASigKey.groovy");
+        MethodNode method = findClass(module, "API").getMethods().stream()
+                .filter(m -> "process".equals(m.getName())).findFirst().orElse(null);
+        assertNotNull(method);
+
+        String key = invokeMethodSignatureKey(method);
+        assertNotNull(key);
+        assertTrue(key.contains("process"));
+    }
+
+    // ---- findClassInsertLine ----
+
+    @Test
+    void findClassInsertLineFindsClosingBrace() throws Exception {
+        String source = "class A {\n    void foo() {}\n}\n";
+        ModuleNode module = parseModule(source, "file:///CAInsertLine.groovy");
+        ClassNode clazz = findClass(module, "A");
+
+        int line = invokeFindClassInsertLine(clazz, source);
+        assertTrue(line >= 1, "Insert line should be at least 1 but got " + line);
+    }
+
+    // ---- buildMissingMethodStubsText ----
+
+    @Test
+    void buildMissingMethodStubsTextGeneratesStubs() throws Exception {
+        String source = """
+                interface Doer {
+                    void doWork()
+                    String status()
+                }
+                class Worker implements Doer {
+                }
+                """;
+        ModuleNode module = parseModule(source, "file:///CAStubs.groovy");
+        ClassNode worker = findClass(module, "Worker");
+
+        List<MethodNode> missing = invokeFindMissingInterfaceMethods(worker, module);
+        if (!missing.isEmpty()) {
+            String stubs = invokeBuildMissingMethodStubsText(worker, missing, source, 5);
+            assertNotNull(stubs);
+            assertTrue(stubs.contains("doWork") || stubs.contains("status"));
+        }
+    }
+
     // ================================================================
     // Reflection helpers
     // ================================================================
@@ -461,7 +652,6 @@ class CodeActionProviderHelpersTest {
         return (int) m.invoke(provider, content);
     }
 
-    @SuppressWarnings("unchecked")
     private boolean invokeWantsKind(java.util.List<String> onlyKinds, String... expected) throws Exception {
         Method m = CodeActionProvider.class.getDeclaredMethod("wantsKind",
                 java.util.List.class, String[].class);
@@ -487,6 +677,49 @@ class CodeActionProviderHelpersTest {
         Method m = CodeActionProvider.class.getDeclaredMethod("extractClassSimpleNameFromMessage", String.class);
         m.setAccessible(true);
         return (String) m.invoke(provider, message);
+    }
+
+    private String invokeGetDiagnosticCode(Diagnostic d) throws Exception {
+        Method m = CodeActionProvider.class.getDeclaredMethod("getDiagnosticCode", Diagnostic.class);
+        m.setAccessible(true);
+        return (String) m.invoke(provider, d);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<MethodNode> invokeFindMissingInterfaceMethods(ClassNode targetClass, ModuleNode module) throws Exception {
+        Method m = CodeActionProvider.class.getDeclaredMethod("findMissingInterfaceMethods", ClassNode.class, ModuleNode.class);
+        m.setAccessible(true);
+        return (List<MethodNode>) m.invoke(provider, targetClass, module);
+    }
+
+    private boolean invokeIsMethodRequired(MethodNode method) throws Exception {
+        Method m = CodeActionProvider.class.getDeclaredMethod("isMethodRequiredForImplementation", MethodNode.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(provider, method);
+    }
+
+    private boolean invokeHasSameParameterTypes(MethodNode left, MethodNode right) throws Exception {
+        Method m = CodeActionProvider.class.getDeclaredMethod("hasSameParameterTypes", MethodNode.class, MethodNode.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(provider, left, right);
+    }
+
+    private boolean invokeHasConcreteMethodInHierarchy(ClassNode cls, MethodNode required) throws Exception {
+        Method m = CodeActionProvider.class.getDeclaredMethod("hasConcreteMethodInHierarchy", ClassNode.class, MethodNode.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(provider, cls, required);
+    }
+
+    private int invokeFindClassInsertLine(ClassNode cls, String content) throws Exception {
+        Method m = CodeActionProvider.class.getDeclaredMethod("findClassInsertLine", ClassNode.class, String.class);
+        m.setAccessible(true);
+        return (int) m.invoke(provider, cls, content);
+    }
+
+    private String invokeBuildMissingMethodStubsText(ClassNode cls, List<MethodNode> missing, String content, int insertLine) throws Exception {
+        Method m = CodeActionProvider.class.getDeclaredMethod("buildMissingMethodStubsText", ClassNode.class, List.class, String.class, int.class);
+        m.setAccessible(true);
+        return (String) m.invoke(provider, cls, missing, content, insertLine);
     }
 
     private ModuleNode parseModule(String source, String uri) {

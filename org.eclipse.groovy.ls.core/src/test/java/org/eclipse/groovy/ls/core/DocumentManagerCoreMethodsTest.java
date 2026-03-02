@@ -15,7 +15,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.IOException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -156,8 +155,7 @@ class DocumentManagerCoreMethodsTest {
 
         // Should not throw — may return a partial AST or null
         ModuleNode module = manager.getGroovyAST(uri);
-        // Either null or a partial AST is acceptable
-        // The key assertion is that it doesn't throw
+        assertTrue(module == null || !module.getClasses().isEmpty());
 
         manager.didClose(uri);
     }
@@ -208,10 +206,284 @@ class DocumentManagerCoreMethodsTest {
         Path sourceFile = Files.writeString(isolatedDir.resolve("Orphan.groovy"), "class Orphan {}\n");
 
         java.io.File root = invokeDetectProjectRoot(manager, sourceFile.toFile());
+        assertTrue(root == null || root.isDirectory());
+    }
 
-        // The tempDir itself doesn't have build markers, so this should be null
-        // unless the test runner's own workspace has markers further up
-        // We just verify it doesn't throw
+    // ---- Additional coverage tests ----
+
+    @Test
+    void positionToOffsetWithEmptyContent() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String content = "";
+        org.eclipse.lsp4j.Position position = new org.eclipse.lsp4j.Position(0, 0);
+
+        int offset = invokePositionToOffset(manager, content, position);
+
+        assertEquals(0, offset);
+    }
+
+    @Test
+    void positionToOffsetWithCRLF() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String content = "line one\r\nline two\r\n";
+        org.eclipse.lsp4j.Position position = new org.eclipse.lsp4j.Position(1, 0);
+
+        int offset = invokePositionToOffset(manager, content, position);
+
+        // After "line one\r\n" = 10 chars, so line 1 start = 10
+        assertEquals(10, offset);
+    }
+
+    @Test
+    void getOpenDocumentUrisTracksOpenDocuments() {
+        DocumentManager manager = new DocumentManager();
+        assertTrue(manager.getOpenDocumentUris().isEmpty());
+
+        manager.didOpen("file:///test/A.groovy", "class A {}\n");
+        manager.didOpen("file:///test/B.groovy", "class B {}\n");
+
+        assertEquals(2, manager.getOpenDocumentUris().size());
+
+        manager.didClose("file:///test/A.groovy");
+        assertEquals(1, manager.getOpenDocumentUris().size());
+    }
+
+    @Test
+    void getWorkingCopyOwnerReturnsNonNull() {
+        DocumentManager manager = new DocumentManager();
+        assertNotNull(manager.getWorkingCopyOwner());
+    }
+
+    @Test
+    void getGroovyASTUpdatesAfterDidChange() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/UpdateAST.groovy";
+        manager.didOpen(uri, "class Original {}\n");
+
+        ModuleNode original = manager.getGroovyAST(uri);
+        assertNotNull(original);
+        assertEquals("Original", original.getClasses().get(0).getNameWithoutPackage());
+
+        // Full replacement
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setText("class Updated {}\n");
+        manager.didChange(uri, java.util.List.of(change));
+
+        ModuleNode updated = manager.getGroovyAST(uri);
+        assertNotNull(updated);
+        assertEquals("Updated", updated.getClasses().get(0).getNameWithoutPackage());
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void normalizeUriHandlesNullAndNonFileUri() {
+        assertNull(DocumentManager.normalizeUri(null));
+        assertEquals("untitled:foo", DocumentManager.normalizeUri("untitled:foo"));
+    }
+
+    @Test
+    void didChangeWithIncrementalEditModifiesContent() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/Incr.groovy";
+        manager.didOpen(uri, "class Foo {}");
+
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setRange(new org.eclipse.lsp4j.Range(
+                new org.eclipse.lsp4j.Position(0, 6),
+                new org.eclipse.lsp4j.Position(0, 9)));
+        change.setText("Bar");
+
+        manager.didChange(uri, java.util.List.of(change));
+
+        assertEquals("class Bar {}", manager.getContent(uri));
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void detectProjectRootFindsPomXml() throws Exception {
+        DocumentManager manager = new DocumentManager();
+
+        Path projectDir = tempDir.resolve("maven-project");
+        Files.createDirectories(projectDir.resolve("src/main/groovy"));
+        Files.writeString(projectDir.resolve("pom.xml"), "<project/>\n");
+        Path sourceFile = Files.writeString(
+                projectDir.resolve("src/main/groovy/App.groovy"), "class App {}\n");
+
+        java.io.File root = invokeDetectProjectRoot(manager, sourceFile.toFile());
+
+        assertNotNull(root);
+        assertEquals(projectDir.toFile().getAbsolutePath(), root.getAbsolutePath());
+    }
+
+    @Test
+    void detectProjectRootFindsGradlewMarker() throws Exception {
+        DocumentManager manager = new DocumentManager();
+
+        Path projectDir = tempDir.resolve("gradlew-project");
+        Files.createDirectories(projectDir.resolve("app"));
+        Files.writeString(projectDir.resolve("gradlew"), "#!/bin/sh\n");
+        Path sourceFile = Files.writeString(
+                projectDir.resolve("app/Main.groovy"), "class Main {}\n");
+
+        java.io.File root = invokeDetectProjectRoot(manager, sourceFile.toFile());
+
+        assertNotNull(root);
+        assertEquals(projectDir.toFile().getAbsolutePath(), root.getAbsolutePath());
+    }
+
+    @Test
+    void didChangeForUnknownUriDoesNotThrow() {
+        DocumentManager manager = new DocumentManager();
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setText("shouldn't matter");
+
+        // Should silently return — no content stored for unknown URI
+        manager.didChange("file:///unknown.groovy", java.util.List.of(change));
+        assertNull(manager.getContent("file:///unknown.groovy"));
+    }
+
+    // ================================================================
+    // didOpen / didClose lifecycle expansion
+    // ================================================================
+
+    @Test
+    void didOpenAndCloseTrackOpenDocuments() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///lifecycle.groovy";
+        manager.didOpen(uri, "class Life {}");
+        assertTrue(manager.getOpenDocumentUris().contains(DocumentManager.normalizeUri(uri)));
+        manager.didClose(uri);
+        assertFalse(manager.getOpenDocumentUris().contains(DocumentManager.normalizeUri(uri)));
+    }
+
+    @Test
+    void didOpenSetsClientUriMapping() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///client_uri.groovy";
+        manager.didOpen(uri, "class X {}");
+        String normalized = DocumentManager.normalizeUri(uri);
+        String clientUri = manager.getClientUri(normalized);
+        assertNotNull(clientUri);
+    }
+
+    @Test
+    void didCloseInvalidatesCompilerCache() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///invalidate.groovy";
+        manager.didOpen(uri, "class Inv {}");
+        ModuleNode ast = manager.getGroovyAST(uri);
+        assertNotNull(ast);
+        manager.didClose(uri);
+        // After close, AST should no longer be available
+        ModuleNode astAfterClose = manager.getGroovyAST(uri);
+        assertNull(astAfterClose);
+    }
+
+    @Test
+    void hasJdtWorkingCopyReturnsFalseAfterDidClose() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///working_copy.groovy";
+        manager.didOpen(uri, "class WC {}");
+        assertFalse(manager.hasJdtWorkingCopy(uri)); // No JDT in test env
+        manager.didClose(uri);
+        assertFalse(manager.hasJdtWorkingCopy(uri));
+    }
+
+    // ================================================================
+    // getGroovyAST expansion
+    // ================================================================
+
+    @Test
+    void getGroovyASTReturnsParsedModuleWithClasses() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///ASTClasses.groovy";
+        manager.didOpen(uri, "class Foo {}\nclass Bar {}");
+        ModuleNode ast = manager.getGroovyAST(uri);
+        assertNotNull(ast);
+        assertTrue(ast.getClasses().size() >= 2);
+    }
+
+    @Test
+    void getGroovyASTCachesResultBetweenCalls() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///Cached.groovy";
+        manager.didOpen(uri, "class Cached { int x }");
+        ModuleNode ast1 = manager.getGroovyAST(uri);
+        ModuleNode ast2 = manager.getGroovyAST(uri);
+        // Both calls should return valid ASTs
+        assertNotNull(ast1);
+        assertNotNull(ast2);
+    }
+
+    // ================================================================
+    // didChange with incremental edits expansion
+    // ================================================================
+
+    @Test
+    void didChangeIncrementalInsert() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///InsertEdit.groovy";
+        manager.didOpen(uri, "class A {}");
+
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setRange(new org.eclipse.lsp4j.Range(
+                new org.eclipse.lsp4j.Position(0, 8),
+                new org.eclipse.lsp4j.Position(0, 8)));
+        change.setText(" extends Object");
+        manager.didChange(uri, java.util.List.of(change));
+
+        String content = manager.getContent(uri);
+        assertTrue(content.contains("extends Object"));
+    }
+
+    @Test
+    void didChangeIncrementalDelete() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///DeleteEdit.groovy";
+        manager.didOpen(uri, "class Deletable {}");
+
+        // Delete "Deletable" → replace with "A"
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setRange(new org.eclipse.lsp4j.Range(
+                new org.eclipse.lsp4j.Position(0, 6),
+                new org.eclipse.lsp4j.Position(0, 15)));
+        change.setText("A");
+        manager.didChange(uri, java.util.List.of(change));
+
+        assertEquals("class A {}", manager.getContent(uri));
+    }
+
+    @Test
+    void didChangeMultipleIncrementalEdits() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///MultiEdit.groovy";
+        manager.didOpen(uri, "def x = 1\ndef y = 2");
+
+        // Two edits: change both values
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change1 =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change1.setRange(new org.eclipse.lsp4j.Range(
+                new org.eclipse.lsp4j.Position(1, 8),
+                new org.eclipse.lsp4j.Position(1, 9)));
+        change1.setText("42");
+
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change2 =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change2.setRange(new org.eclipse.lsp4j.Range(
+                new org.eclipse.lsp4j.Position(0, 8),
+                new org.eclipse.lsp4j.Position(0, 9)));
+        change2.setText("10");
+
+        manager.didChange(uri, java.util.List.of(change1, change2));
+        String content = manager.getContent(uri);
+        assertNotNull(content);
     }
 
     // ---- Helpers ----

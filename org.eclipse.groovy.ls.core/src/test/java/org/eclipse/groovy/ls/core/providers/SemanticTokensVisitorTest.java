@@ -42,6 +42,9 @@ class SemanticTokensVisitorTest {
         List<DecodedToken> tokens = collectTokens(source, null);
 
         assertFalse(tokens.isEmpty());
+        assertTrue(tokens.stream().allMatch(token -> token.column >= 0));
+        assertTrue(tokens.stream().allMatch(token -> token.length > 0));
+        assertTrue(tokens.stream().allMatch(token -> token.modifiers >= 0));
         assertTrue(
             hasTokenType(tokens, SemanticTokensProvider.TYPE_CLASS)
                 || hasTokenType(tokens, SemanticTokensProvider.TYPE_TYPE));

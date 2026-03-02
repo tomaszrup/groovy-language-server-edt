@@ -53,7 +53,7 @@ public class LogOutputStream extends OutputStream {
 
     @Override
     public void flush() throws IOException {
-        if (buffer.length() > 0) {
+        if (!buffer.isEmpty()) {
             String message = buffer.toString();
             buffer.setLength(0);
 
