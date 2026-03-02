@@ -10,6 +10,7 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,6 +65,60 @@ class SourceJarHelperTest {
     }
 
     @Test
+    void findSourcesJarForBinaryJarReturnsNullForInvalidInputs() throws IOException {
+        assertNull(SourceJarHelper.findSourcesJarForBinaryJar(null));
+
+        File notAJar = tempDir.resolve("not-a-jar.txt").toFile();
+        Files.writeString(notAJar.toPath(), "x");
+
+        assertNull(SourceJarHelper.findSourcesJarForBinaryJar(notAJar));
+    }
+
+    @Test
+    void findSourcesJarForBinaryJarFindsSiblingHashDirectoryInGradleCacheLayout() throws IOException {
+        Path versionDir = tempDir.resolve("modules-2/files-2.1/com.example/demo/1.0");
+        Path hashA = versionDir.resolve("hash-a");
+        Path hashB = versionDir.resolve("hash-b");
+        Files.createDirectories(hashA);
+        Files.createDirectories(hashB);
+
+        File binaryJar = createJar(hashA.resolve("demo-1.0.jar"), "com/example/Demo.class", "bytecode");
+        File sourcesJar = createJar(hashB.resolve("demo-1.0-sources.jar"), "com/example/Demo.java", "class Demo {}\n");
+
+        File found = SourceJarHelper.findSourcesJarForBinaryJar(binaryJar);
+
+        assertNotNull(found);
+        assertEquals(sourcesJar.getAbsolutePath(), found.getAbsolutePath());
+    }
+
+    @Test
+    void findSourcesJarForBinaryJarFindsAcrossMavenAndGradleCaches() throws IOException {
+        String originalUserHome = System.getProperty("user.home");
+        Path home = tempDir.resolve("home");
+        Files.createDirectories(home);
+        System.setProperty("user.home", home.toString());
+        try {
+            Path mavenDir = home.resolve(".m2/repository/com/acme/demo/1.0");
+            Path gradleDir = home.resolve(".gradle/caches/modules-2/files-2.1/com.acme/demo/1.0/hash");
+            Files.createDirectories(mavenDir);
+            Files.createDirectories(gradleDir);
+
+            File binaryJar = createJar(mavenDir.resolve("demo-1.0.jar"), "com/acme/Demo.class", "bytecode");
+            File sourcesJar = createJar(gradleDir.resolve("demo-1.0-sources.jar"),
+                    "com/acme/Demo.java", "class Demo {}\n");
+
+            File found = SourceJarHelper.findSourcesJarForBinaryJar(binaryJar);
+
+            assertNotNull(found);
+            assertEquals(sourcesJar.getAbsolutePath(), found.getAbsolutePath());
+        } finally {
+            if (originalUserHome != null) {
+                System.setProperty("user.home", originalUserHome);
+            }
+        }
+    }
+
+    @Test
     void readSourceFromJarReadsJavaOrGroovyEntryByFqn() throws IOException {
         File sourcesJar = createJar(
                 tempDir.resolve("example-sources.jar"),
@@ -74,6 +129,51 @@ class SourceJarHelperTest {
 
         assertNotNull(source);
         assertTrue(source.contains("class Foo"));
+    }
+
+    @Test
+    void readSourceFromJarReturnsNullWhenTypeNotPresent() throws IOException {
+        File sourcesJar = createJar(
+                tempDir.resolve("missing-sources.jar"),
+                "com/example/Other.java",
+                "class Other {}\n");
+
+        assertNull(SourceJarHelper.readSourceFromJar(sourcesJar, "com.example.Missing"));
+    }
+
+    @Test
+    void readSourceFromJdkSrcZipReadsModuleAndLegacyLayouts() throws IOException {
+        String originalJavaHome = System.getProperty("java.home");
+        Path fakeJavaHome = tempDir.resolve("fake-jdk");
+        Path libDir = fakeJavaHome.resolve("lib");
+        Files.createDirectories(libDir);
+
+        createJar(libDir.resolve("src.zip"), "java.base/java/lang/FakeType.java", "package java.lang; class FakeType {}\n");
+        System.setProperty("java.home", fakeJavaHome.toString());
+        try {
+            String moduleSource = SourceJarHelper.readSourceFromJdkSrcZip("java.lang.FakeType");
+            assertNotNull(moduleSource);
+            assertTrue(moduleSource.contains("FakeType"));
+        } finally {
+            if (originalJavaHome != null) {
+                System.setProperty("java.home", originalJavaHome);
+            }
+        }
+
+        Path legacyHome = tempDir.resolve("legacy-jdk");
+        Path legacyLib = legacyHome.resolve("lib");
+        Files.createDirectories(legacyLib);
+        createJar(legacyLib.resolve("src.zip"), "java/lang/LegacyType.java", "package java.lang; class LegacyType {}\n");
+        System.setProperty("java.home", legacyHome.toString());
+        try {
+            String legacySource = SourceJarHelper.readSourceFromJdkSrcZip("java.lang.LegacyType");
+            assertNotNull(legacySource);
+            assertTrue(legacySource.contains("LegacyType"));
+        } finally {
+            if (originalJavaHome != null) {
+                System.setProperty("java.home", originalJavaHome);
+            }
+        }
     }
 
     @Test
@@ -97,6 +197,17 @@ class SourceJarHelperTest {
     }
 
     @Test
+    void extractJavadocReturnsNullWhenUnexpectedTokensAppearBetweenDocAndClass() {
+        String source = """
+                /** Doc */
+                unexpected-token
+                class Demo {}
+                """;
+
+        assertNull(SourceJarHelper.extractJavadoc(source, "Demo"));
+    }
+
+    @Test
     void extractMemberJavadocFindsMethodDocumentation() {
         String source = """
                 class Demo {
@@ -117,6 +228,34 @@ class SourceJarHelperTest {
         assertTrue(doc.contains("Greets a user."));
         assertTrue(doc.contains("**@param** `name` —"));
         assertTrue(doc.contains("**@return**"));
+    }
+
+    @Test
+    void extractMemberJavadocIgnoresPartialIdentifierMatches() {
+        String source = """
+                class Demo {
+                    /**
+                     * Docs for targetMethod.
+                     */
+                    String targetMethod() { "" }
+
+                    String targetMethodology() { "" }
+                }
+                """;
+
+        String doc = SourceJarHelper.extractMemberJavadoc(source, "targetMethodology");
+        assertNull(doc);
+    }
+
+    @Test
+    void writeSourceToTempWritesExpectedFileContent() throws IOException {
+        File written = SourceJarHelper.writeSourceToTemp("com.example.Temp", "class Temp {}\n", ".groovy");
+
+        assertNotNull(written);
+        assertTrue(written.exists());
+        String content = Files.readString(written.toPath());
+        assertTrue(content.contains("class Temp"));
+        assertFalse(content.isBlank());
     }
 
     private File createJar(Path jarPath, String entryName, String content) throws IOException {
