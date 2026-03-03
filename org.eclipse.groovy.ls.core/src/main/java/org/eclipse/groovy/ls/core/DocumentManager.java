@@ -195,26 +195,35 @@ public class DocumentManager {
             clientUris.put(uri, clientUri);
         }
 
-        // Create JDT working copy
-        ICompilationUnit cu = findCompilationUnit(uri);
-        if (cu != null) {
-            try {
-                ICompilationUnit workingCopy = cu.getWorkingCopy(workingCopyOwner, null);
-                workingCopy.getBuffer().setContents(text);
-                workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
-                workingCopies.put(uri, workingCopy);
-                GroovyLanguageServerPlugin.logInfo("JDT working copy created for " + uri
-                        + " (type: " + workingCopy.getClass().getName() + ")");
-                return;
-            } catch (JavaModelException e) {
-                GroovyLanguageServerPlugin.logError("Failed to create working copy for " + uri, e);
-            }
-        }
-
-        // Fallback: parse with standalone Groovy compiler when JDT is unavailable
-        GroovyLanguageServerPlugin.logInfo(
-                "No JDT working copy for " + uri + "; using Groovy compiler fallback.");
+        // Always provide an immediate fallback AST via the standalone compiler
+        // so that semantic tokens / hover / etc. work even before JDT is ready.
         compilerService.parse(uri, text);
+
+        // Create the JDT working copy on a background thread.  findCompilationUnit()
+        // and reconcile() both touch the Eclipse workspace model, which can block
+        // for the duration of a full build.  Doing this on the LSP dispatch thread
+        // would freeze ALL message processing (didOpen, didChange, completion,
+        // semantic tokens) for every other file.
+        final String bgUri = uri;
+        final String bgText = text;
+        java.util.concurrent.CompletableFuture.runAsync(() -> {
+            ICompilationUnit cu = findCompilationUnit(bgUri);
+            if (cu != null) {
+                try {
+                    ICompilationUnit workingCopy = cu.getWorkingCopy(workingCopyOwner, null);
+                    workingCopy.getBuffer().setContents(bgText);
+                    workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
+                    workingCopies.put(bgUri, workingCopy);
+                    GroovyLanguageServerPlugin.logInfo("JDT working copy created for " + bgUri
+                            + " (type: " + workingCopy.getClass().getName() + ")");
+                } catch (JavaModelException e) {
+                    GroovyLanguageServerPlugin.logError("Failed to create working copy for " + bgUri, e);
+                }
+            } else {
+                GroovyLanguageServerPlugin.logInfo(
+                        "No JDT compilation unit for " + bgUri + "; using Groovy compiler fallback.");
+            }
+        });
     }
 
     /**

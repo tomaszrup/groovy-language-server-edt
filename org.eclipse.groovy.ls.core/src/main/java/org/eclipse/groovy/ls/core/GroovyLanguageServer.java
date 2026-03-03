@@ -379,7 +379,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         if (prev != null) {
             prev.cancel(false);
         }
-        sendStatus(STATUS_IMPORTING, "Waiting for remaining classpaths...");
+        // No per-call status message — the initial "Receiving classpaths..."
+        // from classpathUpdate() is sufficient.  Sending status 50 times
+        // just spams the output channel.
         debouncedBuildFuture = initialBuildScheduler.schedule(() -> {
             GroovyLanguageServerPlugin.logInfo(
                     "[debounced-build] Debounce window elapsed — triggering build.");
