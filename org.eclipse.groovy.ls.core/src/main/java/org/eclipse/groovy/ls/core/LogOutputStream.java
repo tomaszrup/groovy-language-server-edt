@@ -57,9 +57,15 @@ public class LogOutputStream extends OutputStream {
             String message = buffer.toString();
             buffer.setLength(0);
 
+            int severity = (level == Level.ERROR) ? IStatus.ERROR : IStatus.INFO;
+
+            // Respect the configured log level
+            if (severity < GroovyLanguageServerPlugin.getLogLevel()) {
+                return;
+            }
+
             ILog log = GroovyLanguageServerPlugin.getPluginLog();
             if (log != null) {
-                int severity = (level == Level.ERROR) ? IStatus.ERROR : IStatus.INFO;
                 log.log(new Status(severity, GroovyLanguageServerPlugin.PLUGIN_ID, message));
             }
         }

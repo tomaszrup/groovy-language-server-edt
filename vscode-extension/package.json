@@ -99,6 +99,17 @@
                     "description": "Additional JVM arguments for the language server process (e.g., -Xmx2G for more memory).",
                     "scope": "machine-overridable"
                 },
+                "groovy.ls.logLevel": {
+                    "type": "string",
+                    "enum": [
+                        "error",
+                        "warning",
+                        "info"
+                    ],
+                    "default": "error",
+                    "description": "Controls the verbosity of the Groovy language server's internal logging. Messages below the selected level are suppressed.",
+                    "scope": "window"
+                },
                 "groovy.trace.server": {
                     "type": "string",
                     "enum": [

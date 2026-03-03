@@ -696,6 +696,9 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         client?.sendNotification('workspace/didChangeConfiguration', {
             settings: {
                 groovy: {
+                    ls: {
+                        logLevel: config.get<string>('ls.logLevel', 'error'),
+                    },
                     format: {
                         settingsUrl: config.get<string>('format.settingsUrl') ?? null,
                         enabled: config.get<boolean>('format.enabled', true),
@@ -723,7 +726,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     // Watch for configuration changes and forward to server
     context.subscriptions.push(
         workspace.onDidChangeConfiguration((e) => {
-            if (client && (e.affectsConfiguration('groovy.format') || e.affectsConfiguration('groovy.inlayHints'))) {
+            if (client && (e.affectsConfiguration('groovy.ls.logLevel') || e.affectsConfiguration('groovy.format') || e.affectsConfiguration('groovy.inlayHints'))) {
                 sendGroovyConfiguration();
             }
         })

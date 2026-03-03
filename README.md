@@ -128,11 +128,11 @@ This project is a clean-room reimplementation of a Groovy language server, built
 
 The previous iteration of this project ([tomaszrup/groovy-language-server](https://github.com/tomaszrup/groovy-language-server)) used a custom Groovy compiler pipeline. This version replaces it entirely with Eclipse JDT + groovy-eclipse for a more robust foundation.
 
-### Lineage of the original scaffold
+### References
 
-1. **[GroovyLanguageServer/groovy-language-server](https://github.com/GroovyLanguageServer/groovy-language-server)** — the original project by [Prominic.NET, Inc.](https://prominic.net/), created for [Moonshine IDE](https://moonshine-ide.com/).
-2. **[pvangeel/groovy-language-server](https://github.com/pvangeel/groovy-language-server)** — a fork by Peter Van Geel that added Gradle Tooling API integration.
-3. **[groovy-language-server/groovy-language-server](https://github.com/groovy-language-server/groovy-language-server)** — the initial scaffold used as a starting point for the Eclipse-based rewrite.
+- [Language Support for Java™ by Red Hat](https://marketplace.visualstudio.com/items?itemName=redhat.java) — VS Code extension providing Java language support and classpath resolution via the Java extension API
+- [Eclipse JDT (Java Development Tools)](https://www.eclipse.org/jdt/) — the compiler infrastructure and language tooling framework that powers this language server
+- [Prominic's Groovy Language Server](https://github.com/GroovyLanguageServer/groovy-language-server) — an earlier Groovy language server that served as inspiration for this project
 
 ## License
 

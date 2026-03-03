@@ -134,9 +134,21 @@ public class GroovyWorkspaceService implements WorkspaceService {
             return;
         }
 
+        applyLogLevelSetting(groovy);
         applyFormatterSettings(groovy);
         com.google.gson.JsonObject inlayHints = getChildJson(groovy, "inlayHints");
         server.getGroovyTextDocumentService().updateInlayHintSettings(parseInlayHintSettings(inlayHints));
+    }
+
+    private void applyLogLevelSetting(com.google.gson.JsonObject groovy) {
+        com.google.gson.JsonObject ls = getChildJson(groovy, "ls");
+        if (ls == null || !ls.has("logLevel")) {
+            return;
+        }
+        com.google.gson.JsonElement levelElem = ls.get("logLevel");
+        String level = (levelElem != null && !levelElem.isJsonNull()) ? levelElem.getAsString() : null;
+        GroovyLanguageServerPlugin.setLogLevelFromString(level);
+        GroovyLanguageServerPlugin.logError("Log level set to: " + level);
     }
 
     private void applyFormatterSettings(com.google.gson.JsonObject groovy) {

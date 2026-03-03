@@ -31,6 +31,14 @@ public class GroovyLanguageServerPlugin extends Plugin {
     private static GroovyLanguageServerPlugin instance;
     private static GroovyLanguageServer languageServer;
 
+    /**
+     * The minimum severity level for log messages to be emitted.
+     * Uses {@link IStatus} severity constants: {@link IStatus#INFO} (1),
+     * {@link IStatus#WARNING} (2), {@link IStatus#ERROR} (4).
+     * Defaults to {@link IStatus#ERROR} to suppress verbose output.
+     */
+    private static volatile int logLevel = IStatus.ERROR;
+
     @Override
     public void start(BundleContext context) throws Exception {
         super.start(context);
@@ -76,6 +84,48 @@ public class GroovyLanguageServerPlugin extends Plugin {
         return languageServer;
     }
 
+    // ---- Log level configuration ----
+
+    /**
+     * Returns the current minimum log severity level.
+     */
+    public static int getLogLevel() {
+        return logLevel;
+    }
+
+    /**
+     * Sets the minimum severity level for log output.
+     *
+     * @param level one of {@link IStatus#INFO}, {@link IStatus#WARNING}, or {@link IStatus#ERROR}
+     */
+    public static void setLogLevel(int level) {
+        logLevel = level;
+    }
+
+    /**
+     * Sets the log level from a string value (case-insensitive).
+     * Accepted values: {@code "error"}, {@code "warning"}, {@code "info"}.
+     * Unrecognised values default to {@link IStatus#ERROR}.
+     */
+    public static void setLogLevelFromString(String level) {
+        if (level == null) {
+            logLevel = IStatus.ERROR;
+            return;
+        }
+        switch (level.toLowerCase(java.util.Locale.ROOT)) {
+            case "info":
+                logLevel = IStatus.INFO;
+                break;
+            case "warning":
+                logLevel = IStatus.WARNING;
+                break;
+            case "error":
+            default:
+                logLevel = IStatus.ERROR;
+                break;
+        }
+    }
+
     // ---- Logging helpers ----
 
     public static void logInfo(String message) {
@@ -95,6 +145,11 @@ public class GroovyLanguageServerPlugin extends Plugin {
     }
 
     private static void log(int severity, String message, Throwable throwable) {
+        // Skip messages below the configured log level
+        if (severity < logLevel) {
+            return;
+        }
+
         // Log to Eclipse platform log
         ILog logger = getPluginLog();
         if (logger != null) {

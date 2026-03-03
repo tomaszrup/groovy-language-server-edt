@@ -14,6 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.lsp4j.MessageParams;
 import org.eclipse.lsp4j.MessageType;
 import org.eclipse.lsp4j.services.LanguageClient;
@@ -26,6 +27,7 @@ class GroovyLanguageServerPluginLoggingTest {
     @AfterEach
     void tearDown() {
         GroovyLanguageServerPlugin.setLanguageServer(null);
+        GroovyLanguageServerPlugin.setLogLevel(IStatus.ERROR); // restore default
     }
 
     @Test
@@ -34,6 +36,7 @@ class GroovyLanguageServerPluginLoggingTest {
         GroovyLanguageServer server = new GroovyLanguageServer();
         server.connect(client);
         GroovyLanguageServerPlugin.setLanguageServer(server);
+        GroovyLanguageServerPlugin.setLogLevel(IStatus.INFO);
 
         GroovyLanguageServerPlugin.logInfo("hello");
 
@@ -49,6 +52,7 @@ class GroovyLanguageServerPluginLoggingTest {
         GroovyLanguageServer server = new GroovyLanguageServer();
         server.connect(client);
         GroovyLanguageServerPlugin.setLanguageServer(server);
+        GroovyLanguageServerPlugin.setLogLevel(IStatus.WARNING);
 
         GroovyLanguageServerPlugin.logWarning("careful");
 
