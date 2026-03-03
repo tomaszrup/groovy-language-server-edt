@@ -1,13 +1,17 @@
 {
-    "name": "groovy-language-server",
-    "displayName": "Groovy Language Support",
+    "name": "groovy-spock-support",
+    "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "0.1.0",
-    "publisher": "groovy-language-server",
+    "version": "1.0.0",
+    "publisher": "TomaszRup",
     "license": "EPL-2.0",
+    "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
     "repository": {
         "type": "git",
-        "url": "https://github.com/groovy-language-server/groovy-language-server"
+        "url": "https://github.com/tomaszrup/groovy-language-server-edt.git"
+    },
+    "bugs": {
+        "url": "https://github.com/tomaszrup/groovy-language-server-edt/issues"
     },
     "engines": {
         "vscode": "^1.85.0"

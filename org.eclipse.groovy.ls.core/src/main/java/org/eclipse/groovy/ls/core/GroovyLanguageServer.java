@@ -32,7 +32,9 @@ import org.eclipse.jdt.core.JavaCore;
 import com.google.gson.JsonObject;
 import org.eclipse.lsp4j.CodeActionKind;
 import org.eclipse.lsp4j.CodeActionOptions;
+import org.eclipse.lsp4j.CodeLensOptions;
 import org.eclipse.lsp4j.CompletionOptions;
+import org.eclipse.lsp4j.DocumentOnTypeFormattingOptions;
 import org.eclipse.lsp4j.FileOperationFilter;
 import org.eclipse.lsp4j.FileOperationOptions;
 import org.eclipse.lsp4j.FileOperationPattern;
@@ -270,8 +272,24 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             capabilities.setDocumentFormattingProvider(true);
             capabilities.setDocumentRangeFormattingProvider(true);
 
+            // On-type formatting (auto-format on }, ;, newline)
+            DocumentOnTypeFormattingOptions onTypeOptions =
+                    new DocumentOnTypeFormattingOptions("}");
+            onTypeOptions.setMoreTriggerCharacter(List.of(";", "\n"));
+            capabilities.setDocumentOnTypeFormattingProvider(onTypeOptions);
+
             // Folding ranges
             capabilities.setFoldingRangeProvider(true);
+
+            // Type hierarchy (supertypes / subtypes navigation)
+            capabilities.setTypeHierarchyProvider(true);
+
+            // Call hierarchy (incoming / outgoing calls)
+            capabilities.setCallHierarchyProvider(true);
+
+            // Code lens (reference counts on types and methods)
+            CodeLensOptions codeLensOptions = new CodeLensOptions(true);
+            capabilities.setCodeLensProvider(codeLensOptions);
 
             GroovyLanguageServerPlugin.logInfo("Groovy Language Server initialized with capabilities.");
 

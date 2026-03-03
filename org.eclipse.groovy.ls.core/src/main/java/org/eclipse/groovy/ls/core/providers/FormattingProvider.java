@@ -29,6 +29,7 @@ import org.eclipse.jdt.core.ToolFactory;
 import org.eclipse.jdt.core.formatter.CodeFormatter;
 import org.eclipse.jdt.core.formatter.DefaultCodeFormatterConstants;
 import org.eclipse.lsp4j.DocumentFormattingParams;
+import org.eclipse.lsp4j.DocumentOnTypeFormattingParams;
 import org.eclipse.lsp4j.DocumentRangeFormattingParams;
 import org.eclipse.lsp4j.FormattingOptions;
 import org.eclipse.lsp4j.Position;
@@ -116,6 +117,100 @@ public class FormattingProvider {
 
         Map<String, String> options = buildFormatterOptions(params.getOptions(), uri);
         return formatSource(source, offset, length, options);
+    }
+
+    /**
+     * Format on typing a trigger character.
+     * <p>
+     * Supports three trigger characters:
+     * <ul>
+     *   <li>{@code \}} — formats the block from the matching {@code \{}</li>
+     *   <li>{@code ;} — formats the current line</li>
+     *   <li>{@code \n} — formats the previous line</li>
+     * </ul>
+     */
+    public List<TextEdit> formatOnType(DocumentOnTypeFormattingParams params) {
+        String uri = params.getTextDocument().getUri();
+        String source = documentManager.getContent(uri);
+        if (source == null || source.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        Position triggerPos = params.getPosition();
+        String triggerChar = params.getCh();
+        int triggerOffset = positionToOffset(source, triggerPos);
+
+        int formatStart;
+        int formatEnd;
+
+        switch (triggerChar) {
+            case "}" -> {
+                // Find the matching opening brace
+                int matchingBrace = findMatchingOpenBrace(source, triggerOffset - 1);
+                if (matchingBrace < 0) {
+                    return new ArrayList<>();
+                }
+                // Extend to the line start of the opening brace
+                formatStart = findLineStart(source, matchingBrace);
+                formatEnd = Math.min(triggerOffset + 1, source.length());
+            }
+            case ";" -> {
+                // Format the current line
+                formatStart = findLineStart(source, triggerOffset);
+                formatEnd = Math.min(triggerOffset + 1, source.length());
+            }
+            case "\n" -> {
+                // Format the previous line (the line that was just completed)
+                int prevLineEnd = triggerOffset - 1;
+                if (prevLineEnd < 0) {
+                    return new ArrayList<>();
+                }
+                formatStart = findLineStart(source, prevLineEnd);
+                formatEnd = Math.min(triggerOffset, source.length());
+            }
+            default -> {
+                return new ArrayList<>();
+            }
+        }
+
+        if (formatStart >= formatEnd || formatStart < 0) {
+            return new ArrayList<>();
+        }
+
+        Map<String, String> options = buildFormatterOptions(params.getOptions(), uri);
+        return formatSource(source, formatStart, formatEnd - formatStart, options);
+    }
+
+    /**
+     * Find the matching opening brace for a closing brace, accounting for
+     * nesting. Skips braces inside string literals and comments.
+     */
+    private int findMatchingOpenBrace(String source, int closeBraceOffset) {
+        int depth = 1;
+        for (int i = closeBraceOffset - 1; i >= 0; i--) {
+            char c = source.charAt(i);
+            if (c == '}') {
+                depth++;
+            } else if (c == '{') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Find the start offset of the line containing the given offset.
+     */
+    private int findLineStart(String source, int offset) {
+        for (int i = Math.min(offset, source.length() - 1); i >= 0; i--) {
+            if (source.charAt(i) == '\n') {
+                return i + 1;
+            }
+        }
+        return 0;
     }
 
     /**

@@ -15,6 +15,8 @@ import java.util.concurrent.CompletableFuture;
 
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.providers.CodeActionProvider;
+import org.eclipse.groovy.ls.core.providers.CallHierarchyProvider;
+import org.eclipse.groovy.ls.core.providers.CodeLensProvider;
 import org.eclipse.groovy.ls.core.providers.CompletionProvider;
 import org.eclipse.groovy.ls.core.providers.DefinitionProvider;
 import org.eclipse.groovy.ls.core.providers.DiagnosticsProvider;
@@ -31,6 +33,7 @@ import org.eclipse.groovy.ls.core.providers.RenameProvider;
 import org.eclipse.groovy.ls.core.providers.SemanticTokensProvider;
 import org.eclipse.groovy.ls.core.providers.SignatureHelpProvider;
 import org.eclipse.groovy.ls.core.providers.TypeDefinitionProvider;
+import org.eclipse.groovy.ls.core.providers.TypeHierarchyProvider;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.jsonrpc.messages.Either3;
@@ -67,6 +70,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
     private final FoldingRangeProvider foldingRangeProvider;
     private final TypeDefinitionProvider typeDefinitionProvider;
     private final ImplementationProvider implementationProvider;
+    private final TypeHierarchyProvider typeHierarchyProvider;
+    private final CallHierarchyProvider callHierarchyProvider;
+    private final CodeLensProvider codeLensProvider;
 
     private InlayHintSettings inlayHintSettings = InlayHintSettings.defaults();
 
@@ -94,6 +100,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
         this.foldingRangeProvider = new FoldingRangeProvider(documentManager);
         this.typeDefinitionProvider = new TypeDefinitionProvider(documentManager);
         this.implementationProvider = new ImplementationProvider(documentManager);
+        this.typeHierarchyProvider = new TypeHierarchyProvider(documentManager);
+        this.callHierarchyProvider = new CallHierarchyProvider(documentManager);
+        this.codeLensProvider = new CodeLensProvider(documentManager);
     }
 
     void connect(LanguageClient client) {
@@ -430,6 +439,127 @@ public class GroovyTextDocumentService implements TextDocumentService {
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Range formatting failed", e);
                 return new ArrayList<>();
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<List<? extends TextEdit>> onTypeFormatting(
+            DocumentOnTypeFormattingParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return formattingProvider.formatOnType(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("On-type formatting failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    // ---- Type Hierarchy ----
+
+    @Override
+    public CompletableFuture<List<TypeHierarchyItem>> prepareTypeHierarchy(
+            TypeHierarchyPrepareParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return typeHierarchyProvider.prepareTypeHierarchy(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Prepare type hierarchy failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<List<TypeHierarchyItem>> typeHierarchySupertypes(
+            TypeHierarchySupertypesParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return typeHierarchyProvider.getSupertypes(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Type hierarchy supertypes failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<List<TypeHierarchyItem>> typeHierarchySubtypes(
+            TypeHierarchySubtypesParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return typeHierarchyProvider.getSubtypes(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Type hierarchy subtypes failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    // ---- Call Hierarchy ----
+
+    @Override
+    public CompletableFuture<List<CallHierarchyItem>> prepareCallHierarchy(
+            CallHierarchyPrepareParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return callHierarchyProvider.prepareCallHierarchy(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Prepare call hierarchy failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<List<CallHierarchyIncomingCall>> callHierarchyIncomingCalls(
+            CallHierarchyIncomingCallsParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return callHierarchyProvider.getIncomingCalls(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Call hierarchy incoming calls failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<List<CallHierarchyOutgoingCall>> callHierarchyOutgoingCalls(
+            CallHierarchyOutgoingCallsParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return callHierarchyProvider.getOutgoingCalls(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Call hierarchy outgoing calls failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    // ---- Code Lens ----
+
+    @Override
+    public CompletableFuture<List<? extends CodeLens>> codeLens(CodeLensParams params) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return codeLensProvider.getCodeLenses(params);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Code lens failed", e);
+                return new ArrayList<>();
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<CodeLens> resolveCodeLens(CodeLens codeLens) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return codeLensProvider.resolveCodeLens(codeLens);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Code lens resolve failed", e);
+                return codeLens;
             }
         });
     }

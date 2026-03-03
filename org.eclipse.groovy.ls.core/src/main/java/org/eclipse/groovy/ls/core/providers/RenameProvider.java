@@ -25,7 +25,10 @@ import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
@@ -49,9 +52,12 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either3;
  * of the selected element, then generates a {@link WorkspaceEdit} replacing the
  * old name with the new name at every location.
  * <p>
- * Note: This is a lightweight rename based on search-and-replace. For more
- * complex renames (e.g., renaming a package, moving files, updating imports),
- * a full JDT refactoring session would be needed.
+ * Enhanced rename features:
+ * <ul>
+ *   <li>Type rename: also updates import statements across workspace files</li>
+ *   <li>Type rename: also renames constructors</li>
+ *   <li>Field rename: also renames corresponding getters/setters</li>
+ * </ul>
  */
 public class RenameProvider {
 
@@ -179,6 +185,10 @@ public class RenameProvider {
                 return null;
             }
 
+            // Enhanced rename: additional edits for specific element types
+            IJavaElement element = elements[0];
+            addEnhancedRenameEdits(element, newName, editsByUri);
+
             WorkspaceEdit edit = new WorkspaceEdit();
             edit.setChanges(editsByUri);
             return edit;
@@ -252,6 +262,202 @@ public class RenameProvider {
             }
         }
         return new Position(line, col);
+    }
+
+    // ---- Enhanced rename: type/field-specific additions ----
+
+    /**
+     * Add additional edits when renaming specific element types:
+     * <ul>
+     *   <li>Type rename: update import statements, rename constructors</li>
+     *   <li>Field rename: rename corresponding getters/setters</li>
+     * </ul>
+     */
+    private void addEnhancedRenameEdits(IJavaElement element, String newName,
+                                         Map<String, List<TextEdit>> editsByUri) {
+        try {
+            if (element instanceof IType type) {
+                addImportRenameEdits(type, newName, editsByUri);
+                addConstructorRenameEdits(type, newName, editsByUri);
+            } else if (element instanceof IField field) {
+                addAccessorRenameEdits(field, newName, editsByUri);
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Enhanced rename edits failed", e);
+        }
+    }
+
+    /**
+     * When renaming a type, update all import statements that reference it.
+     * The SearchEngine ALL_OCCURRENCES search may not find import statements in all cases,
+     * so we scan workspace files explicitly.
+     */
+    private void addImportRenameEdits(IType type, String newName,
+                                       Map<String, List<TextEdit>> editsByUri) {
+        try {
+            String oldFqn = type.getFullyQualifiedName();
+            String oldSimpleName = type.getElementName();
+
+            // Scan all workspace source files
+            org.eclipse.core.resources.IProject[] projects =
+                    org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot().getProjects();
+            for (org.eclipse.core.resources.IProject project : projects) {
+                if (!project.isOpen()) continue;
+                scanProjectForImportRenames(project.members(), oldFqn, oldSimpleName, newName, editsByUri);
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Import rename scan failed", e);
+        }
+    }
+
+    private void scanProjectForImportRenames(IResource[] resources, String oldFqn,
+                                              String oldSimpleName, String newName,
+                                              Map<String, List<TextEdit>> editsByUri) throws Exception {
+        for (IResource resource : resources) {
+            if (resource instanceof org.eclipse.core.resources.IFile file) {
+                String fileName = file.getName();
+                if (fileName.endsWith(".groovy") || fileName.endsWith(".java")) {
+                    scanFileForImportRename(file, oldFqn, oldSimpleName, newName, editsByUri);
+                }
+            } else if (resource instanceof org.eclipse.core.resources.IFolder folder) {
+                if (folder.isAccessible()) {
+                    scanProjectForImportRenames(folder.members(), oldFqn, oldSimpleName, newName, editsByUri);
+                }
+            }
+        }
+    }
+
+    private void scanFileForImportRename(org.eclipse.core.resources.IFile file, String oldFqn,
+                                          String oldSimpleName, String newName,
+                                          Map<String, List<TextEdit>> editsByUri) {
+        try {
+            String uri = file.getLocationURI().toString();
+            String content = readContent(uri, file);
+            if (content == null) return;
+
+            // Look for import statements containing the old FQN
+            String importLine = "import " + oldFqn;
+            int idx = content.indexOf(importLine);
+            while (idx >= 0) {
+                // Find the position of just the simple name within the import
+                int nameStart = idx + "import ".length() + oldFqn.length() - oldSimpleName.length();
+                int nameEnd = nameStart + oldSimpleName.length();
+
+                // Verify it's actually the simple name
+                String found = content.substring(nameStart, nameEnd);
+                if (found.equals(oldSimpleName)) {
+                    Position start = offsetToPosition(content, nameStart);
+                    Position end = offsetToPosition(content, nameEnd);
+
+                    // Only add if not already covered by the search edit
+                    List<TextEdit> existingEdits = editsByUri.get(uri);
+                    if (!hasEditAt(existingEdits, start.getLine(), start.getCharacter())) {
+                        editsByUri.computeIfAbsent(uri, k -> new ArrayList<>())
+                                .add(new TextEdit(new Range(start, end), newName));
+                    }
+                }
+
+                idx = content.indexOf(importLine, idx + 1);
+            }
+        } catch (Exception e) {
+            // Silently skip files we can't process
+        }
+    }
+
+    private boolean hasEditAt(List<TextEdit> edits, int line, int character) {
+        if (edits == null) return false;
+        for (TextEdit edit : edits) {
+            Position start = edit.getRange().getStart();
+            if (start.getLine() == line && start.getCharacter() == character) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * When renaming a type, also rename its constructors.
+     */
+    private void addConstructorRenameEdits(IType type, String newName,
+                                            Map<String, List<TextEdit>> editsByUri) {
+        try {
+            for (IMethod method : type.getMethods()) {
+                if (method.isConstructor()) {
+                    SearchPattern pattern = SearchPattern.createPattern(
+                            method, IJavaSearchConstants.ALL_OCCURRENCES);
+                    if (pattern != null) {
+                        SearchEngine engine = new SearchEngine();
+                        engine.search(pattern,
+                                new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                                SearchEngine.createWorkspaceScope(),
+                                new SearchRequestor() {
+                                    @Override
+                                    public void acceptSearchMatch(SearchMatch match) {
+                                        addRenameEdit(match, newName, editsByUri);
+                                    }
+                                },
+                                null);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Constructor rename failed", e);
+        }
+    }
+
+    /**
+     * When renaming a field, also rename corresponding getter/setter methods.
+     * <p>
+     * Groovy auto-generates getters and setters for properties, so renaming
+     * a field should also rename {@code getFieldName()}, {@code setFieldName()},
+     * and {@code isFieldName()} if they exist.
+     */
+    private void addAccessorRenameEdits(IField field, String newName,
+                                         Map<String, List<TextEdit>> editsByUri) {
+        try {
+            IType declaringType = field.getDeclaringType();
+            if (declaringType == null) return;
+
+            String oldName = field.getElementName();
+            String oldCapName = capitalize(oldName);
+            String newCapName = capitalize(newName);
+
+            // Look for getOldName, setOldName, isOldName
+            renameAccessorIfExists(declaringType, "get" + oldCapName, "get" + newCapName, editsByUri);
+            renameAccessorIfExists(declaringType, "set" + oldCapName, "set" + newCapName, editsByUri);
+            renameAccessorIfExists(declaringType, "is" + oldCapName, "is" + newCapName, editsByUri);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Accessor rename failed", e);
+        }
+    }
+
+    private void renameAccessorIfExists(IType type, String oldAccessorName, String newAccessorName,
+                                         Map<String, List<TextEdit>> editsByUri) throws Exception {
+        for (IMethod method : type.getMethods()) {
+            if (method.getElementName().equals(oldAccessorName)) {
+                SearchPattern pattern = SearchPattern.createPattern(
+                        method, IJavaSearchConstants.ALL_OCCURRENCES);
+                if (pattern != null) {
+                    SearchEngine engine = new SearchEngine();
+                    engine.search(pattern,
+                            new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                            SearchEngine.createWorkspaceScope(),
+                            new SearchRequestor() {
+                                @Override
+                                public void acceptSearchMatch(SearchMatch match) {
+                                    addRenameEdit(match, newAccessorName, editsByUri);
+                                }
+                            },
+                            null);
+                }
+                break; // Found the accessor, no need to check further
+            }
+        }
+    }
+
+    private static String capitalize(String name) {
+        if (name == null || name.isEmpty()) return name;
+        return Character.toUpperCase(name.charAt(0)) + name.substring(1);
     }
 
     // ---- Groovy AST fallback rename ----

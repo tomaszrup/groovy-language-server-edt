@@ -221,6 +221,15 @@ public class DiagnosticsProvider {
             GroovyLanguageServerPlugin.logError("Unused import detection failed for " + uri, e);
         }
 
+        // Detect unused types and methods (faded text via DiagnosticTag.Unnecessary)
+        try {
+            List<Diagnostic> unusedDeclarations =
+                    UnusedDeclarationDetector.detectUnusedDeclarations(uri, documentManager);
+            diagnostics.addAll(unusedDeclarations);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Unused declaration detection failed for " + uri, e);
+        }
+
         return diagnostics;
     }
 

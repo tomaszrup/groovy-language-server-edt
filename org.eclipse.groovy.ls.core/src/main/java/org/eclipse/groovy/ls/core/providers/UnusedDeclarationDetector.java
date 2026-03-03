@@ -1,0 +1,367 @@
+/*******************************************************************************
+ * Copyright (c) 2026 Groovy Language Server Contributors.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ *******************************************************************************/
+package org.eclipse.groovy.ls.core.providers;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
+import org.eclipse.jdt.core.IAnnotation;
+import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.ISourceRange;
+import org.eclipse.jdt.core.ISourceReference;
+import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.core.search.IJavaSearchConstants;
+import org.eclipse.jdt.core.search.IJavaSearchScope;
+import org.eclipse.jdt.core.search.SearchEngine;
+import org.eclipse.jdt.core.search.SearchMatch;
+import org.eclipse.jdt.core.search.SearchParticipant;
+import org.eclipse.jdt.core.search.SearchPattern;
+import org.eclipse.jdt.core.search.SearchRequestor;
+import org.eclipse.lsp4j.Diagnostic;
+import org.eclipse.lsp4j.DiagnosticSeverity;
+import org.eclipse.lsp4j.DiagnosticTag;
+import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
+
+/**
+ * Detects unused type and method declarations in Groovy documents.
+ * <p>
+ * Unused declarations (those with zero references) are reported as
+ * {@link DiagnosticSeverity#Hint} diagnostics with the
+ * {@link DiagnosticTag#Unnecessary} tag, causing the editor to render them
+ * with reduced opacity (faded text).
+ * <p>
+ * Test methods are excluded from this analysis since they are invoked by the
+ * test runner and will never have explicit code references.
+ */
+public class UnusedDeclarationDetector {
+
+    /** Diagnostic code used for unused declarations. */
+    public static final String DIAG_CODE_UNUSED_DECLARATION = "groovy.unusedDeclaration";
+
+    private static final String DIAGNOSTIC_SOURCE = "groovy";
+
+    /**
+     * Annotation simple names that mark a method as a test entry point.
+     * These methods are executed by test runners and should not be flagged
+     * as unused even when they have zero references.
+     */
+    private static final String[] TEST_ANNOTATIONS = {
+        "Test",
+        "ParameterizedTest",
+        "RepeatedTest",
+        "TestFactory",
+        "TestTemplate",
+        "BeforeEach",
+        "AfterEach",
+        "BeforeAll",
+        "AfterAll",
+        "Before",
+        "After",
+        "BeforeClass",
+        "AfterClass",
+        "Ignore",
+        "Disabled",
+        "Suite",
+        "RunWith",
+        "Specification",  // Spock
+        "Unroll",         // Spock
+    };
+
+    /**
+     * FQN prefixes for test annotations (matched against annotation element names
+     * that might be fully qualified).
+     */
+    private static final String[] TEST_ANNOTATION_FQ_PREFIXES = {
+        "org.junit.",
+        "org.junit.jupiter.",
+        "org.testng.",
+        "spock.",
+    };
+
+    private UnusedDeclarationDetector() {
+        // utility class
+    }
+
+    /**
+     * Detect unused types and methods in the given compilation unit.
+     *
+     * @param uri             the document URI
+     * @param documentManager the document manager
+     * @return diagnostics for unused declarations (empty list if none)
+     */
+    public static List<Diagnostic> detectUnusedDeclarations(
+            String uri, DocumentManager documentManager) {
+
+        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        if (workingCopy == null) {
+            return Collections.emptyList();
+        }
+
+        String content = documentManager.getContent(uri);
+        if (content == null) {
+            return Collections.emptyList();
+        }
+
+        List<Diagnostic> diagnostics = new ArrayList<>();
+
+        try {
+            IType[] types = workingCopy.getTypes();
+            for (IType type : types) {
+                collectUnusedDeclarations(type, content, diagnostics);
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Unused declaration detection failed for " + uri, e);
+        }
+
+        return diagnostics;
+    }
+
+    private static void collectUnusedDeclarations(
+            IType type, String content, List<Diagnostic> diagnostics)
+            throws JavaModelException {
+
+        // Check the type itself — but skip if it's in a test class context
+        if (!isTestType(type) && isUnreferenced(type)) {
+            Diagnostic diag = createUnusedDiagnostic(type, content);
+            if (diag != null) {
+                diagnostics.add(diag);
+            }
+        }
+
+        // Check methods
+        for (IMethod method : type.getMethods()) {
+            if (isTestMethod(method)) {
+                continue;
+            }
+            if (isMainMethod(method)) {
+                continue;
+            }
+            if (isUnreferenced(method)) {
+                Diagnostic diag = createUnusedDiagnostic(method, content);
+                if (diag != null) {
+                    diagnostics.add(diag);
+                }
+            }
+        }
+
+        // Recurse into inner types
+        for (IType innerType : type.getTypes()) {
+            collectUnusedDeclarations(innerType, content, diagnostics);
+        }
+    }
+
+    /**
+     * Check if an element has zero references in the workspace.
+     */
+    private static boolean isUnreferenced(IJavaElement element) {
+        try {
+            SearchPattern pattern = SearchPattern.createPattern(
+                    element, IJavaSearchConstants.REFERENCES);
+            if (pattern == null) {
+                return false;
+            }
+
+            boolean[] found = {false};
+            IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
+            SearchEngine engine = new SearchEngine();
+
+            engine.search(pattern,
+                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                    scope,
+                    new SearchRequestor() {
+                        @Override
+                        public void acceptSearchMatch(SearchMatch match) {
+                            found[0] = true;
+                        }
+                    },
+                    null);
+
+            return !found[0];
+        } catch (Exception e) {
+            // If search fails, don't flag as unused
+            return false;
+        }
+    }
+
+    /**
+     * Determine if a method is a test method (should not be faded).
+     */
+    private static boolean isTestMethod(IMethod method) {
+        try {
+            // Check annotations on the method
+            for (IAnnotation annotation : method.getAnnotations()) {
+                if (isTestAnnotation(annotation)) {
+                    return true;
+                }
+            }
+
+            // Check if declaring type is a test type — methods in test classes
+            // named "test*" are likely JUnit 3 tests
+            IType declaringType = method.getDeclaringType();
+            if (declaringType != null && isTestType(declaringType)) {
+                String name = method.getElementName();
+                if (name.startsWith("test")) {
+                    return true;
+                }
+                // setup/tearDown in test classes
+                if ("setUp".equals(name) || "tearDown".equals(name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        } catch (Exception e) {
+            // If we can't determine, err on the side of not fading
+            return true;
+        }
+    }
+
+    /**
+     * Determine if a type is a test class.
+     */
+    private static boolean isTestType(IType type) {
+        try {
+            // Check annotations on the type
+            for (IAnnotation annotation : type.getAnnotations()) {
+                if (isTestAnnotation(annotation)) {
+                    return true;
+                }
+            }
+
+            // Check superclass names for common test base classes
+            String[] superInterfaceNames = type.getSuperInterfaceNames();
+            String superclassName = type.getSuperclassName();
+
+            if (superclassName != null) {
+                if (superclassName.equals("TestCase")
+                        || superclassName.equals("junit.framework.TestCase")
+                        || superclassName.equals("GroovyTestCase")
+                        || superclassName.equals("groovy.test.GroovyTestCase")
+                        || superclassName.equals("Specification")
+                        || superclassName.equals("spock.lang.Specification")) {
+                    return true;
+                }
+            }
+
+            // Check if the source path suggests a test directory
+            org.eclipse.core.resources.IResource resource = type.getResource();
+            if (resource != null) {
+                String path = resource.getFullPath().toString();
+                if (path.contains("/test/") || path.contains("/tests/")
+                        || path.contains("\\test\\") || path.contains("\\tests\\")) {
+                    return true;
+                }
+            }
+
+            return false;
+        } catch (Exception e) {
+            return true; // err on the side of not fading
+        }
+    }
+
+    /**
+     * Check if an annotation is a test-related annotation.
+     */
+    private static boolean isTestAnnotation(IAnnotation annotation) {
+        String name = annotation.getElementName();
+
+        // Check simple name
+        for (String testAnnotation : TEST_ANNOTATIONS) {
+            if (testAnnotation.equals(name)) {
+                return true;
+            }
+        }
+
+        // Check FQN prefixes
+        for (String prefix : TEST_ANNOTATION_FQ_PREFIXES) {
+            if (name.startsWith(prefix)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if a method is a main method entry point.
+     */
+    private static boolean isMainMethod(IMethod method) {
+        try {
+            if ("main".equals(method.getElementName())
+                    && org.eclipse.jdt.core.Flags.isStatic(method.getFlags())) {
+                return true;
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return false;
+    }
+
+    /**
+     * Create an Unnecessary diagnostic for an unused declaration.
+     */
+    private static Diagnostic createUnusedDiagnostic(IJavaElement element, String content) {
+        try {
+            if (!(element instanceof ISourceReference sourceRef)) {
+                return null;
+            }
+
+            ISourceRange nameRange = sourceRef.getNameRange();
+            if (nameRange == null || nameRange.getOffset() < 0) {
+                return null;
+            }
+
+            int startOffset = nameRange.getOffset();
+            int endOffset = startOffset + nameRange.getLength();
+
+            Position start = offsetToPosition(content, startOffset);
+            Position end = offsetToPosition(content, endOffset);
+
+            String kind = element instanceof IType ? "type" : "method";
+
+            Diagnostic diag = new Diagnostic();
+            diag.setRange(new Range(start, end));
+            diag.setSeverity(DiagnosticSeverity.Hint);
+            diag.setMessage("The " + kind + " '" + element.getElementName()
+                    + "' is never used");
+            diag.setSource(DIAGNOSTIC_SOURCE);
+            diag.setCode(DIAG_CODE_UNUSED_DECLARATION);
+            diag.setTags(Collections.singletonList(DiagnosticTag.Unnecessary));
+            return diag;
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to create unused diagnostic for " + element.getElementName(), e);
+            return null;
+        }
+    }
+
+    private static Position offsetToPosition(String content, int offset) {
+        int line = 0;
+        int col = 0;
+        int safeOffset = Math.min(offset, content.length());
+        for (int i = 0; i < safeOffset; i++) {
+            if (content.charAt(i) == '\n') {
+                line++;
+                col = 0;
+            } else {
+                col++;
+            }
+        }
+        return new Position(line, col);
+    }
+}

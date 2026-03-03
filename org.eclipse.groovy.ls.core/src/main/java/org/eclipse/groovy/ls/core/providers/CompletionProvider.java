@@ -15,6 +15,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.ImportNode;
@@ -53,8 +57,11 @@ import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.TypeNameRequestor;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionItemKind;
+import org.eclipse.lsp4j.CompletionItemTag;
 import org.eclipse.lsp4j.CompletionParams;
 import org.eclipse.lsp4j.InsertTextFormat;
+import org.eclipse.lsp4j.MarkupContent;
+import org.eclipse.lsp4j.MarkupKind;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextEdit;
 
@@ -167,6 +174,25 @@ public class CompletionProvider {
     /** Maximum number of member results per type hierarchy. */
     private static final int MAX_MEMBER_RESULTS = 300;
 
+    /** java.lang.Object method names — these are always present; push them down in sorting. */
+    private static final Set<String> OBJECT_METHODS = Set.of(
+            "toString", "hashCode", "equals", "getClass", "notify", "notifyAll",
+            "wait", "clone", "finalize");
+
+    /** Commit characters for method completions. */
+    private static final List<String> METHOD_COMMIT_CHARS = List.of(".", "(");
+
+    /** Commit characters for field/property completions. */
+    private static final List<String> FIELD_COMMIT_CHARS = List.of(".");
+
+    /** Commit characters for type completions. */
+    private static final List<String> TYPE_COMMIT_CHARS = List.of(".");
+
+    /** Commit characters for keyword completions. */
+    private static final List<String> KEYWORD_COMMIT_CHARS = List.of(" ");
+
+    private static final Gson GSON = new Gson();
+
     public CompletionProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
     }
@@ -241,9 +267,162 @@ public class CompletionProvider {
 
     /**
      * Resolve additional details for a completion item.
+     * <p>
+     * Lazily loads Javadoc/Groovydoc documentation for the item by looking up
+     * the JDT element from the stored data (declaring type FQN, element name,
+     * parameter signatures).
      */
     public CompletionItem resolveCompletionItem(CompletionItem item) {
+        if (item.getData() == null) {
+            return item;
+        }
+
+        try {
+            JsonElement dataElement;
+            if (item.getData() instanceof JsonElement je) {
+                dataElement = je;
+            } else {
+                dataElement = GSON.toJsonTree(item.getData());
+            }
+
+            if (!dataElement.isJsonObject()) {
+                return item;
+            }
+
+            JsonObject data = dataElement.getAsJsonObject();
+            String kind = getJsonString(data, "kind");
+            if (kind == null) {
+                return item;
+            }
+
+            String fqn = getJsonString(data, "fqn");
+            String elementName = getJsonString(data, "name");
+
+            IJavaProject project = findOpenWorkspaceJavaProject();
+            if (project == null || fqn == null) {
+                return item;
+            }
+
+            IType type = project.findType(fqn);
+            if (type == null || !type.exists()) {
+                return item;
+            }
+
+            String documentation = null;
+
+            switch (kind) {
+                case "method": {
+                    if (elementName == null) break;
+                    IMethod method = findMethodInType(type, elementName, data);
+                    if (method != null) {
+                        documentation = getJavadocForMember(method);
+                    }
+                    break;
+                }
+                case "field": {
+                    if (elementName == null) break;
+                    IField field = type.getField(elementName);
+                    if (field != null && field.exists()) {
+                        documentation = getJavadocForMember(field);
+                    }
+                    break;
+                }
+                case "type": {
+                    documentation = getJavadocForMember(type);
+                    break;
+                }
+                default:
+                    break;
+            }
+
+            if (documentation != null && !documentation.isEmpty()) {
+                MarkupContent markup = new MarkupContent();
+                markup.setKind(MarkupKind.MARKDOWN);
+                markup.setValue(documentation);
+                item.setDocumentation(markup);
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[completion] resolveCompletionItem failed", e);
+        }
+
         return item;
+    }
+
+    private IMethod findMethodInType(IType type, String name, JsonObject data) {
+        try {
+            // Try to match by parameter count first
+            int paramCount = data.has("paramCount") ? data.get("paramCount").getAsInt() : -1;
+            for (IMethod method : type.getMethods()) {
+                if (method.getElementName().equals(name)) {
+                    if (paramCount < 0 || method.getParameterTypes().length == paramCount) {
+                        return method;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+
+    /**
+     * Get Javadoc for a JDT member, falling back to source JAR resolution.
+     */
+    private String getJavadocForMember(IJavaElement element) {
+        try {
+            // Try JDT attached Javadoc first
+            if (element instanceof org.eclipse.jdt.core.IMember member) {
+                String attached = member.getAttachedJavadoc(null);
+                if (attached != null && !attached.isEmpty()) {
+                    return attached;
+                }
+            }
+
+            // Try source JAR approach
+            IType ownerType = null;
+            if (element instanceof IType t) {
+                ownerType = t;
+            } else {
+                IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
+                if (ancestor instanceof IType t) {
+                    ownerType = t;
+                }
+            }
+
+            if (ownerType != null) {
+                String fqn = ownerType.getFullyQualifiedName();
+                String source = null;
+
+                if (ownerType.getClassFile() != null) {
+                    java.io.File sourcesJar = SourceJarHelper.findSourcesJar(ownerType);
+                    if (sourcesJar != null) {
+                        source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
+                    }
+                }
+
+                if (source == null || source.isEmpty()) {
+                    source = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
+                }
+
+                if (source != null && !source.isEmpty()) {
+                    if (element instanceof IType) {
+                        return SourceJarHelper.extractJavadoc(source, ownerType.getElementName());
+                    } else {
+                        return SourceJarHelper.extractMemberJavadoc(source, element.getElementName());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[completion] Javadoc resolution failed for " + element.getElementName(), e);
+        }
+        return null;
+    }
+
+    private static String getJsonString(JsonObject obj, String key) {
+        if (obj.has(key) && !obj.get(key).isJsonNull()) {
+            return obj.get(key).getAsString();
+        }
+        return null;
     }
 
     // =========================================================================
@@ -542,11 +721,29 @@ public class CompletionProvider {
                                                     IType ownerType, String sortPrefix)
             throws JavaModelException {
         CompletionItem item = new CompletionItem(name);
-        item.setKind(Flags.isEnum(field.getFlags())
-                ? CompletionItemKind.EnumMember : CompletionItemKind.Field);
+        boolean isEnum = Flags.isEnum(field.getFlags());
+        item.setKind(isEnum ? CompletionItemKind.EnumMember : CompletionItemKind.Field);
         item.setDetail(resolveFieldDetail(field, ownerType));
         item.setInsertText(name);
-        item.setSortText(sortPrefix + "_" + name);
+        item.setFilterText(name);
+        item.setCommitCharacters(FIELD_COMMIT_CHARS);
+
+        // Deprecation marking
+        boolean deprecated = Flags.isDeprecated(field.getFlags());
+        if (deprecated) {
+            item.setTags(List.of(CompletionItemTag.Deprecated));
+            item.setSortText(sortPrefix + "z_" + name);
+        } else {
+            item.setSortText(sortPrefix + "_" + name);
+        }
+
+        // Store data for lazy resolution
+        JsonObject data = new JsonObject();
+        data.addProperty("kind", "field");
+        data.addProperty("fqn", ownerType.getFullyQualifiedName());
+        data.addProperty("name", name);
+        item.setData(data);
+
         return item;
     }
 
@@ -604,7 +801,27 @@ public class CompletionProvider {
             }
 
             item.setFilterText(name);
-            item.setSortText(sortPrefix + "_" + name);
+            item.setCommitCharacters(METHOD_COMMIT_CHARS);
+
+            // Deprecation marking
+            boolean deprecated = Flags.isDeprecated(method.getFlags());
+            if (deprecated) {
+                item.setTags(List.of(CompletionItemTag.Deprecated));
+                item.setSortText(sortPrefix + "z_" + name);
+            } else if (OBJECT_METHODS.contains(name)) {
+                // Push Object methods below other supertype members
+                item.setSortText("1y_" + name);
+            } else {
+                item.setSortText(sortPrefix + "_" + name);
+            }
+
+            // Store data for lazy resolution
+            JsonObject data = new JsonObject();
+            data.addProperty("kind", "method");
+            data.addProperty("fqn", owner.getFullyQualifiedName());
+            data.addProperty("name", name);
+            data.addProperty("paramCount", method.getParameterTypes().length);
+            item.setData(data);
         } catch (Exception e) {
             item.setLabel(name);
             item.setInsertText(name);
@@ -1829,12 +2046,29 @@ public class CompletionProvider {
         item.setDetail(pkg.isEmpty() ? simpleName : pkg + "." + simpleName);
         item.setInsertText(simpleName);
         item.setFilterText(simpleName);
+        item.setCommitCharacters(TYPE_COMMIT_CHARS);
         if (shouldAutoImportType(fqn, pkg, searchContext.currentPackage,
                 searchContext.existingImports)) {
             item.setAdditionalTextEdits(
                     java.util.Collections.singletonList(createImportEdit(searchContext.importInsertLine, fqn)));
         }
-        item.setSortText((searchContext.annotationOnly ? "4_" : "5_") + simpleName);
+
+        // Deprecation marking
+        boolean deprecated = Flags.isDeprecated(modifiers);
+        String sortPrefix = searchContext.annotationOnly ? "4_" : "5_";
+        if (deprecated) {
+            item.setTags(List.of(CompletionItemTag.Deprecated));
+            item.setSortText(sortPrefix + "z_" + simpleName);
+        } else {
+            item.setSortText(sortPrefix + simpleName);
+        }
+
+        // Store data for lazy resolution
+        JsonObject data = new JsonObject();
+        data.addProperty("kind", "type");
+        data.addProperty("fqn", fqn);
+        item.setData(data);
+
         return item;
     }
 
@@ -1936,6 +2170,8 @@ public class CompletionProvider {
                 CompletionItem item = new CompletionItem(keyword);
                 item.setKind(CompletionItemKind.Keyword);
                 item.setInsertText(keyword);
+                item.setFilterText(keyword);
+                item.setCommitCharacters(KEYWORD_COMMIT_CHARS);
                 item.setSortText("9_" + keyword);
                 items.add(item);
             }
