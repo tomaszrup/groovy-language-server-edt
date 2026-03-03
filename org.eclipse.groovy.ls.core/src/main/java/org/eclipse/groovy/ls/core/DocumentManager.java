@@ -140,12 +140,16 @@ public class DocumentManager {
         // Manual fallback: strip scheme and decode
         try {
             String path = uri;
+            // Strip scheme portion but keep the leading '/' that belongs to the path.
+            // file:///tmp/foo  →  /tmp/foo   (empty authority, absolute path)
+            // file:/tmp/foo    →  /tmp/foo   (no authority, absolute path)
+            // file:/C:/foo     →  /C:/foo    (Windows; File resolves to C:\foo)
             if (path.startsWith("file:///")) {
-                path = path.substring(8);
+                path = path.substring(7);
             } else if (path.startsWith("file://")) {
                 path = path.substring(7);
             } else if (path.startsWith("file:/")) {
-                path = path.substring(6);
+                path = path.substring(5);
             }
             // Decode percent-encoded characters
             path = URLDecoder.decode(path, "UTF-8");
