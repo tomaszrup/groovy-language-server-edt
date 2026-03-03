@@ -131,6 +131,13 @@ public class DiagnosticsProvider {
             return;
         }
 
+        // Skip if the document was closed between scheduling and execution
+        if (documentManager.getContent(uri) == null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] publishDiagnostics skipped (document closed) uri=" + uri);
+            return;
+        }
+
         List<Diagnostic> diagnostics = collectDiagnostics(uri);
         latestDiagnosticsByUri.put(normalizedUri, diagnostics);
         GroovyLanguageServerPlugin.logInfo(
@@ -156,10 +163,22 @@ public class DiagnosticsProvider {
     }
 
     /**
-     * Clear cached diagnostics for a URI.
+     * Clear cached diagnostics for a URI and cancel any pending debounced
+     * diagnostic task.  Called when a document is closed.
      */
     public void clearDiagnostics(String uri) {
-        latestDiagnosticsByUri.remove(DocumentManager.normalizeUri(uri));
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+        latestDiagnosticsByUri.remove(normalizedUri);
+
+        // Cancel any scheduled but not-yet-started diagnostic task for this URI.
+        // Without this, a debounced task from didOpen can fire after didClose,
+        // triggering a reconcile for a file that's no longer open.
+        java.util.concurrent.ScheduledFuture<?> pending = pendingPublish.remove(normalizedUri);
+        if (pending != null) {
+            pending.cancel(false);
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] cancelled pending diagnostic task on close for " + uri);
+        }
     }
 
     /**
@@ -187,6 +206,14 @@ public class DiagnosticsProvider {
     private List<Diagnostic> collectDiagnostics(String uri) {
         List<Diagnostic> diagnostics = new ArrayList<>();
         String content = documentManager.getContent(uri);
+
+        // If the document is no longer open (was closed while the debounced
+        // task was waiting), skip all expensive work immediately.
+        if (content == null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] collectDiagnostics skipped (document closed) uri=" + uri);
+            return diagnostics;
+        }
 
         // When no classpath is available for this project, report only syntax
         // errors (from the standalone Groovy compiler) and append a warning at

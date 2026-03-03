@@ -67,6 +67,24 @@ public class DocumentManager {
     private final Map<String, ICompilationUnit> workingCopies = new ConcurrentHashMap<>();
 
     /**
+     * Tracks in-flight background didOpen futures so they can be cancelled
+     * when the document is closed before the JDT working copy is ready.
+     */
+    private final Map<String, java.util.concurrent.Future<?>> pendingOpenFutures = new ConcurrentHashMap<>();
+
+    /**
+     * Dedicated executor for didOpen background tasks (JDT working copy
+     * creation + initial reconcile). Uses a bounded pool so that rapid
+     * file previewing doesn't exhaust the shared ForkJoinPool.
+     */
+    private final java.util.concurrent.ExecutorService didOpenExecutor =
+            java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "groovy-ls-didOpen");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
      * Standalone Groovy compiler service used as a fallback when JDT
      * working copies cannot be created (e.g., file outside Eclipse project).
      */
@@ -206,16 +224,47 @@ public class DocumentManager {
         // semantic tokens) for every other file.
         final String bgUri = uri;
         final String bgText = text;
-        java.util.concurrent.CompletableFuture.runAsync(() -> {
+
+        // Cancel any previous in-flight task for this URI (e.g., rapid re-open)
+        java.util.concurrent.Future<?> prev = pendingOpenFutures.remove(bgUri);
+        if (prev != null) {
+            prev.cancel(true);
+        }
+
+        java.util.concurrent.Future<?> future = didOpenExecutor.submit(() -> {
+            // Check if the document was already closed before we even start
+            if (!openDocuments.containsKey(bgUri)) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "didOpen background task skipped (already closed): " + bgUri);
+                return;
+            }
+
             ICompilationUnit cu = findCompilationUnit(bgUri);
             if (cu != null) {
                 try {
+                    // Check again after the potentially-slow findCompilationUnit
+                    if (!openDocuments.containsKey(bgUri)) {
+                        GroovyLanguageServerPlugin.logInfo(
+                                "didOpen background task aborted after findCU (closed): " + bgUri);
+                        return;
+                    }
+
                     ICompilationUnit workingCopy = cu.getWorkingCopy(workingCopyOwner, null);
                     workingCopy.getBuffer().setContents(bgText);
                     workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
-                    workingCopies.put(bgUri, workingCopy);
-                    GroovyLanguageServerPlugin.logInfo("JDT working copy created for " + bgUri
-                            + " (type: " + workingCopy.getClass().getName() + ")");
+
+                    // After reconcile completes, verify the document is still open.
+                    // If didClose ran while we were reconciling, discard immediately
+                    // to prevent a leaked working copy.
+                    if (openDocuments.containsKey(bgUri)) {
+                        workingCopies.put(bgUri, workingCopy);
+                        GroovyLanguageServerPlugin.logInfo("JDT working copy created for " + bgUri
+                                + " (type: " + workingCopy.getClass().getName() + ")");
+                    } else {
+                        workingCopy.discardWorkingCopy();
+                        GroovyLanguageServerPlugin.logInfo(
+                                "didOpen background task discarded working copy (closed): " + bgUri);
+                    }
                 } catch (JavaModelException e) {
                     GroovyLanguageServerPlugin.logError("Failed to create working copy for " + bgUri, e);
                 }
@@ -223,7 +272,10 @@ public class DocumentManager {
                 GroovyLanguageServerPlugin.logInfo(
                         "No JDT compilation unit for " + bgUri + "; using Groovy compiler fallback.");
             }
+
+            pendingOpenFutures.remove(bgUri);
         });
+        pendingOpenFutures.put(bgUri, future);
     }
 
     /**
@@ -281,6 +333,15 @@ public class DocumentManager {
         openDocuments.remove(uri);
         clientUris.remove(uri);
         compilerService.invalidate(uri);
+
+        // Cancel any in-flight didOpen background task for this URI.
+        // This prevents the background task from creating a working copy
+        // that would never be cleaned up (leaked).
+        java.util.concurrent.Future<?> pending = pendingOpenFutures.remove(uri);
+        if (pending != null) {
+            pending.cancel(true);
+            GroovyLanguageServerPlugin.logInfo("Cancelled pending didOpen task for " + uri);
+        }
 
         ICompilationUnit workingCopy = workingCopies.remove(uri);
         if (workingCopy != null) {
