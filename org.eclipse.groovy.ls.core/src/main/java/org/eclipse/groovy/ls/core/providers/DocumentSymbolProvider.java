@@ -198,18 +198,20 @@ public class DocumentSymbolProvider {
 
                 // Full source range
                 ISourceRange sourceRange = sourceRef.getSourceRange();
+                Range fullRange;
                 if (sourceRange != null && sourceRange.getOffset() >= 0) {
-                    symbol.setRange(toRange(content, sourceRange));
+                    fullRange = toRange(content, sourceRange);
                 } else {
-                    symbol.setRange(new Range(new Position(0, 0), new Position(0, 0)));
+                    fullRange = new Range(new Position(0, 0), new Position(0, 0));
                 }
+                symbol.setRange(fullRange);
 
                 // Name range (selection range)
                 ISourceRange nameRange = sourceRef.getNameRange();
                 if (nameRange != null && nameRange.getOffset() >= 0) {
-                    symbol.setSelectionRange(toRange(content, nameRange));
+                    symbol.setSelectionRange(clampSelectionRange(toRange(content, nameRange), fullRange));
                 } else {
-                    symbol.setSelectionRange(symbol.getRange());
+                    symbol.setSelectionRange(fullRange);
                 }
             } else {
                 Range defaultRange = new Range(new Position(0, 0), new Position(0, 0));
@@ -444,6 +446,11 @@ public class DocumentSymbolProvider {
         int endLine = Math.max(startLine, node.getLastLineNumber() - 1);
         int endCol = Math.max(0, node.getLastColumnNumber() - 1);
 
+        // Guard against invalid ranges where end is before start
+        if (endLine == startLine && endCol < startCol) {
+            endCol = startCol;
+        }
+
         Range fullRange = new Range(
                 new Position(startLine, startCol),
                 new Position(endLine, endCol));
@@ -453,7 +460,43 @@ public class DocumentSymbolProvider {
         Range nameRange = new Range(
                 new Position(startLine, startCol),
                 new Position(startLine, startCol + symbol.getName().length()));
-        symbol.setSelectionRange(nameRange);
+        symbol.setSelectionRange(clampSelectionRange(nameRange, fullRange));
+    }
+
+    /**
+     * Clamp a selectionRange so that it is fully contained within the fullRange.
+     * The LSP spec requires selectionRange to be within the enclosing range.
+     */
+    private Range clampSelectionRange(Range selection, Range full) {
+        Position selStart = selection.getStart();
+        Position selEnd = selection.getEnd();
+        Position fullStart = full.getStart();
+        Position fullEnd = full.getEnd();
+
+        Position clampedStart = maxPosition(selStart, fullStart);
+        Position clampedEnd = minPosition(selEnd, fullEnd);
+
+        // If clamping made the range invalid (start after end), collapse to start
+        if (comparePositions(clampedStart, clampedEnd) > 0) {
+            clampedEnd = clampedStart;
+        }
+
+        return new Range(clampedStart, clampedEnd);
+    }
+
+    private static Position maxPosition(Position a, Position b) {
+        return comparePositions(a, b) >= 0 ? a : b;
+    }
+
+    private static Position minPosition(Position a, Position b) {
+        return comparePositions(a, b) <= 0 ? a : b;
+    }
+
+    private static int comparePositions(Position a, Position b) {
+        if (a.getLine() != b.getLine()) {
+            return Integer.compare(a.getLine(), b.getLine());
+        }
+        return Integer.compare(a.getCharacter(), b.getCharacter());
     }
 
     private boolean isVisibleNonPropertyField(ClassNode classNode, FieldNode field) {
