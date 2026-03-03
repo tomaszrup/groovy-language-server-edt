@@ -97,7 +97,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     private volatile boolean initialBuildDone = false;
     private volatile boolean diagnosticsEnabled = false;
+    private volatile boolean firstFullBuildComplete = false;
     private java.util.concurrent.ScheduledFuture<?> initialBuildTimer;
+    private volatile java.util.concurrent.ScheduledFuture<?> debouncedBuildFuture;
+    private static final long BUILD_DEBOUNCE_MS = 3000;
     private final java.util.concurrent.ScheduledExecutorService initialBuildScheduler =
             java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "initial-build-timer");
@@ -334,27 +337,54 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     /**
-     * Trigger a full build of the workspace and publish diagnostics for all open documents.
-     * Sends status notifications (Compiling → Ready/Error) via the server.
+     * Trigger a workspace build and publish diagnostics for all open documents.
+     * Uses FULL_BUILD the first time (to initialise JDT indexes) and
+     * INCREMENTAL_BUILD for all subsequent invocations so that the Eclipse
+     * workspace lock is held for the shortest possible time.
      */
     void triggerFullBuild() {
         java.util.concurrent.CompletableFuture.runAsync(() -> {
-            GroovyLanguageServerPlugin.logInfo("Triggering full workspace build...");
-            GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerFullBuild start");
+            int buildKind;
+            if (!firstFullBuildComplete) {
+                buildKind = org.eclipse.core.resources.IncrementalProjectBuilder.FULL_BUILD;
+                GroovyLanguageServerPlugin.logInfo("Triggering initial FULL workspace build...");
+            } else {
+                buildKind = org.eclipse.core.resources.IncrementalProjectBuilder.INCREMENTAL_BUILD;
+                GroovyLanguageServerPlugin.logInfo("Triggering INCREMENTAL workspace build...");
+            }
+            GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerBuild start (kind=" + buildKind + ")");
             try {
-                ResourcesPlugin.getWorkspace().build(
-                        org.eclipse.core.resources.IncrementalProjectBuilder.FULL_BUILD,
-                        new NullProgressMonitor());
+                ResourcesPlugin.getWorkspace().build(buildKind, new NullProgressMonitor());
 
                 textDocumentService.publishDiagnosticsForOpenDocuments();
 
-                GroovyLanguageServerPlugin.logInfo("Full build completed.");
+                firstFullBuildComplete = true;
+                GroovyLanguageServerPlugin.logInfo("Build completed (kind=" + buildKind + ").");
                 sendStatus(STATUS_READY, null);
             } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError("Full build failed", e);
+                GroovyLanguageServerPlugin.logError("Build failed (kind=" + buildKind + ")", e);
                 sendStatus("Error", "Build failed: " + e.getMessage());
             }
         });
+    }
+
+    /**
+     * Schedule a debounced build. Multiple rapid calls (e.g. 50 classpath
+     * updates) are coalesced into a single build that fires {@value #BUILD_DEBOUNCE_MS}
+     * ms after the last call. This prevents N full-builds when N subprojects
+     * send their classpaths in quick succession.
+     */
+    void scheduleDebouncedBuild() {
+        java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture;
+        if (prev != null) {
+            prev.cancel(false);
+        }
+        sendStatus(STATUS_IMPORTING, "Waiting for remaining classpaths...");
+        debouncedBuildFuture = initialBuildScheduler.schedule(() -> {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[debounced-build] Debounce window elapsed — triggering build.");
+            triggerFullBuild();
+        }, BUILD_DEBOUNCE_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -482,6 +512,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             GroovyLanguageServerPlugin.logInfo(
                     "[classpath-check] Added '" + projName + "' to projectsWithClasspath. "
                     + "All projects with classpath: " + projectsWithClasspath);
+
+            // Eagerly publish diagnostics for any currently-open files that
+            // belong to this project. This gives near-instant feedback for the
+            // files the user is looking at, rather than waiting for all 50
+            // projects' classpaths to arrive + a full workspace build.
+            publishDiagnosticsForProjectFiles(projName);
+
             triggerBuildAfterClasspathUpdate();
 
         } catch (Exception e) {
@@ -604,9 +641,29 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 initialBuildTimer.cancel(false);
             }
             GroovyLanguageServerPlugin.logInfo(
-                    "[classpathUpdate] First classpath received. Triggering initial build.");
+                    "[classpathUpdate] First classpath received. Will build after debounce.");
         }
 
+        if (workspaceRoot != null) {
+            // Debounce: multiple rapid classpath updates (one per subproject)
+            // are coalesced into a single build.
+            scheduleDebouncedBuild();
+        }
+    }
+
+    /**
+     * Handle {@code groovy/classpathBatchComplete} notification from the client.
+     * Sent after all pre-fetched classpaths have been delivered, allowing us to
+     * stop waiting for the debounce timer and build immediately.
+     */
+    @JsonNotification("groovy/classpathBatchComplete")
+    public void classpathBatchComplete(JsonObject params) {
+        GroovyLanguageServerPlugin.logInfo(
+                "[classpathBatchComplete] All initial classpaths received. Triggering build now.");
+        java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture;
+        if (prev != null) {
+            prev.cancel(false);
+        }
         if (workspaceRoot != null) {
             triggerFullBuild();
         }
@@ -826,6 +883,33 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     public boolean areDiagnosticsEnabled() {
         return diagnosticsEnabled;
+    }
+
+    /**
+     * Immediately (debounced per-file) publish diagnostics for any currently-open
+     * documents that belong to the given Eclipse project name. This provides
+     * near-instant feedback when a project's classpath becomes available,
+     * without waiting for the full workspace build.
+     */
+    private void publishDiagnosticsForProjectFiles(String projectName) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                for (String uri : documentManager.getOpenDocumentUris()) {
+                    String ownerProject = getProjectNameForUri(
+                            documentManager.getClientUri(uri));
+                    if (projectName.equals(ownerProject)) {
+                        GroovyLanguageServerPlugin.logInfo(
+                                "[eager-diag] Publishing diagnostics for " + uri
+                                + " (project " + projectName + ")");
+                        textDocumentService.publishDiagnosticsIfEnabled(uri);
+                    }
+                }
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                        "[eager-diag] Failed to publish early diagnostics for project "
+                        + projectName, e);
+            }
+        });
     }
 
     /**

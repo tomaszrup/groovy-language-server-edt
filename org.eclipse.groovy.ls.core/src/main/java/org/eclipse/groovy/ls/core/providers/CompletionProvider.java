@@ -26,9 +26,11 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.codehaus.groovy.ast.ConstructorNode;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
 import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.codehaus.groovy.ast.expr.Expression;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.ExpressionStatement;
@@ -112,6 +114,13 @@ public class CompletionProvider {
     private static final String PACKAGE_PREFIX = "package ";
 
     private final DocumentManager documentManager;
+
+    /**
+     * Thread-local reference to the current AST being resolved during dot-completion.
+     * Set during {@link #addAstDotCompletions} so that chained method call resolution
+     * can look up local variables from the same AST.
+     */
+    private ModuleNode currentResolveAst;
 
     /**
      * Find a usable IJavaProject. The working copy's own project may be stale/non-existent
@@ -1636,6 +1645,9 @@ public class CompletionProvider {
         ModuleNode ast = resolveAst(workingCopy, lspUri);
         if (ast == null) return;
 
+        // Store the AST for method call chain resolution in resolveVariableFromStatement
+        this.currentResolveAst = ast;
+
         IJavaProject project = findWorkingProject(workingCopy);
 
         for (ClassNode classNode : ast.getClasses()) {
@@ -1650,6 +1662,24 @@ public class CompletionProvider {
         ClassNode scriptType = resolveLocalVariableTypeInBlock(
                 ast.getStatementBlock(), exprName);
         addAstResolvedTypeMembers(scriptType, project, prefix, items);
+
+        // JDT-aware method call chain resolution fallback:
+        // When the AST alone can't resolve the type (e.g., def value = new JavaClass().method()),
+        // use JDT to resolve the method return type via the receiver type.
+        if (items.isEmpty() && project != null) {
+            IType jdtResolvedType = resolveVariableTypeViaJdt(ast, exprName, project);
+            if (jdtResolvedType != null) {
+                try {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[completion] JDT chain resolved variable '" + exprName
+                            + "' to type: " + jdtResolvedType.getFullyQualifiedName());
+                    addMembersOfType(jdtResolvedType, prefix, false, items);
+                } catch (Exception e) {
+                    GroovyLanguageServerPlugin.logError(
+                            "[completion] JDT chain resolution addMembers failed", e);
+                }
+            }
+        }
     }
 
     private ClassNode resolveAstExpressionType(ClassNode classNode, ModuleNode ast, String exprName) {
@@ -1661,6 +1691,134 @@ public class CompletionProvider {
 
         // Check local variables inside method bodies
         return resolveLocalVariableTypeInClass(classNode, exprName);
+    }
+
+    /**
+     * Resolve a variable's type using JDT when the AST alone cannot determine
+     * the return type of a method call chain (e.g., {@code def value = new JavaClass().method()}).
+     * Walks the AST to find the variable declaration, extracts the receiver type from the
+     * method call chain, then uses JDT to look up the method's return type.
+     */
+    private IType resolveVariableTypeViaJdt(ModuleNode ast, String varName, IJavaProject project) {
+        // Find the variable's declaration expression in the AST
+        DeclarationExpression decl = findVariableDeclaration(ast, varName);
+        if (decl == null) return null;
+
+        Expression initializer = decl.getRightExpression();
+        if (!(initializer instanceof MethodCallExpression methodCall)) return null;
+
+        return resolveMethodCallChainTypeViaJdt(methodCall, ast, project);
+    }
+
+    /**
+     * Search all classes and script blocks in the AST for a variable declaration matching varName.
+     */
+    private DeclarationExpression findVariableDeclaration(ModuleNode ast, String varName) {
+        for (ClassNode classNode : ast.getClasses()) {
+            if (classNode.getLineNumber() < 0) continue;
+            for (MethodNode method : classNode.getMethods()) {
+                DeclarationExpression decl = findDeclInBlock(methodBodyBlock(method), varName);
+                if (decl != null) return decl;
+            }
+            for (ConstructorNode ctor : classNode.getDeclaredConstructors()) {
+                DeclarationExpression decl = findDeclInBlock(methodBodyBlock(ctor), varName);
+                if (decl != null) return decl;
+            }
+        }
+        BlockStatement stmtBlock = ast.getStatementBlock();
+        if (stmtBlock != null) {
+            DeclarationExpression decl = findDeclInBlock(stmtBlock, varName);
+            if (decl != null) return decl;
+        }
+        return null;
+    }
+
+    private DeclarationExpression findDeclInBlock(BlockStatement block, String varName) {
+        if (block == null) return null;
+        for (Statement stmt : block.getStatements()) {
+            if (!(stmt instanceof ExpressionStatement exprStmt)) continue;
+            if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) continue;
+            Expression left = decl.getLeftExpression();
+            if (left instanceof VariableExpression varExpr && varName.equals(varExpr.getName())) {
+                return decl;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve a MethodCallExpression chain to a JDT IType by:
+     * 1. Resolving the receiver (constructor call, variable, nested method call) to a type
+     * 2. Using JDT to find the method and its return type
+     */
+    private IType resolveMethodCallChainTypeViaJdt(MethodCallExpression methodCall,
+                                                    ModuleNode ast, IJavaProject project) {
+        try {
+            Expression objectExpr = methodCall.getObjectExpression();
+            String methodName = methodCall.getMethodAsString();
+            if (methodName == null) return null;
+
+            IType receiverJdtType = null;
+
+            if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+                ClassNode ctorType = ctorCall.getType();
+                receiverJdtType = resolveAstTypeInProject(project, ctorType);
+            } else if (objectExpr instanceof MethodCallExpression nestedCall) {
+                receiverJdtType = resolveMethodCallChainTypeViaJdt(nestedCall, ast, project);
+            } else if (objectExpr instanceof VariableExpression varExpr) {
+                String receiverVarName = varExpr.getName();
+                if (!"this".equals(receiverVarName)) {
+                    // Try to resolve the variable's type
+                    ClassNode varType = resolveVariableTypeFromAllClasses(receiverVarName);
+                    if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+                        receiverJdtType = resolveAstTypeInProject(project, varType);
+                    }
+                }
+            }
+
+            if (receiverJdtType == null) return null;
+
+            GroovyLanguageServerPlugin.logInfo("[completion] JDT chain: looking up method '"
+                    + methodName + "' in " + receiverJdtType.getFullyQualifiedName());
+
+            // Find the method in the receiver type and resolve its return type
+            for (IMethod method : receiverJdtType.getMethods()) {
+                if (methodName.equals(method.getElementName())) {
+                    String returnSig = method.getReturnType();
+                    if (returnSig != null) {
+                        String returnTypeName = Signature.toString(returnSig);
+                        IType returnType = resolveTypeName(returnTypeName,
+                                receiverJdtType, project);
+                        if (returnType != null) {
+                            return returnType;
+                        }
+                    }
+                }
+            }
+
+            // Check supertypes
+            ITypeHierarchy hierarchy = receiverJdtType.newSupertypeHierarchy(null);
+            if (hierarchy != null) {
+                for (IType superType : hierarchy.getAllSupertypes(receiverJdtType)) {
+                    for (IMethod method : superType.getMethods()) {
+                        if (methodName.equals(method.getElementName())) {
+                            String returnSig = method.getReturnType();
+                            if (returnSig != null) {
+                                String returnTypeName = Signature.toString(returnSig);
+                                IType returnType = resolveTypeName(returnTypeName,
+                                        superType, project);
+                                if (returnType != null) {
+                                    return returnType;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[completion] JDT chain resolution failed", e);
+        }
+        return null;
     }
 
     /**
@@ -1723,6 +1881,14 @@ public class CompletionProvider {
             return ctorCall.getType();
         }
 
+        // "def x = new Foo().bar()" or "def x = something.bar()" → resolve the chain
+        if (initializer instanceof MethodCallExpression methodCall) {
+            ClassNode chainResolved = resolveMethodCallChainType(methodCall);
+            if (chainResolved != null && !"java.lang.Object".equals(chainResolved.getName())) {
+                return chainResolved;
+            }
+        }
+
         // Typed declaration (e.g. "String x = ...") → use the declared type
         ClassNode originType = varExpr.getOriginType();
         if (originType != null
@@ -1732,6 +1898,74 @@ public class CompletionProvider {
 
         // Fallback: use the initializer expression's inferred type
         return initializer != null ? initializer.getType() : null;
+    }
+
+    /**
+     * Resolve the return type of a method call chain by walking the AST.
+     * For {@code new Foo().bar()}: resolves receiver {@code new Foo()} to type {@code Foo},
+     * then looks up method {@code bar()} in Foo's ClassNode to get its return type.
+     * For deeper chains like {@code a.b().c()}: resolves recursively.
+     */
+    private ClassNode resolveMethodCallChainType(MethodCallExpression methodCall) {
+        Expression objectExpr = methodCall.getObjectExpression();
+        String methodName = methodCall.getMethodAsString();
+        if (methodName == null) return null;
+
+        ClassNode receiverType = null;
+
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            receiverType = ctorCall.getType();
+        } else if (objectExpr instanceof MethodCallExpression nestedCall) {
+            receiverType = resolveMethodCallChainType(nestedCall);
+        } else if (objectExpr instanceof VariableExpression varExpr) {
+            String receiverVarName = varExpr.getName();
+            if ("this".equals(receiverVarName)) {
+                return null;
+            }
+            // Try to find the variable type in enclosing scope
+            // (reuse the existing local variable resolution)
+            receiverType = resolveVariableTypeFromAllClasses(receiverVarName);
+        }
+
+        if (receiverType == null || "java.lang.Object".equals(receiverType.getName())) {
+            return null;
+        }
+
+        // Look up the method in the receiver's ClassNode
+        for (MethodNode mn : receiverType.getMethods()) {
+            if (methodName.equals(mn.getName())) {
+                ClassNode returnType = mn.getReturnType();
+                if (returnType != null && !"java.lang.Object".equals(returnType.getName())) {
+                    return returnType;
+                }
+            }
+        }
+
+        // ClassNode from AST might not have the method (e.g., Java type at CONVERSION phase).
+        // Return the receiver type — the caller can use JDT to look up the method.
+        return null;
+    }
+
+    /**
+     * Helper: resolve a variable name's type by searching all classes in the last resolved AST.
+     * Used by method call chain resolution when the receiver is a variable.
+     */
+    private ClassNode resolveVariableTypeFromAllClasses(String varName) {
+        // This is called from the AST dot-completion context.
+        // We need access to the current AST. Store it during addAstDotCompletions.
+        if (currentResolveAst == null) return null;
+        for (ClassNode classNode : currentResolveAst.getClasses()) {
+            if (classNode.getLineNumber() >= 0) {
+                ClassNode type = resolveLocalVariableTypeInClass(classNode, varName);
+                if (type != null) return type;
+            }
+        }
+        BlockStatement stmtBlock = currentResolveAst.getStatementBlock();
+        if (stmtBlock != null) {
+            ClassNode type = resolveLocalVariableTypeInBlock(stmtBlock, varName);
+            if (type != null) return type;
+        }
+        return null;
     }
 
     private ClassNode resolveClassMemberExpressionType(ClassNode classNode, String exprName) {
@@ -1962,7 +2196,7 @@ public class CompletionProvider {
                             }
                         }
                     },
-                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
                     null);
 
             String chosen = (preferredFqn[0] != null) ? preferredFqn[0] : firstFqn[0];
@@ -2040,7 +2274,7 @@ public class CompletionProvider {
                             }
                         }
                     },
-                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
                     null);
 
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"

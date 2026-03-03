@@ -381,7 +381,7 @@ public class CodeActionProvider {
                     IJavaSearchConstants.TYPE,               // classes, interfaces, enums
                     scope,
                     requestor,
-                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
                     null);
 
             // Convert matches to FQNs, filtering out internal/synthetic types

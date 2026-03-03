@@ -14,11 +14,20 @@ import java.util.Collections;
 import java.util.List;
 
 import org.codehaus.groovy.ast.ASTNode;
+import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
+import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.codehaus.groovy.ast.expr.ClassExpression;
+import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
+import org.codehaus.groovy.ast.expr.Expression;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
+import org.codehaus.groovy.ast.expr.VariableExpression;
+import org.codehaus.groovy.ast.stmt.Statement;
+import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
@@ -723,6 +732,20 @@ public class DefinitionProvider {
             return locations;
         }
 
+        // 3) Check if the word is a method call after a dot — resolve via JDT
+        Location dotCallResult = resolveAstDotMethodCall(ast, content, offset, word, uri);
+        if (dotCallResult != null) {
+            locations.add(dotCallResult);
+            return locations;
+        }
+
+        // 4) Check if the word is a local variable — navigate to its declaration
+        Location localVarResult = resolveLocalVariableDeclaration(ast, word, uri);
+        if (localVarResult != null) {
+            locations.add(localVarResult);
+            return locations;
+        }
+
         return locations;
     }
 
@@ -871,6 +894,365 @@ public class DefinitionProvider {
      * Checks class names, methods, fields, properties, and inner classes.
      * Returns a Location if found, or null.
      */
+    // =========================================================================
+    // Dot method call resolution for go-to-definition
+    // =========================================================================
+
+    /**
+     * When the cursor is on a method name after a dot (e.g., {@code foo.value()}),
+     * resolve the receiver expression's type via JDT and navigate to the method's source.
+     */
+    private Location resolveAstDotMethodCall(ModuleNode ast, String content, int offset,
+                                              String word, String uri) {
+        try {
+            // Check if preceded by a dot
+            int wordStart = offset;
+            while (wordStart > 0 && Character.isJavaIdentifierPart(content.charAt(wordStart - 1))) {
+                wordStart--;
+            }
+            if (wordStart <= 0 || content.charAt(wordStart - 1) != '.') {
+                return null;
+            }
+
+            // Find a JDT project for type resolution
+            ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+            if (workingCopy == null) return null;
+
+            org.eclipse.jdt.core.IJavaProject project = workingCopy.getJavaProject();
+            if (project == null || !project.exists()) return null;
+
+            // Try text-based receiver extraction first
+            int dotPos = wordStart - 1;
+            int receiverEnd = dotPos;
+            int receiverStart = receiverEnd - 1;
+            while (receiverStart >= 0 && Character.isJavaIdentifierPart(content.charAt(receiverStart))) {
+                receiverStart--;
+            }
+            receiverStart++;
+
+            IType receiverType = null;
+
+            if (receiverStart < receiverEnd) {
+                String receiverName = content.substring(receiverStart, receiverEnd);
+                GroovyLanguageServerPlugin.logInfo("[definition-ast] Dot call: receiver='"
+                        + receiverName + "' method='" + word + "'");
+
+                ClassNode receiverClassNode = resolveReceiverClassNode(ast, receiverName);
+                if (receiverClassNode != null) {
+                    receiverType = resolveClassNodeToIType(receiverClassNode, ast, project);
+                }
+            }
+
+            // Fallback: AST-based resolution for complex receivers like "new Foo().method()"
+            if (receiverType == null) {
+                receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content);
+            }
+
+            if (receiverType == null) return null;
+
+            // Find the method and navigate to it
+            for (org.eclipse.jdt.core.IMethod method : receiverType.getMethods()) {
+                if (word.equals(method.getElementName())) {
+                    Location loc = toLocation(method);
+                    if (loc != null) return loc;
+                }
+            }
+
+            // Check supertypes
+            org.eclipse.jdt.core.ITypeHierarchy hierarchy = receiverType.newSupertypeHierarchy(null);
+            if (hierarchy != null) {
+                for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
+                    for (org.eclipse.jdt.core.IMethod method : superType.getMethods()) {
+                        if (word.equals(method.getElementName())) {
+                            Location loc = toLocation(method);
+                            if (loc != null) return loc;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[definition-ast] resolveAstDotMethodCall failed", e);
+        }
+        return null;
+    }
+
+    /**
+     * Walk the AST to find a MethodCallExpression at the given offset whose method
+     * name matches {@code methodName}, then resolve the receiver's type via JDT.
+     * This handles complex receiver expressions like {@code new Foo().method()}.
+     */
+    private IType resolveReceiverTypeFromAst(ModuleNode ast, org.eclipse.jdt.core.IJavaProject project,
+                                              int offset, String methodName, String content) {
+        MethodCallExpression found = findMethodCallAtOffset(ast, offset, methodName, content);
+        if (found == null) return null;
+
+        Expression objectExpr = found.getObjectExpression();
+        ClassNode receiverClassNode = resolveObjectExpressionType(objectExpr, ast);
+        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[definition-ast] AST fallback: receiver ClassNode='"
+                + receiverClassNode.getName() + "' for method '" + methodName + "'");
+
+        return resolveClassNodeToIType(receiverClassNode, ast, project);
+    }
+
+    /**
+     * Resolve the type of an object expression (the receiver part of a method call).
+     */
+    private ClassNode resolveObjectExpressionType(Expression objectExpr, ModuleNode ast) {
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+        if (objectExpr instanceof VariableExpression varExpr) {
+            String varName = varExpr.getName();
+            if ("this".equals(varName)) return null;
+            // Check local variable declarations in the AST
+            for (ClassNode classNode : ast.getClasses()) {
+                if (classNode.getLineNumber() < 0) continue;
+                for (MethodNode method : classNode.getMethods()) {
+                    ClassNode type = resolveLocalVarTypeInBlock(getBlock(method), varName);
+                    if (type != null) return type;
+                }
+            }
+            org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = ast.getStatementBlock();
+            if (stmtBlock != null) {
+                ClassNode type = resolveLocalVarTypeInBlock(stmtBlock, varName);
+                if (type != null) return type;
+            }
+            ClassNode exprType = varExpr.getType();
+            if (exprType != null && !"java.lang.Object".equals(exprType.getName())) {
+                return exprType;
+            }
+        }
+        if (objectExpr instanceof ClassExpression classExpr) {
+            return classExpr.getType();
+        }
+        return null;
+    }
+
+    /**
+     * Walk the AST to find a MethodCallExpression at the given offset with the given method name.
+     */
+    private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
+                                                         String methodName, String content) {
+        // Convert offset to 1-based line/column for AST node matching
+        Position pos = offsetToPosition(content, offset);
+        int targetLine = pos.getLine() + 1;  // AST uses 1-based lines
+        int targetCol = pos.getCharacter() + 1;  // AST uses 1-based columns
+
+        final MethodCallExpression[] result = new MethodCallExpression[1];
+
+        ClassCodeVisitorSupport visitor = new ClassCodeVisitorSupport() {
+            @Override
+            protected SourceUnit getSourceUnit() {
+                return module.getContext();
+            }
+
+            @Override
+            public void visitMethodCallExpression(MethodCallExpression call) {
+                if (result[0] != null) return;
+                String name = call.getMethodAsString();
+                if (methodName.equals(name)) {
+                    Expression methodExpr = call.getMethod();
+                    int mLine = methodExpr.getLineNumber();
+                    int mCol = methodExpr.getColumnNumber();
+                    int mLastCol = methodExpr.getLastColumnNumber();
+                    if (mLine == targetLine && targetCol >= mCol && targetCol <= mLastCol) {
+                        result[0] = call;
+                        return;
+                    }
+                }
+                super.visitMethodCallExpression(call);
+            }
+        };
+
+        for (ClassNode classNode : module.getClasses()) {
+            if (result[0] != null) break;
+            visitor.visitClass(classNode);
+        }
+
+        // Also check module-level statements (Groovy scripts)
+        if (result[0] == null) {
+            org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = module.getStatementBlock();
+            if (stmtBlock != null) {
+                for (Statement stmt : stmtBlock.getStatements()) {
+                    if (result[0] != null) break;
+                    stmt.visit(visitor);
+                }
+            }
+        }
+
+        return result[0];
+    }
+
+    /**
+     * Resolve a receiver name to a ClassNode from the AST.
+     * Handles constructor calls, local variables, fields/properties.
+     */
+    private ClassNode resolveReceiverClassNode(ModuleNode ast, String receiverName) {
+        // Check if it's a type name (uppercase)
+        if (!receiverName.isEmpty() && Character.isUpperCase(receiverName.charAt(0))) {
+            for (ClassNode classNode : ast.getClasses()) {
+                if (receiverName.equals(classNode.getNameWithoutPackage())) {
+                    return classNode;
+                }
+            }
+            // Could be an imported type — return a ClassNode placeholder
+            for (org.codehaus.groovy.ast.ImportNode imp : ast.getImports()) {
+                ClassNode impType = imp.getType();
+                if (impType != null && receiverName.equals(impType.getNameWithoutPackage())) {
+                    return impType;
+                }
+            }
+        }
+
+        // Check local variable declarations
+        for (ClassNode classNode : ast.getClasses()) {
+            if (classNode.getLineNumber() < 0) continue;
+            for (MethodNode method : classNode.getMethods()) {
+                ClassNode type = resolveLocalVarTypeInBlock(getBlock(method), receiverName);
+                if (type != null) return type;
+            }
+        }
+        org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = ast.getStatementBlock();
+        if (stmtBlock != null) {
+            ClassNode type = resolveLocalVarTypeInBlock(stmtBlock, receiverName);
+            if (type != null) return type;
+        }
+
+        // Check fields/properties
+        for (ClassNode classNode : ast.getClasses()) {
+            for (FieldNode field : classNode.getFields()) {
+                if (receiverName.equals(field.getName())) return field.getType();
+            }
+            for (PropertyNode prop : classNode.getProperties()) {
+                if (receiverName.equals(prop.getName())) return prop.getType();
+            }
+        }
+
+        return null;
+    }
+
+    private org.codehaus.groovy.ast.stmt.BlockStatement getBlock(MethodNode method) {
+        org.codehaus.groovy.ast.stmt.Statement code = method.getCode();
+        return (code instanceof org.codehaus.groovy.ast.stmt.BlockStatement block) ? block : null;
+    }
+
+    private ClassNode resolveLocalVarTypeInBlock(org.codehaus.groovy.ast.stmt.BlockStatement block,
+                                                  String varName) {
+        if (block == null) return null;
+        for (org.codehaus.groovy.ast.stmt.Statement stmt : block.getStatements()) {
+            if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) continue;
+            if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) continue;
+            org.codehaus.groovy.ast.expr.Expression left = decl.getLeftExpression();
+            if (!(left instanceof org.codehaus.groovy.ast.expr.VariableExpression varExpr)) continue;
+            if (!varName.equals(varExpr.getName())) continue;
+
+            org.codehaus.groovy.ast.expr.Expression init = decl.getRightExpression();
+            if (init instanceof org.codehaus.groovy.ast.expr.ConstructorCallExpression ctorCall) {
+                return ctorCall.getType();
+            }
+            ClassNode originType = varExpr.getOriginType();
+            if (originType != null && !"java.lang.Object".equals(originType.getName())) {
+                return originType;
+            }
+        }
+        return null;
+    }
+
+    private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module,
+                                           org.eclipse.jdt.core.IJavaProject project) {
+        if (typeNode == null || project == null) return null;
+        try {
+            String typeName = typeNode.getName();
+            if (typeName == null || typeName.isEmpty()) return null;
+
+            if (typeName.contains(".")) {
+                IType type = project.findType(typeName);
+                if (type != null) return type;
+            }
+
+            // Check imports
+            for (org.codehaus.groovy.ast.ImportNode imp : module.getImports()) {
+                ClassNode impType = imp.getType();
+                if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
+                    IType type = project.findType(impType.getName());
+                    if (type != null) return type;
+                }
+            }
+
+            // Star imports
+            for (org.codehaus.groovy.ast.ImportNode starImport : module.getStarImports()) {
+                String pkgName = starImport.getPackageName();
+                if (pkgName != null) {
+                    IType type = project.findType(pkgName + typeName);
+                    if (type != null) return type;
+                }
+            }
+
+            // Module package
+            String pkg = module.getPackageName();
+            if (pkg != null && !pkg.isEmpty()) {
+                if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
+                IType type = project.findType(pkg + "." + typeName);
+                if (type != null) return type;
+            }
+
+            // Auto-import packages
+            String[] autoPackages = {"java.lang.", "java.util.", "java.io.",
+                    "groovy.lang.", "groovy.util.", "java.math."};
+            for (String autoPkg : autoPackages) {
+                IType type = project.findType(autoPkg + typeName);
+                if (type != null) return type;
+            }
+        } catch (JavaModelException e) {
+            // ignore
+        }
+        return null;
+    }
+
+    // =========================================================================
+    // Local variable declaration navigation
+    // =========================================================================
+
+    /**
+     * Find the declaration of a local variable in the AST and navigate to it.
+     */
+    private Location resolveLocalVariableDeclaration(ModuleNode ast, String word, String uri) {
+        for (ClassNode classNode : ast.getClasses()) {
+            if (classNode.getLineNumber() < 0) continue;
+            for (MethodNode method : classNode.getMethods()) {
+                Location loc = findVarDeclInBlock(getBlock(method), word, uri);
+                if (loc != null) return loc;
+            }
+        }
+        org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = ast.getStatementBlock();
+        if (stmtBlock != null) {
+            Location loc = findVarDeclInBlock(stmtBlock, word, uri);
+            if (loc != null) return loc;
+        }
+        return null;
+    }
+
+    private Location findVarDeclInBlock(org.codehaus.groovy.ast.stmt.BlockStatement block,
+                                         String varName, String uri) {
+        if (block == null) return null;
+        for (org.codehaus.groovy.ast.stmt.Statement stmt : block.getStatements()) {
+            if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) continue;
+            if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) continue;
+            org.codehaus.groovy.ast.expr.Expression left = decl.getLeftExpression();
+            if (!(left instanceof org.codehaus.groovy.ast.expr.VariableExpression varExpr)) continue;
+            if (!varName.equals(varExpr.getName())) continue;
+
+            if (varExpr.getLineNumber() >= 1) {
+                return astNodeToLocation(uri, varExpr);
+            }
+        }
+        return null;
+    }
+
     private Location scanAllClassesForSymbol(ModuleNode ast, String word, String uri) {
         for (ClassNode classNode : ast.getClasses()) {
             if (classNode.getLineNumber() < 0) continue;

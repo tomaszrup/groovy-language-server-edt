@@ -246,14 +246,17 @@ public class DocumentManager {
             }
         }
 
-        // Update the JDT working copy
+        // Update the JDT working copy buffer so that subsequent operations
+        // (completion, hover, etc.) see the latest content. We intentionally
+        // do NOT call reconcile() here — the single reconcile happens in the
+        // debounced diagnostics pass (500ms later), avoiding redundant Groovy
+        // compiler runs on every keystroke.
         ICompilationUnit workingCopy = workingCopies.get(uri);
         if (workingCopy != null) {
             try {
                 workingCopy.getBuffer().setContents(content.toString());
-                workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
             } catch (JavaModelException e) {
-                GroovyLanguageServerPlugin.logError("Failed to reconcile working copy for " + uri, e);
+                GroovyLanguageServerPlugin.logError("Failed to update working copy buffer for " + uri, e);
             }
         } else {
             // Fallback: re-parse with Groovy compiler

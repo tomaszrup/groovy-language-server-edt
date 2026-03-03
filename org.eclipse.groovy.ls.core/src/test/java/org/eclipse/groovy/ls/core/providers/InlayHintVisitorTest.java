@@ -904,6 +904,108 @@ class InlayHintVisitorTest {
         assertNotNull(hints);
     }
 
+    @Test
+    void suppressesRedundantTypeHintWhenConstructorMatchesType() {
+        String source = """
+                class Foo {}
+                class Bar {
+                    void run() {
+                        def x = new Foo()
+                    }
+                }
+                """;
+        InlayHintVisitor visitor = new InlayHintVisitor(source, null,
+                new InlayHintSettings(true, false, false, false));
+        visitor.visitModule(parseModule(source));
+        List<InlayHint> hints = visitor.getHints();
+
+        assertFalse(containsTypeHint(hints, ": Foo"),
+                "Type hint should be suppressed when RHS is constructor of same type");
+    }
+
+    @Test
+    void showsTypeHintWhenConstructorDiffersFromInferredType() {
+        // When the variable type differs from the constructor type, hint should still show
+        String source = """
+                class Base {}
+                class Derived extends Base {}
+                class Ctx {
+                    void run() {
+                        def name = 'hello'
+                    }
+                }
+                """;
+        InlayHintVisitor visitor = new InlayHintVisitor(source, null,
+                new InlayHintSettings(true, false, false, false));
+        visitor.visitModule(parseModule(source));
+        List<InlayHint> hints = visitor.getHints();
+
+        assertTrue(containsTypeHint(hints, ": String"),
+                "Type hint should still appear for non-constructor RHS");
+    }
+
+    @Test
+    void suppressesParameterHintWhenArgumentNameMatchesParameterName() {
+        String source = """
+                class Svc {
+                    void process(String data) {}
+                    void run() {
+                        def data = 'hello'
+                        process(data)
+                    }
+                }
+                """;
+        InlayHintVisitor visitor = new InlayHintVisitor(source, null,
+                new InlayHintSettings(false, true, false, false));
+        visitor.visitModule(parseModule(source));
+        List<InlayHint> hints = visitor.getHints();
+
+        assertFalse(containsParameterHint(hints, "data:"),
+                "Parameter hint should be suppressed when argument name matches parameter name");
+    }
+
+    @Test
+    void showsParameterHintWhenArgumentNameDiffersFromParameterName() {
+        String source = """
+                class Svc {
+                    void process(String data) {}
+                    void run() {
+                        def input = 'hello'
+                        process(input)
+                    }
+                }
+                """;
+        InlayHintVisitor visitor = new InlayHintVisitor(source, null,
+                new InlayHintSettings(false, true, false, false));
+        visitor.visitModule(parseModule(source));
+        List<InlayHint> hints = visitor.getHints();
+
+        assertTrue(containsParameterHint(hints, "data:"),
+                "Parameter hint should appear when argument name differs from parameter name");
+    }
+
+    @Test
+    void suppressesParameterHintForConstructorWhenArgumentNameMatches() {
+        String source = """
+                class Item {
+                    Item(String name) {}
+                }
+                class Ctx {
+                    void run() {
+                        def name = 'widget'
+                        new Item(name)
+                    }
+                }
+                """;
+        InlayHintVisitor visitor = new InlayHintVisitor(source, null,
+                new InlayHintSettings(false, true, false, false));
+        visitor.visitModule(parseModule(source));
+        List<InlayHint> hints = visitor.getHints();
+
+        assertFalse(containsParameterHint(hints, "name:"),
+                "Constructor parameter hint should be suppressed when argument name matches");
+    }
+
     private Object invokePrivate(Object target, String methodName, Class<?>[] paramTypes, Object[] args) throws Exception {
         Method method = target.getClass().getDeclaredMethod(methodName, paramTypes);
         method.setAccessible(true);

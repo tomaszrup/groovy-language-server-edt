@@ -14,6 +14,7 @@ import java.util.List;
 
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.ConstructorNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
@@ -22,6 +23,13 @@ import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.codehaus.groovy.ast.expr.ClassExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
+import org.codehaus.groovy.ast.expr.DeclarationExpression;
+import org.codehaus.groovy.ast.expr.Expression;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
+import org.codehaus.groovy.ast.expr.VariableExpression;
+import org.codehaus.groovy.ast.stmt.BlockStatement;
+import org.codehaus.groovy.ast.stmt.ExpressionStatement;
+import org.codehaus.groovy.ast.stmt.Statement;
 import org.codehaus.groovy.control.SourceUnit;
 import org.codehaus.jdt.groovy.model.GroovyCompilationUnit;
 import org.codehaus.jdt.groovy.model.ICodeSelectHelper;
@@ -30,7 +38,9 @@ import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.core.Signature;
 
 /**
  * {@link ICodeSelectHelper} that uses the Groovy AST to resolve the element
@@ -126,6 +136,24 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             if (localElement != null) {
                 results.add(localElement);
                 GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved local declaration: " + localElement.getElementName());
+                return results.toArray(new IJavaElement[0]);
+            }
+
+            // 3b. Check if cursor is on a method call after a dot (e.g., "expr.value()")
+            //     Resolve the receiver expression type and find the method in it.
+            IJavaElement dotCallElement = resolveDotMethodCall(module, javaProject, source, offset, word);
+            if (dotCallElement != null) {
+                results.add(dotCallElement);
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved dot method call: " + dotCallElement.getElementName());
+                return results.toArray(new IJavaElement[0]);
+            }
+
+            // 3c. Check if the word is a local variable reference (e.g., "value" in "value.xxx")
+            //     Resolve the variable's initializer type and return it.
+            IJavaElement localVarType = resolveLocalVariableType(module, javaProject, word);
+            if (localVarType != null) {
+                results.add(localVarType);
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved local variable type: " + localVarType.getElementName());
                 return results.toArray(new IJavaElement[0]);
             }
 
@@ -914,6 +942,454 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
         }
         return line;
+    }
+
+    /**
+     * Convert a 0-based offset to a 1-based column number (matching Groovy AST conventions).
+     */
+    private int offsetToColumn(String source, int offset) {
+        int safeOffset = Math.max(0, Math.min(offset, source.length()));
+        int col = 1;
+        for (int i = safeOffset - 1; i >= 0; i--) {
+            if (source.charAt(i) == '\n') break;
+            col++;
+        }
+        return col;
+    }
+
+    /**
+     * Search for a type by simple name, checking default Groovy auto-imports
+     * and java.lang.
+     */
+    // =========================================================================
+    // 3b. Dot method call resolution  (expr.method())
+    // =========================================================================
+
+    /**
+     * When the cursor is on a method name after a dot (e.g., {@code foo.value()}),
+     * resolve the receiver expression type and find the method within it.
+     */
+    private IJavaElement resolveDotMethodCall(ModuleNode module, IJavaProject project,
+                                              String source, int offset, String word) {
+        try {
+            // Check if the word is preceded by a dot
+            int wordStart = offset;
+            while (wordStart > 0 && Character.isJavaIdentifierPart(source.charAt(wordStart - 1))) {
+                wordStart--;
+            }
+            if (wordStart <= 0 || source.charAt(wordStart - 1) != '.') {
+                return null; // Not a dot-expression
+            }
+
+            // Extract the receiver identifier before the dot
+            int dotPos = wordStart - 1;
+            int receiverEnd = dotPos;
+            int receiverStart = receiverEnd - 1;
+            while (receiverStart >= 0 && Character.isJavaIdentifierPart(source.charAt(receiverStart))) {
+                receiverStart--;
+            }
+            receiverStart++;
+
+            IType receiverType = null;
+
+            if (receiverStart < receiverEnd) {
+                // Simple identifier receiver (e.g., "foo.value()")
+                String receiverName = source.substring(receiverStart, receiverEnd);
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Dot call: receiver='" + receiverName
+                        + "' method='" + word + "'");
+                receiverType = resolveExpressionType(module, project, receiverName);
+            }
+
+            // Fallback: AST-based resolution for complex receivers like "new Foo().method()"
+            if (receiverType == null) {
+                receiverType = resolveReceiverTypeFromAst(module, project, offset, word, source);
+            }
+
+            if (receiverType == null) {
+                return null;
+            }
+
+            GroovyLanguageServerPlugin.logInfo("[codeSelect] Receiver type: " + receiverType.getFullyQualifiedName());
+
+            // Find the method in the receiver type
+            IMethod method = findMethodByNameInHierarchy(receiverType, word, project);
+            if (method != null) {
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Found method '" + word
+                        + "' in " + receiverType.getFullyQualifiedName());
+                return method;
+            }
+
+            // Also check for property access (Groovy: "foo.bar" → "foo.getBar()")
+            org.eclipse.jdt.core.IField field = findFieldByName(receiverType, word);
+            if (field != null) {
+                return field;
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[codeSelect] resolveDotMethodCall failed", e);
+        }
+        return null;
+    }
+
+    /**
+     * Walk the AST to find a MethodCallExpression at the given offset whose method
+     * name matches {@code word}, then resolve the receiver's type via JDT.
+     * This handles complex receiver expressions like {@code new Foo().method()}.
+     */
+    private IType resolveReceiverTypeFromAst(ModuleNode module, IJavaProject project,
+                                              int offset, String methodName, String source) {
+        MethodCallExpression found = findMethodCallAtOffset(module, offset, methodName, source);
+        if (found == null) return null;
+
+        Expression objectExpr = found.getObjectExpression();
+        ClassNode receiverClassNode = resolveObjectExpressionType(objectExpr, module);
+        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] AST fallback: receiver ClassNode='"
+                + receiverClassNode.getName() + "' for method '" + methodName + "'");
+
+        try {
+            return resolveClassNodeToIType(receiverClassNode, module, project);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[codeSelect] AST fallback type resolution failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Resolve the type of an object expression (the receiver part of a method call).
+     */
+    private ClassNode resolveObjectExpressionType(Expression objectExpr, ModuleNode module) {
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+        if (objectExpr instanceof MethodCallExpression nestedCall) {
+            return resolveMethodCallReturnType(nestedCall, module);
+        }
+        if (objectExpr instanceof VariableExpression varExpr) {
+            String varName = varExpr.getName();
+            if ("this".equals(varName)) return null;
+            ClassNode varType = resolveLocalVariableClassNode(module, varName);
+            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+                return varType;
+            }
+            ClassNode exprType = varExpr.getType();
+            if (exprType != null && !"java.lang.Object".equals(exprType.getName())) {
+                return exprType;
+            }
+        }
+        if (objectExpr instanceof ClassExpression classExpr) {
+            return classExpr.getType();
+        }
+        return null;
+    }
+
+    /**
+     * Walk the AST to find a MethodCallExpression at the given offset with the given method name.
+     */
+    private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
+                                                         String methodName, String source) {
+        // Convert offset to 1-based line/column for AST node matching
+        int targetLine = offsetToLine(source, offset);
+        int targetCol = offsetToColumn(source, offset);
+
+        final MethodCallExpression[] result = new MethodCallExpression[1];
+
+        ClassCodeVisitorSupport visitor = new ClassCodeVisitorSupport() {
+            @Override
+            protected SourceUnit getSourceUnit() {
+                return module.getContext();
+            }
+
+            @Override
+            public void visitMethodCallExpression(MethodCallExpression call) {
+                if (result[0] != null) return; // already found
+                String name = call.getMethodAsString();
+                if (methodName.equals(name)) {
+                    // Check if the method name expression is on the same line/column
+                    Expression methodExpr = call.getMethod();
+                    int mLine = methodExpr.getLineNumber();
+                    int mCol = methodExpr.getColumnNumber();
+                    int mLastCol = methodExpr.getLastColumnNumber();
+                    if (mLine == targetLine && targetCol >= mCol && targetCol <= mLastCol) {
+                        result[0] = call;
+                        return;
+                    }
+                }
+                super.visitMethodCallExpression(call);
+            }
+        };
+
+        for (ClassNode classNode : module.getClasses()) {
+            if (result[0] != null) break;
+            visitor.visitClass(classNode);
+        }
+
+        // Also check module-level statements (Groovy scripts)
+        if (result[0] == null) {
+            org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = module.getStatementBlock();
+            if (stmtBlock != null) {
+                for (Statement stmt : stmtBlock.getStatements()) {
+                    if (result[0] != null) break;
+                    stmt.visit(visitor);
+                }
+            }
+        }
+
+        return result[0];
+    }
+
+    /**
+     * Resolve an expression name (variable, type, or constructor call receiver) to its JDT IType.
+     */
+    private IType resolveExpressionType(ModuleNode module, IJavaProject project, String name) {
+        try {
+            // 1. Check if it's a type name (uppercase)
+            if (!name.isEmpty() && Character.isUpperCase(name.charAt(0))) {
+                IType type = resolveClassNameToType(module, project, name);
+                if (type != null) return type;
+            }
+
+            // 2. Check if it's a local variable — resolve its initializer type
+            ClassNode varType = resolveLocalVariableClassNode(module, name);
+            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+                return resolveClassNodeToIType(varType, module, project);
+            }
+
+            // 3. Check if it's a field/property in any class
+            for (ClassNode classNode : module.getClasses()) {
+                ClassNode memberType = resolveClassMemberType(classNode, name);
+                if (memberType != null) {
+                    return resolveClassNodeToIType(memberType, module, project);
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[codeSelect] resolveExpressionType failed for " + name, e);
+        }
+        return null;
+    }
+
+    /**
+     * Resolve a class name (simple or imported) to an IType.
+     */
+    private IType resolveClassNameToType(ModuleNode module, IJavaProject project, String name) {
+        try {
+            String fqn = resolveFromImports(module, name);
+            if (fqn != null) {
+                IType type = project.findType(fqn);
+                if (type != null) return type;
+            }
+            // Try AST resolution
+            String astFqn = resolveTypeFromAST(module, name);
+            if (astFqn != null) {
+                IType type = project.findType(astFqn);
+                if (type != null) return type;
+            }
+            // Try auto-import packages
+            return resolveTypeByPackages(project, name, DEFAULT_AUTO_PACKAGES);
+        } catch (JavaModelException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Walk the AST to find a local variable declaration and resolve its initializer type.
+     * Handles {@code def x = new Foo()}, {@code def x = new Foo().bar()}, and typed declarations.
+     */
+    private ClassNode resolveLocalVariableClassNode(ModuleNode module, String varName) {
+        for (ClassNode classNode : module.getClasses()) {
+            if (classNode.getLineNumber() < 0) continue;
+
+            for (MethodNode method : classNode.getMethods()) {
+                ClassNode type = resolveLocalVarInBlock(getMethodBlock(method), varName, module);
+                if (type != null) return type;
+            }
+            for (ConstructorNode ctor : classNode.getDeclaredConstructors()) {
+                ClassNode type = resolveLocalVarInBlock(getMethodBlock(ctor), varName, module);
+                if (type != null) return type;
+            }
+        }
+
+        // Also check script-level (module statement block)
+        BlockStatement stmtBlock = module.getStatementBlock();
+        if (stmtBlock != null) {
+            ClassNode type = resolveLocalVarInBlock(stmtBlock, varName, module);
+            if (type != null) return type;
+        }
+        return null;
+    }
+
+    private BlockStatement getMethodBlock(MethodNode method) {
+        Statement code = method.getCode();
+        return (code instanceof BlockStatement block) ? block : null;
+    }
+
+    private ClassNode resolveLocalVarInBlock(BlockStatement block, String varName, ModuleNode module) {
+        if (block == null) return null;
+        for (Statement stmt : block.getStatements()) {
+            ClassNode resolved = resolveVarFromStatement(stmt, varName, module);
+            if (resolved != null) return resolved;
+        }
+        return null;
+    }
+
+    /**
+     * Check a single statement for a variable declaration matching the name,
+     * and resolve its type — including chained method calls.
+     */
+    private ClassNode resolveVarFromStatement(Statement stmt, String varName, ModuleNode module) {
+        if (!(stmt instanceof ExpressionStatement exprStmt)) return null;
+        if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) return null;
+
+        Expression left = decl.getLeftExpression();
+        if (!(left instanceof VariableExpression varExpr)) return null;
+        if (!varName.equals(varExpr.getName())) return null;
+
+        Expression initializer = decl.getRightExpression();
+        if (initializer == null) return null;
+
+        // "def x = new Foo()" → use the constructor type
+        if (initializer instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+
+        // "def x = new Foo().bar()" → resolve chain
+        if (initializer instanceof MethodCallExpression methodCall) {
+            return resolveMethodCallReturnType(methodCall, module);
+        }
+
+        // Typed declaration (e.g., "String x = ...")
+        ClassNode originType = varExpr.getOriginType();
+        if (originType != null && !"java.lang.Object".equals(originType.getName())) {
+            return originType;
+        }
+
+        ClassNode initType = initializer.getType();
+        if (initType != null && !"java.lang.Object".equals(initType.getName())) {
+            return initType;
+        }
+        return null;
+    }
+
+    /**
+     * Resolve the return type of a method call expression by looking at the receiver type
+     * and finding the method's return type via JDT.
+     * Handles: {@code new Foo().bar()}, {@code someVar.bar()}, {@code Foo.staticBar()}.
+     */
+    private ClassNode resolveMethodCallReturnType(MethodCallExpression methodCall, ModuleNode module) {
+        Expression objectExpr = methodCall.getObjectExpression();
+        String methodName = methodCall.getMethodAsString();
+        if (methodName == null) return null;
+
+        ClassNode receiverClassNode = null;
+
+        // Receiver is a constructor: new Foo().bar()
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            receiverClassNode = ctorCall.getType();
+        }
+        // Receiver is another method call: foo().bar()
+        else if (objectExpr instanceof MethodCallExpression nestedCall) {
+            receiverClassNode = resolveMethodCallReturnType(nestedCall, module);
+        }
+        // Receiver is a variable: someVar.bar()
+        else if (objectExpr instanceof VariableExpression varExpr) {
+            String receiverVarName = varExpr.getName();
+            if ("this".equals(receiverVarName)) {
+                return null; // Let other resolution handle 'this'
+            }
+            receiverClassNode = resolveLocalVariableClassNode(module, receiverVarName);
+            if (receiverClassNode == null) {
+                // Maybe it's a class name for static call
+                ClassNode varType = varExpr.getType();
+                if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+                    receiverClassNode = varType;
+                }
+            }
+        }
+
+        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+            return null;
+        }
+
+        // Now look up the method's return type via the receiver type's ClassNode
+        // First try using methods defined on the ClassNode (for Groovy types in the same file)
+        for (MethodNode mn : receiverClassNode.getMethods()) {
+            if (methodName.equals(mn.getName())) {
+                ClassNode returnType = mn.getReturnType();
+                if (returnType != null && !"java.lang.Object".equals(returnType.getName())) {
+                    return returnType;
+                }
+            }
+        }
+
+        // ClassNode methods weren't helpful — leave it to JDT resolution in the caller
+        // Return the receiver type as a marker that we at least know the receiver
+        return null;
+    }
+
+    /**
+     * Find a method by name in the type hierarchy (type + supertypes).
+     */
+    private IMethod findMethodByNameInHierarchy(IType type, String name, IJavaProject project) 
+            throws JavaModelException {
+        // First check in the type itself
+        IMethod method = findMethodByName(type, name);
+        if (method != null) return method;
+
+        // Check supertypes
+        ITypeHierarchy hierarchy = type.newSupertypeHierarchy(null);
+        if (hierarchy != null) {
+            IType[] supers = hierarchy.getAllSupertypes(type);
+            for (IType superType : supers) {
+                method = findMethodByName(superType, name);
+                if (method != null) return method;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve the type of a field or property in a ClassNode.
+     */
+    private ClassNode resolveClassMemberType(ClassNode classNode, String name) {
+        for (PropertyNode prop : classNode.getProperties()) {
+            if (name.equals(prop.getName())) return prop.getType();
+        }
+        for (FieldNode field : classNode.getFields()) {
+            if (name.equals(field.getName())) return field.getType();
+        }
+        return null;
+    }
+
+    // =========================================================================
+    // 3c. Local variable type resolution
+    // =========================================================================
+
+    /**
+     * Check if the word is a local variable and resolve its type to a JDT IType.
+     * This allows codeSelect on a variable name to return the variable's type.
+     */
+    private IJavaElement resolveLocalVariableType(ModuleNode module, IJavaProject project, String word) {
+        // Only for lowercase identifiers (variable names)
+        if (word.isEmpty() || Character.isUpperCase(word.charAt(0))) {
+            return null;
+        }
+
+        try {
+            ClassNode varType = resolveLocalVariableClassNode(module, word);
+            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+                IType jdtType = resolveClassNodeToIType(varType, module, project);
+                if (jdtType != null) {
+                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Local variable '" + word
+                            + "' resolved to type: " + jdtType.getFullyQualifiedName());
+                    return jdtType;
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[codeSelect] resolveLocalVariableType failed for " + word, e);
+        }
+        return null;
     }
 
     /**

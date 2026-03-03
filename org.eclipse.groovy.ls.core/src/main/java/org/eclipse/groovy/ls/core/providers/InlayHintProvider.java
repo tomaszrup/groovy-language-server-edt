@@ -18,16 +18,19 @@ import java.util.Set;
 
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.expr.ArgumentListExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
+import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.codehaus.groovy.ast.expr.Expression;
 import org.codehaus.groovy.ast.expr.MapExpression;
 import org.codehaus.groovy.ast.expr.MethodCallExpression;
 import org.codehaus.groovy.ast.expr.NamedArgumentListExpression;
 import org.codehaus.groovy.ast.expr.TupleExpression;
+import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -35,6 +38,7 @@ import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.Flags;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
@@ -113,6 +117,17 @@ public class InlayHintProvider {
             nonParameterVisitor.visitModule(module);
             mergedHints.addAll(nonParameterVisitor.getHints());
 
+            // JDT-aware variable type hints for method call chains
+            // (e.g., def value = new JavaClass().method() — the AST alone returns Object)
+            if (effectiveSettings.isVariableTypesEnabled()) {
+                ICompilationUnit varWorkingCopy = documentManager.getWorkingCopy(uri);
+                if (varWorkingCopy != null) {
+                    List<InlayHint> jdtVarHints = computeJdtVariableTypeHints(
+                            module, content, requestedRange, varWorkingCopy);
+                    mergedHints.addAll(jdtVarHints);
+                }
+            }
+
             if (effectiveSettings.isParameterNamesEnabled()) {
                 ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
                 List<InlayHint> parameterHints = new ArrayList<>();
@@ -167,6 +182,317 @@ public class InlayHintProvider {
                 .thenComparing(hint -> hint.getPosition().getCharacter()));
 
         return sorted;
+    }
+
+    // =========================================================================
+    // JDT-aware variable type hints for method call chains
+    // =========================================================================
+
+    /**
+     * Compute variable type inlay hints for declarations whose right-hand side is a method
+     * call chain (e.g., {@code def value = new JavaClass().method()}). The AST visitor can't
+     * resolve these because the Groovy compiler at CONVERSION phase doesn't know the method's
+     * return type. We use JDT to look it up.
+     */
+    private List<InlayHint> computeJdtVariableTypeHints(ModuleNode module, String content,
+                                                         Range requestedRange,
+                                                         ICompilationUnit workingCopy) {
+        List<InlayHint> hints = new ArrayList<>();
+        try {
+            IJavaProject project = workingCopy.getJavaProject();
+            if (project == null || !project.exists()) return hints;
+
+            MethodCallDeclCollector collector = new MethodCallDeclCollector();
+            for (ClassNode classNode : module.getClasses()) {
+                collector.visitClass(classNode);
+            }
+            BlockStatement stmtBlock = module.getStatementBlock();
+            if (stmtBlock != null) {
+                stmtBlock.visit(collector);
+            }
+
+            for (MethodCallDeclCollector.DeclInfo info : collector.getDeclarations()) {
+                if (requestedRange != null && !isInRange(info.line, requestedRange)) {
+                    continue;
+                }
+                IType returnType = resolveMethodCallChainType(info.methodCall, module, project);
+                if (returnType != null) {
+                    String typeName = returnType.getElementName();
+                    Position hintPos = new Position(info.line, info.column + info.varName.length());
+                    InlayHint hint = new InlayHint(hintPos, Either.forLeft(": " + typeName));
+                    hint.setKind(InlayHintKind.Type);
+                    hint.setPaddingLeft(false);
+                    hint.setPaddingRight(true);
+                    hints.add(hint);
+                }
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("JDT variable type hint computation failed", e);
+        }
+        return hints;
+    }
+
+    private boolean isInRange(int zeroBasedLine, Range range) {
+        return zeroBasedLine >= range.getStart().getLine()
+                && zeroBasedLine <= range.getEnd().getLine();
+    }
+
+    /**
+     * Resolve a method call expression chain to a JDT IType.
+     */
+    private IType resolveMethodCallChainType(MethodCallExpression methodCall,
+                                              ModuleNode module, IJavaProject project) {
+        try {
+            Expression objectExpr = methodCall.getObjectExpression();
+            String methodName = methodCall.getMethodAsString();
+            if (methodName == null) return null;
+
+            IType receiverType = null;
+
+            if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+                ClassNode ctorType = ctorCall.getType();
+                receiverType = resolveClassNodeToType(ctorType, module, project);
+            } else if (objectExpr instanceof MethodCallExpression nestedCall) {
+                receiverType = resolveMethodCallChainType(nestedCall, module, project);
+            } else if (objectExpr instanceof VariableExpression varExpr) {
+                String receiverVarName = varExpr.getName();
+                if (!"this".equals(receiverVarName)) {
+                    // Try to resolve the variable's initializer type
+                    ClassNode varType = resolveLocalVarType(module, receiverVarName);
+                    if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+                        receiverType = resolveClassNodeToType(varType, module, project);
+                    }
+                }
+            }
+
+            if (receiverType == null) return null;
+
+            // Find the method return type via JDT
+            return findMethodReturnType(receiverType, methodName, project);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private IType findMethodReturnType(IType receiverType, String methodName, IJavaProject project)
+            throws JavaModelException {
+        // Search in the type and its supertypes
+        IMethod[] methods = receiverType.getMethods();
+        for (IMethod method : methods) {
+            if (methodName.equals(method.getElementName())) {
+                String returnSig = method.getReturnType();
+                if (returnSig != null) {
+                    String returnTypeName = org.eclipse.jdt.core.Signature.toString(returnSig);
+                    IType returnType = resolveTypeByName(returnTypeName, receiverType, project);
+                    if (returnType != null) return returnType;
+                }
+            }
+        }
+
+        // Check supertypes
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = receiverType.newSupertypeHierarchy(null);
+        if (hierarchy != null) {
+            for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
+                for (IMethod method : superType.getMethods()) {
+                    if (methodName.equals(method.getElementName())) {
+                        String returnSig = method.getReturnType();
+                        if (returnSig != null) {
+                            String returnTypeName = org.eclipse.jdt.core.Signature.toString(returnSig);
+                            IType returnType = resolveTypeByName(returnTypeName, superType, project);
+                            if (returnType != null) return returnType;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private IType resolveTypeByName(String typeName, IType context, IJavaProject project)
+            throws JavaModelException {
+        IType type = project.findType(typeName);
+        if (type != null) return type;
+
+        if (context != null) {
+            String[][] resolved = context.resolveType(typeName);
+            if (resolved != null && resolved.length > 0) {
+                String fqn = resolved[0][0].isEmpty()
+                        ? resolved[0][1]
+                        : resolved[0][0] + "." + resolved[0][1];
+                type = project.findType(fqn);
+                if (type != null) return type;
+            }
+        }
+
+        // Try java.lang
+        type = project.findType("java.lang." + typeName);
+        return type;
+    }
+
+    private IType resolveClassNodeToType(ClassNode typeNode, ModuleNode module, IJavaProject project)
+            throws JavaModelException {
+        if (typeNode == null || project == null) return null;
+        String typeName = typeNode.getName();
+        if (typeName == null || typeName.isEmpty()) return null;
+
+        if (typeName.contains(".")) {
+            IType type = project.findType(typeName);
+            if (type != null) return type;
+        }
+
+        // Check imports
+        for (ImportNode imp : module.getImports()) {
+            ClassNode impType = imp.getType();
+            if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
+                IType type = project.findType(impType.getName());
+                if (type != null) return type;
+            }
+        }
+
+        // Star imports
+        for (ImportNode starImport : module.getStarImports()) {
+            String pkgName = starImport.getPackageName();
+            if (pkgName != null) {
+                IType type = project.findType(pkgName + typeName);
+                if (type != null) return type;
+            }
+        }
+
+        // Module package
+        String pkg = module.getPackageName();
+        if (pkg != null && !pkg.isEmpty()) {
+            if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
+            IType type = project.findType(pkg + "." + typeName);
+            if (type != null) return type;
+        }
+
+        // Auto-import packages
+        String[] autoPackages = {"java.lang.", "java.util.", "java.io.", "groovy.lang.", "groovy.util.", "java.math."};
+        for (String autoPkg : autoPackages) {
+            IType type = project.findType(autoPkg + typeName);
+            if (type != null) return type;
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve a local variable's type from the AST by finding its declaration.
+     */
+    private ClassNode resolveLocalVarType(ModuleNode module, String varName) {
+        for (ClassNode classNode : module.getClasses()) {
+            if (classNode.getLineNumber() < 0) continue;
+            for (MethodNode method : classNode.getMethods()) {
+                ClassNode type = resolveVarInBlock(getBlock(method), varName);
+                if (type != null) return type;
+            }
+        }
+        BlockStatement stmtBlock = module.getStatementBlock();
+        if (stmtBlock != null) {
+            ClassNode type = resolveVarInBlock(stmtBlock, varName);
+            if (type != null) return type;
+        }
+        return null;
+    }
+
+    private BlockStatement getBlock(MethodNode method) {
+        org.codehaus.groovy.ast.stmt.Statement code = method.getCode();
+        return (code instanceof BlockStatement block) ? block : null;
+    }
+
+    private ClassNode resolveVarInBlock(BlockStatement block, String varName) {
+        if (block == null) return null;
+        for (org.codehaus.groovy.ast.stmt.Statement stmt : block.getStatements()) {
+            if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) continue;
+            if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) continue;
+            Expression left = decl.getLeftExpression();
+            if (!(left instanceof VariableExpression varExpr)) continue;
+            if (!varName.equals(varExpr.getName())) continue;
+
+            Expression init = decl.getRightExpression();
+            if (init instanceof ConstructorCallExpression ctorCall) {
+                return ctorCall.getType();
+            }
+            ClassNode originType = varExpr.getOriginType();
+            if (originType != null && !"java.lang.Object".equals(originType.getName())) {
+                return originType;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Collects DeclarationExpressions where the RHS is a MethodCallExpression
+     * and the variable is declared with 'def' style (untyped).
+     */
+    private static final class MethodCallDeclCollector extends ClassCodeVisitorSupport {
+        static final class DeclInfo {
+            final String varName;
+            final int line;
+            final int column;
+            final MethodCallExpression methodCall;
+
+            DeclInfo(String varName, int line, int column, MethodCallExpression methodCall) {
+                this.varName = varName;
+                this.line = line;
+                this.column = column;
+                this.methodCall = methodCall;
+            }
+        }
+
+        private final List<DeclInfo> declarations = new ArrayList<>();
+
+        @Override
+        protected SourceUnit getSourceUnit() {
+            return null;
+        }
+
+        List<DeclInfo> getDeclarations() {
+            return declarations;
+        }
+
+        @Override
+        public void visitDeclarationExpression(DeclarationExpression expr) {
+            if (expr == null || expr.getLineNumber() < 1) {
+                super.visitDeclarationExpression(expr);
+                return;
+            }
+            Expression left = expr.getLeftExpression();
+            if (!(left instanceof VariableExpression variable)) {
+                super.visitDeclarationExpression(expr);
+                return;
+            }
+            String variableName = variable.getName();
+            if (variableName == null || variableName.isEmpty()) {
+                super.visitDeclarationExpression(expr);
+                return;
+            }
+
+            // Check if it's a def-style declaration (no explicit type)
+            if (!isDynamic(variable)) {
+                super.visitDeclarationExpression(expr);
+                return;
+            }
+
+            Expression rightExpr = expr.getRightExpression();
+            if (rightExpr instanceof MethodCallExpression methodCall) {
+                // Only collect when the AST type is unhelpful
+                ClassNode inferredType = rightExpr.getType();
+                if (inferredType == null
+                        || "java.lang.Object".equals(inferredType.getName())
+                        || "void".equals(inferredType.getName())) {
+                    int line = Math.max(0, variable.getLineNumber() - 1);
+                    int col = Math.max(0, variable.getColumnNumber() - 1);
+                    declarations.add(new DeclInfo(variableName, line, col, methodCall));
+                }
+            }
+            super.visitDeclarationExpression(expr);
+        }
+
+        private boolean isDynamic(VariableExpression var) {
+            return var.isDynamicTyped()
+                    || "java.lang.Object".equals(var.getOriginType().getName());
+        }
     }
 
     private static final class ParameterHintCollector extends ClassCodeVisitorSupport {
@@ -315,7 +641,7 @@ public class InlayHintProvider {
             for (int index = 0; index < max; index++) {
                 Expression argument = arguments.get(index);
                 String parameterName = parameterNames[index];
-                if (isHintableArgument(argument) && parameterName != null && !parameterName.isBlank()) {
+                if (isHintableArgument(argument, parameterName) && parameterName != null && !parameterName.isBlank()) {
                     Position position = new Position(
                             Math.max(0, argument.getLineNumber() - 1),
                             Math.max(0, argument.getColumnNumber() - 1));
@@ -324,8 +650,19 @@ public class InlayHintProvider {
             }
         }
 
-        private boolean isHintableArgument(Expression argument) {
-            return argument != null && argument.getLineNumber() >= 1 && !isNamedArgument(argument);
+        private boolean isHintableArgument(Expression argument, String parameterName) {
+            return argument != null
+                    && argument.getLineNumber() >= 1
+                    && !isNamedArgument(argument)
+                    && !isArgumentNameMatchingParameter(argument, parameterName);
+        }
+
+        private boolean isArgumentNameMatchingParameter(Expression arg, String parameterName) {
+            if (arg instanceof VariableExpression variable) {
+                String argName = variable.getName();
+                return argName != null && argName.equals(parameterName);
+            }
+            return false;
         }
 
         private IMethod resolveBestMethodTarget(int offset, String methodName, int argumentCount) {

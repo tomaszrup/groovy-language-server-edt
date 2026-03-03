@@ -156,10 +156,30 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         }
 
         ClassNode inferredType = null;
-        if (expr.getRightExpression() != null) {
-            inferredType = expr.getRightExpression().getType();
+        Expression rightExpr = expr.getRightExpression();
+        if (rightExpr != null) {
+            inferredType = rightExpr.getType();
         }
+
+        // When the inferred type is unhelpful (Object) and the right expression
+        // is a method call chain (e.g., new Foo().bar()), try to resolve the
+        // receiver type from the chain — even though we can't determine the exact
+        // return type without JDT, knowing the receiver type is still useful.
+        if (isUnhelpfulType(inferredType) && rightExpr instanceof MethodCallExpression methodCall) {
+            ClassNode chainReceiverType = resolveMethodCallReceiverType(methodCall);
+            if (chainReceiverType != null && !isUnhelpfulType(chainReceiverType)) {
+                // We know the receiver but not the method return type at AST level.
+                // Skip the hint rather than showing the wrong type.
+                // The JDT-aware InlayHintProvider will handle this separately.
+                return;
+            }
+        }
+
         if (isUnhelpfulType(inferredType)) {
+            return;
+        }
+
+        if (isRedundantConstructorType(rightExpr, inferredType)) {
             return;
         }
 
@@ -168,6 +188,21 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
                 Math.max(0, variable.getColumnNumber() - 1) + variableName.length());
 
         addTypeHint(hintPosition, ": " + formatType(inferredType));
+    }
+
+    /**
+     * Walk a MethodCallExpression chain to find the outermost receiver type.
+     * For {@code new Foo().bar().baz()}, returns the ClassNode for {@code Foo}.
+     */
+    private ClassNode resolveMethodCallReceiverType(MethodCallExpression methodCall) {
+        Expression objectExpr = methodCall.getObjectExpression();
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+        if (objectExpr instanceof MethodCallExpression nestedCall) {
+            return resolveMethodCallReceiverType(nestedCall);
+        }
+        return null;
     }
 
     private void addMethodReturnTypeHint(MethodNode node) {
@@ -353,7 +388,8 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
                 && arg.getLineNumber() >= 1
                 && !isNamedArgumentExpression(arg)
                 && parameterName != null
-                && !parameterName.isEmpty();
+                && !parameterName.isEmpty()
+                && !isArgumentNameMatchingParameter(arg, parameterName);
     }
 
     private MethodNode findMatchingMethod(String methodName, int argumentCount) {
@@ -489,6 +525,21 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
 
     private boolean isNamedArgumentExpression(Expression expr) {
         return expr instanceof NamedArgumentListExpression || expr instanceof MapExpression;
+    }
+
+    private boolean isRedundantConstructorType(Expression rightExpression, ClassNode inferredType) {
+        if (!(rightExpression instanceof ConstructorCallExpression)) {
+            return false;
+        }
+        return formatType(inferredType).equals(formatType(rightExpression.getType()));
+    }
+
+    private boolean isArgumentNameMatchingParameter(Expression arg, String parameterName) {
+        if (arg instanceof VariableExpression variable) {
+            String argName = variable.getName();
+            return argName != null && argName.equals(parameterName);
+        }
+        return false;
     }
 
     private boolean isUnhelpfulType(ClassNode type) {

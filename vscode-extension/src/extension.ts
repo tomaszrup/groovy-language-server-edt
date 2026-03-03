@@ -715,6 +715,11 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
             );
         }
         preFetchedClasspathData = []; // clear after sending
+
+        // Tell the server all initial classpaths are delivered so it can
+        // build immediately instead of waiting for the debounce timer.
+        client.sendNotification('groovy/classpathBatchComplete', {});
+        outputChannel.appendLine('[java-ext] Sent groovy/classpathBatchComplete to server.');
     }
 
     // Push initial configuration (formatter + inlay hints) to the server
@@ -1006,9 +1011,17 @@ async function initJavaExtensionClasspath(
             }
 
             let fetched = 0;
-            for (const target of targets) {
-                const ok = await fetchClasspathForProject(target, projectRootMap);
-                if (ok) fetched++;
+            // Fetch classpaths in parallel batches of 10 to avoid
+            // sequential round-trips for large multi-project workspaces.
+            const BATCH_SIZE = 10;
+            for (let i = 0; i < targets.length; i += BATCH_SIZE) {
+                const batch = targets.slice(i, i + BATCH_SIZE);
+                const results = await Promise.allSettled(
+                    batch.map(target => fetchClasspathForProject(target, projectRootMap))
+                );
+                for (const r of results) {
+                    if (r.status === 'fulfilled' && r.value) fetched++;
+                }
             }
             outputChannel.appendLine(`[java-ext] Sent classpath for ${fetched}/${targets.length} project(s)`);
             return fetched;

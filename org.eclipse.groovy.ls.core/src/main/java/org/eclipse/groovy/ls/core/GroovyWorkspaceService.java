@@ -244,12 +244,15 @@ public class GroovyWorkspaceService implements WorkspaceService {
                 return;
             }
 
-            refreshOpenProjects();
+            // Only refresh the projects that own the changed files,
+            // not the entire workspace.
+            refreshAffectedProjects(params);
             GroovyLanguageServerPlugin.logInfo(
                     "[diag-trace] didChangeWatchedFiles sourceChanged=true javaChanged="
                             + summary.hasJavaSourceChange + " -> refresh diagnostics");
             if (summary.hasJavaSourceChange) {
-                server.triggerFullBuild();
+                // Debounce: rapid Java saves don't each trigger a full build
+                server.scheduleDebouncedBuild();
             } else {
                 server.getGroovyTextDocumentService().publishDiagnosticsForOpenDocuments();
             }
@@ -298,6 +301,32 @@ public class GroovyWorkspaceService implements WorkspaceService {
                 project.refreshLocal(
                         org.eclipse.core.resources.IResource.DEPTH_INFINITE,
                         new org.eclipse.core.runtime.NullProgressMonitor());
+            }
+        }
+    }
+
+    /**
+     * Refresh only the Eclipse projects that own the changed files,
+     * using DEPTH_ZERO on each file instead of DEPTH_INFINITE on every project.
+     */
+    private void refreshAffectedProjects(DidChangeWatchedFilesParams params) {
+        java.util.Set<org.eclipse.core.resources.IProject> refreshed = new java.util.HashSet<>();
+        for (FileEvent event : params.getChanges()) {
+            try {
+                URI fileUri = URI.create(event.getUri());
+                org.eclipse.core.resources.IFile[] files =
+                        ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri);
+                for (org.eclipse.core.resources.IFile file : files) {
+                    org.eclipse.core.resources.IProject project = file.getProject();
+                    if (project != null && project.isOpen() && refreshed.add(project)) {
+                        project.refreshLocal(
+                                org.eclipse.core.resources.IResource.DEPTH_ONE,
+                                new org.eclipse.core.runtime.NullProgressMonitor());
+                    }
+                }
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                        "Failed to refresh affected project for: " + event.getUri(), e);
             }
         }
     }

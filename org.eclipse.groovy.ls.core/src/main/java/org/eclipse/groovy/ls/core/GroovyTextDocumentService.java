@@ -158,9 +158,11 @@ public class GroovyTextDocumentService implements TextDocumentService {
         String uri = params.getTextDocument().getUri();
         GroovyLanguageServerPlugin.logInfo("Document saved: " + uri);
 
-        // Trigger a full build and re-publish diagnostics
+        // Use debounced diagnostics (same as didChange) so that the save
+        // coalesces with any pending didChange debounce instead of running
+        // a redundant third reconcile.
         if (server.areDiagnosticsEnabled()) {
-            diagnosticsProvider.publishDiagnostics(uri);
+            diagnosticsProvider.publishDiagnosticsDebounced(uri);
         }
     }
 

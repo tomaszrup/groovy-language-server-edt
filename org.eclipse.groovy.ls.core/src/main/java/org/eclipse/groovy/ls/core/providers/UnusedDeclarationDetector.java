@@ -211,6 +211,11 @@ public class UnusedDeclarationDetector {
             // named "test*" are likely JUnit 3 tests
             IType declaringType = method.getDeclaringType();
             if (declaringType != null && isTestType(declaringType)) {
+                // Spock specifications: all methods are framework-managed
+                // (feature methods use string names, plus setup/cleanup/helpers)
+                if (isSpockSpecification(declaringType)) {
+                    return true;
+                }
                 String name = method.getElementName();
                 if (name.startsWith("test")) {
                     return true;
@@ -266,6 +271,23 @@ public class UnusedDeclarationDetector {
             return false;
         } catch (Exception e) {
             return true; // err on the side of not fading
+        }
+    }
+
+    /**
+     * Check if a type is a Spock specification (extends Specification).
+     * In Spock, all methods inside a specification are framework-managed:
+     * feature methods use string names, and lifecycle/helper methods are
+     * invoked by the Spock runner.
+     */
+    private static boolean isSpockSpecification(IType type) {
+        try {
+            String superclassName = type.getSuperclassName();
+            return superclassName != null
+                    && (superclassName.equals("Specification")
+                        || superclassName.equals("spock.lang.Specification"));
+        } catch (Exception e) {
+            return false;
         }
     }
 
