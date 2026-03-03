@@ -86,6 +86,12 @@ public class DiagnosticsProvider {
                 t.setDaemon(true);
                 return t;
             });
+    // Limit concurrent JDT reconciles. reconcile(getJLSLatest()) is expensive
+    // (~1-5s per file in large workspaces). If all threads are doing reconcile,
+    // no more diagnostics can be scheduled. The semaphore lets us fall back to
+    // fast syntax-only diagnostics when the limit is reached.
+    private final java.util.concurrent.Semaphore reconcileSemaphore =
+            new java.util.concurrent.Semaphore(2);
 
     public DiagnosticsProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -224,16 +230,33 @@ public class DiagnosticsProvider {
         }
 
         try {
-            // Approach 1: Get problems from the working copy reconciliation
+            // Approach 1: Get problems from the working copy reconciliation.
+            // Use a semaphore to prevent all threads from blocking in reconcile()
+            // simultaneously — excess requests fall through to the faster
+            // standalone Groovy compiler instead of queueing.
             ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
             if (workingCopy != null) {
-                collectFromWorkingCopy(workingCopy, diagnostics, content);
+                boolean gotPermit = reconcileSemaphore.tryAcquire();
+                if (gotPermit) {
+                    try {
+                        collectFromWorkingCopy(workingCopy, diagnostics, content);
 
-                // Also get problems from resource markers (for saved files)
-                IFile[] files = ResourcesPlugin.getWorkspace().getRoot()
-                        .findFilesForLocationURI(URI.create(uri));
-                if (files.length > 0) {
-                collectFromMarkers(files[0], diagnostics, content);
+                        // Also get problems from resource markers (for saved files)
+                        IFile[] files = ResourcesPlugin.getWorkspace().getRoot()
+                                .findFilesForLocationURI(URI.create(uri));
+                        if (files.length > 0) {
+                            collectFromMarkers(files[0], diagnostics, content);
+                        }
+                    } finally {
+                        reconcileSemaphore.release();
+                    }
+                } else {
+                    // All reconcile slots are busy — use fast syntax-only diagnostics.
+                    // This file will get full JDT diagnostics on the next change or
+                    // when publishDiagnosticsForOpenDocuments() runs after a build.
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[diag-trace] Reconcile slots busy, syntax-only for " + uri);
+                    collectFromGroovyCompiler(uri, diagnostics);
                 }
             } else {
                 // Fallback: use standalone Groovy compiler for syntax diagnostics

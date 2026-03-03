@@ -251,10 +251,20 @@ public class GroovyWorkspaceService implements WorkspaceService {
                     "[diag-trace] didChangeWatchedFiles sourceChanged=true javaChanged="
                             + summary.hasJavaSourceChange + " -> refresh diagnostics");
             if (summary.hasJavaSourceChange) {
-                // Debounce: rapid Java saves don't each trigger a full build
+                // Java source changed — need a workspace build so that Groovy
+                // files that reference the changed Java types get updated.
                 server.scheduleDebouncedBuild();
             } else {
-                server.getGroovyTextDocumentService().publishDiagnosticsForOpenDocuments();
+                // Only Groovy/resource files changed — publish diagnostics for
+                // just the changed files, not every open file in the workspace.
+                // The didSave handler already covers the active editor; this
+                // handles external edits (e.g. git checkout, formatter, etc.).
+                for (org.eclipse.lsp4j.FileEvent event : params.getChanges()) {
+                    String uri = event.getUri();
+                    if (isSourceFileUri(uri)) {
+                        server.getGroovyTextDocumentService().publishDiagnosticsIfEnabled(uri);
+                    }
+                }
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to handle file changes", e);
