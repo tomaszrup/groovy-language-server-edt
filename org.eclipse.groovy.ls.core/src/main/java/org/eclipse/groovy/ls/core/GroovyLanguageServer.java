@@ -98,6 +98,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private volatile boolean initialBuildDone = false;
     private volatile boolean diagnosticsEnabled = false;
     private volatile boolean firstFullBuildComplete = false;
+    private volatile boolean buildInProgress = false;
     private java.util.concurrent.ScheduledFuture<?> initialBuildTimer;
     private volatile java.util.concurrent.ScheduledFuture<?> debouncedBuildFuture;
     private static final long BUILD_DEBOUNCE_MS = 3000;
@@ -353,10 +354,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 GroovyLanguageServerPlugin.logInfo("Triggering INCREMENTAL workspace build...");
             }
             GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerBuild start (kind=" + buildKind + ")");
+            buildInProgress = true;
             try {
                 ResourcesPlugin.getWorkspace().build(buildKind, new NullProgressMonitor());
-
-                textDocumentService.publishDiagnosticsForOpenDocuments();
 
                 firstFullBuildComplete = true;
                 GroovyLanguageServerPlugin.logInfo("Build completed (kind=" + buildKind + ").");
@@ -364,7 +364,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Build failed (kind=" + buildKind + ")", e);
                 sendStatus("Error", "Build failed: " + e.getMessage());
+            } finally {
+                buildInProgress = false;
             }
+
+            // Now that the workspace lock is released, publish full JDT-based
+            // diagnostics for every open file.
+            textDocumentService.publishDiagnosticsForOpenDocuments();
         });
     }
 
@@ -888,6 +894,15 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     public boolean areDiagnosticsEnabled() {
         return diagnosticsEnabled;
+    }
+
+    /**
+     * Returns {@code true} while a workspace build is in progress.
+     * Callers should avoid blocking JDT operations (reconcile, search)
+     * during this time to prevent thread pool exhaustion.
+     */
+    public boolean isBuildInProgress() {
+        return buildInProgress;
     }
 
     /**

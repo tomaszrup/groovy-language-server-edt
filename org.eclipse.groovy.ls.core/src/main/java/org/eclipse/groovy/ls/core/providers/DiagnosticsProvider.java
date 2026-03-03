@@ -70,6 +70,8 @@ public class DiagnosticsProvider {
     private LanguageClient client;
     private final java.util.concurrent.atomic.AtomicReference<java.util.function.Predicate<String>> classpathAvailableForUri =
             new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<java.util.function.BooleanSupplier> buildInProgressSupplier =
+            new java.util.concurrent.atomic.AtomicReference<>(() -> false);
         private final java.util.Map<String, List<Diagnostic>> latestDiagnosticsByUri =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -101,6 +103,16 @@ public class DiagnosticsProvider {
      */
     public void setClasspathChecker(java.util.function.Predicate<String> checker) {
         this.classpathAvailableForUri.set(checker);
+    }
+
+    /**
+     * Set a supplier that returns {@code true} while a workspace build is
+     * in progress.  When true, diagnostics will skip JDT reconcile (which
+     * blocks on the workspace lock) and use the standalone Groovy compiler
+     * for fast, non-blocking syntax diagnostics instead.
+     */
+    public void setBuildInProgressSupplier(java.util.function.BooleanSupplier supplier) {
+        this.buildInProgressSupplier.set(supplier);
     }
 
     /**
@@ -190,6 +202,24 @@ public class DiagnosticsProvider {
                     "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
             }
             diagnostics.add(createNoClasspathWarning(content));
+            return diagnostics;
+        }
+
+        // When a build is in progress, the workspace lock is held and any
+        // JDT reconcile() call would block this thread indefinitely.  Use
+        // fast syntax-only diagnostics from the standalone Groovy compiler
+        // instead.  Full JDT diagnostics are published automatically after
+        // the build completes.
+        boolean buildRunning = buildInProgressSupplier.get().getAsBoolean();
+        if (buildRunning) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] Build in progress → syntax-only diagnostics for " + uri);
+            try {
+                collectFromGroovyCompiler(uri, diagnostics);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                    "Failed to collect syntax diagnostics (build in progress) for " + uri, e);
+            }
             return diagnostics;
         }
 
