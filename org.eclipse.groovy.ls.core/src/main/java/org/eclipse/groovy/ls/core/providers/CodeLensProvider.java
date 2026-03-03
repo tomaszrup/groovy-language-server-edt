@@ -11,8 +11,6 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
@@ -48,6 +46,8 @@ import org.eclipse.lsp4j.Range;
  * only, and {@code resolveCodeLens} performs the actual reference count.
  */
 public class CodeLensProvider {
+
+    private static final String HANDLE_ID_KEY = "handleId";
 
     private final DocumentManager documentManager;
 
@@ -106,8 +106,8 @@ public class CodeLensProvider {
             String handleId = null;
             if (dataElement.isJsonObject()) {
                 JsonObject obj = dataElement.getAsJsonObject();
-                if (obj.has("handleId")) {
-                    handleId = obj.get("handleId").getAsString();
+                if (obj.has(HANDLE_ID_KEY)) {
+                    handleId = obj.get(HANDLE_ID_KEY).getAsString();
                 }
             }
 
@@ -184,7 +184,7 @@ public class CodeLensProvider {
 
             // Store handle identifier (kept for compatibility)
             JsonObject data = new JsonObject();
-            data.addProperty("handleId", element.getHandleIdentifier());
+            data.addProperty(HANDLE_ID_KEY, element.getHandleIdentifier());
             lens.setData(data);
 
             return lens;
@@ -198,7 +198,7 @@ public class CodeLensProvider {
     /**
      * Count references to an element using JDT SearchEngine.
      */
-    private int countReferences(IJavaElement element) throws Exception {
+    private int countReferences(IJavaElement element) throws org.eclipse.core.runtime.CoreException {
         SearchPattern pattern = SearchPattern.createPattern(
                 element, IJavaSearchConstants.REFERENCES);
         if (pattern == null) {

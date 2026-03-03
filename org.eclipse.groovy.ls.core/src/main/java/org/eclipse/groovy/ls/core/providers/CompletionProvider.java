@@ -192,6 +192,7 @@ public class CompletionProvider {
     private static final List<String> KEYWORD_COMMIT_CHARS = List.of(" ");
 
     private static final Gson GSON = new Gson();
+    private static final String PARAM_COUNT_KEY = "paramCount";
 
     public CompletionProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -278,63 +279,12 @@ public class CompletionProvider {
         }
 
         try {
-            JsonElement dataElement;
-            if (item.getData() instanceof JsonElement je) {
-                dataElement = je;
-            } else {
-                dataElement = GSON.toJsonTree(item.getData());
-            }
-
-            if (!dataElement.isJsonObject()) {
+            JsonObject data = parseItemData(item);
+            if (data == null) {
                 return item;
             }
 
-            JsonObject data = dataElement.getAsJsonObject();
-            String kind = getJsonString(data, "kind");
-            if (kind == null) {
-                return item;
-            }
-
-            String fqn = getJsonString(data, "fqn");
-            String elementName = getJsonString(data, "name");
-
-            IJavaProject project = findOpenWorkspaceJavaProject();
-            if (project == null || fqn == null) {
-                return item;
-            }
-
-            IType type = project.findType(fqn);
-            if (type == null || !type.exists()) {
-                return item;
-            }
-
-            String documentation = null;
-
-            switch (kind) {
-                case "method": {
-                    if (elementName == null) break;
-                    IMethod method = findMethodInType(type, elementName, data);
-                    if (method != null) {
-                        documentation = getJavadocForMember(method);
-                    }
-                    break;
-                }
-                case "field": {
-                    if (elementName == null) break;
-                    IField field = type.getField(elementName);
-                    if (field != null && field.exists()) {
-                        documentation = getJavadocForMember(field);
-                    }
-                    break;
-                }
-                case "type": {
-                    documentation = getJavadocForMember(type);
-                    break;
-                }
-                default:
-                    break;
-            }
-
+            String documentation = resolveDocumentation(data);
             if (documentation != null && !documentation.isEmpty()) {
                 MarkupContent markup = new MarkupContent();
                 markup.setKind(MarkupKind.MARKDOWN);
@@ -348,15 +298,66 @@ public class CompletionProvider {
         return item;
     }
 
+    private JsonObject parseItemData(CompletionItem item) {
+        JsonElement dataElement;
+        if (item.getData() instanceof JsonElement je) {
+            dataElement = je;
+        } else {
+            dataElement = GSON.toJsonTree(item.getData());
+        }
+        return dataElement.isJsonObject() ? dataElement.getAsJsonObject() : null;
+    }
+
+    private String resolveDocumentation(JsonObject data) throws JavaModelException {
+        String kind = getJsonString(data, "kind");
+        if (kind == null) {
+            return null;
+        }
+
+        String fqn = getJsonString(data, "fqn");
+        String elementName = getJsonString(data, "name");
+
+        IJavaProject project = findOpenWorkspaceJavaProject();
+        if (project == null || fqn == null) {
+            return null;
+        }
+
+        IType type = project.findType(fqn);
+        if (type == null || !type.exists()) {
+            return null;
+        }
+
+        return resolveDocumentationForKind(kind, type, elementName, data);
+    }
+
+    private String resolveDocumentationForKind(String kind, IType type,
+                                                String elementName, JsonObject data) {
+        switch (kind) {
+            case "method": {
+                if (elementName == null) return null;
+                IMethod method = findMethodInType(type, elementName, data);
+                return method != null ? getJavadocForMember(method) : null;
+            }
+            case "field": {
+                if (elementName == null) return null;
+                IField field = type.getField(elementName);
+                return (field != null && field.exists()) ? getJavadocForMember(field) : null;
+            }
+            case "type":
+                return getJavadocForMember(type);
+            default:
+                return null;
+        }
+    }
+
     private IMethod findMethodInType(IType type, String name, JsonObject data) {
         try {
             // Try to match by parameter count first
-            int paramCount = data.has("paramCount") ? data.get("paramCount").getAsInt() : -1;
+            int paramCount = data.has(PARAM_COUNT_KEY) ? data.get(PARAM_COUNT_KEY).getAsInt() : -1;
             for (IMethod method : type.getMethods()) {
-                if (method.getElementName().equals(name)) {
-                    if (paramCount < 0 || method.getParameterTypes().length == paramCount) {
-                        return method;
-                    }
+                if (method.getElementName().equals(name)
+                        && (paramCount < 0 || method.getParameterTypes().length == paramCount)) {
+                    return method;
                 }
             }
         } catch (Exception e) {
@@ -371,51 +372,70 @@ public class CompletionProvider {
     private String getJavadocForMember(IJavaElement element) {
         try {
             // Try JDT attached Javadoc first
-            if (element instanceof org.eclipse.jdt.core.IMember member) {
-                String attached = member.getAttachedJavadoc(null);
-                if (attached != null && !attached.isEmpty()) {
-                    return attached;
-                }
+            String attached = getAttachedJavadoc(element);
+            if (attached != null) {
+                return attached;
             }
 
             // Try source JAR approach
-            IType ownerType = null;
-            if (element instanceof IType t) {
-                ownerType = t;
-            } else {
-                IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
-                if (ancestor instanceof IType t) {
-                    ownerType = t;
-                }
-            }
-
-            if (ownerType != null) {
-                String fqn = ownerType.getFullyQualifiedName();
-                String source = null;
-
-                if (ownerType.getClassFile() != null) {
-                    java.io.File sourcesJar = SourceJarHelper.findSourcesJar(ownerType);
-                    if (sourcesJar != null) {
-                        source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-                    }
-                }
-
-                if (source == null || source.isEmpty()) {
-                    source = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
-                }
-
-                if (source != null && !source.isEmpty()) {
-                    if (element instanceof IType) {
-                        return SourceJarHelper.extractJavadoc(source, ownerType.getElementName());
-                    } else {
-                        return SourceJarHelper.extractMemberJavadoc(source, element.getElementName());
-                    }
-                }
-            }
+            return getJavadocFromSource(element);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[completion] Javadoc resolution failed for " + element.getElementName(), e);
         }
         return null;
+    }
+
+    private String getAttachedJavadoc(IJavaElement element) throws JavaModelException {
+        if (element instanceof org.eclipse.jdt.core.IMember member) {
+            String attached = member.getAttachedJavadoc(null);
+            if (attached != null && !attached.isEmpty()) {
+                return attached;
+            }
+        }
+        return null;
+    }
+
+    private String getJavadocFromSource(IJavaElement element) {
+        IType ownerType = resolveOwnerType(element);
+        if (ownerType == null) {
+            return null;
+        }
+
+        String source = readSourceForType(ownerType);
+        if (source == null || source.isEmpty()) {
+            return null;
+        }
+
+        if (element instanceof IType) {
+            return SourceJarHelper.extractJavadoc(source, ownerType.getElementName());
+        }
+        return SourceJarHelper.extractMemberJavadoc(source, element.getElementName());
+    }
+
+    private IType resolveOwnerType(IJavaElement element) {
+        if (element instanceof IType t) {
+            return t;
+        }
+        IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
+        return ancestor instanceof IType t ? t : null;
+    }
+
+    private String readSourceForType(IType ownerType) {
+        String fqn = ownerType.getFullyQualifiedName();
+        String source = null;
+
+        if (ownerType.getClassFile() != null) {
+            java.io.File sourcesJar = SourceJarHelper.findSourcesJar(ownerType);
+            if (sourcesJar != null) {
+                source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
+            }
+        }
+
+        if (source == null || source.isEmpty()) {
+            source = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
+        }
+
+        return source;
     }
 
     private static String getJsonString(JsonObject obj, String key) {
@@ -762,71 +782,73 @@ public class CompletionProvider {
                                                    IType owner, String sortPrefix) {
         CompletionItem item = new CompletionItem();
         try {
-            // Label: name(ParamType1 p1, ParamType2 p2)
             String[] paramTypes = method.getParameterTypes();
             String[] paramNames = method.getParameterNames();
-            StringBuilder label = new StringBuilder(name).append('(');
-            for (int i = 0; i < paramTypes.length; i++) {
-                if (i > 0) label.append(", ");
-                label.append(Signature.toString(paramTypes[i]));
-                if (i < paramNames.length) {
-                    label.append(' ').append(paramNames[i]);
-                }
-            }
-            label.append(')');
-            item.setLabel(label.toString());
 
-            // Detail: returnType — DeclaringClass
-            String returnType = Signature.toString(method.getReturnType());
-            item.setDetail(returnType + " — " + owner.getElementName());
-
-            // Kind
+            item.setLabel(buildMethodLabel(name, paramTypes, paramNames));
+            item.setDetail(Signature.toString(method.getReturnType()) + " — " + owner.getElementName());
             item.setKind(method.isConstructor()
                     ? CompletionItemKind.Constructor : CompletionItemKind.Method);
-
-            // Insert text as snippet with parameter placeholders
-            if (paramNames.length > 0) {
-                StringBuilder snippet = new StringBuilder(name).append('(');
-                for (int i = 0; i < paramNames.length; i++) {
-                    if (i > 0) snippet.append(", ");
-                    snippet.append("${").append(i + 1).append(':')
-                            .append(paramNames[i]).append('}');
-                }
-                snippet.append(')');
-                item.setInsertText(snippet.toString());
-                item.setInsertTextFormat(InsertTextFormat.Snippet);
-            } else {
-                item.setInsertText(name + "()");
-                item.setInsertTextFormat(InsertTextFormat.PlainText);
-            }
-
+            setMethodInsertText(item, name, paramNames);
             item.setFilterText(name);
             item.setCommitCharacters(METHOD_COMMIT_CHARS);
-
-            // Deprecation marking
-            boolean deprecated = Flags.isDeprecated(method.getFlags());
-            if (deprecated) {
-                item.setTags(List.of(CompletionItemTag.Deprecated));
-                item.setSortText(sortPrefix + "z_" + name);
-            } else if (OBJECT_METHODS.contains(name)) {
-                // Push Object methods below other supertype members
-                item.setSortText("1y_" + name);
-            } else {
-                item.setSortText(sortPrefix + "_" + name);
-            }
+            setMethodSortText(item, method, name, sortPrefix);
 
             // Store data for lazy resolution
             JsonObject data = new JsonObject();
             data.addProperty("kind", "method");
             data.addProperty("fqn", owner.getFullyQualifiedName());
             data.addProperty("name", name);
-            data.addProperty("paramCount", method.getParameterTypes().length);
+            data.addProperty(PARAM_COUNT_KEY, method.getParameterTypes().length);
             item.setData(data);
         } catch (Exception e) {
             item.setLabel(name);
             item.setInsertText(name);
         }
         return item;
+    }
+
+    private String buildMethodLabel(String name, String[] paramTypes, String[] paramNames) {
+        StringBuilder label = new StringBuilder(name).append('(');
+        for (int i = 0; i < paramTypes.length; i++) {
+            if (i > 0) label.append(", ");
+            label.append(Signature.toString(paramTypes[i]));
+            if (i < paramNames.length) {
+                label.append(' ').append(paramNames[i]);
+            }
+        }
+        label.append(')');
+        return label.toString();
+    }
+
+    private void setMethodInsertText(CompletionItem item, String name, String[] paramNames) {
+        if (paramNames.length > 0) {
+            StringBuilder snippet = new StringBuilder(name).append('(');
+            for (int i = 0; i < paramNames.length; i++) {
+                if (i > 0) snippet.append(", ");
+                snippet.append("${").append(i + 1).append(':')
+                        .append(paramNames[i]).append('}');
+            }
+            snippet.append(')');
+            item.setInsertText(snippet.toString());
+            item.setInsertTextFormat(InsertTextFormat.Snippet);
+        } else {
+            item.setInsertText(name + "()");
+            item.setInsertTextFormat(InsertTextFormat.PlainText);
+        }
+    }
+
+    private void setMethodSortText(CompletionItem item, IMethod method,
+                                    String name, String sortPrefix) throws JavaModelException {
+        boolean deprecated = Flags.isDeprecated(method.getFlags());
+        if (deprecated) {
+            item.setTags(List.of(CompletionItemTag.Deprecated));
+            item.setSortText(sortPrefix + "z_" + name);
+        } else if (OBJECT_METHODS.contains(name)) {
+            item.setSortText("1y_" + name);
+        } else {
+            item.setSortText(sortPrefix + "_" + name);
+        }
     }
 
     // =========================================================================
@@ -1677,34 +1699,39 @@ public class CompletionProvider {
         if (block == null) return null;
 
         for (Statement stmt : block.getStatements()) {
-            if (!(stmt instanceof ExpressionStatement exprStmt)) continue;
-            if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) continue;
-
-            Expression left = decl.getLeftExpression();
-            if (!(left instanceof VariableExpression varExpr)) continue;
-            if (!varName.equals(varExpr.getName())) continue;
-
-            // Found the declaration — determine the type
-            Expression initializer = decl.getRightExpression();
-
-            // "def x = new Foo()" → use the constructor call type directly
-            if (initializer instanceof ConstructorCallExpression ctorCall) {
-                return ctorCall.getType();
-            }
-
-            // Typed declaration (e.g. "String x = ...") → use the declared type
-            ClassNode originType = varExpr.getOriginType();
-            if (originType != null
-                    && !"java.lang.Object".equals(originType.getName())) {
-                return originType;
-            }
-
-            // Fallback: use the initializer expression's inferred type
-            if (initializer != null) {
-                return initializer.getType();
+            ClassNode resolved = resolveVariableFromStatement(stmt, varName);
+            if (resolved != null) {
+                return resolved;
             }
         }
         return null;
+    }
+
+    private ClassNode resolveVariableFromStatement(Statement stmt, String varName) {
+        if (!(stmt instanceof ExpressionStatement exprStmt)) return null;
+        if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) return null;
+
+        Expression left = decl.getLeftExpression();
+        if (!(left instanceof VariableExpression varExpr)) return null;
+        if (!varName.equals(varExpr.getName())) return null;
+
+        // Found the declaration — determine the type
+        Expression initializer = decl.getRightExpression();
+
+        // "def x = new Foo()" → use the constructor call type directly
+        if (initializer instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+
+        // Typed declaration (e.g. "String x = ...") → use the declared type
+        ClassNode originType = varExpr.getOriginType();
+        if (originType != null
+                && !"java.lang.Object".equals(originType.getName())) {
+            return originType;
+        }
+
+        // Fallback: use the initializer expression's inferred type
+        return initializer != null ? initializer.getType() : null;
     }
 
     private ClassNode resolveClassMemberExpressionType(ClassNode classNode, String exprName) {

@@ -179,26 +179,6 @@ class DefinitionProviderTest {
         assertTrue(found == null || found.isScript(), "Expected null or script class fallback");
     }
 
-    // ---- findClassBySimpleName ----
-
-    @Test
-    void findClassBySimpleNameFindsClass() throws Exception {
-        ModuleNode module = parseModule("class Alpha {}\nclass Beta {}",
-                "file:///FindByName.groovy");
-        ClassNode found = invokeFindClassBySimpleName(module, "Beta");
-        assertNotNull(found);
-        assertEquals("Beta", found.getNameWithoutPackage());
-    }
-
-    @Test
-    void findClassBySimpleNameReturnsNullForMissing() throws Exception {
-        ModuleNode module = parseModule("class Alpha {}",
-                "file:///FindByNameNull.groovy");
-        assertNull(invokeFindClassBySimpleName(module, "Gamma"));
-        assertNull(invokeFindClassBySimpleName(module, null));
-        assertNull(invokeFindClassBySimpleName(module, ""));
-    }
-
     // ---- findMemberDeclarationInClass ----
 
     @Test
@@ -353,13 +333,6 @@ class DefinitionProviderTest {
     }
 
     @Test
-    void findClassBySimpleNameWithPackage() throws Exception {
-        ModuleNode module = parseModule("package demo\nclass Alpha {}", "file:///PkgFindName.groovy");
-        ClassNode found = invokeFindClassBySimpleName(module, "Alpha");
-        assertNotNull(found);
-    }
-
-    @Test
     void getDefinitionFromGroovyASTFindsFieldByName() throws Exception {
         String uri = "file:///DefASTField.groovy";
         String content = """
@@ -469,13 +442,6 @@ class DefinitionProviderTest {
         Method m = DefinitionProvider.class.getDeclaredMethod("findEnclosingClass", ModuleNode.class, int.class);
         m.setAccessible(true);
         return (ClassNode) m.invoke(provider, module, targetLine);
-    }
-
-    private ClassNode invokeFindClassBySimpleName(ModuleNode module, String simpleName) throws Exception {
-        Method m = DefinitionProvider.class.getDeclaredMethod("findClassBySimpleName",
-                ModuleNode.class, String.class);
-        m.setAccessible(true);
-        return (ClassNode) m.invoke(provider, module, simpleName);
     }
 
     private Location invokeFindMemberDeclarationInClass(ClassNode classNode, String word,

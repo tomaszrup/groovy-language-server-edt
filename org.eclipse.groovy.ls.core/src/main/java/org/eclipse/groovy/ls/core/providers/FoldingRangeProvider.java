@@ -13,19 +13,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.codehaus.groovy.ast.ClassNode;
-import org.codehaus.groovy.ast.FieldNode;
-import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
-import org.codehaus.groovy.ast.PropertyNode;
-import org.codehaus.groovy.ast.stmt.BlockStatement;
-import org.codehaus.groovy.ast.stmt.Statement;
 import org.eclipse.groovy.ls.core.DocumentManager;
-import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.lsp4j.FoldingRange;
 import org.eclipse.lsp4j.FoldingRangeKind;
 import org.eclipse.lsp4j.FoldingRangeRequestParams;
-import org.eclipse.lsp4j.Position;
 
 /**
  * Provides folding ranges for Groovy documents.
@@ -99,24 +92,36 @@ public class FoldingRangeProvider {
      */
     void addCommentFolding(String content, List<FoldingRange> ranges) {
         String[] lines = content.split("\n", -1);
-        for (int i = 0; i < lines.length; i++) {
+        int i = 0;
+        while (i < lines.length) {
             String trimmed = lines[i].trim();
             if (trimmed.startsWith("/*")) {
-                int startLine = i;
-                // Find the end of the comment
-                for (int j = i; j < lines.length; j++) {
-                    if (lines[j].contains("*/")) {
-                        if (j > startLine) {
-                            FoldingRange range = new FoldingRange(startLine, j);
-                            range.setKind(FoldingRangeKind.Comment);
-                            ranges.add(range);
-                        }
-                        i = j; // skip past
-                        break;
-                    }
+                int endLine = findCommentEnd(lines, i);
+                if (endLine > i) {
+                    FoldingRange range = new FoldingRange(i, endLine);
+                    range.setKind(FoldingRangeKind.Comment);
+                    ranges.add(range);
+                    i = endLine + 1;
+                } else {
+                    i++;
                 }
+            } else {
+                i++;
             }
         }
+    }
+
+    /**
+     * Find the end line of a block comment starting at {@code startLine}.
+     * Returns {@code -1} if the closing {@code * /} is not found.
+     */
+    private int findCommentEnd(String[] lines, int startLine) {
+        for (int j = startLine; j < lines.length; j++) {
+            if (lines[j].contains("*/")) {
+                return j > startLine ? j : -1;
+            }
+        }
+        return -1;
     }
 
     /**

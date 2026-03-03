@@ -249,7 +249,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
                     "[diag-trace] didChangeWatchedFiles sourceChanged=true javaChanged="
                             + summary.hasJavaSourceChange + " -> refresh diagnostics");
             if (summary.hasJavaSourceChange) {
-                server.getGroovyTextDocumentService().triggerFullBuild(server);
+                server.triggerFullBuild();
             } else {
                 server.getGroovyTextDocumentService().publishDiagnosticsForOpenDocuments();
             }
@@ -524,7 +524,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             try {
                 if (javaRename) {
                     GroovyLanguageServerPlugin.logInfo("[rename-trace] didRenameFiles: triggerFullBuild");
-                    server.getGroovyTextDocumentService().triggerFullBuild(server);
+                    server.triggerFullBuild();
                 } else {
                     GroovyLanguageServerPlugin.logInfo("[rename-trace] didRenameFiles: publish open diagnostics");
                     server.getGroovyTextDocumentService().publishDiagnosticsForOpenDocuments();

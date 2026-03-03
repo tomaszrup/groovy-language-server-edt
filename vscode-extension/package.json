@@ -32,7 +32,6 @@
         "redhat.java"
     ],
     "activationEvents": [
-        "onLanguage:groovy",
         "workspaceContains:**/*.groovy"
     ],
     "main": "./dist/extension.js",

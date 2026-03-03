@@ -51,9 +51,36 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either;
 public class InlayHintProvider {
 
     private final DocumentManager documentManager;
+    private final java.util.concurrent.atomic.AtomicReference<InlayHintSettings> currentSettings =
+            new java.util.concurrent.atomic.AtomicReference<>(InlayHintSettings.defaults());
 
     public InlayHintProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
+    }
+
+    /**
+     * Update the inlay hint settings.
+     */
+    public void updateSettings(InlayHintSettings settings) {
+        if (settings != null) {
+            this.currentSettings.set(settings);
+        }
+    }
+
+    /**
+     * Update settings from a generic Object (avoids coupling callers to InlayHintSettings).
+     */
+    public void updateSettingsFromObject(Object settings) {
+        if (settings instanceof InlayHintSettings s) {
+            updateSettings(s);
+        }
+    }
+
+    /**
+     * Compute inlay hints for the given document range using the current settings.
+     */
+    public List<InlayHint> getInlayHints(InlayHintParams params) {
+        return getInlayHints(params, currentSettings.get());
     }
 
     /**

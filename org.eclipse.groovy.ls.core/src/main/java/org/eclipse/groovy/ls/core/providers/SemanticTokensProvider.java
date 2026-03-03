@@ -283,44 +283,59 @@ public class SemanticTokensProvider {
             GroovyCompilerService compilerService = documentManager.getCompilerService();
 
             // First try: parse the content as-is
-            GroovyCompilerService.ParseResult result = compilerService.parse(uri, content);
-            if (result.hasAST()) {
-                ModuleNode module = result.getModuleNode();
-                int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
-                GroovyLanguageServerPlugin.logInfo(
-                        "[semantic] Standalone compiler fallback for " + uri + " classes=" + classCount);
-                if (classCount > 0) {
-                    return module;
-                }
+            ModuleNode module = tryParseContent(compilerService, uri, content);
+            if (module != null) {
+                return module;
             }
 
-            // Second try: blank out lines that have errors and re-parse.
-            // The compiler tells us where the errors are — by removing those lines
-            // we often recover the surrounding class/method structure.
-            if (result.getErrors() != null && !result.getErrors().isEmpty()) {
-                String patched = blankErrorLines(content, result.getErrors());
-                if (patched != null) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[semantic] Trying error-line-blanked content for " + uri);
-                    // Use a synthetic URI so we don't pollute the cache for the real file
-                    GroovyCompilerService.ParseResult patchedResult =
-                            compilerService.parse(uri + "#semantic-patched", patched);
-                    if (patchedResult.hasAST()) {
-                        ModuleNode module = patchedResult.getModuleNode();
-                        int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[semantic] Error-line-blanked content for " + uri + " classes=" + classCount);
-                        if (classCount > 0) {
-                            return module;
-                        }
-                    }
-                }
-            }
+            // Second try: blank out lines that have errors and re-parse
+            GroovyCompilerService.ParseResult result = compilerService.parse(uri, content);
+            return tryParsePatchedContent(compilerService, uri, content, result);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "[semantic] Standalone compiler fallback failed for " + uri, e);
         }
         return null;
+    }
+
+    private ModuleNode tryParseContent(GroovyCompilerService compilerService,
+                                        String uri, String content) {
+        GroovyCompilerService.ParseResult result = compilerService.parse(uri, content);
+        if (!result.hasAST()) {
+            return null;
+        }
+        ModuleNode module = result.getModuleNode();
+        int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
+        GroovyLanguageServerPlugin.logInfo(
+                "[semantic] Standalone compiler fallback for " + uri + " classes=" + classCount);
+        return classCount > 0 ? module : null;
+    }
+
+    private ModuleNode tryParsePatchedContent(GroovyCompilerService compilerService,
+                                               String uri, String content,
+                                               GroovyCompilerService.ParseResult result) {
+        if (result.getErrors() == null || result.getErrors().isEmpty()) {
+            return null;
+        }
+
+        String patched = blankErrorLines(content, result.getErrors());
+        if (patched == null) {
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[semantic] Trying error-line-blanked content for " + uri);
+        GroovyCompilerService.ParseResult patchedResult =
+                compilerService.parse(uri + "#semantic-patched", patched);
+        if (!patchedResult.hasAST()) {
+            return null;
+        }
+
+        ModuleNode module = patchedResult.getModuleNode();
+        int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
+        GroovyLanguageServerPlugin.logInfo(
+                "[semantic] Error-line-blanked content for " + uri + " classes=" + classCount);
+        return classCount > 0 ? module : null;
     }
 
     /**

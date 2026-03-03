@@ -655,28 +655,18 @@ public class DocumentManager {
 
             for (String srcDir : candidateSrcDirs) {
                 IFolder folder = project.getFolder(srcDir);
-                if (folder != null && folder.exists()) {
-                    // Skip generic folders (e.g. "src") if we already added a
-                    // more specific sub-path (e.g. "src/main/java").  JDT does
-                    // not allow nesting source folders.
-                    boolean nestedConflict = false;
-                    for (String existing : addedSrcDirs) {
-                        if (existing.startsWith(srcDir + "/") || srcDir.startsWith(existing + "/")) {
-                            nestedConflict = true;
-                            break;
-                        }
-                    }
-                    if (nestedConflict) {
+                if (folder == null || !folder.exists() || hasNestedConflict(srcDir, addedSrcDirs)) {
+                    if (folder != null && folder.exists()) {
                         GroovyLanguageServerPlugin.logInfo(
                                 "[ext] Skipping nested source folder: " + srcDir);
-                        continue;
                     }
-                    entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
-                    addedSrcDirs.add(srcDir);
-                    foundAny = true;
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[ext] Added source folder: " + srcDir);
+                    continue;
                 }
+                entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
+                addedSrcDirs.add(srcDir);
+                foundAny = true;
+                GroovyLanguageServerPlugin.logInfo(
+                        "[ext] Added source folder: " + srcDir);
             }
 
             if (!foundAny) {
@@ -706,6 +696,19 @@ public class DocumentManager {
                     "Failed to configure classpath for external project "
                     + project.getName() + " (non-fatal): " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Check if {@code srcDir} conflicts with any already-added source directory.
+     * JDT does not allow nesting source folders.
+     */
+    private boolean hasNestedConflict(String srcDir, Set<String> addedSrcDirs) {
+        for (String existing : addedSrcDirs) {
+            if (existing.startsWith(srcDir + "/") || srcDir.startsWith(existing + "/")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

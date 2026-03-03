@@ -734,14 +734,11 @@ public class FormattingProvider {
      */
     private boolean isContinuationContext(char before, char after) {
         // Line ends with an operator / open delimiter → expression continues
-        if (".,([{+*/-=%?&|\\".indexOf(before) >= 0) {
+        if (".,([{+*/-=%?&|\\" .indexOf(before) >= 0) {
             return true;
         }
         // Line after starts with dot (chained call) or closing bracket
-        if (".)]},".indexOf(after) >= 0) {
-            return true;
-        }
-        return false;
+        return ".)]},".indexOf(after) >= 0;
     }
 
     // ================================================================

@@ -966,22 +966,6 @@ public class DefinitionProvider {
         return best;
     }
 
-    /**
-     * Find a class declaration by its simple name in the given module's AST.
-     * Returns the first matching {@link ClassNode}, or {@code null} if not found.
-     */
-    private ClassNode findClassBySimpleName(ModuleNode module, String simpleName) {
-        if (module == null || simpleName == null || simpleName.isEmpty()) {
-            return null;
-        }
-        for (ClassNode classNode : module.getClasses()) {
-            if (simpleName.equals(classNode.getNameWithoutPackage())) {
-                return classNode;
-            }
-        }
-        return null;
-    }
-
     private Location findMemberDeclarationInClass(ClassNode classNode, String word, String uri) {
         if (classNode == null) {
             return null;

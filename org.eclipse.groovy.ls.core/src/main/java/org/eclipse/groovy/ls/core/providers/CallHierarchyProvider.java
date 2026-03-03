@@ -29,7 +29,6 @@ import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
-import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMember;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.ISourceRange;
@@ -67,6 +66,8 @@ import org.eclipse.lsp4j.SymbolKind;
  * </ol>
  */
 public class CallHierarchyProvider {
+
+    private static final String HANDLE_ID_KEY = "handleId";
 
     private final DocumentManager documentManager;
 
@@ -216,7 +217,7 @@ public class CallHierarchyProvider {
                     recordOutgoingCall(call.getMethodAsString(),
                             call.getLineNumber(), call.getColumnNumber(),
                             call.getLastLineNumber(), call.getLastColumnNumber(),
-                            uri, content, callMap);
+                            callMap);
                     super.visitMethodCallExpression(call);
                 }
 
@@ -225,7 +226,7 @@ public class CallHierarchyProvider {
                     recordOutgoingCall(call.getMethodAsString(),
                             call.getLineNumber(), call.getColumnNumber(),
                             call.getLastLineNumber(), call.getLastColumnNumber(),
-                            uri, content, callMap);
+                            callMap);
                     super.visitStaticMethodCallExpression(call);
                 }
 
@@ -235,53 +236,69 @@ public class CallHierarchyProvider {
                     recordOutgoingCall(typeName,
                             call.getLineNumber(), call.getColumnNumber(),
                             call.getLastLineNumber(), call.getLastColumnNumber(),
-                            uri, content, callMap);
+                            callMap);
                     super.visitConstructorCallExpression(call);
                 }
             });
 
             // Try to resolve each outgoing call to a JDT element
             ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-            for (OutgoingCallData data : callMap.values()) {
-                CallHierarchyOutgoingCall outgoing = new CallHierarchyOutgoingCall();
-
-                // Try to resolve the call target via codeSelect
-                CallHierarchyItem toItem = null;
-                if (workingCopy != null && !data.ranges.isEmpty()) {
-                    Range firstRange = data.ranges.get(0);
-                    int callOffset = positionToOffset(content, firstRange.getStart());
-                    try {
-                        IJavaElement[] resolved = workingCopy.codeSelect(callOffset, 0);
-                        if (resolved != null && resolved.length > 0) {
-                            toItem = buildCallHierarchyItem(resolved[0]);
-                        }
-                    } catch (Exception e) {
-                        // codeSelect failed, create a stub item
-                    }
-                }
-
-                if (toItem == null) {
-                    // Create a stub item without JDT resolution
-                    toItem = new CallHierarchyItem();
-                    toItem.setName(data.name);
-                    toItem.setKind(SymbolKind.Method);
-                    toItem.setUri(uri);
-                    Range stubRange = data.ranges.isEmpty()
-                            ? new Range(new Position(0, 0), new Position(0, 0))
-                            : data.ranges.get(0);
-                    toItem.setRange(stubRange);
-                    toItem.setSelectionRange(stubRange);
-                }
-
-                outgoing.setTo(toItem);
-                outgoing.setFromRanges(data.ranges);
-                result.add(outgoing);
-            }
+            resolveOutgoingCalls(callMap, workingCopy, content, uri, result);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("getOutgoingCalls failed for " + uri, e);
         }
 
         return result;
+    }
+
+    // ---- Outgoing call resolution helpers ----
+
+    private void resolveOutgoingCalls(Map<String, OutgoingCallData> callMap,
+                                       ICompilationUnit workingCopy, String content,
+                                       String uri, List<CallHierarchyOutgoingCall> result) {
+        for (OutgoingCallData data : callMap.values()) {
+            CallHierarchyOutgoingCall outgoing = new CallHierarchyOutgoingCall();
+            CallHierarchyItem toItem = resolveCallTarget(workingCopy, content, data);
+
+            if (toItem == null) {
+                toItem = buildStubCallItem(data, uri);
+            }
+
+            outgoing.setTo(toItem);
+            outgoing.setFromRanges(data.ranges);
+            result.add(outgoing);
+        }
+    }
+
+    private CallHierarchyItem resolveCallTarget(ICompilationUnit workingCopy,
+                                                 String content, OutgoingCallData data) {
+        if (workingCopy == null || data.ranges.isEmpty()) {
+            return null;
+        }
+        Range firstRange = data.ranges.get(0);
+        int callOffset = positionToOffset(content, firstRange.getStart());
+        try {
+            IJavaElement[] resolved = workingCopy.codeSelect(callOffset, 0);
+            if (resolved != null && resolved.length > 0) {
+                return buildCallHierarchyItem(resolved[0]);
+            }
+        } catch (Exception e) {
+            // codeSelect failed, create a stub item
+        }
+        return null;
+    }
+
+    private CallHierarchyItem buildStubCallItem(OutgoingCallData data, String uri) {
+        CallHierarchyItem toItem = new CallHierarchyItem();
+        toItem.setName(data.name);
+        toItem.setKind(SymbolKind.Method);
+        toItem.setUri(uri);
+        Range stubRange = data.ranges.isEmpty()
+                ? new Range(new Position(0, 0), new Position(0, 0))
+                : data.ranges.get(0);
+        toItem.setRange(stubRange);
+        toItem.setSelectionRange(stubRange);
+        return toItem;
     }
 
     // ---- Internal data classes ----
@@ -363,8 +380,8 @@ public class CallHierarchyProvider {
     }
 
     private void recordOutgoingCall(String methodName, int startLine, int startCol,
-                                     int endLine, int endCol, String uri,
-                                     String content, Map<String, OutgoingCallData> callMap) {
+                                     int endLine, int endCol,
+                                     Map<String, OutgoingCallData> callMap) {
         if (methodName == null || methodName.isEmpty()) {
             return;
         }
@@ -437,7 +454,7 @@ public class CallHierarchyProvider {
 
             // Store handle identifier for later resolution
             JsonObject data = new JsonObject();
-            data.addProperty("handleId", element.getHandleIdentifier());
+            data.addProperty(HANDLE_ID_KEY, element.getHandleIdentifier());
             item.setData(data);
 
             return item;
@@ -461,8 +478,8 @@ public class CallHierarchyProvider {
             String handleId = null;
             if (dataElement.isJsonObject()) {
                 JsonObject obj = dataElement.getAsJsonObject();
-                if (obj.has("handleId")) {
-                    handleId = obj.get("handleId").getAsString();
+                if (obj.has(HANDLE_ID_KEY)) {
+                    handleId = obj.get(HANDLE_ID_KEY).getAsString();
                 }
             }
 

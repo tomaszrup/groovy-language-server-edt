@@ -330,7 +330,31 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         diagnosticsEnabled = true;
         initialBuildDone = true;
         sendStatus(STATUS_COMPILING, "Building workspace...");
-        textDocumentService.triggerFullBuild(this);
+        triggerFullBuild();
+    }
+
+    /**
+     * Trigger a full build of the workspace and publish diagnostics for all open documents.
+     * Sends status notifications (Compiling → Ready/Error) via the server.
+     */
+    void triggerFullBuild() {
+        java.util.concurrent.CompletableFuture.runAsync(() -> {
+            GroovyLanguageServerPlugin.logInfo("Triggering full workspace build...");
+            GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerFullBuild start");
+            try {
+                ResourcesPlugin.getWorkspace().build(
+                        org.eclipse.core.resources.IncrementalProjectBuilder.FULL_BUILD,
+                        new NullProgressMonitor());
+
+                textDocumentService.publishDiagnosticsForOpenDocuments();
+
+                GroovyLanguageServerPlugin.logInfo("Full build completed.");
+                sendStatus(STATUS_READY, null);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Full build failed", e);
+                sendStatus("Error", "Build failed: " + e.getMessage());
+            }
+        });
     }
 
     @Override
@@ -584,7 +608,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
 
         if (workspaceRoot != null) {
-            textDocumentService.triggerFullBuild(this);
+            triggerFullBuild();
         }
     }
 

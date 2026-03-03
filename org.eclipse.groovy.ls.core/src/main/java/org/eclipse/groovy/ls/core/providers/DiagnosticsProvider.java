@@ -68,7 +68,8 @@ public class DiagnosticsProvider {
 
     private final DocumentManager documentManager;
     private LanguageClient client;
-    private volatile java.util.function.Predicate<String> classpathAvailableForUri;
+    private final java.util.concurrent.atomic.AtomicReference<java.util.function.Predicate<String>> classpathAvailableForUri =
+            new java.util.concurrent.atomic.AtomicReference<>();
         private final java.util.Map<String, List<Diagnostic>> latestDiagnosticsByUri =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -97,7 +98,7 @@ public class DiagnosticsProvider {
      * package/first line.
      */
     public void setClasspathChecker(java.util.function.Predicate<String> checker) {
-        this.classpathAvailableForUri = checker;
+        this.classpathAvailableForUri.set(checker);
     }
 
     /**
@@ -170,7 +171,7 @@ public class DiagnosticsProvider {
         // When no classpath is available for this project, report only syntax
         // errors (from the standalone Groovy compiler) and append a warning at
         // the top of the file so the user knows why full diagnostics are missing.
-        java.util.function.Predicate<String> checker = classpathAvailableForUri;
+        java.util.function.Predicate<String> checker = classpathAvailableForUri.get();
         boolean hasClasspath = checker == null || checker.test(uri);
         GroovyLanguageServerPlugin.logInfo(
                 "[classpath-check] uri=" + uri

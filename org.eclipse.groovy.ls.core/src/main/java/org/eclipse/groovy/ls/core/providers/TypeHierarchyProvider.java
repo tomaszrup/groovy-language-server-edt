@@ -14,7 +14,6 @@ import java.util.List;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonPrimitive;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
@@ -24,10 +23,8 @@ import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.ISourceRange;
-import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.ITypeHierarchy;
-import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.SymbolKind;
@@ -179,35 +176,43 @@ public class TypeHierarchyProvider {
 
         try {
             JsonElement dataElement = (JsonElement) item.getData();
-            String fqn = null;
-            if (dataElement.isJsonObject()) {
-                JsonObject obj = dataElement.getAsJsonObject();
-                if (obj.has("fqn")) {
-                    fqn = obj.get("fqn").getAsString();
-                }
-            } else if (dataElement.isJsonPrimitive()) {
-                fqn = dataElement.getAsString();
-            }
+            String fqn = extractFqn(dataElement);
 
             if (fqn == null || fqn.isEmpty()) {
                 return null;
             }
 
-            // Search across all workspace projects
-            for (org.eclipse.core.resources.IProject project :
-                    org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
-                if (project.isOpen() && project.hasNature(org.eclipse.jdt.core.JavaCore.NATURE_ID)) {
-                    IJavaProject javaProject = org.eclipse.jdt.core.JavaCore.create(project);
-                    IType type = javaProject.findType(fqn);
-                    if (type != null && type.exists()) {
-                        return type;
-                    }
-                }
-            }
+            return findTypeInWorkspace(fqn);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to resolve type from hierarchy item", e);
         }
 
+        return null;
+    }
+
+    private String extractFqn(JsonElement dataElement) {
+        if (dataElement.isJsonObject()) {
+            JsonObject obj = dataElement.getAsJsonObject();
+            if (obj.has("fqn")) {
+                return obj.get("fqn").getAsString();
+            }
+        } else if (dataElement.isJsonPrimitive()) {
+            return dataElement.getAsString();
+        }
+        return null;
+    }
+
+    private IType findTypeInWorkspace(String fqn) throws org.eclipse.core.runtime.CoreException {
+        for (org.eclipse.core.resources.IProject project :
+                org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
+            if (project.isOpen() && project.hasNature(org.eclipse.jdt.core.JavaCore.NATURE_ID)) {
+                IJavaProject javaProject = org.eclipse.jdt.core.JavaCore.create(project);
+                IType type = javaProject.findType(fqn);
+                if (type != null && type.exists()) {
+                    return type;
+                }
+            }
+        }
         return null;
     }
 
@@ -291,14 +296,11 @@ public class TypeHierarchyProvider {
 
     private Range getTypeRange(IType type, String uri) {
         try {
-            if (type instanceof ISourceReference) {
-                ISourceReference sourceRef = (ISourceReference) type;
-                ISourceRange sourceRange = sourceRef.getSourceRange();
-                if (sourceRange != null && sourceRange.getOffset() >= 0) {
-                    String content = getContent(type, uri);
-                    if (content != null) {
-                        return toRange(content, sourceRange);
-                    }
+            ISourceRange sourceRange = type.getSourceRange();
+            if (sourceRange != null && sourceRange.getOffset() >= 0) {
+                String content = getContent(type, uri);
+                if (content != null) {
+                    return toRange(content, sourceRange);
                 }
             }
         } catch (Exception e) {
@@ -309,14 +311,11 @@ public class TypeHierarchyProvider {
 
     private Range getTypeSelectionRange(IType type, String uri, Range fallback) {
         try {
-            if (type instanceof ISourceReference) {
-                ISourceReference sourceRef = (ISourceReference) type;
-                ISourceRange nameRange = sourceRef.getNameRange();
-                if (nameRange != null && nameRange.getOffset() >= 0) {
-                    String content = getContent(type, uri);
-                    if (content != null) {
-                        return toRange(content, nameRange);
-                    }
+            ISourceRange nameRange = type.getNameRange();
+            if (nameRange != null && nameRange.getOffset() >= 0) {
+                String content = getContent(type, uri);
+                if (content != null) {
+                    return toRange(content, nameRange);
                 }
             }
         } catch (Exception e) {
@@ -332,8 +331,7 @@ public class TypeHierarchyProvider {
         }
         try {
             org.eclipse.core.resources.IResource resource = type.getResource();
-            if (resource instanceof org.eclipse.core.resources.IFile) {
-                org.eclipse.core.resources.IFile file = (org.eclipse.core.resources.IFile) resource;
+            if (resource instanceof org.eclipse.core.resources.IFile file) {
                 try (java.io.InputStream is = file.getContents()) {
                     return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
                 }

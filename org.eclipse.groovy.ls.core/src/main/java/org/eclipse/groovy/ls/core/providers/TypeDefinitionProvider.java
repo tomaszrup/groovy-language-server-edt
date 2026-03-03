@@ -14,11 +14,7 @@ import java.util.List;
 
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
-import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
-import org.codehaus.groovy.ast.PropertyNode;
-import org.codehaus.groovy.ast.expr.Expression;
-import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -27,7 +23,6 @@ import org.eclipse.jdt.core.ILocalVariable;
 import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.ISourceRange;
-import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.Signature;
@@ -252,7 +247,7 @@ public class TypeDefinitionProvider {
             for (FieldNode field : classNode.getFields()) {
                 if (word.equals(field.getName())) {
                     String typeName = field.getType().getNameWithoutPackage();
-                    Location loc = findClassLocationInFile(uri, content, ast, typeName);
+                    Location loc = findClassLocationInFile(uri, ast, typeName);
                     if (loc != null) {
                         locations.add(loc);
                         return locations;
@@ -264,7 +259,7 @@ public class TypeDefinitionProvider {
         return locations;
     }
 
-    private Location findClassLocationInFile(String uri, String content, ModuleNode ast,
+    private Location findClassLocationInFile(String uri, ModuleNode ast,
             String typeName) {
         for (ClassNode classNode : ast.getClasses()) {
             if (typeName.equals(classNode.getNameWithoutPackage())

@@ -17,8 +17,6 @@ import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
-import org.eclipse.jdt.core.ISourceRange;
-import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
@@ -90,7 +88,7 @@ public class ImplementationProvider {
         return locations;
     }
 
-    private void findTypeImplementors(IType type, List<Location> locations) throws Exception {
+    private void findTypeImplementors(IType type, List<Location> locations) throws org.eclipse.core.runtime.CoreException {
         SearchPattern pattern = SearchPattern.createPattern(
                 type, IJavaSearchConstants.IMPLEMENTORS);
         if (pattern == null) {
@@ -99,7 +97,7 @@ public class ImplementationProvider {
         search(pattern, locations);
     }
 
-    private void findMethodImplementors(IMethod method, List<Location> locations) throws Exception {
+    private void findMethodImplementors(IMethod method, List<Location> locations) throws org.eclipse.core.runtime.CoreException {
         // First find implementors of the declaring type, then look for the method
         IType declaringType = method.getDeclaringType();
         if (declaringType == null) {
@@ -115,7 +113,7 @@ public class ImplementationProvider {
         search(pattern, locations);
     }
 
-    private void search(SearchPattern pattern, List<Location> locations) throws Exception {
+    private void search(SearchPattern pattern, List<Location> locations) throws org.eclipse.core.runtime.CoreException {
         IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
         SearchEngine engine = new SearchEngine();
 

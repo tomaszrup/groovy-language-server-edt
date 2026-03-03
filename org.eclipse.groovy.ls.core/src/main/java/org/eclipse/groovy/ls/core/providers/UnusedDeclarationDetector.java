@@ -145,10 +145,7 @@ public class UnusedDeclarationDetector {
 
         // Check methods
         for (IMethod method : type.getMethods()) {
-            if (isTestMethod(method)) {
-                continue;
-            }
-            if (isMainMethod(method)) {
+            if (isTestMethod(method) || isMainMethod(method)) {
                 continue;
             }
             if (isUnreferenced(method)) {
@@ -244,18 +241,16 @@ public class UnusedDeclarationDetector {
             }
 
             // Check superclass names for common test base classes
-            String[] superInterfaceNames = type.getSuperInterfaceNames();
             String superclassName = type.getSuperclassName();
 
-            if (superclassName != null) {
-                if (superclassName.equals("TestCase")
+            if (superclassName != null
+                    && (superclassName.equals("TestCase")
                         || superclassName.equals("junit.framework.TestCase")
                         || superclassName.equals("GroovyTestCase")
                         || superclassName.equals("groovy.test.GroovyTestCase")
                         || superclassName.equals("Specification")
-                        || superclassName.equals("spock.lang.Specification")) {
-                    return true;
-                }
+                        || superclassName.equals("spock.lang.Specification"))) {
+                return true;
             }
 
             // Check if the source path suggests a test directory

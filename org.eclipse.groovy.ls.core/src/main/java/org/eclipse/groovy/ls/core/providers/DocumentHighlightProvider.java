@@ -14,11 +14,6 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.codehaus.groovy.ast.ClassNode;
-import org.codehaus.groovy.ast.FieldNode;
-import org.codehaus.groovy.ast.MethodNode;
-import org.codehaus.groovy.ast.ModuleNode;
-import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -101,36 +96,7 @@ public class DocumentHighlightProvider {
             engine.search(pattern,
                     new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
                     scope,
-                    new SearchRequestor() {
-                        @Override
-                        public void acceptSearchMatch(SearchMatch match) {
-                            if (match.getResource() == null
-                                    || match.getResource().getLocationURI() == null) {
-                                return;
-                            }
-                            String matchUri = match.getResource().getLocationURI().toString();
-                            if (!normalizedUri.equals(normalizeUri(matchUri))) {
-                                return;
-                            }
-
-                            String matchContent = documentManager.getContent(matchUri);
-                            if (matchContent == null) {
-                                matchContent = content;
-                            }
-
-                            int startOffset = match.getOffset();
-                            int endOffset = startOffset + match.getLength();
-                            Position start = offsetToPosition(matchContent, startOffset);
-                            Position end = offsetToPosition(matchContent, endOffset);
-
-                            DocumentHighlightKind kind = match.isInsideDocComment()
-                                    ? DocumentHighlightKind.Text
-                                    : (match.getAccuracy() == SearchMatch.A_ACCURATE
-                                            ? DocumentHighlightKind.Read
-                                            : DocumentHighlightKind.Text);
-                            highlights.add(new DocumentHighlight(new Range(start, end), kind));
-                        }
-                    },
+                    createHighlightRequestor(highlights, normalizedUri, content),
                     null);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -139,6 +105,46 @@ public class DocumentHighlightProvider {
         }
 
         return highlights;
+    }
+
+    private SearchRequestor createHighlightRequestor(
+            List<DocumentHighlight> highlights, String normalizedUri, String fallbackContent) {
+        return new SearchRequestor() {
+            @Override
+            public void acceptSearchMatch(SearchMatch match) {
+                if (match.getResource() == null
+                        || match.getResource().getLocationURI() == null) {
+                    return;
+                }
+                String matchUri = match.getResource().getLocationURI().toString();
+                if (!normalizedUri.equals(normalizeUri(matchUri))) {
+                    return;
+                }
+
+                String matchContent = documentManager.getContent(matchUri);
+                if (matchContent == null) {
+                    matchContent = fallbackContent;
+                }
+
+                int startOffset = match.getOffset();
+                int endOffset = startOffset + match.getLength();
+                Position start = offsetToPosition(matchContent, startOffset);
+                Position end = offsetToPosition(matchContent, endOffset);
+
+                DocumentHighlightKind kind = resolveHighlightKind(match);
+                highlights.add(new DocumentHighlight(new Range(start, end), kind));
+            }
+        };
+    }
+
+    private static DocumentHighlightKind resolveHighlightKind(SearchMatch match) {
+        if (match.isInsideDocComment()) {
+            return DocumentHighlightKind.Text;
+        }
+        if (match.getAccuracy() == SearchMatch.A_ACCURATE) {
+            return DocumentHighlightKind.Read;
+        }
+        return DocumentHighlightKind.Text;
     }
 
     /**

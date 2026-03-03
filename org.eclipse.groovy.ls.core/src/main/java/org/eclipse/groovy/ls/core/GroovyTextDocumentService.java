@@ -13,7 +13,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.providers.CodeActionProvider;
 import org.eclipse.groovy.ls.core.providers.CallHierarchyProvider;
 import org.eclipse.groovy.ls.core.providers.CodeLensProvider;
@@ -27,7 +26,6 @@ import org.eclipse.groovy.ls.core.providers.FormattingProvider;
 import org.eclipse.groovy.ls.core.providers.HoverProvider;
 import org.eclipse.groovy.ls.core.providers.ImplementationProvider;
 import org.eclipse.groovy.ls.core.providers.InlayHintProvider;
-import org.eclipse.groovy.ls.core.providers.InlayHintSettings;
 import org.eclipse.groovy.ls.core.providers.ReferenceProvider;
 import org.eclipse.groovy.ls.core.providers.RenameProvider;
 import org.eclipse.groovy.ls.core.providers.SemanticTokensProvider;
@@ -73,8 +71,6 @@ public class GroovyTextDocumentService implements TextDocumentService {
     private final TypeHierarchyProvider typeHierarchyProvider;
     private final CallHierarchyProvider callHierarchyProvider;
     private final CodeLensProvider codeLensProvider;
-
-    private InlayHintSettings inlayHintSettings = InlayHintSettings.defaults();
 
     public GroovyTextDocumentService(GroovyLanguageServer server, DocumentManager documentManager) {
         this.server = server;
@@ -393,7 +389,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
     public CompletableFuture<List<InlayHint>> inlayHint(InlayHintParams params) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                return inlayHintProvider.getInlayHints(params, inlayHintSettings);
+                return inlayHintProvider.getInlayHints(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Inlay hints failed", e);
                 return new ArrayList<>();
@@ -571,10 +567,8 @@ public class GroovyTextDocumentService implements TextDocumentService {
         formattingProvider.setFormatterProfilePath(profilePath);
     }
 
-    public void updateInlayHintSettings(InlayHintSettings settings) {
-        if (settings != null) {
-            this.inlayHintSettings = settings;
-        }
+    public void updateInlayHintSettings(Object settings) {
+        inlayHintProvider.updateSettingsFromObject(settings);
     }
 
     void publishDiagnosticsIfEnabled(String uri) {
@@ -594,46 +588,5 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 diagnosticsProvider.publishDiagnosticsDebounced(documentManager.getClientUri(uri));
             }
         }
-    }
-
-    // ---- Build trigger ----
-
-    /**
-     * Trigger a full build of the workspace and publish diagnostics for all open documents.
-     * Sends status notifications (Compiling → Ready/Error) via the server.
-     */
-    void triggerFullBuild(GroovyLanguageServer languageServer) {
-        CompletableFuture.runAsync(() -> {
-            GroovyLanguageServerPlugin.logInfo("Triggering full workspace build...");
-            GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerFullBuild start");
-            try {
-                ResourcesPlugin.getWorkspace().build(
-                        org.eclipse.core.resources.IncrementalProjectBuilder.FULL_BUILD,
-                        new org.eclipse.core.runtime.NullProgressMonitor());
-
-                // Publish diagnostics for all open documents
-                if (server.areDiagnosticsEnabled()) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[diag-trace] triggerFullBuild publish open docs count="
-                            + documentManager.getOpenDocumentUris().size());
-                    for (String uri : documentManager.getOpenDocumentUris()) {
-                        diagnosticsProvider.publishDiagnostics(documentManager.getClientUri(uri));
-                    }
-                }
-
-                GroovyLanguageServerPlugin.logInfo("Full build completed.");
-                languageServer.sendStatus("Ready", null);
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError("Full build failed", e);
-                languageServer.sendStatus("Error", "Build failed: " + e.getMessage());
-            }
-        });
-    }
-
-    /**
-     * Trigger a full build of the workspace (without status notifications).
-     */
-    void triggerFullBuild() {
-        triggerFullBuild(server);
     }
 }
