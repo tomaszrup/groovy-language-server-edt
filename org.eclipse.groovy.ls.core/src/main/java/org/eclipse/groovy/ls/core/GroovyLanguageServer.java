@@ -470,7 +470,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                         ? " for projectUri: " + request.projectUri : " (no project URI)")
                     + (request.projectPath != null ? ", projectPath: " + request.projectPath : ""));
 
-            sendStatus(STATUS_IMPORTING, "Updating classpath...");
+            // Only send "Importing" status once (on the first classpath arrival),
+            // not 50 times for 50 subprojects.
+            if (!initialBuildDone) {
+                sendStatus(STATUS_IMPORTING, "Receiving classpaths...");
+            }
 
             IProject eclipseProject = findEclipseProjectFor(request.projectUri, request.projectPath);
             if (eclipseProject == null || !eclipseProject.isOpen()) {
@@ -506,7 +510,6 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                             + " directories) to '" + projName + "'. Total: "
                             + newEntries.size() + " entries.");
 
-            sendStatus(STATUS_READY, null);
             diagnosticsEnabled = true;
             projectsWithClasspath.add(projName);
             GroovyLanguageServerPlugin.logInfo(

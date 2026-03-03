@@ -199,8 +199,9 @@ public class DocumentSymbolProvider {
                 // Full source range
                 ISourceRange sourceRange = sourceRef.getSourceRange();
                 Range fullRange;
-                if (sourceRange != null && sourceRange.getOffset() >= 0) {
-                    fullRange = toRange(content, sourceRange);
+                if (sourceRange != null && sourceRange.getOffset() >= 0
+                        && sourceRange.getLength() >= 0) {
+                    fullRange = normalizeRange(toRange(content, sourceRange));
                 } else {
                     fullRange = new Range(new Position(0, 0), new Position(0, 0));
                 }
@@ -209,7 +210,8 @@ public class DocumentSymbolProvider {
                 // Name range (selection range)
                 ISourceRange nameRange = sourceRef.getNameRange();
                 if (nameRange != null && nameRange.getOffset() >= 0) {
-                    symbol.setSelectionRange(clampSelectionRange(toRange(content, nameRange), fullRange));
+                    symbol.setSelectionRange(clampSelectionRange(
+                            normalizeRange(toRange(content, nameRange)), fullRange));
                 } else {
                     symbol.setSelectionRange(fullRange);
                 }
@@ -461,6 +463,17 @@ public class DocumentSymbolProvider {
                 new Position(startLine, startCol),
                 new Position(startLine, startCol + symbol.getName().length()));
         symbol.setSelectionRange(clampSelectionRange(nameRange, fullRange));
+    }
+
+    /**
+     * Ensure a range has end >= start. If the range is inverted, collapse it
+     * to a zero-width range at the start position.
+     */
+    private Range normalizeRange(Range range) {
+        if (comparePositions(range.getEnd(), range.getStart()) < 0) {
+            return new Range(range.getStart(), range.getStart());
+        }
+        return range;
     }
 
     /**

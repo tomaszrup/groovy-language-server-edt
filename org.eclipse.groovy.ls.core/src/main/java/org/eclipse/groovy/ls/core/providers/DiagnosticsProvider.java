@@ -76,8 +76,10 @@ public class DiagnosticsProvider {
     // Simple debounce: track last scheduled publish per URI
     private final java.util.Map<String, java.util.concurrent.ScheduledFuture<?>> pendingPublish =
             new java.util.concurrent.ConcurrentHashMap<>();
+    // Use a pool of 4 threads so that one reconcile blocked on the workspace
+    // lock doesn't stall diagnostics for every other open file.
     private final java.util.concurrent.ScheduledExecutorService scheduler =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            java.util.concurrent.Executors.newScheduledThreadPool(4, r -> {
                 Thread t = new Thread(r, "groovy-ls-diagnostics");
                 t.setDaemon(true);
                 return t;

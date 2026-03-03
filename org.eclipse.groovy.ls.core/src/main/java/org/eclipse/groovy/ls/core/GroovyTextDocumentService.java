@@ -116,9 +116,13 @@ public class GroovyTextDocumentService implements TextDocumentService {
         GroovyLanguageServerPlugin.logInfo("Document opened: " + uri);
         documentManager.didOpen(uri, text);
 
-        // Publish diagnostics for the newly opened document
+        // Use debounced (non-blocking) diagnostics so that the LSP dispatch
+        // thread is never stalled by workspace-lock contention during a build.
+        // A synchronous publishDiagnostics here would freeze ALL message
+        // processing (including semantic tokens, completion, further didOpen
+        // calls) whenever a full build is in progress.
         if (server.areDiagnosticsEnabled()) {
-            diagnosticsProvider.publishDiagnostics(uri);
+            diagnosticsProvider.publishDiagnosticsDebounced(uri);
         }
     }
 
