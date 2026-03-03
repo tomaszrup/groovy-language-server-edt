@@ -12,10 +12,10 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
@@ -111,11 +111,25 @@ public class SemanticTokensProvider {
     private final DocumentManager documentManager;
 
     /**
-     * Cache of the last successfully computed (non-empty) semantic tokens per URI.
+     * Maximum number of cached semantic token results.  With a large workspace
+     * users may browse many files over a session; unbounded caching would
+     * leak memory.
+     */
+    private static final int MAX_TOKEN_CACHE_SIZE = 500;
+
+    /**
+     * Bounded LRU cache of the last successfully computed (non-empty) semantic tokens per URI.
      * When a transient syntax error causes the AST to have zero classes, we return
      * the cached tokens instead of wiping all highlighting.
+     * Wrapped in {@code synchronizedMap} for thread safety.
      */
-    private final Map<String, SemanticTokens> lastGoodTokensCache = new ConcurrentHashMap<>();
+    private final Map<String, SemanticTokens> lastGoodTokensCache =
+            Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, SemanticTokens> eldest) {
+                    return size() > MAX_TOKEN_CACHE_SIZE;
+                }
+            });
 
     public SemanticTokensProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -250,16 +264,10 @@ public class SemanticTokensProvider {
      */
     private ModuleNode getModuleNode(ICompilationUnit unit) {
         try {
-            // GroovyCompilationUnit.getModuleNode() returns the parsed AST
-            java.lang.reflect.Method getModuleNode = unit.getClass().getMethod("getModuleNode");
-            Object result = getModuleNode.invoke(unit);
-            if (result instanceof ModuleNode moduleNode) {
-                return moduleNode;
+            ModuleNode module = ReflectionCache.getModuleNode(unit);
+            if (module != null) {
+                return module;
             }
-        } catch (NoSuchMethodException e) {
-            // Not a GroovyCompilationUnit — e.g. a plain .java file
-            GroovyLanguageServerPlugin.logInfo(
-                    "Semantic tokens: compilation unit is not a GroovyCompilationUnit");
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Semantic tokens: failed to get ModuleNode via reflection", e);

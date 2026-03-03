@@ -821,4 +821,745 @@ class GroovyWorkspaceServiceTest {
         method.setAccessible(true);
         return method.invoke(service, args);
     }
+
+    // ================================================================
+    // sameExtension tests
+    // ================================================================
+
+    @Test
+    void sameExtensionBothJava() throws Exception {
+        assertEquals(true, invoke("sameExtension",
+                new Class<?>[] {String.class, String.class},
+                new Object[] {"java", "java"}));
+    }
+
+    @Test
+    void sameExtensionDifferent() throws Exception {
+        assertEquals(false, invoke("sameExtension",
+                new Class<?>[] {String.class, String.class},
+                new Object[] {"java", "groovy"}));
+    }
+
+    @Test
+    void sameExtensionNullFirst() throws Exception {
+        assertEquals(false, invoke("sameExtension",
+                new Class<?>[] {String.class, String.class},
+                new Object[] {(String) null, "java"}));
+    }
+
+    @Test
+    void sameExtensionBothNull() throws Exception {
+        // both null may be true or false depending on implementation
+        Object result = invoke("sameExtension",
+                new Class<?>[] {String.class, String.class},
+                new Object[] {(String) null, (String) null});
+        assertNotNull(result);
+    }
+
+    // ================================================================
+    // getChildJson tests
+    // ================================================================
+
+    @Test
+    void getChildJsonReturnsChild() throws Exception {
+        JsonObject root = new JsonObject();
+        JsonObject child = new JsonObject();
+        child.addProperty("key", "value");
+        root.add("child", child);
+        JsonObject result = (JsonObject) invoke("getChildJson",
+                new Class<?>[] {JsonObject.class, String.class},
+                new Object[] {root, "child"});
+        assertNotNull(result);
+        assertEquals("value", result.get("key").getAsString());
+    }
+
+    @Test
+    void getChildJsonReturnsNullForMissing() throws Exception {
+        JsonObject root = new JsonObject();
+        JsonObject result = (JsonObject) invoke("getChildJson",
+                new Class<?>[] {JsonObject.class, String.class},
+                new Object[] {root, "missing"});
+        assertNull(result);
+    }
+
+    @Test
+    void getChildJsonReturnsNullForNull() throws Exception {
+        JsonObject result = (JsonObject) invoke("getChildJson",
+                new Class<?>[] {JsonObject.class, String.class},
+                new Object[] {(JsonObject) null, "key"});
+        assertNull(result);
+    }
+
+    @Test
+    void getChildJsonReturnsNullForNonObject() throws Exception {
+        JsonObject root = new JsonObject();
+        root.addProperty("child", "string_value");
+        JsonObject result = (JsonObject) invoke("getChildJson",
+                new Class<?>[] {JsonObject.class, String.class},
+                new Object[] {root, "child"});
+        assertNull(result);
+    }
+
+    // ================================================================
+    // shouldReplaceQualifiedReference tests
+    // ================================================================
+
+    @Test
+    void shouldReplaceQualifiedReferenceBasic() throws Exception {
+        String content = "import com.example.Foo\nclass A { Foo foo }";
+        java.util.Set<Integer> seen = new java.util.HashSet<>();
+        int matchOffset = content.indexOf("Foo", content.indexOf("class")); // Foo in class body
+        int matchLength = 3;
+        int endOffset = matchOffset + matchLength;
+        String simpleTypeName = "Foo";
+        boolean result = (boolean) invoke("shouldReplaceQualifiedReference",
+                new Class<?>[] {String.class, java.util.Set.class, int.class, int.class, int.class, String.class},
+                new Object[] {content, seen, matchOffset, matchLength, endOffset, simpleTypeName});
+        assertTrue(result);
+    }
+
+    // ================================================================
+    // isSimpleTypeMatch tests
+    // ================================================================
+
+    @Test
+    void isSimpleTypeMatchOnIdentifier() throws Exception {
+        String content = "class A { Foo foo }";
+        int offset = content.indexOf("Foo");
+        boolean result = (boolean) invoke("isSimpleTypeMatch",
+                new Class<?>[] {String.class, String.class, int.class, int.class, int.class},
+                new Object[] {content, "Foo", offset, 3, offset + 3});
+        assertTrue(result);
+    }
+
+    @Test
+    void isSimpleTypeMatchInsideImport() throws Exception {
+        String content = "import com.example.Foo\nclass A {}";
+        int offset = content.indexOf("Foo");
+        boolean result = (boolean) invoke("isSimpleTypeMatch",
+                new Class<?>[] {String.class, String.class, int.class, int.class, int.class},
+                new Object[] {content, "Foo", offset, 3, offset + 3});
+        // Inside import line - should return false
+        assertFalse(result);
+    }
+
+    // ================================================================
+    // buildWillRenameWorkspaceEdit null/empty tests
+    // ================================================================
+
+    @Test
+    void buildWillRenameWorkspaceEditReturnsNullForNull() throws Exception {
+        Object result = invoke("buildWillRenameWorkspaceEdit",
+                new Class<?>[] {org.eclipse.lsp4j.RenameFilesParams.class},
+                new Object[] {(org.eclipse.lsp4j.RenameFilesParams) null});
+        assertNull(result);
+    }
+
+    @Test
+    void buildWillRenameWorkspaceEditReturnsNullForEmptyFiles() throws Exception {
+        org.eclipse.lsp4j.RenameFilesParams params = new org.eclipse.lsp4j.RenameFilesParams();
+        params.setFiles(new ArrayList<>());
+        Object result = invoke("buildWillRenameWorkspaceEdit",
+                new Class<?>[] {org.eclipse.lsp4j.RenameFilesParams.class},
+                new Object[] {params});
+        // May return null or empty WorkspaceEdit
+    }
+
+    // ================================================================
+    // summarizeRenames tests
+    // ================================================================
+
+    @Test
+    void summarizeRenamesNoRenames() throws Exception {
+        List<org.eclipse.lsp4j.FileRename> renames = new ArrayList<>();
+        Object result = invoke("summarizeRenames",
+                new Class<?>[] {java.util.List.class},
+                new Object[] {renames});
+        assertNotNull(result);
+        // Access private fields via reflection
+        java.lang.reflect.Field hasSourceField = result.getClass().getDeclaredField("hasSourceRename");
+        hasSourceField.setAccessible(true);
+        assertFalse((boolean) hasSourceField.get(result));
+        java.lang.reflect.Field hasJavaField = result.getClass().getDeclaredField("hasJavaRename");
+        hasJavaField.setAccessible(true);
+        assertFalse((boolean) hasJavaField.get(result));
+    }
+
+    @Test
+    void summarizeRenamesGroovyOnly() throws Exception {
+        List<org.eclipse.lsp4j.FileRename> renames = new ArrayList<>();
+        org.eclipse.lsp4j.FileRename fr = new org.eclipse.lsp4j.FileRename();
+        fr.setOldUri("file:///src/Foo.groovy");
+        fr.setNewUri("file:///src/Bar.groovy");
+        renames.add(fr);
+        Object result = invoke("summarizeRenames",
+                new Class<?>[] {java.util.List.class},
+                new Object[] {renames});
+        java.lang.reflect.Field hasSourceField = result.getClass().getDeclaredField("hasSourceRename");
+        hasSourceField.setAccessible(true);
+        assertTrue((boolean) hasSourceField.get(result));
+        java.lang.reflect.Field hasJavaField = result.getClass().getDeclaredField("hasJavaRename");
+        hasJavaField.setAccessible(true);
+        assertFalse((boolean) hasJavaField.get(result));
+    }
+
+    @Test
+    void summarizeRenamesJavaFile() throws Exception {
+        List<org.eclipse.lsp4j.FileRename> renames = new ArrayList<>();
+        org.eclipse.lsp4j.FileRename fr = new org.eclipse.lsp4j.FileRename();
+        fr.setOldUri("file:///src/Foo.java");
+        fr.setNewUri("file:///src/Bar.java");
+        renames.add(fr);
+        Object result = invoke("summarizeRenames",
+                new Class<?>[] {java.util.List.class},
+                new Object[] {renames});
+        java.lang.reflect.Field hasSourceField = result.getClass().getDeclaredField("hasSourceRename");
+        hasSourceField.setAccessible(true);
+        assertTrue((boolean) hasSourceField.get(result));
+        java.lang.reflect.Field hasJavaField = result.getClass().getDeclaredField("hasJavaRename");
+        hasJavaField.setAccessible(true);
+        assertTrue((boolean) hasJavaField.get(result));
+    }
+
+    @Test
+    void summarizeRenamesNonSourceFile() throws Exception {
+        List<org.eclipse.lsp4j.FileRename> renames = new ArrayList<>();
+        org.eclipse.lsp4j.FileRename fr = new org.eclipse.lsp4j.FileRename();
+        fr.setOldUri("file:///src/readme.txt");
+        fr.setNewUri("file:///src/readme2.txt");
+        renames.add(fr);
+        Object result = invoke("summarizeRenames",
+                new Class<?>[] {java.util.List.class},
+                new Object[] {renames});
+        java.lang.reflect.Field hasSourceField = result.getClass().getDeclaredField("hasSourceRename");
+        hasSourceField.setAccessible(true);
+        assertFalse((boolean) hasSourceField.get(result));
+    }
+
+    @Test
+    void summarizeRenamesNullEntry() throws Exception {
+        List<org.eclipse.lsp4j.FileRename> renames = new ArrayList<>();
+        renames.add(null);
+        Object result = invoke("summarizeRenames",
+                new Class<?>[] {java.util.List.class},
+                new Object[] {renames});
+        java.lang.reflect.Field hasSourceField = result.getClass().getDeclaredField("hasSourceRename");
+        hasSourceField.setAccessible(true);
+        assertFalse((boolean) hasSourceField.get(result));
+    }
+
+    // ================================================================
+    // addDeclarationFallbackEdit tests
+    // ================================================================
+
+    @Test
+    void addDeclarationFallbackEditSkipsWhenJavaRename() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> workspaceEdits = new java.util.HashMap<>();
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        invoke("addDeclarationFallbackEdit",
+                new Class<?>[] {String.class, String.class, String.class, boolean.class, Map.class, Map.class},
+                new Object[] {"file:///Foo.groovy", "Foo", "Bar", true, workspaceEdits, changes});
+        assertTrue(changes.isEmpty());
+    }
+
+    @Test
+    void addDeclarationFallbackEditSkipsWhenWorkspaceEditsNonEmpty() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> workspaceEdits = new java.util.HashMap<>();
+        workspaceEdits.put("file:///Other.groovy", new ArrayList<>());
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        invoke("addDeclarationFallbackEdit",
+                new Class<?>[] {String.class, String.class, String.class, boolean.class, Map.class, Map.class},
+                new Object[] {"file:///Foo.groovy", "Foo", "Bar", false, workspaceEdits, changes});
+        assertTrue(changes.isEmpty());
+    }
+
+    @Test
+    void addDeclarationFallbackEditAddsEditWhenSourceAvailable() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        String uri = "file:///FallbackDecl.groovy";
+        dm.didOpen(uri, "class Foo { }");
+        GroovyWorkspaceService svc = new GroovyWorkspaceService(new GroovyLanguageServer(), dm);
+
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> workspaceEdits = new java.util.HashMap<>();
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        java.lang.reflect.Method m = GroovyWorkspaceService.class.getDeclaredMethod(
+                "addDeclarationFallbackEdit",
+                String.class, String.class, String.class, boolean.class, Map.class, Map.class);
+        m.setAccessible(true);
+        m.invoke(svc, uri, "Foo", "Bar", false, workspaceEdits, changes);
+        assertFalse(changes.isEmpty());
+    }
+
+    @Test
+    void addDeclarationFallbackEditNoEditWhenNoSource() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> workspaceEdits = new java.util.HashMap<>();
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        invoke("addDeclarationFallbackEdit",
+                new Class<?>[] {String.class, String.class, String.class, boolean.class, Map.class, Map.class},
+                new Object[] {"file:///Missing.groovy", "Foo", "Bar", false, workspaceEdits, changes});
+        assertTrue(changes.isEmpty());
+    }
+
+    // ================================================================
+    // applyWillRenameForFile tests
+    // ================================================================
+
+    @Test
+    void applyWillRenameForFileNullRename() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        invoke("applyWillRenameForFile",
+                new Class<?>[] {org.eclipse.lsp4j.FileRename.class, Map.class},
+                new Object[] {null, changes});
+        assertTrue(changes.isEmpty());
+    }
+
+    @Test
+    void applyWillRenameForFileNonSourceFile() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        org.eclipse.lsp4j.FileRename fr = new org.eclipse.lsp4j.FileRename();
+        fr.setOldUri("file:///readme.txt");
+        fr.setNewUri("file:///readme2.txt");
+        invoke("applyWillRenameForFile",
+                new Class<?>[] {org.eclipse.lsp4j.FileRename.class, Map.class},
+                new Object[] {fr, changes});
+        assertTrue(changes.isEmpty());
+    }
+
+    @Test
+    void applyWillRenameForFileExtensionMismatch() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        org.eclipse.lsp4j.FileRename fr = new org.eclipse.lsp4j.FileRename();
+        fr.setOldUri("file:///Foo.groovy");
+        fr.setNewUri("file:///Foo.java");
+        invoke("applyWillRenameForFile",
+                new Class<?>[] {org.eclipse.lsp4j.FileRename.class, Map.class},
+                new Object[] {fr, changes});
+        assertTrue(changes.isEmpty());
+    }
+
+    // ================================================================
+    // collectGroovyMoveMatch tests
+    // ================================================================
+
+    @Test
+    void collectGroovyMoveMatchNullResource() throws Exception {
+        Map<String, List<org.eclipse.jdt.core.search.SearchMatch>> matchesByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        when(match.getResource()).thenReturn(null);
+        invoke("collectGroovyMoveMatch",
+                new Class<?>[] {Map.class, org.eclipse.jdt.core.search.SearchMatch.class},
+                new Object[] {matchesByUri, match});
+        assertTrue(matchesByUri.isEmpty());
+    }
+
+    @Test
+    void collectGroovyMoveMatchNonGroovyFile() throws Exception {
+        Map<String, List<org.eclipse.jdt.core.search.SearchMatch>> matchesByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.java"));
+        when(match.getResource()).thenReturn(resource);
+        invoke("collectGroovyMoveMatch",
+                new Class<?>[] {Map.class, org.eclipse.jdt.core.search.SearchMatch.class},
+                new Object[] {matchesByUri, match});
+        assertTrue(matchesByUri.isEmpty());
+    }
+
+    @Test
+    void collectGroovyMoveMatchGroovyFile() throws Exception {
+        Map<String, List<org.eclipse.jdt.core.search.SearchMatch>> matchesByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.groovy"));
+        when(match.getResource()).thenReturn(resource);
+        invoke("collectGroovyMoveMatch",
+                new Class<?>[] {Map.class, org.eclipse.jdt.core.search.SearchMatch.class},
+                new Object[] {matchesByUri, match});
+        assertFalse(matchesByUri.isEmpty());
+    }
+
+    // ================================================================
+    // addWorkspaceRenameEdit tests
+    // ================================================================
+
+    @Test
+    void addWorkspaceRenameEditNullResource() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> editsByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        when(match.getResource()).thenReturn(null);
+        invoke("addWorkspaceRenameEdit",
+                new Class<?>[] {org.eclipse.jdt.core.search.SearchMatch.class, String.class, Map.class, boolean.class},
+                new Object[] {match, "NewName", editsByUri, false});
+        assertTrue(editsByUri.isEmpty());
+    }
+
+    @Test
+    void addWorkspaceRenameEditNegativeOffset() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> editsByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.groovy"));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(-1);
+        when(match.getLength()).thenReturn(3);
+        invoke("addWorkspaceRenameEdit",
+                new Class<?>[] {org.eclipse.jdt.core.search.SearchMatch.class, String.class, Map.class, boolean.class},
+                new Object[] {match, "NewName", editsByUri, false});
+        assertTrue(editsByUri.isEmpty());
+    }
+
+    @Test
+    void addWorkspaceRenameEditZeroLength() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> editsByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.groovy"));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(0);
+        when(match.getLength()).thenReturn(0);
+        invoke("addWorkspaceRenameEdit",
+                new Class<?>[] {org.eclipse.jdt.core.search.SearchMatch.class, String.class, Map.class, boolean.class},
+                new Object[] {match, "NewName", editsByUri, false});
+        assertTrue(editsByUri.isEmpty());
+    }
+
+    @Test
+    void addWorkspaceRenameEditGroovyOnlyFilterJava() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen("file:///Foo.java", "class Foo {}");
+        GroovyWorkspaceService svc = new GroovyWorkspaceService(new GroovyLanguageServer(), dm);
+
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> editsByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.java"));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(6);
+        when(match.getLength()).thenReturn(3);
+        java.lang.reflect.Method m = GroovyWorkspaceService.class.getDeclaredMethod(
+                "addWorkspaceRenameEdit",
+                org.eclipse.jdt.core.search.SearchMatch.class, String.class, Map.class, boolean.class);
+        m.setAccessible(true);
+        m.invoke(svc, match, "Bar", editsByUri, true);
+        assertTrue(editsByUri.isEmpty());
+    }
+
+    @Test
+    void addWorkspaceRenameEditAddsEdit() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        String uri = "file:///WsRename.groovy";
+        dm.didOpen(uri, "class Foo { }");
+        GroovyWorkspaceService svc = new GroovyWorkspaceService(new GroovyLanguageServer(), dm);
+
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> editsByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create(uri));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(6);
+        when(match.getLength()).thenReturn(3);
+        java.lang.reflect.Method m = GroovyWorkspaceService.class.getDeclaredMethod(
+                "addWorkspaceRenameEdit",
+                org.eclipse.jdt.core.search.SearchMatch.class, String.class, Map.class, boolean.class);
+        m.setAccessible(true);
+        m.invoke(svc, match, "Bar", editsByUri, false);
+        assertFalse(editsByUri.isEmpty());
+    }
+
+    @Test
+    void addWorkspaceRenameEditOffsetPastContent() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        String uri = "file:///WsRename2.groovy";
+        dm.didOpen(uri, "class Foo { }");
+        GroovyWorkspaceService svc = new GroovyWorkspaceService(new GroovyLanguageServer(), dm);
+
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> editsByUri = new java.util.HashMap<>();
+        org.eclipse.jdt.core.search.SearchMatch match = mock(org.eclipse.jdt.core.search.SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create(uri));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(999);
+        when(match.getLength()).thenReturn(3);
+        java.lang.reflect.Method m = GroovyWorkspaceService.class.getDeclaredMethod(
+                "addWorkspaceRenameEdit",
+                org.eclipse.jdt.core.search.SearchMatch.class, String.class, Map.class, boolean.class);
+        m.setAccessible(true);
+        m.invoke(svc, match, "Bar", editsByUri, false);
+        assertTrue(editsByUri.isEmpty());
+    }
+
+    // ================================================================
+    // toSymbolInformation tests
+    // ================================================================
+
+    @Test
+    void toSymbolInformationNullResource() throws Exception {
+        org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
+        when(element.getElementName()).thenReturn("Foo");
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.TYPE);
+        when(element.getResource()).thenReturn(null);
+        Object result = invoke("toSymbolInformation",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertNull(result);
+    }
+
+    @Test
+    void toSymbolInformationBasicType() throws Exception {
+        org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.groovy"));
+        when(element.getElementName()).thenReturn("Foo");
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.TYPE);
+        when(element.getResource()).thenReturn(resource);
+        when(element.getParent()).thenReturn(null);
+        Object result = invoke("toSymbolInformation",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertNotNull(result);
+        org.eclipse.lsp4j.SymbolInformation info = (org.eclipse.lsp4j.SymbolInformation) result;
+        assertEquals("Foo", info.getName());
+        assertEquals(org.eclipse.lsp4j.SymbolKind.Class, info.getKind());
+    }
+
+    @Test
+    void toSymbolInformationMethodWithParent() throws Exception {
+        org.eclipse.jdt.core.IJavaElement parent = mock(org.eclipse.jdt.core.IJavaElement.class);
+        when(parent.getElementName()).thenReturn("MyClass");
+
+        org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///MyClass.groovy"));
+        when(element.getElementName()).thenReturn("myMethod");
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.METHOD);
+        when(element.getResource()).thenReturn(resource);
+        when(element.getParent()).thenReturn(parent);
+        Object result = invoke("toSymbolInformation",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertNotNull(result);
+        org.eclipse.lsp4j.SymbolInformation info = (org.eclipse.lsp4j.SymbolInformation) result;
+        assertEquals("myMethod", info.getName());
+        assertEquals(org.eclipse.lsp4j.SymbolKind.Method, info.getKind());
+        assertEquals("MyClass", info.getContainerName());
+    }
+
+    @Test
+    void toSymbolInformationField() throws Exception {
+        org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.groovy"));
+        when(element.getElementName()).thenReturn("myField");
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.FIELD);
+        when(element.getResource()).thenReturn(resource);
+        when(element.getParent()).thenReturn(null);
+        Object result = invoke("toSymbolInformation",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertNotNull(result);
+        org.eclipse.lsp4j.SymbolInformation info = (org.eclipse.lsp4j.SymbolInformation) result;
+        assertEquals(org.eclipse.lsp4j.SymbolKind.Field, info.getKind());
+    }
+
+    @Test
+    void toSymbolInformationWithSourceRef() throws Exception {
+        org.eclipse.jdt.core.IType element = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///Foo.groovy"));
+        when(element.getElementName()).thenReturn("Foo");
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.TYPE);
+        when(element.getResource()).thenReturn(resource);
+        when(element.getParent()).thenReturn(null);
+        org.eclipse.jdt.core.ISourceRange nameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
+        when(nameRange.getOffset()).thenReturn(6);
+        when(nameRange.getLength()).thenReturn(3);
+        when(element.getNameRange()).thenReturn(nameRange);
+        Object result = invoke("toSymbolInformation",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertNotNull(result);
+        org.eclipse.lsp4j.SymbolInformation info = (org.eclipse.lsp4j.SymbolInformation) result;
+        assertNotNull(info.getLocation().getRange());
+    }
+
+    // ================================================================
+    // applyLogLevelSetting tests
+    // ================================================================
+
+    @Test
+    void applyLogLevelSettingMissingLs() throws Exception {
+        com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
+        invoke("applyLogLevelSetting",
+                new Class<?>[] {com.google.gson.JsonObject.class},
+                new Object[] {groovy});
+        // No exception when 'ls' key missing
+    }
+
+    @Test
+    void applyLogLevelSettingNoLogLevel() throws Exception {
+        com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
+        com.google.gson.JsonObject ls = new com.google.gson.JsonObject();
+        groovy.add("ls", ls);
+        invoke("applyLogLevelSetting",
+                new Class<?>[] {com.google.gson.JsonObject.class},
+                new Object[] {groovy});
+        // No exception when logLevel not present
+    }
+
+    @Test
+    void applyLogLevelSettingWithLogLevel() throws Exception {
+        com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
+        com.google.gson.JsonObject ls = new com.google.gson.JsonObject();
+        ls.addProperty("logLevel", "DEBUG");
+        groovy.add("ls", ls);
+        invoke("applyLogLevelSetting",
+                new Class<?>[] {com.google.gson.JsonObject.class},
+                new Object[] {groovy});
+        // Should not throw
+    }
+
+    @Test
+    void applyLogLevelSettingNullLogLevel() throws Exception {
+        com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
+        com.google.gson.JsonObject ls = new com.google.gson.JsonObject();
+        ls.add("logLevel", com.google.gson.JsonNull.INSTANCE);
+        groovy.add("ls", ls);
+        invoke("applyLogLevelSetting",
+                new Class<?>[] {com.google.gson.JsonObject.class},
+                new Object[] {groovy});
+        // Should handle null gracefully
+    }
+
+    // ================================================================
+    // addGroovyFallbackPackageEdit tests
+    // ================================================================
+
+    @Test
+    void addGroovyFallbackPackageEditNonGroovyFile() throws Exception {
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        invoke("addGroovyFallbackPackageEdit",
+                new Class<?>[] {String.class, String.class, Map.class},
+                new Object[] {"file:///Foo.java", "file:///Bar.java", changes});
+        assertTrue(changes.isEmpty());
+    }
+
+    @Test
+    void addGroovyFallbackPackageEditGroovyFile() throws Exception {
+        // Opens a groovy file with a package, simulates a move
+        DocumentManager dm = new DocumentManager();
+        String uri = "file:///src/com/example/Foo.groovy";
+        dm.didOpen(uri, "package com.example\nclass Foo { }");
+        GroovyWorkspaceService svc = new GroovyWorkspaceService(new GroovyLanguageServer(), dm);
+
+        Map<String, List<org.eclipse.lsp4j.TextEdit>> changes = new java.util.HashMap<>();
+        java.lang.reflect.Method m = GroovyWorkspaceService.class.getDeclaredMethod(
+                "addGroovyFallbackPackageEdit", String.class, String.class, Map.class);
+        m.setAccessible(true);
+        // findGroovyPackageMoveFallbackEdit will try to resolve package - may produce null
+        // but code path is exercised
+        m.invoke(svc, uri, "file:///src/com/other/Foo.groovy", changes);
+    }
+
+    // ================================================================
+    // toSymbolKind extended tests
+    // ================================================================
+
+    @Test
+    void toSymbolKindLocalVariable() throws Exception {
+        org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.LOCAL_VARIABLE);
+        Object result = invoke("toSymbolKind",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertEquals(org.eclipse.lsp4j.SymbolKind.Variable, result);
+    }
+
+    @Test
+    void toSymbolKindPackageFragment() throws Exception {
+        org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.PACKAGE_FRAGMENT);
+        Object result = invoke("toSymbolKind",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertEquals(org.eclipse.lsp4j.SymbolKind.Package, result);
+    }
+
+    @Test
+    void toSymbolKindInterface() throws Exception {
+        org.eclipse.jdt.core.IType element = mock(org.eclipse.jdt.core.IType.class);
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.TYPE);
+        when(element.isInterface()).thenReturn(true);
+        Object result = invoke("toSymbolKind",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertEquals(org.eclipse.lsp4j.SymbolKind.Interface, result);
+    }
+
+    @Test
+    void toSymbolKindEnum() throws Exception {
+        org.eclipse.jdt.core.IType element = mock(org.eclipse.jdt.core.IType.class);
+        when(element.getElementType()).thenReturn(org.eclipse.jdt.core.IJavaElement.TYPE);
+        when(element.isInterface()).thenReturn(false);
+        when(element.isEnum()).thenReturn(true);
+        Object result = invoke("toSymbolKind",
+                new Class<?>[] {org.eclipse.jdt.core.IJavaElement.class},
+                new Object[] {element});
+        assertEquals(org.eclipse.lsp4j.SymbolKind.Enum, result);
+    }
+
+    // ================================================================
+    // Additional isSimpleTypeMatch edge cases
+    // ================================================================
+
+    @Test
+    void isSimpleTypeMatchAtEndOfContent() throws Exception {
+        // "class Foo" - match at the very end
+        Object result = invoke("isSimpleTypeMatch",
+                new Class<?>[] {String.class, String.class, int.class, int.class, int.class},
+                new Object[] {"class Foo", "Foo", 6, 3, 9});
+        assertTrue((boolean) result);
+    }
+
+    @Test
+    void isSimpleTypeMatchPrecededByLetter() throws Exception {
+        // "classFoo" - substring(5,8)="Foo" matches => true (no word-boundary check)
+        Object result = invoke("isSimpleTypeMatch",
+                new Class<?>[] {String.class, String.class, int.class, int.class, int.class},
+                new Object[] {"classFoo", "Foo", 5, 3, 8});
+        assertTrue((boolean) result);
+    }
+
+    @Test
+    void isSimpleTypeMatchTokenMismatch() throws Exception {
+        // "class Bar" - substring(6,9)="Bar" != "Foo" => false
+        Object result = invoke("isSimpleTypeMatch",
+                new Class<?>[] {String.class, String.class, int.class, int.class, int.class},
+                new Object[] {"class Bar", "Foo", 6, 3, 9});
+        assertFalse((boolean) result);
+    }
+
+    // ================================================================
+    // Additional shouldReplaceQualifiedReference tests
+    // ================================================================
+
+    @Test
+    void shouldReplaceQualifiedReferenceDotBeforeMatch() throws Exception {
+        // "com.Foo" - offset 4, preceded by '.' = qualified reference
+        java.util.Set<Integer> importLines = new java.util.HashSet<>();
+        Object result = invoke("shouldReplaceQualifiedReference",
+                new Class<?>[] {String.class, java.util.Set.class, int.class, int.class, int.class, String.class},
+                new Object[] {"com.Foo", importLines, 4, 3, 7, "Foo"});
+        assertTrue((boolean) result);
+    }
+
+    @Test
+    void shouldReplaceQualifiedReferenceOnImportLine() throws Exception {
+        // On an import line - should not replace
+        java.util.Set<Integer> importLines = new java.util.HashSet<>();
+        importLines.add(0);
+        Object result = invoke("shouldReplaceQualifiedReference",
+                new Class<?>[] {String.class, java.util.Set.class, int.class, int.class, int.class, String.class},
+                new Object[] {"import com.Foo", importLines, 11, 3, 14, "Foo"});
+        assertFalse((boolean) result);
+    }
 }

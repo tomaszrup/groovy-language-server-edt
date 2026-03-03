@@ -15,10 +15,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.ImportNode;
@@ -26,11 +22,9 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
-import org.codehaus.groovy.ast.ConstructorNode;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
 import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.codehaus.groovy.ast.expr.Expression;
-import org.codehaus.groovy.ast.expr.MethodCallExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.ExpressionStatement;
@@ -59,11 +53,8 @@ import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.TypeNameRequestor;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionItemKind;
-import org.eclipse.lsp4j.CompletionItemTag;
 import org.eclipse.lsp4j.CompletionParams;
 import org.eclipse.lsp4j.InsertTextFormat;
-import org.eclipse.lsp4j.MarkupContent;
-import org.eclipse.lsp4j.MarkupKind;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextEdit;
 
@@ -114,13 +105,6 @@ public class CompletionProvider {
     private static final String PACKAGE_PREFIX = "package ";
 
     private final DocumentManager documentManager;
-
-    /**
-     * Thread-local reference to the current AST being resolved during dot-completion.
-     * Set during {@link #addAstDotCompletions} so that chained method call resolution
-     * can look up local variables from the same AST.
-     */
-    private ModuleNode currentResolveAst;
 
     /**
      * Find a usable IJavaProject. The working copy's own project may be stale/non-existent
@@ -182,26 +166,6 @@ public class CompletionProvider {
 
     /** Maximum number of member results per type hierarchy. */
     private static final int MAX_MEMBER_RESULTS = 300;
-
-    /** java.lang.Object method names — these are always present; push them down in sorting. */
-    private static final Set<String> OBJECT_METHODS = Set.of(
-            "toString", "hashCode", "equals", "getClass", "notify", "notifyAll",
-            "wait", "clone", "finalize");
-
-    /** Commit characters for method completions. */
-    private static final List<String> METHOD_COMMIT_CHARS = List.of(".", "(");
-
-    /** Commit characters for field/property completions. */
-    private static final List<String> FIELD_COMMIT_CHARS = List.of(".");
-
-    /** Commit characters for type completions. */
-    private static final List<String> TYPE_COMMIT_CHARS = List.of(".");
-
-    /** Commit characters for keyword completions. */
-    private static final List<String> KEYWORD_COMMIT_CHARS = List.of(" ");
-
-    private static final Gson GSON = new Gson();
-    private static final String PARAM_COUNT_KEY = "paramCount";
 
     public CompletionProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -277,181 +241,9 @@ public class CompletionProvider {
 
     /**
      * Resolve additional details for a completion item.
-     * <p>
-     * Lazily loads Javadoc/Groovydoc documentation for the item by looking up
-     * the JDT element from the stored data (declaring type FQN, element name,
-     * parameter signatures).
      */
     public CompletionItem resolveCompletionItem(CompletionItem item) {
-        if (item.getData() == null) {
-            return item;
-        }
-
-        try {
-            JsonObject data = parseItemData(item);
-            if (data == null) {
-                return item;
-            }
-
-            String documentation = resolveDocumentation(data);
-            if (documentation != null && !documentation.isEmpty()) {
-                MarkupContent markup = new MarkupContent();
-                markup.setKind(MarkupKind.MARKDOWN);
-                markup.setValue(documentation);
-                item.setDocumentation(markup);
-            }
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("[completion] resolveCompletionItem failed", e);
-        }
-
         return item;
-    }
-
-    private JsonObject parseItemData(CompletionItem item) {
-        JsonElement dataElement;
-        if (item.getData() instanceof JsonElement je) {
-            dataElement = je;
-        } else {
-            dataElement = GSON.toJsonTree(item.getData());
-        }
-        return dataElement.isJsonObject() ? dataElement.getAsJsonObject() : null;
-    }
-
-    private String resolveDocumentation(JsonObject data) throws JavaModelException {
-        String kind = getJsonString(data, "kind");
-        if (kind == null) {
-            return null;
-        }
-
-        String fqn = getJsonString(data, "fqn");
-        String elementName = getJsonString(data, "name");
-
-        IJavaProject project = findOpenWorkspaceJavaProject();
-        if (project == null || fqn == null) {
-            return null;
-        }
-
-        IType type = project.findType(fqn);
-        if (type == null || !type.exists()) {
-            return null;
-        }
-
-        return resolveDocumentationForKind(kind, type, elementName, data);
-    }
-
-    private String resolveDocumentationForKind(String kind, IType type,
-                                                String elementName, JsonObject data) {
-        switch (kind) {
-            case "method": {
-                if (elementName == null) return null;
-                IMethod method = findMethodInType(type, elementName, data);
-                return method != null ? getJavadocForMember(method) : null;
-            }
-            case "field": {
-                if (elementName == null) return null;
-                IField field = type.getField(elementName);
-                return (field != null && field.exists()) ? getJavadocForMember(field) : null;
-            }
-            case "type":
-                return getJavadocForMember(type);
-            default:
-                return null;
-        }
-    }
-
-    private IMethod findMethodInType(IType type, String name, JsonObject data) {
-        try {
-            // Try to match by parameter count first
-            int paramCount = data.has(PARAM_COUNT_KEY) ? data.get(PARAM_COUNT_KEY).getAsInt() : -1;
-            for (IMethod method : type.getMethods()) {
-                if (method.getElementName().equals(name)
-                        && (paramCount < 0 || method.getParameterTypes().length == paramCount)) {
-                    return method;
-                }
-            }
-        } catch (Exception e) {
-            // ignore
-        }
-        return null;
-    }
-
-    /**
-     * Get Javadoc for a JDT member, falling back to source JAR resolution.
-     */
-    private String getJavadocForMember(IJavaElement element) {
-        try {
-            // Try JDT attached Javadoc first
-            String attached = getAttachedJavadoc(element);
-            if (attached != null) {
-                return attached;
-            }
-
-            // Try source JAR approach
-            return getJavadocFromSource(element);
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("[completion] Javadoc resolution failed for " + element.getElementName(), e);
-        }
-        return null;
-    }
-
-    private String getAttachedJavadoc(IJavaElement element) throws JavaModelException {
-        if (element instanceof org.eclipse.jdt.core.IMember member) {
-            String attached = member.getAttachedJavadoc(null);
-            if (attached != null && !attached.isEmpty()) {
-                return attached;
-            }
-        }
-        return null;
-    }
-
-    private String getJavadocFromSource(IJavaElement element) {
-        IType ownerType = resolveOwnerType(element);
-        if (ownerType == null) {
-            return null;
-        }
-
-        String source = readSourceForType(ownerType);
-        if (source == null || source.isEmpty()) {
-            return null;
-        }
-
-        if (element instanceof IType) {
-            return SourceJarHelper.extractJavadoc(source, ownerType.getElementName());
-        }
-        return SourceJarHelper.extractMemberJavadoc(source, element.getElementName());
-    }
-
-    private IType resolveOwnerType(IJavaElement element) {
-        if (element instanceof IType t) {
-            return t;
-        }
-        IJavaElement ancestor = element.getAncestor(IJavaElement.TYPE);
-        return ancestor instanceof IType t ? t : null;
-    }
-
-    private String readSourceForType(IType ownerType) {
-        String fqn = ownerType.getFullyQualifiedName();
-        String source = null;
-
-        if (ownerType.getClassFile() != null) {
-            java.io.File sourcesJar = SourceJarHelper.findSourcesJar(ownerType);
-            if (sourcesJar != null) {
-                source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-            }
-        }
-
-        if (source == null || source.isEmpty()) {
-            source = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
-        }
-
-        return source;
-    }
-
-    private static String getJsonString(JsonObject obj, String key) {
-        if (obj.has(key) && !obj.get(key).isJsonNull()) {
-            return obj.get(key).getAsString();
-        }
-        return null;
     }
 
     // =========================================================================
@@ -750,29 +542,11 @@ public class CompletionProvider {
                                                     IType ownerType, String sortPrefix)
             throws JavaModelException {
         CompletionItem item = new CompletionItem(name);
-        boolean isEnum = Flags.isEnum(field.getFlags());
-        item.setKind(isEnum ? CompletionItemKind.EnumMember : CompletionItemKind.Field);
+        item.setKind(Flags.isEnum(field.getFlags())
+                ? CompletionItemKind.EnumMember : CompletionItemKind.Field);
         item.setDetail(resolveFieldDetail(field, ownerType));
         item.setInsertText(name);
-        item.setFilterText(name);
-        item.setCommitCharacters(FIELD_COMMIT_CHARS);
-
-        // Deprecation marking
-        boolean deprecated = Flags.isDeprecated(field.getFlags());
-        if (deprecated) {
-            item.setTags(List.of(CompletionItemTag.Deprecated));
-            item.setSortText(sortPrefix + "z_" + name);
-        } else {
-            item.setSortText(sortPrefix + "_" + name);
-        }
-
-        // Store data for lazy resolution
-        JsonObject data = new JsonObject();
-        data.addProperty("kind", "field");
-        data.addProperty("fqn", ownerType.getFullyQualifiedName());
-        data.addProperty("name", name);
-        item.setData(data);
-
+        item.setSortText(sortPrefix + "_" + name);
         return item;
     }
 
@@ -791,73 +565,51 @@ public class CompletionProvider {
                                                    IType owner, String sortPrefix) {
         CompletionItem item = new CompletionItem();
         try {
+            // Label: name(ParamType1 p1, ParamType2 p2)
             String[] paramTypes = method.getParameterTypes();
             String[] paramNames = method.getParameterNames();
+            StringBuilder label = new StringBuilder(name).append('(');
+            for (int i = 0; i < paramTypes.length; i++) {
+                if (i > 0) label.append(", ");
+                label.append(Signature.toString(paramTypes[i]));
+                if (i < paramNames.length) {
+                    label.append(' ').append(paramNames[i]);
+                }
+            }
+            label.append(')');
+            item.setLabel(label.toString());
 
-            item.setLabel(buildMethodLabel(name, paramTypes, paramNames));
-            item.setDetail(Signature.toString(method.getReturnType()) + " — " + owner.getElementName());
+            // Detail: returnType — DeclaringClass
+            String returnType = Signature.toString(method.getReturnType());
+            item.setDetail(returnType + " — " + owner.getElementName());
+
+            // Kind
             item.setKind(method.isConstructor()
                     ? CompletionItemKind.Constructor : CompletionItemKind.Method);
-            setMethodInsertText(item, name, paramNames);
-            item.setFilterText(name);
-            item.setCommitCharacters(METHOD_COMMIT_CHARS);
-            setMethodSortText(item, method, name, sortPrefix);
 
-            // Store data for lazy resolution
-            JsonObject data = new JsonObject();
-            data.addProperty("kind", "method");
-            data.addProperty("fqn", owner.getFullyQualifiedName());
-            data.addProperty("name", name);
-            data.addProperty(PARAM_COUNT_KEY, method.getParameterTypes().length);
-            item.setData(data);
+            // Insert text as snippet with parameter placeholders
+            if (paramNames.length > 0) {
+                StringBuilder snippet = new StringBuilder(name).append('(');
+                for (int i = 0; i < paramNames.length; i++) {
+                    if (i > 0) snippet.append(", ");
+                    snippet.append("${").append(i + 1).append(':')
+                            .append(paramNames[i]).append('}');
+                }
+                snippet.append(')');
+                item.setInsertText(snippet.toString());
+                item.setInsertTextFormat(InsertTextFormat.Snippet);
+            } else {
+                item.setInsertText(name + "()");
+                item.setInsertTextFormat(InsertTextFormat.PlainText);
+            }
+
+            item.setFilterText(name);
+            item.setSortText(sortPrefix + "_" + name);
         } catch (Exception e) {
             item.setLabel(name);
             item.setInsertText(name);
         }
         return item;
-    }
-
-    private String buildMethodLabel(String name, String[] paramTypes, String[] paramNames) {
-        StringBuilder label = new StringBuilder(name).append('(');
-        for (int i = 0; i < paramTypes.length; i++) {
-            if (i > 0) label.append(", ");
-            label.append(Signature.toString(paramTypes[i]));
-            if (i < paramNames.length) {
-                label.append(' ').append(paramNames[i]);
-            }
-        }
-        label.append(')');
-        return label.toString();
-    }
-
-    private void setMethodInsertText(CompletionItem item, String name, String[] paramNames) {
-        if (paramNames.length > 0) {
-            StringBuilder snippet = new StringBuilder(name).append('(');
-            for (int i = 0; i < paramNames.length; i++) {
-                if (i > 0) snippet.append(", ");
-                snippet.append("${").append(i + 1).append(':')
-                        .append(paramNames[i]).append('}');
-            }
-            snippet.append(')');
-            item.setInsertText(snippet.toString());
-            item.setInsertTextFormat(InsertTextFormat.Snippet);
-        } else {
-            item.setInsertText(name + "()");
-            item.setInsertTextFormat(InsertTextFormat.PlainText);
-        }
-    }
-
-    private void setMethodSortText(CompletionItem item, IMethod method,
-                                    String name, String sortPrefix) throws JavaModelException {
-        boolean deprecated = Flags.isDeprecated(method.getFlags());
-        if (deprecated) {
-            item.setTags(List.of(CompletionItemTag.Deprecated));
-            item.setSortText(sortPrefix + "z_" + name);
-        } else if (OBJECT_METHODS.contains(name)) {
-            item.setSortText("1y_" + name);
-        } else {
-            item.setSortText(sortPrefix + "_" + name);
-        }
     }
 
     // =========================================================================
@@ -1645,9 +1397,6 @@ public class CompletionProvider {
         ModuleNode ast = resolveAst(workingCopy, lspUri);
         if (ast == null) return;
 
-        // Store the AST for method call chain resolution in resolveVariableFromStatement
-        this.currentResolveAst = ast;
-
         IJavaProject project = findWorkingProject(workingCopy);
 
         for (ClassNode classNode : ast.getClasses()) {
@@ -1662,24 +1411,6 @@ public class CompletionProvider {
         ClassNode scriptType = resolveLocalVariableTypeInBlock(
                 ast.getStatementBlock(), exprName);
         addAstResolvedTypeMembers(scriptType, project, prefix, items);
-
-        // JDT-aware method call chain resolution fallback:
-        // When the AST alone can't resolve the type (e.g., def value = new JavaClass().method()),
-        // use JDT to resolve the method return type via the receiver type.
-        if (items.isEmpty() && project != null) {
-            IType jdtResolvedType = resolveVariableTypeViaJdt(ast, exprName, project);
-            if (jdtResolvedType != null) {
-                try {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[completion] JDT chain resolved variable '" + exprName
-                            + "' to type: " + jdtResolvedType.getFullyQualifiedName());
-                    addMembersOfType(jdtResolvedType, prefix, false, items);
-                } catch (Exception e) {
-                    GroovyLanguageServerPlugin.logError(
-                            "[completion] JDT chain resolution addMembers failed", e);
-                }
-            }
-        }
     }
 
     private ClassNode resolveAstExpressionType(ClassNode classNode, ModuleNode ast, String exprName) {
@@ -1691,134 +1422,6 @@ public class CompletionProvider {
 
         // Check local variables inside method bodies
         return resolveLocalVariableTypeInClass(classNode, exprName);
-    }
-
-    /**
-     * Resolve a variable's type using JDT when the AST alone cannot determine
-     * the return type of a method call chain (e.g., {@code def value = new JavaClass().method()}).
-     * Walks the AST to find the variable declaration, extracts the receiver type from the
-     * method call chain, then uses JDT to look up the method's return type.
-     */
-    private IType resolveVariableTypeViaJdt(ModuleNode ast, String varName, IJavaProject project) {
-        // Find the variable's declaration expression in the AST
-        DeclarationExpression decl = findVariableDeclaration(ast, varName);
-        if (decl == null) return null;
-
-        Expression initializer = decl.getRightExpression();
-        if (!(initializer instanceof MethodCallExpression methodCall)) return null;
-
-        return resolveMethodCallChainTypeViaJdt(methodCall, ast, project);
-    }
-
-    /**
-     * Search all classes and script blocks in the AST for a variable declaration matching varName.
-     */
-    private DeclarationExpression findVariableDeclaration(ModuleNode ast, String varName) {
-        for (ClassNode classNode : ast.getClasses()) {
-            if (classNode.getLineNumber() < 0) continue;
-            for (MethodNode method : classNode.getMethods()) {
-                DeclarationExpression decl = findDeclInBlock(methodBodyBlock(method), varName);
-                if (decl != null) return decl;
-            }
-            for (ConstructorNode ctor : classNode.getDeclaredConstructors()) {
-                DeclarationExpression decl = findDeclInBlock(methodBodyBlock(ctor), varName);
-                if (decl != null) return decl;
-            }
-        }
-        BlockStatement stmtBlock = ast.getStatementBlock();
-        if (stmtBlock != null) {
-            DeclarationExpression decl = findDeclInBlock(stmtBlock, varName);
-            if (decl != null) return decl;
-        }
-        return null;
-    }
-
-    private DeclarationExpression findDeclInBlock(BlockStatement block, String varName) {
-        if (block == null) return null;
-        for (Statement stmt : block.getStatements()) {
-            if (!(stmt instanceof ExpressionStatement exprStmt)) continue;
-            if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) continue;
-            Expression left = decl.getLeftExpression();
-            if (left instanceof VariableExpression varExpr && varName.equals(varExpr.getName())) {
-                return decl;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Resolve a MethodCallExpression chain to a JDT IType by:
-     * 1. Resolving the receiver (constructor call, variable, nested method call) to a type
-     * 2. Using JDT to find the method and its return type
-     */
-    private IType resolveMethodCallChainTypeViaJdt(MethodCallExpression methodCall,
-                                                    ModuleNode ast, IJavaProject project) {
-        try {
-            Expression objectExpr = methodCall.getObjectExpression();
-            String methodName = methodCall.getMethodAsString();
-            if (methodName == null) return null;
-
-            IType receiverJdtType = null;
-
-            if (objectExpr instanceof ConstructorCallExpression ctorCall) {
-                ClassNode ctorType = ctorCall.getType();
-                receiverJdtType = resolveAstTypeInProject(project, ctorType);
-            } else if (objectExpr instanceof MethodCallExpression nestedCall) {
-                receiverJdtType = resolveMethodCallChainTypeViaJdt(nestedCall, ast, project);
-            } else if (objectExpr instanceof VariableExpression varExpr) {
-                String receiverVarName = varExpr.getName();
-                if (!"this".equals(receiverVarName)) {
-                    // Try to resolve the variable's type
-                    ClassNode varType = resolveVariableTypeFromAllClasses(receiverVarName);
-                    if (varType != null && !"java.lang.Object".equals(varType.getName())) {
-                        receiverJdtType = resolveAstTypeInProject(project, varType);
-                    }
-                }
-            }
-
-            if (receiverJdtType == null) return null;
-
-            GroovyLanguageServerPlugin.logInfo("[completion] JDT chain: looking up method '"
-                    + methodName + "' in " + receiverJdtType.getFullyQualifiedName());
-
-            // Find the method in the receiver type and resolve its return type
-            for (IMethod method : receiverJdtType.getMethods()) {
-                if (methodName.equals(method.getElementName())) {
-                    String returnSig = method.getReturnType();
-                    if (returnSig != null) {
-                        String returnTypeName = Signature.toString(returnSig);
-                        IType returnType = resolveTypeName(returnTypeName,
-                                receiverJdtType, project);
-                        if (returnType != null) {
-                            return returnType;
-                        }
-                    }
-                }
-            }
-
-            // Check supertypes
-            ITypeHierarchy hierarchy = receiverJdtType.newSupertypeHierarchy(null);
-            if (hierarchy != null) {
-                for (IType superType : hierarchy.getAllSupertypes(receiverJdtType)) {
-                    for (IMethod method : superType.getMethods()) {
-                        if (methodName.equals(method.getElementName())) {
-                            String returnSig = method.getReturnType();
-                            if (returnSig != null) {
-                                String returnTypeName = Signature.toString(returnSig);
-                                IType returnType = resolveTypeName(returnTypeName,
-                                        superType, project);
-                                if (returnType != null) {
-                                    return returnType;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("[completion] JDT chain resolution failed", e);
-        }
-        return null;
     }
 
     /**
@@ -1857,113 +1460,32 @@ public class CompletionProvider {
         if (block == null) return null;
 
         for (Statement stmt : block.getStatements()) {
-            ClassNode resolved = resolveVariableFromStatement(stmt, varName);
-            if (resolved != null) {
-                return resolved;
+            if (!(stmt instanceof ExpressionStatement exprStmt)) continue;
+            if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) continue;
+
+            Expression left = decl.getLeftExpression();
+            if (!(left instanceof VariableExpression varExpr)) continue;
+            if (!varName.equals(varExpr.getName())) continue;
+
+            // Found the declaration — determine the type
+            Expression initializer = decl.getRightExpression();
+
+            // "def x = new Foo()" → use the constructor call type directly
+            if (initializer instanceof ConstructorCallExpression ctorCall) {
+                return ctorCall.getType();
             }
-        }
-        return null;
-    }
 
-    private ClassNode resolveVariableFromStatement(Statement stmt, String varName) {
-        if (!(stmt instanceof ExpressionStatement exprStmt)) return null;
-        if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) return null;
-
-        Expression left = decl.getLeftExpression();
-        if (!(left instanceof VariableExpression varExpr)) return null;
-        if (!varName.equals(varExpr.getName())) return null;
-
-        // Found the declaration — determine the type
-        Expression initializer = decl.getRightExpression();
-
-        // "def x = new Foo()" → use the constructor call type directly
-        if (initializer instanceof ConstructorCallExpression ctorCall) {
-            return ctorCall.getType();
-        }
-
-        // "def x = new Foo().bar()" or "def x = something.bar()" → resolve the chain
-        if (initializer instanceof MethodCallExpression methodCall) {
-            ClassNode chainResolved = resolveMethodCallChainType(methodCall);
-            if (chainResolved != null && !"java.lang.Object".equals(chainResolved.getName())) {
-                return chainResolved;
+            // Typed declaration (e.g. "String x = ...") → use the declared type
+            ClassNode originType = varExpr.getOriginType();
+            if (originType != null
+                    && !"java.lang.Object".equals(originType.getName())) {
+                return originType;
             }
-        }
 
-        // Typed declaration (e.g. "String x = ...") → use the declared type
-        ClassNode originType = varExpr.getOriginType();
-        if (originType != null
-                && !"java.lang.Object".equals(originType.getName())) {
-            return originType;
-        }
-
-        // Fallback: use the initializer expression's inferred type
-        return initializer != null ? initializer.getType() : null;
-    }
-
-    /**
-     * Resolve the return type of a method call chain by walking the AST.
-     * For {@code new Foo().bar()}: resolves receiver {@code new Foo()} to type {@code Foo},
-     * then looks up method {@code bar()} in Foo's ClassNode to get its return type.
-     * For deeper chains like {@code a.b().c()}: resolves recursively.
-     */
-    private ClassNode resolveMethodCallChainType(MethodCallExpression methodCall) {
-        Expression objectExpr = methodCall.getObjectExpression();
-        String methodName = methodCall.getMethodAsString();
-        if (methodName == null) return null;
-
-        ClassNode receiverType = null;
-
-        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
-            receiverType = ctorCall.getType();
-        } else if (objectExpr instanceof MethodCallExpression nestedCall) {
-            receiverType = resolveMethodCallChainType(nestedCall);
-        } else if (objectExpr instanceof VariableExpression varExpr) {
-            String receiverVarName = varExpr.getName();
-            if ("this".equals(receiverVarName)) {
-                return null;
+            // Fallback: use the initializer expression's inferred type
+            if (initializer != null) {
+                return initializer.getType();
             }
-            // Try to find the variable type in enclosing scope
-            // (reuse the existing local variable resolution)
-            receiverType = resolveVariableTypeFromAllClasses(receiverVarName);
-        }
-
-        if (receiverType == null || "java.lang.Object".equals(receiverType.getName())) {
-            return null;
-        }
-
-        // Look up the method in the receiver's ClassNode
-        for (MethodNode mn : receiverType.getMethods()) {
-            if (methodName.equals(mn.getName())) {
-                ClassNode returnType = mn.getReturnType();
-                if (returnType != null && !"java.lang.Object".equals(returnType.getName())) {
-                    return returnType;
-                }
-            }
-        }
-
-        // ClassNode from AST might not have the method (e.g., Java type at CONVERSION phase).
-        // Return the receiver type — the caller can use JDT to look up the method.
-        return null;
-    }
-
-    /**
-     * Helper: resolve a variable name's type by searching all classes in the last resolved AST.
-     * Used by method call chain resolution when the receiver is a variable.
-     */
-    private ClassNode resolveVariableTypeFromAllClasses(String varName) {
-        // This is called from the AST dot-completion context.
-        // We need access to the current AST. Store it during addAstDotCompletions.
-        if (currentResolveAst == null) return null;
-        for (ClassNode classNode : currentResolveAst.getClasses()) {
-            if (classNode.getLineNumber() >= 0) {
-                ClassNode type = resolveLocalVariableTypeInClass(classNode, varName);
-                if (type != null) return type;
-            }
-        }
-        BlockStatement stmtBlock = currentResolveAst.getStatementBlock();
-        if (stmtBlock != null) {
-            ClassNode type = resolveLocalVariableTypeInBlock(stmtBlock, varName);
-            if (type != null) return type;
         }
         return null;
     }
@@ -2040,12 +1562,7 @@ public class CompletionProvider {
     private ModuleNode getModuleFromWorkingCopy(ICompilationUnit workingCopy) {
         if (workingCopy == null) return null;
         try {
-            java.lang.reflect.Method getModuleNode =
-                    workingCopy.getClass().getMethod("getModuleNode");
-            Object result = getModuleNode.invoke(workingCopy);
-            if (result instanceof ModuleNode moduleNode) {
-                return moduleNode;
-            }
+            return ReflectionCache.getModuleNode(workingCopy);
         } catch (Exception e) {
             // Not a GroovyCompilationUnit or reflection failed
         }
@@ -2196,7 +1713,7 @@ public class CompletionProvider {
                             }
                         }
                     },
-                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
+                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
                     null);
 
             String chosen = (preferredFqn[0] != null) ? preferredFqn[0] : firstFqn[0];
@@ -2274,7 +1791,7 @@ public class CompletionProvider {
                             }
                         }
                     },
-                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
+                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
                     null);
 
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"
@@ -2307,29 +1824,12 @@ public class CompletionProvider {
         item.setDetail(pkg.isEmpty() ? simpleName : pkg + "." + simpleName);
         item.setInsertText(simpleName);
         item.setFilterText(simpleName);
-        item.setCommitCharacters(TYPE_COMMIT_CHARS);
         if (shouldAutoImportType(fqn, pkg, searchContext.currentPackage,
                 searchContext.existingImports)) {
             item.setAdditionalTextEdits(
                     java.util.Collections.singletonList(createImportEdit(searchContext.importInsertLine, fqn)));
         }
-
-        // Deprecation marking
-        boolean deprecated = Flags.isDeprecated(modifiers);
-        String sortPrefix = searchContext.annotationOnly ? "4_" : "5_";
-        if (deprecated) {
-            item.setTags(List.of(CompletionItemTag.Deprecated));
-            item.setSortText(sortPrefix + "z_" + simpleName);
-        } else {
-            item.setSortText(sortPrefix + simpleName);
-        }
-
-        // Store data for lazy resolution
-        JsonObject data = new JsonObject();
-        data.addProperty("kind", "type");
-        data.addProperty("fqn", fqn);
-        item.setData(data);
-
+        item.setSortText((searchContext.annotationOnly ? "4_" : "5_") + simpleName);
         return item;
     }
 
@@ -2431,8 +1931,6 @@ public class CompletionProvider {
                 CompletionItem item = new CompletionItem(keyword);
                 item.setKind(CompletionItemKind.Keyword);
                 item.setInsertText(keyword);
-                item.setFilterText(keyword);
-                item.setCommitCharacters(KEYWORD_COMMIT_CHARS);
                 item.setSortText("9_" + keyword);
                 items.add(item);
             }

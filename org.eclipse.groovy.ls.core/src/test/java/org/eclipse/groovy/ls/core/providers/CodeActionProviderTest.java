@@ -1300,4 +1300,827 @@ class CodeActionProviderTest {
     private Object invokeHelper(String methodName, Class<?>[] types, Object[] args) throws Exception {
         return invoke(testProvider, methodName, types, args);
     }
+
+    // ================================================================
+    // Pure-logic utility method tests
+    // ================================================================
+
+    // ---- extractTypeNameFromMessage ----
+
+    @Test
+    void extractTypeNameFromSimpleMessage() throws Exception {
+        assertEquals("FooBar", invokeHelper("extractTypeNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {"unable to resolve class FooBar"}));
+    }
+
+    @Test
+    void extractTypeNameFromGroovyPrefixedMessage() throws Exception {
+        assertEquals("MyType", invokeHelper("extractTypeNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {"Groovy:unable to resolve class MyType"}));
+    }
+
+    @Test
+    void extractTypeNameFromMessageReturnsNullForNull() throws Exception {
+        assertNull(invokeHelper("extractTypeNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {(String) null}));
+    }
+
+    @Test
+    void extractTypeNameFromMessageReturnsNullForUnrelatedMessage() throws Exception {
+        assertNull(invokeHelper("extractTypeNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {"some random error"}));
+    }
+
+    // ---- extractQuotedTypeCandidate ----
+
+    @Test
+    void extractQuotedTypeCandidateFindsQuoted() throws Exception {
+        assertEquals("MyType", invokeHelper("extractQuotedTypeCandidate",
+                new Class<?>[] {String.class},
+                new Object[] {"Cannot find class 'MyType' in scope"}));
+    }
+
+    @Test
+    void extractQuotedTypeCandidateReturnsNullForNoQuotes() throws Exception {
+        assertNull(invokeHelper("extractQuotedTypeCandidate",
+                new Class<?>[] {String.class},
+                new Object[] {"no quotes here"}));
+    }
+
+    @Test
+    void extractQuotedTypeCandidateReturnsNullForSingleQuote() throws Exception {
+        assertNull(invokeHelper("extractQuotedTypeCandidate",
+                new Class<?>[] {String.class},
+                new Object[] {"only one' quote"}));
+    }
+
+    // ---- extractTypeCandidateAfterMarker ----
+
+    @Test
+    void extractTypeCandidateAfterMarkerFindsType() throws Exception {
+        assertEquals("Foo", invokeHelper("extractTypeCandidateAfterMarker",
+                new Class<?>[] {String.class, String.class},
+                new Object[] {"The type Foo is not accessible", "The type "}));
+    }
+
+    @Test
+    void extractTypeCandidateAfterMarkerReturnsNullWhenNotFound() throws Exception {
+        assertNull(invokeHelper("extractTypeCandidateAfterMarker",
+                new Class<?>[] {String.class, String.class},
+                new Object[] {"random message", "The type "}));
+    }
+
+    // ---- simpleTypeName ----
+
+    @Test
+    void simpleTypeNameFromFqn() throws Exception {
+        assertEquals("List", invokeHelper("simpleTypeName",
+                new Class<?>[] {String.class},
+                new Object[] {"java.util.List"}));
+    }
+
+    @Test
+    void simpleTypeNameAlreadySimple() throws Exception {
+        assertEquals("Foo", invokeHelper("simpleTypeName",
+                new Class<?>[] {String.class},
+                new Object[] {"Foo"}));
+    }
+
+    // ---- packagePriority ----
+
+    @Test
+    void packagePriorityJavaLang() throws Exception {
+        assertEquals(0, invoke(testProvider, "packagePriority",
+                new Class<?>[] {String.class}, new Object[] {"java.lang.String"}));
+    }
+
+    @Test
+    void packagePriorityJavaUtil() throws Exception {
+        assertEquals(1, invoke(testProvider, "packagePriority",
+                new Class<?>[] {String.class}, new Object[] {"java.util.List"}));
+    }
+
+    @Test
+    void packagePriorityGroovy() throws Exception {
+        assertEquals(6, invoke(testProvider, "packagePriority",
+                new Class<?>[] {String.class}, new Object[] {"groovy.lang.Closure"}));
+    }
+
+    @Test
+    void packagePriorityOther() throws Exception {
+        assertEquals(10, invoke(testProvider, "packagePriority",
+                new Class<?>[] {String.class}, new Object[] {"com.example.Foo"}));
+    }
+
+    @Test
+    void packagePriorityJUnit() throws Exception {
+        assertEquals(8, invoke(testProvider, "packagePriority",
+                new Class<?>[] {String.class}, new Object[] {"org.junit.Test"}));
+    }
+
+    // ---- isImportSearchCandidate ----
+
+    @Test
+    void isImportSearchCandidateAcceptsNormal() throws Exception {
+        assertEquals(true, invoke(testProvider, "isImportSearchCandidate",
+                new Class<?>[] {String.class}, new Object[] {"java.util.List"}));
+    }
+
+    @Test
+    void isImportSearchCandidateRejectsSun() throws Exception {
+        assertEquals(false, invoke(testProvider, "isImportSearchCandidate",
+                new Class<?>[] {String.class}, new Object[] {"sun.misc.Unsafe"}));
+    }
+
+    @Test
+    void isImportSearchCandidateRejectsComSun() throws Exception {
+        assertEquals(false, invoke(testProvider, "isImportSearchCandidate",
+                new Class<?>[] {String.class}, new Object[] {"com.sun.internal.Foo"}));
+    }
+
+    @Test
+    void isImportSearchCandidateRejectsDollar() throws Exception {
+        assertEquals(false, invoke(testProvider, "isImportSearchCandidate",
+                new Class<?>[] {String.class}, new Object[] {"Foo$Bar"}));
+    }
+
+    @Test
+    void isImportSearchCandidateRejectsEmpty() throws Exception {
+        assertEquals(false, invoke(testProvider, "isImportSearchCandidate",
+                new Class<?>[] {String.class}, new Object[] {""}));
+    }
+
+    @Test
+    void isImportSearchCandidateRejectsNull() throws Exception {
+        assertEquals(false, invoke(testProvider, "isImportSearchCandidate",
+                new Class<?>[] {String.class}, new Object[] {(String) null}));
+    }
+
+    // ---- findImportInsertLine ----
+
+    @Test
+    void findImportInsertLineAfterExistingImports() throws Exception {
+        String content = "package com.example\nimport java.util.List\nclass Foo {}";
+        assertEquals(2, invoke(testProvider, "findImportInsertLine",
+                new Class<?>[] {String.class}, new Object[] {content}));
+    }
+
+    @Test
+    void findImportInsertLineAfterPackage() throws Exception {
+        String content = "package com.example\n\nclass Foo {}";
+        assertEquals(2, invoke(testProvider, "findImportInsertLine",
+                new Class<?>[] {String.class}, new Object[] {content}));
+    }
+
+    @Test
+    void findImportInsertLineNoPackageNoImport() throws Exception {
+        String content = "class Foo {}";
+        assertEquals(0, invoke(testProvider, "findImportInsertLine",
+                new Class<?>[] {String.class}, new Object[] {content}));
+    }
+
+    // ---- sanitizeParameterName ----
+
+    @Test
+    void sanitizeParameterNameValid() throws Exception {
+        assertEquals("name", invoke(testProvider, "sanitizeParameterName",
+                new Class<?>[] {String.class, int.class}, new Object[] {"name", 0}));
+    }
+
+    @Test
+    void sanitizeParameterNameNull() throws Exception {
+        assertEquals("arg0", invoke(testProvider, "sanitizeParameterName",
+                new Class<?>[] {String.class, int.class}, new Object[] {null, 0}));
+    }
+
+    @Test
+    void sanitizeParameterNameEmpty() throws Exception {
+        assertEquals("arg1", invoke(testProvider, "sanitizeParameterName",
+                new Class<?>[] {String.class, int.class}, new Object[] {"", 1}));
+    }
+
+    @Test
+    void sanitizeParameterNameInvalidStart() throws Exception {
+        assertEquals("arg2", invoke(testProvider, "sanitizeParameterName",
+                new Class<?>[] {String.class, int.class}, new Object[] {"1bad", 2}));
+    }
+
+    @Test
+    void sanitizeParameterNameInvalidMiddle() throws Exception {
+        assertEquals("arg3", invoke(testProvider, "sanitizeParameterName",
+                new Class<?>[] {String.class, int.class}, new Object[] {"na-me", 3}));
+    }
+
+    // ---- renderType ----
+
+    @Test
+    void renderTypeNull() throws Exception {
+        assertEquals("def", invoke(testProvider, "renderType",
+                new Class<?>[] {ClassNode.class}, new Object[] {(ClassNode) null}));
+    }
+
+    @Test
+    void renderTypeSimple() throws Exception {
+        assertEquals("String", invoke(testProvider, "renderType",
+                new Class<?>[] {ClassNode.class},
+                new Object[] {org.codehaus.groovy.ast.ClassHelper.STRING_TYPE}));
+    }
+
+    @Test
+    void renderTypeInt() throws Exception {
+        assertEquals("int", invoke(testProvider, "renderType",
+                new Class<?>[] {ClassNode.class},
+                new Object[] {org.codehaus.groovy.ast.ClassHelper.int_TYPE}));
+    }
+
+    // ---- normalizeTypeName ----
+
+    @Test
+    void normalizeTypeNameNull() throws Exception {
+        assertEquals("def", invoke(testProvider, "normalizeTypeName",
+                new Class<?>[] {ClassNode.class}, new Object[] {(ClassNode) null}));
+    }
+
+    @Test
+    void normalizeTypeNameString() throws Exception {
+        assertEquals("java.lang.String", invoke(testProvider, "normalizeTypeName",
+                new Class<?>[] {ClassNode.class},
+                new Object[] {org.codehaus.groovy.ast.ClassHelper.STRING_TYPE}));
+    }
+
+    // ---- leadingWhitespace ----
+
+    @Test
+    void leadingWhitespaceSpaces() throws Exception {
+        assertEquals("    ", invoke(testProvider, "leadingWhitespace",
+                new Class<?>[] {String.class}, new Object[] {"    code"}));
+    }
+
+    @Test
+    void leadingWhitespaceNone() throws Exception {
+        assertEquals("", invoke(testProvider, "leadingWhitespace",
+                new Class<?>[] {String.class}, new Object[] {"code"}));
+    }
+
+    @Test
+    void leadingWhitespaceTabs() throws Exception {
+        assertEquals("\t\t", invoke(testProvider, "leadingWhitespace",
+                new Class<?>[] {String.class}, new Object[] {"\t\tcode"}));
+    }
+
+    // ---- wantsKind ----
+
+    @Test
+    void wantsKindNullOnlyKindsReturnsTrue() throws Exception {
+        assertEquals(true, invoke(testProvider, "wantsKind",
+                new Class<?>[] {List.class, String[].class},
+                new Object[] {null, new String[] {"quickfix"}}));
+    }
+
+    @Test
+    void wantsKindMatchingReturnsTrue() throws Exception {
+        assertEquals(true, invoke(testProvider, "wantsKind",
+                new Class<?>[] {List.class, String[].class},
+                new Object[] {List.of("quickfix", "refactor"), new String[] {"quickfix"}}));
+    }
+
+    @Test
+    void wantsKindNoMatchReturnsFalse() throws Exception {
+        assertEquals(false, invoke(testProvider, "wantsKind",
+                new Class<?>[] {List.class, String[].class},
+                new Object[] {List.of("refactor"), new String[] {"quickfix"}}));
+    }
+
+    // ---- isMethodRequiredForImplementation ----
+
+    @Test
+    void isMethodRequiredForImplementationAbstract() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "abstract class Svc {\n  abstract String process(int n)\n}";
+        ModuleNode ast = cs.parse("file:///tmp.groovy", source).getModuleNode();
+        ClassNode cls = ast.getClasses().stream()
+                .filter(c -> "Svc".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        MethodNode method = cls.getMethods().stream()
+                .filter(m -> "process".equals(m.getName())).findFirst().orElseThrow();
+        assertEquals(true, invoke(testProvider, "isMethodRequiredForImplementation",
+                new Class<?>[] {MethodNode.class}, new Object[] {method}));
+    }
+
+    @Test
+    void isMethodRequiredForImplementationNonAbstract() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "class Svc {\n  String process(int n) { '' }\n}";
+        ModuleNode ast = cs.parse("file:///tmp.groovy", source).getModuleNode();
+        ClassNode cls = ast.getClasses().stream()
+                .filter(c -> "Svc".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        MethodNode method = cls.getMethods().stream()
+                .filter(m -> "process".equals(m.getName())).findFirst().orElseThrow();
+        assertEquals(false, invoke(testProvider, "isMethodRequiredForImplementation",
+                new Class<?>[] {MethodNode.class}, new Object[] {method}));
+    }
+
+    @Test
+    void isMethodRequiredForImplementationNull() throws Exception {
+        assertEquals(false, invoke(testProvider, "isMethodRequiredForImplementation",
+                new Class<?>[] {MethodNode.class}, new Object[] {(MethodNode) null}));
+    }
+
+    // ---- extractClassSimpleNameFromMessage ----
+
+    @Test
+    void extractClassSimpleNameFromQuotedMessage() throws Exception {
+        assertEquals("Widget", invokeHelper("extractClassSimpleNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {"Cannot find class 'com.example.Widget' in scope"}));
+    }
+
+    @Test
+    void extractClassSimpleNameFromMarkerMessage() throws Exception {
+        assertEquals("Widget", invokeHelper("extractClassSimpleNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {"The type Widget is not accessible"}));
+    }
+
+    @Test
+    void extractClassSimpleNameReturnsNullForEmpty() throws Exception {
+        assertNull(invokeHelper("extractClassSimpleNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {""}));
+    }
+
+    @Test
+    void extractClassSimpleNameReturnsNullForNull() throws Exception {
+        assertNull(invokeHelper("extractClassSimpleNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {(String) null}));
+    }
+
+    // ---- renderParameters ----
+
+    @Test
+    void renderParametersOne() throws Exception {
+        Parameter p = new Parameter(org.codehaus.groovy.ast.ClassHelper.STRING_TYPE, "name");
+        String result = (String) invoke(testProvider, "renderParameters",
+                new Class<?>[] {Parameter[].class},
+                new Object[] {new Parameter[] {p}});
+        assertTrue(result.contains("String"));
+        assertTrue(result.contains("name"));
+    }
+
+    // ---- inferIndentUnit ----
+
+    @Test
+    void inferIndentUnitFromSource() throws Exception {
+        String[] lines = {"class Foo {", "    void run() {}", "}"};
+        String result = (String) invoke(testProvider, "inferIndentUnit",
+                new Class<?>[] {String[].class, String.class, int.class, int.class},
+                new Object[] {lines, "", 0, 2});
+        assertEquals("    ", result);
+    }
+
+    @Test
+    void inferIndentUnitDefault() throws Exception {
+        String[] lines = {"class Foo {", "}"};
+        String result = (String) invoke(testProvider, "inferIndentUnit",
+                new Class<?>[] {String[].class, String.class, int.class, int.class},
+                new Object[] {lines, "", 0, 1});
+        assertEquals("    ", result);
+    }
+
+    // ---- findClassInsertLine ----
+
+    @Test
+    void findClassInsertLineAtClosingBrace() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "class Foo {\n  void run() {}\n}";
+        ModuleNode ast = cs.parse("file:///tmp.groovy", source).getModuleNode();
+        ClassNode cls = ast.getClasses().stream()
+                .filter(c -> "Foo".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        int line = (int) invoke(testProvider, "findClassInsertLine",
+                new Class<?>[] {ClassNode.class, String.class},
+                new Object[] {cls, source});
+        assertEquals(2, line); // line where "}" is
+    }
+
+    // ---- hasSameParameterTypes ----
+
+    @Test
+    void hasSameParameterTypesBothEmpty() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "class X {\n  void a() {}\n  void b() {}\n}";
+        ModuleNode ast = cs.parse("file:///tmp.groovy", source).getModuleNode();
+        ClassNode cls = ast.getClasses().stream()
+                .filter(c -> "X".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        MethodNode a = cls.getMethods().stream().filter(m -> "a".equals(m.getName())).findFirst().orElseThrow();
+        MethodNode b = cls.getMethods().stream().filter(m -> "b".equals(m.getName())).findFirst().orElseThrow();
+        assertEquals(true, invoke(testProvider, "hasSameParameterTypes",
+                new Class<?>[] {MethodNode.class, MethodNode.class}, new Object[] {a, b}));
+    }
+
+    @Test
+    void hasSameParameterTypesDifferent() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "class X {\n  void a(String s) {}\n  void b(int i) {}\n}";
+        ModuleNode ast = cs.parse("file:///tmp.groovy", source).getModuleNode();
+        ClassNode cls = ast.getClasses().stream()
+                .filter(c -> "X".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        MethodNode a = cls.getMethods().stream().filter(m -> "a".equals(m.getName())).findFirst().orElseThrow();
+        MethodNode b = cls.getMethods().stream().filter(m -> "b".equals(m.getName())).findFirst().orElseThrow();
+        assertEquals(false, invoke(testProvider, "hasSameParameterTypes",
+                new Class<?>[] {MethodNode.class, MethodNode.class}, new Object[] {a, b}));
+    }
+
+    // ================================================================
+    // Batch 6 — additional CodeActionProvider coverage
+    // ================================================================
+
+    // ---- findMissingInterfaceMethods ----
+
+    @Test
+    void findMissingInterfaceMethodsDetectsMissing() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = """
+                interface Greeter {
+                    String greet(String name)
+                    void wave()
+                }
+                class MyGreeter implements Greeter {
+                    String greet(String name) { "Hi $name" }
+                }
+                """;
+        ModuleNode ast = cs.parse("file:///findMissing.groovy", source).getModuleNode();
+        ClassNode myGreeter = ast.getClasses().stream()
+                .filter(c -> "MyGreeter".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        @SuppressWarnings("unchecked")
+        List<MethodNode> missing = (List<MethodNode>) invoke(testProvider, "findMissingInterfaceMethods",
+                new Class<?>[] {ClassNode.class, ModuleNode.class},
+                new Object[] {myGreeter, ast});
+        assertNotNull(missing);
+        assertTrue(missing.stream().anyMatch(m -> "wave".equals(m.getName())),
+                "Expected 'wave' in missing methods");
+    }
+
+    @Test
+    void findMissingMethodsEmptyWhenFullyImplemented() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = """
+                interface Runner {
+                    void run()
+                }
+                class MyRunner implements Runner {
+                    void run() { println 'running' }
+                }
+                """;
+        ModuleNode ast = cs.parse("file:///findMissAll.groovy", source).getModuleNode();
+        ClassNode myRunner = ast.getClasses().stream()
+                .filter(c -> "MyRunner".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        @SuppressWarnings("unchecked")
+        List<MethodNode> missing = (List<MethodNode>) invoke(testProvider, "findMissingInterfaceMethods",
+                new Class<?>[] {ClassNode.class, ModuleNode.class},
+                new Object[] {myRunner, ast});
+        assertNotNull(missing);
+        assertTrue(missing.isEmpty(), "Expected no missing methods");
+    }
+
+    // ---- renderType / renderParameters / methodSignatureKey ----
+
+    @Test
+    void renderTypeHandlesSimpleAndArrayTypes() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "class Demo { String name; int[] values }";
+        ModuleNode ast = cs.parse("file:///renderType.groovy", source).getModuleNode();
+        ClassNode demo = ast.getClasses().stream()
+                .filter(c -> "Demo".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        // Get the String type from the 'name' field
+        ClassNode stringType = demo.getField("name").getType();
+        String rendered = (String) invoke(testProvider, "renderType",
+                new Class<?>[] {ClassNode.class}, new Object[] {stringType});
+        assertEquals("String", rendered);
+    }
+
+    @Test
+    void renderParametersForMultipleParams() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "class Demo { void run(String s, int n) {} }";
+        ModuleNode ast = cs.parse("file:///renderParams.groovy", source).getModuleNode();
+        ClassNode demo = ast.getClasses().stream()
+                .filter(c -> "Demo".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        MethodNode run = demo.getMethods().stream()
+                .filter(m -> "run".equals(m.getName())).findFirst().orElseThrow();
+        String rendered = (String) invoke(testProvider, "renderParameters",
+                new Class<?>[] {Parameter[].class}, new Object[] {run.getParameters()});
+        assertNotNull(rendered);
+        assertTrue(rendered.contains("String"));
+    }
+
+    @Test
+    void methodSignatureKeyIncludesParamTypes() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = "class Demo { void doIt(String s, int n) {} }";
+        ModuleNode ast = cs.parse("file:///methodSig.groovy", source).getModuleNode();
+        ClassNode demo = ast.getClasses().stream()
+                .filter(c -> "Demo".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        MethodNode doIt = demo.getMethods().stream()
+                .filter(m -> "doIt".equals(m.getName())).findFirst().orElseThrow();
+        String key = (String) invoke(testProvider, "methodSignatureKey",
+                new Class<?>[] {MethodNode.class}, new Object[] {doIt});
+        assertNotNull(key);
+        assertTrue(key.startsWith("doIt("));
+    }
+
+    // ---- normalizeTypeName ----
+
+    @Test
+    void normalizeTypeNameHandlesNull() throws Exception {
+        String result = (String) invoke(testProvider, "normalizeTypeName",
+                new Class<?>[] {ClassNode.class}, new Object[] {(ClassNode) null});
+        assertEquals("def", result);
+    }
+
+    // ---- findClassInsertLine ----
+
+    @Test
+    void findClassInsertLineReturnsValidLine() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = """
+                class Example {
+                    void a() {}
+                }
+                """;
+        ModuleNode ast = cs.parse("file:///insertLine.groovy", source).getModuleNode();
+        ClassNode example = ast.getClasses().stream()
+                .filter(c -> "Example".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        int line = (int) invoke(testProvider, "findClassInsertLine",
+                new Class<?>[] {ClassNode.class, String.class},
+                new Object[] {example, source});
+        assertTrue(line >= 0, "Expected a valid insert line");
+    }
+
+    // ---- leadingWhitespace ----
+
+    @Test
+    void leadingWhitespaceExtractsIndent() throws Exception {
+        assertEquals("    ", invoke(testProvider, "leadingWhitespace",
+                new Class<?>[] {String.class}, new Object[] {"    hello"}));
+        assertEquals("", invoke(testProvider, "leadingWhitespace",
+                new Class<?>[] {String.class}, new Object[] {"hello"}));
+        assertEquals("\t", invoke(testProvider, "leadingWhitespace",
+                new Class<?>[] {String.class}, new Object[] {"\thello"}));
+    }
+
+    // ---- wantsQuickFix / wantsSource / wantsKind ----
+
+    @Test
+    void wantsQuickFixReturnsTrueForQuickFixKind() throws Exception {
+        List<String> kinds = List.of(CodeActionKind.QuickFix);
+        assertEquals(true, invoke(testProvider, "wantsQuickFix",
+                new Class<?>[] {List.class}, new Object[] {kinds}));
+    }
+
+    @Test
+    void wantsQuickFixReturnsFalseForRefactorKind() throws Exception {
+        List<String> kinds = List.of(CodeActionKind.Refactor);
+        assertEquals(false, invoke(testProvider, "wantsQuickFix",
+                new Class<?>[] {List.class}, new Object[] {kinds}));
+    }
+
+    @Test
+    void wantsQuickFixReturnsTrueForNullKinds() throws Exception {
+        assertEquals(true, invoke(testProvider, "wantsQuickFix",
+                new Class<?>[] {List.class}, new Object[] {(List<?>) null}));
+    }
+
+    @Test
+    void wantsSourceReturnsTrueForSourceKind() throws Exception {
+        List<String> kinds = List.of(CodeActionKind.Source);
+        assertEquals(true, invoke(testProvider, "wantsSource",
+                new Class<?>[] {List.class}, new Object[] {kinds}));
+    }
+
+    // ---- isMethodRequiredForImplementation ----
+
+    @Test
+    void isMethodRequiredFiltersStaticAndSynthetic() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = """
+                interface Sayer {
+                    String say()
+                    static String defaultSay() { 'hello' }
+                }
+                """;
+        ModuleNode ast = cs.parse("file:///isMethodReq.groovy", source).getModuleNode();
+        ClassNode sayer = ast.getClasses().stream()
+                .filter(c -> "Sayer".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        for (MethodNode m : sayer.getMethods()) {
+            if ("say".equals(m.getName())) {
+                assertEquals(true, invoke(testProvider, "isMethodRequiredForImplementation",
+                        new Class<?>[] {MethodNode.class}, new Object[] {m}));
+            }
+        }
+    }
+
+    // ---- simpleTypeName ----
+
+    @Test
+    void simpleTypeNameExtractsLastSegment() throws Exception {
+        assertEquals("MyClass", invoke(testProvider, "simpleTypeName",
+                new Class<?>[] {String.class}, new Object[] {"com.example.MyClass"}));
+        assertEquals("Simple", invoke(testProvider, "simpleTypeName",
+                new Class<?>[] {String.class}, new Object[] {"Simple"}));
+    }
+
+    // ---- extractQuotedTypeCandidate ----
+
+    @Test
+    void extractQuotedTypeCandidateExtractsFromQuotes() throws Exception {
+        assertEquals("MyWidget", invoke(testProvider, "extractQuotedTypeCandidate",
+                new Class<?>[] {String.class},
+                new Object[] {"The type 'MyWidget' cannot be found"}));
+    }
+
+    @Test
+    void extractQuotedTypeCandidateNullWhenNoSingleQuotes() throws Exception {
+        assertNull(invoke(testProvider, "extractQuotedTypeCandidate",
+                new Class<?>[] {String.class},
+                new Object[] {"no quotes here"}));
+    }
+
+    // ---- findImportInsertLine ----
+
+    @Test
+    void findImportInsertLineFindsCorrectPosition() throws Exception {
+        String content = "package com.example\n\nimport java.util.List\n\nclass Demo {}";
+        int line = (int) invoke(testProvider, "findImportInsertLine",
+                new Class<?>[] {String.class}, new Object[] {content});
+        assertTrue(line >= 2, "Import insert line should be after package");
+    }
+
+    @Test
+    void findImportInsertLineForNoPackage() throws Exception {
+        String content = "class Demo {}";
+        int line = (int) invoke(testProvider, "findImportInsertLine",
+                new Class<?>[] {String.class}, new Object[] {content});
+        assertTrue(line >= 0, "Should find a valid insert line");
+    }
+
+    // ---- buildMissingMethodStubsText ----
+
+    @Test
+    void buildMissingMethodStubsTextGeneratesStubs() throws Exception {
+        GroovyCompilerService cs = new GroovyCompilerService();
+        String source = """
+                interface Callable {
+                    String call(String arg)
+                }
+                class Impl implements Callable {
+                }
+                """;
+        ModuleNode ast = cs.parse("file:///buildStubs.groovy", source).getModuleNode();
+        ClassNode impl = ast.getClasses().stream()
+                .filter(c -> "Impl".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
+        @SuppressWarnings("unchecked")
+        List<MethodNode> missing = (List<MethodNode>) invoke(testProvider, "findMissingInterfaceMethods",
+                new Class<?>[] {ClassNode.class, ModuleNode.class},
+                new Object[] {impl, ast});
+        if (!missing.isEmpty()) {
+            int insertLine = (int) invoke(testProvider, "findClassInsertLine",
+                    new Class<?>[] {ClassNode.class, String.class},
+                    new Object[] {impl, source});
+            String stubs = (String) invoke(testProvider, "buildMissingMethodStubsText",
+                    new Class<?>[] {ClassNode.class, List.class, String.class, int.class},
+                    new Object[] {impl, missing, source, insertLine});
+            assertNotNull(stubs);
+            assertTrue(stubs.contains("call"), "Stubs should contain method name 'call'");
+        }
+    }
+
+    // ---- sanitizeParameterName ----
+
+    @Test
+    void sanitizeParameterNameReturnsValidIdentifier() throws Exception {
+        assertEquals("name", invoke(testProvider, "sanitizeParameterName",
+                new Class<?>[] {String.class, int.class}, new Object[] {"name", 0}));
+    }
+
+    @Test
+    void sanitizeParameterNameReplacesInvalidWithArgN() throws Exception {
+        String result = (String) invoke(testProvider, "sanitizeParameterName",
+                new Class<?>[] {String.class, int.class}, new Object[] {"", 2});
+        assertNotNull(result);
+        assertTrue(result.contains("arg"), "Expected fallback arg name");
+    }
+
+    // ---- extractClassSimpleNameFromMessage ----
+
+    @Test
+    void extractClassSimpleNameFromVariousMessages() throws Exception {
+        assertEquals("MyService", invoke(testProvider, "extractClassSimpleNameFromMessage",
+                new Class<?>[] {String.class},
+                new Object[] {"unable to resolve class 'MyService'"}));
+    }
+
+    // ---- isUnresolvedTypeDiagnostic / isMissingInterfaceMemberDiagnostic ----
+
+    @Test
+    void isUnresolvedTypeDiagnosticMatchesUnresolvedClass() throws Exception {
+        Diagnostic d = new Diagnostic();
+        d.setMessage("unable to resolve class FooBar");
+        assertEquals(true, invoke(testProvider, "isUnresolvedTypeDiagnostic",
+                new Class<?>[] {Diagnostic.class}, new Object[] {d}));
+    }
+
+    @Test
+    void isUnresolvedTypeDiagnosticReturnsFalseForOther() throws Exception {
+        Diagnostic d = new Diagnostic();
+        d.setMessage("syntax error");
+        assertEquals(false, invoke(testProvider, "isUnresolvedTypeDiagnostic",
+                new Class<?>[] {Diagnostic.class}, new Object[] {d}));
+    }
+
+    @Test
+    void isMissingInterfaceMemberMatches() throws Exception {
+        Diagnostic d = new Diagnostic();
+        d.setMessage("Can't have an abstract method in a non-abstract class. " +
+                "The class 'Foo' must be declared abstract or the method 'void bar()' must be implemented");
+        assertEquals(true, invoke(testProvider, "isMissingInterfaceMemberDiagnostic",
+                new Class<?>[] {Diagnostic.class}, new Object[] {d}));
+    }
+
+    // ---- getDiagnosticMessage ----
+
+    @Test
+    void getDiagnosticMessageReturnsString() throws Exception {
+        Diagnostic d = new Diagnostic();
+        d.setMessage("test message");
+        Object msg = invoke(testProvider, "getDiagnosticMessage",
+                new Class<?>[] {Diagnostic.class}, new Object[] {d});
+        assertNotNull(msg);
+        assertTrue(msg.toString().contains("test message"));
+    }
+
+    @Test
+    void getDiagnosticMessageReturnsEmptyForNoMessage() throws Exception {
+        Diagnostic d = new Diagnostic();
+        Object msg = invoke(testProvider, "getDiagnosticMessage",
+                new Class<?>[] {Diagnostic.class}, new Object[] {d});
+        assertNotNull(msg);
+    }
+
+    // ================================================================
+    // createRemoveImportAction tests (79 missed instructions)
+    // ================================================================
+
+    @Test
+    void createRemoveImportActionCreatesQuickFix() throws Exception {
+        String uri = "file:///removeImport.groovy";
+        String content = "import java.util.ArrayList\nimport java.util.HashMap\nclass Foo {}";
+        Diagnostic diag = new Diagnostic();
+        diag.setRange(new Range(new Position(0, 0), new Position(0, 27)));
+
+        CodeAction action = (CodeAction) invoke(testProvider, "createRemoveImportAction",
+                new Class<?>[] {String.class, String.class, Diagnostic.class},
+                new Object[] {uri, content, diag});
+        assertNotNull(action);
+        assertEquals("Remove unused import", action.getTitle());
+        assertEquals(CodeActionKind.QuickFix, action.getKind());
+        assertTrue(action.getIsPreferred());
+        assertNotNull(action.getEdit());
+        assertNotNull(action.getEdit().getChanges().get(uri));
+        assertEquals(1, action.getEdit().getChanges().get(uri).size());
+        TextEdit edit = action.getEdit().getChanges().get(uri).get(0);
+        assertEquals("", edit.getNewText());
+        assertEquals(0, edit.getRange().getStart().getLine());
+        assertEquals(1, edit.getRange().getEnd().getLine());
+    }
+
+    @Test
+    void createRemoveImportActionReturnsNullForInvalidLine() throws Exception {
+        String uri = "file:///removeImport2.groovy";
+        String content = "class Foo {}";
+        Diagnostic diag = new Diagnostic();
+        diag.setRange(new Range(new Position(99, 0), new Position(99, 5)));
+
+        CodeAction action = (CodeAction) invoke(testProvider, "createRemoveImportAction",
+                new Class<?>[] {String.class, String.class, Diagnostic.class},
+                new Object[] {uri, content, diag});
+        assertNull(action);
+    }
+
+    @Test
+    void createRemoveImportActionHandlesLastLine() throws Exception {
+        String uri = "file:///removeImport3.groovy";
+        String content = "import java.util.List\nclass Foo {}";
+        Diagnostic diag = new Diagnostic();
+        diag.setRange(new Range(new Position(0, 0), new Position(0, 22)));
+
+        CodeAction action = (CodeAction) invoke(testProvider, "createRemoveImportAction",
+                new Class<?>[] {String.class, String.class, Diagnostic.class},
+                new Object[] {uri, content, diag});
+        assertNotNull(action);
+        assertFalse(action.getEdit().getChanges().get(uri).isEmpty());
+    }
 }

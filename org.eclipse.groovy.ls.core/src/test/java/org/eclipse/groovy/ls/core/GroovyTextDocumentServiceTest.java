@@ -23,29 +23,46 @@ import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Set;
 
+import org.eclipse.groovy.ls.core.providers.CallHierarchyProvider;
 import org.eclipse.groovy.ls.core.providers.CodeActionProvider;
+import org.eclipse.groovy.ls.core.providers.CodeLensProvider;
 import org.eclipse.groovy.ls.core.providers.CompletionProvider;
 import org.eclipse.groovy.ls.core.providers.DefinitionProvider;
 import org.eclipse.groovy.ls.core.providers.DiagnosticsProvider;
+import org.eclipse.groovy.ls.core.providers.DocumentHighlightProvider;
 import org.eclipse.groovy.ls.core.providers.DocumentSymbolProvider;
+import org.eclipse.groovy.ls.core.providers.FoldingRangeProvider;
 import org.eclipse.groovy.ls.core.providers.FormattingProvider;
 import org.eclipse.groovy.ls.core.providers.HoverProvider;
+import org.eclipse.groovy.ls.core.providers.ImplementationProvider;
 import org.eclipse.groovy.ls.core.providers.InlayHintProvider;
 import org.eclipse.groovy.ls.core.providers.ReferenceProvider;
 import org.eclipse.groovy.ls.core.providers.RenameProvider;
 import org.eclipse.groovy.ls.core.providers.SemanticTokensProvider;
 import org.eclipse.groovy.ls.core.providers.SignatureHelpProvider;
+import org.eclipse.groovy.ls.core.providers.TypeDefinitionProvider;
+import org.eclipse.groovy.ls.core.providers.TypeHierarchyProvider;
+import org.eclipse.lsp4j.CallHierarchyIncomingCallsParams;
+import org.eclipse.lsp4j.CallHierarchyOutgoingCallsParams;
+import org.eclipse.lsp4j.CallHierarchyPrepareParams;
 import org.eclipse.lsp4j.CodeActionParams;
+import org.eclipse.lsp4j.CodeLens;
+import org.eclipse.lsp4j.CodeLensParams;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionList;
 import org.eclipse.lsp4j.CompletionParams;
 import org.eclipse.lsp4j.DefinitionParams;
 import org.eclipse.lsp4j.DidCloseTextDocumentParams;
 import org.eclipse.lsp4j.DocumentFormattingParams;
+import org.eclipse.lsp4j.DocumentHighlightParams;
+import org.eclipse.lsp4j.DocumentOnTypeFormattingParams;
 import org.eclipse.lsp4j.DocumentRangeFormattingParams;
 import org.eclipse.lsp4j.DocumentSymbolParams;
+import org.eclipse.lsp4j.FoldingRangeRequestParams;
 import org.eclipse.lsp4j.HoverParams;
+import org.eclipse.lsp4j.ImplementationParams;
 import org.eclipse.lsp4j.InlayHintParams;
+import org.eclipse.lsp4j.PrepareRenameParams;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.ReferenceParams;
 import org.eclipse.lsp4j.RenameParams;
@@ -53,6 +70,10 @@ import org.eclipse.lsp4j.SemanticTokensParams;
 import org.eclipse.lsp4j.SemanticTokensRangeParams;
 import org.eclipse.lsp4j.SignatureHelpParams;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
+import org.eclipse.lsp4j.TypeDefinitionParams;
+import org.eclipse.lsp4j.TypeHierarchyPrepareParams;
+import org.eclipse.lsp4j.TypeHierarchySubtypesParams;
+import org.eclipse.lsp4j.TypeHierarchySupertypesParams;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.Test;
@@ -290,6 +311,337 @@ class GroovyTextDocumentServiceTest {
         service.didChange(changeParams);
 
         assertEquals("class Changed {}", documentManager.getContent("file:///test/Change.groovy"));
+    }
+
+    // ---- Additional delegation tests for untested methods ----
+
+    @Test
+    void documentHighlightDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        DocumentHighlightProvider provider = mock(DocumentHighlightProvider.class);
+        setField(service, "documentHighlightProvider", provider);
+        when(provider.getDocumentHighlights(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.documentHighlight(new DocumentHighlightParams()).join().isEmpty());
+    }
+
+    @Test
+    void typeDefinitionDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        TypeDefinitionProvider provider = mock(TypeDefinitionProvider.class);
+        setField(service, "typeDefinitionProvider", provider);
+        when(provider.getTypeDefinition(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.typeDefinition(new TypeDefinitionParams()).join().getLeft().isEmpty());
+    }
+
+    @Test
+    void implementationDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        ImplementationProvider provider = mock(ImplementationProvider.class);
+        setField(service, "implementationProvider", provider);
+        when(provider.getImplementations(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.implementation(new ImplementationParams()).join().getLeft().isEmpty());
+    }
+
+    @Test
+    void foldingRangeDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        FoldingRangeProvider provider = mock(FoldingRangeProvider.class);
+        setField(service, "foldingRangeProvider", provider);
+        when(provider.getFoldingRanges(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.foldingRange(new FoldingRangeRequestParams()).join().isEmpty());
+    }
+
+    @Test
+    void prepareRenameDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        RenameProvider provider = mock(RenameProvider.class);
+        setField(service, "renameProvider", provider);
+        when(provider.prepareRename(any())).thenThrow(new RuntimeException("boom"));
+        assertNull(service.prepareRename(new PrepareRenameParams()).join());
+    }
+
+    @Test
+    void onTypeFormattingDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        FormattingProvider provider = mock(FormattingProvider.class);
+        setField(service, "formattingProvider", provider);
+        when(provider.formatOnType(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.onTypeFormatting(new DocumentOnTypeFormattingParams()).join().isEmpty());
+    }
+
+    @Test
+    void prepareTypeHierarchyDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        TypeHierarchyProvider provider = mock(TypeHierarchyProvider.class);
+        setField(service, "typeHierarchyProvider", provider);
+        when(provider.prepareTypeHierarchy(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.prepareTypeHierarchy(new TypeHierarchyPrepareParams()).join().isEmpty());
+    }
+
+    @Test
+    void typeHierarchySupertypesDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        TypeHierarchyProvider provider = mock(TypeHierarchyProvider.class);
+        setField(service, "typeHierarchyProvider", provider);
+        when(provider.getSupertypes(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.typeHierarchySupertypes(new TypeHierarchySupertypesParams()).join().isEmpty());
+    }
+
+    @Test
+    void typeHierarchySubtypesDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        TypeHierarchyProvider provider = mock(TypeHierarchyProvider.class);
+        setField(service, "typeHierarchyProvider", provider);
+        when(provider.getSubtypes(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.typeHierarchySubtypes(new TypeHierarchySubtypesParams()).join().isEmpty());
+    }
+
+    @Test
+    void prepareCallHierarchyDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CallHierarchyProvider provider = mock(CallHierarchyProvider.class);
+        setField(service, "callHierarchyProvider", provider);
+        when(provider.prepareCallHierarchy(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.prepareCallHierarchy(new CallHierarchyPrepareParams()).join().isEmpty());
+    }
+
+    @Test
+    void callHierarchyIncomingCallsDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CallHierarchyProvider provider = mock(CallHierarchyProvider.class);
+        setField(service, "callHierarchyProvider", provider);
+        when(provider.getIncomingCalls(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.callHierarchyIncomingCalls(new CallHierarchyIncomingCallsParams()).join().isEmpty());
+    }
+
+    @Test
+    void callHierarchyOutgoingCallsDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CallHierarchyProvider provider = mock(CallHierarchyProvider.class);
+        setField(service, "callHierarchyProvider", provider);
+        when(provider.getOutgoingCalls(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.callHierarchyOutgoingCalls(new CallHierarchyOutgoingCallsParams()).join().isEmpty());
+    }
+
+    @Test
+    void codeLensDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CodeLensProvider provider = mock(CodeLensProvider.class);
+        setField(service, "codeLensProvider", provider);
+        when(provider.getCodeLenses(any())).thenThrow(new RuntimeException("boom"));
+        assertTrue(service.codeLens(new CodeLensParams()).join().isEmpty());
+    }
+
+    @Test
+    void resolveCodeLensDelegatesToProviderOnFailure() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CodeLensProvider provider = mock(CodeLensProvider.class);
+        setField(service, "codeLensProvider", provider);
+        CodeLens lens = new CodeLens();
+        when(provider.resolveCodeLens(any())).thenThrow(new RuntimeException("boom"));
+        assertSame(lens, service.resolveCodeLens(lens).join());
+    }
+
+    @Test
+    void shutdownPoolsAndClearsPendingTokens() {
+        GroovyTextDocumentService service = createService();
+        // Should not throw
+        service.shutdown();
+    }
+
+    // ================================================================
+    // Happy-path delegation tests — success paths
+    // ================================================================
+
+    @Test
+    void completionDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CompletionProvider provider = mock(CompletionProvider.class);
+        setField(service, "completionProvider", provider);
+
+        CompletionItem ci = new CompletionItem("hello");
+        when(provider.getCompletions(any())).thenReturn(List.of(ci));
+
+        Either<List<CompletionItem>, CompletionList> result = service.completion(new CompletionParams()).join();
+        assertTrue(result.isRight());
+        assertEquals(1, result.getRight().getItems().size());
+    }
+
+    @Test
+    void hoverDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        HoverProvider provider = mock(HoverProvider.class);
+        setField(service, "hoverProvider", provider);
+
+        org.eclipse.lsp4j.Hover expected = new org.eclipse.lsp4j.Hover();
+        when(provider.getHover(any())).thenReturn(expected);
+
+        org.eclipse.lsp4j.Hover result = service.hover(new HoverParams()).join();
+        assertSame(expected, result);
+    }
+
+    @Test
+    void signatureHelpDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        SignatureHelpProvider provider = mock(SignatureHelpProvider.class);
+        setField(service, "signatureHelpProvider", provider);
+
+        org.eclipse.lsp4j.SignatureHelp expected = new org.eclipse.lsp4j.SignatureHelp();
+        when(provider.getSignatureHelp(any())).thenReturn(expected);
+
+        org.eclipse.lsp4j.SignatureHelp result = service.signatureHelp(new SignatureHelpParams()).join();
+        assertSame(expected, result);
+    }
+
+    @Test
+    void formattingDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        FormattingProvider provider = mock(FormattingProvider.class);
+        setField(service, "formattingProvider", provider);
+
+        org.eclipse.lsp4j.TextEdit edit = new org.eclipse.lsp4j.TextEdit();
+        when(provider.format(any())).thenReturn(List.of(edit));
+
+        var result = service.formatting(new DocumentFormattingParams()).join();
+        assertEquals(1, result.size());
+    }
+
+    @Test
+    void rangeFormattingDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        FormattingProvider provider = mock(FormattingProvider.class);
+        setField(service, "formattingProvider", provider);
+
+        org.eclipse.lsp4j.TextEdit edit = new org.eclipse.lsp4j.TextEdit();
+        when(provider.formatRange(any())).thenReturn(List.of(edit));
+
+        var result = service.rangeFormatting(new DocumentRangeFormattingParams()).join();
+        assertEquals(1, result.size());
+    }
+
+    @Test
+    void semanticTokensFullDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        SemanticTokensProvider provider = mock(SemanticTokensProvider.class);
+        setField(service, "semanticTokensProvider", provider);
+
+        org.eclipse.lsp4j.SemanticTokens expected = new org.eclipse.lsp4j.SemanticTokens(List.of(1, 2, 3, 4, 5));
+        when(provider.getSemanticTokensFull(any())).thenReturn(expected);
+
+        SemanticTokensParams params = new SemanticTokensParams(new TextDocumentIdentifier("file:///test.groovy"));
+        org.eclipse.lsp4j.SemanticTokens result = service.semanticTokensFull(params).join();
+        assertNotNull(result);
+    }
+
+    @Test
+    void semanticTokensRangeDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        SemanticTokensProvider provider = mock(SemanticTokensProvider.class);
+        setField(service, "semanticTokensProvider", provider);
+
+        org.eclipse.lsp4j.SemanticTokens expected = new org.eclipse.lsp4j.SemanticTokens(List.of(1, 2, 3, 4, 5));
+        when(provider.getSemanticTokensRange(any())).thenReturn(expected);
+
+        SemanticTokensRangeParams params = new SemanticTokensRangeParams(
+                new TextDocumentIdentifier("file:///test.groovy"),
+                new org.eclipse.lsp4j.Range(
+                        new org.eclipse.lsp4j.Position(0, 0),
+                        new org.eclipse.lsp4j.Position(10, 0)));
+        org.eclipse.lsp4j.SemanticTokens result = service.semanticTokensRange(params).join();
+        assertNotNull(result);
+    }
+
+    @Test
+    void inlayHintDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        InlayHintProvider provider = mock(InlayHintProvider.class);
+        setField(service, "inlayHintProvider", provider);
+
+        org.eclipse.lsp4j.InlayHint hint = new org.eclipse.lsp4j.InlayHint();
+        when(provider.getInlayHints(any())).thenReturn(List.of(hint));
+
+        var result = service.inlayHint(new InlayHintParams()).join();
+        assertEquals(1, result.size());
+    }
+
+    @Test
+    void codeActionDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CodeActionProvider provider = mock(CodeActionProvider.class);
+        setField(service, "codeActionProvider", provider);
+
+        org.eclipse.lsp4j.CodeAction action = new org.eclipse.lsp4j.CodeAction("fix");
+        when(provider.getCodeActions(any())).thenReturn(List.of(Either.forRight(action)));
+
+        var result = service.codeAction(new CodeActionParams()).join();
+        assertEquals(1, result.size());
+    }
+
+    @Test
+    void codeLensDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CodeLensProvider provider = mock(CodeLensProvider.class);
+        setField(service, "codeLensProvider", provider);
+
+        CodeLens lens = new CodeLens();
+        when(provider.getCodeLenses(any())).thenReturn(List.of(lens));
+
+        var result = service.codeLens(new CodeLensParams()).join();
+        assertEquals(1, result.size());
+    }
+
+    @Test
+    void resolveCompletionItemDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CompletionProvider provider = mock(CompletionProvider.class);
+        setField(service, "completionProvider", provider);
+
+        CompletionItem item = new CompletionItem("hello");
+        CompletionItem resolved = new CompletionItem("hello resolved");
+        when(provider.resolveCompletionItem(item)).thenReturn(resolved);
+
+        CompletionItem result = service.resolveCompletionItem(item).join();
+        assertSame(resolved, result);
+    }
+
+    @Test
+    void resolveCodeLensDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CodeLensProvider provider = mock(CodeLensProvider.class);
+        setField(service, "codeLensProvider", provider);
+
+        CodeLens lens = new CodeLens();
+        CodeLens resolved = new CodeLens(new org.eclipse.lsp4j.Range());
+        when(provider.resolveCodeLens(lens)).thenReturn(resolved);
+
+        CodeLens result = service.resolveCodeLens(lens).join();
+        assertSame(resolved, result);
+    }
+
+    @Test
+    void documentHighlightDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        DocumentHighlightProvider provider = mock(DocumentHighlightProvider.class);
+        setField(service, "documentHighlightProvider", provider);
+
+        org.eclipse.lsp4j.DocumentHighlight highlight = new org.eclipse.lsp4j.DocumentHighlight();
+        when(provider.getDocumentHighlights(any())).thenReturn(List.of(highlight));
+
+        var result = service.documentHighlight(new DocumentHighlightParams()).join();
+        assertEquals(1, result.size());
+    }
+
+    @Test
+    void foldingRangeDelegatesToProviderOnSuccess() throws Exception {
+        GroovyTextDocumentService service = createService();
+        FoldingRangeProvider provider = mock(FoldingRangeProvider.class);
+        setField(service, "foldingRangeProvider", provider);
+
+        org.eclipse.lsp4j.FoldingRange range = new org.eclipse.lsp4j.FoldingRange(0, 10);
+        when(provider.getFoldingRanges(any())).thenReturn(List.of(range));
+
+        var result = service.foldingRange(new FoldingRangeRequestParams()).join();
+        assertEquals(1, result.size());
     }
 
     private GroovyTextDocumentService createService() {

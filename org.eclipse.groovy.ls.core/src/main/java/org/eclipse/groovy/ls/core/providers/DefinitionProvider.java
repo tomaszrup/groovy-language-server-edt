@@ -373,9 +373,9 @@ public class DefinitionProvider {
 
             // If not open, read from the file system
             if (content == null && resource instanceof org.eclipse.core.resources.IFile ifile) {
-                java.io.InputStream is = ifile.getContents();
-                content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                is.close();
+                try (java.io.InputStream is = ifile.getContents()) {
+                    content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                }
             }
 
             if (content == null) {
@@ -385,8 +385,9 @@ public class DefinitionProvider {
             int startOffset = sourceRange.getOffset();
             int endOffset = startOffset + sourceRange.getLength();
 
-            Position start = offsetToPosition(content, startOffset);
-            Position end = offsetToPosition(content, endOffset);
+            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
+            Position start = lineIndex.offsetToPosition(startOffset);
+            Position end = lineIndex.offsetToPosition(endOffset);
 
             return new Range(start, end);
 

@@ -25,6 +25,7 @@ import java.util.Properties;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.lsp4j.DocumentFormattingParams;
+import org.eclipse.lsp4j.DocumentOnTypeFormattingParams;
 import org.eclipse.lsp4j.DocumentRangeFormattingParams;
 import org.eclipse.lsp4j.FormattingOptions;
 import org.eclipse.lsp4j.Position;
@@ -685,5 +686,422 @@ class FormattingProviderTest {
                 org.eclipse.text.edits.TextEdit.class, String.class);
         m.setAccessible(true);
         return m.invoke(target, edit, source);
+    }
+
+    private boolean invokeIsContinuationContext(Object target, char before, char after) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod("isContinuationContext", char.class, char.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(target, before, after);
+    }
+
+    private boolean invokeIsNewlineRemovalSafe(Object target, String source, int offset, int length) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod("isNewlineRemovalSafe", String.class, int.class, int.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(target, source, offset, length);
+    }
+
+    private String invokeDetectLineSeparator(Object target, String source) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod("detectLineSeparator", String.class);
+        m.setAccessible(true);
+        return (String) m.invoke(target, source);
+    }
+
+    private char invokeLastNonWhitespaceBefore(Object target, String source, int index) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod("lastNonWhitespaceBefore", String.class, int.class);
+        m.setAccessible(true);
+        return (char) m.invoke(target, source, index);
+    }
+
+    private char invokeFirstNonWhitespaceAfter(Object target, String source, int index) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod("firstNonWhitespaceAfter", String.class, int.class);
+        m.setAccessible(true);
+        return (char) m.invoke(target, source, index);
+    }
+
+    private boolean invokeIsKeywordAt(Object target, StringBuilder sb, String keyword, int index, int len) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod("isKeywordAt", StringBuilder.class, String.class, int.class, int.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(target, sb, keyword, index, len);
+    }
+
+    private boolean invokeHasKeywordBoundaries(Object target, StringBuilder sb, int index, int len) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod("hasKeywordBoundaries", StringBuilder.class, int.class, int.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(target, sb, index, len);
+    }
+
+    // ================================================================
+    // isContinuationContext tests
+    // ================================================================
+
+    @Test
+    void isContinuationContextDotBefore() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertTrue(invokeIsContinuationContext(p, '.', 'f'));
+    }
+
+    @Test
+    void isContinuationContextPlusBefore() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertTrue(invokeIsContinuationContext(p, '+', 'x'));
+    }
+
+    @Test
+    void isContinuationContextDotAfter() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertTrue(invokeIsContinuationContext(p, 'x', '.'));
+    }
+
+    @Test
+    void isContinuationContextClosingParenAfter() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertTrue(invokeIsContinuationContext(p, 'x', ')'));
+    }
+
+    @Test
+    void isContinuationContextNoContinuation() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertFalse(invokeIsContinuationContext(p, 'x', 'y'));
+    }
+
+    @Test
+    void isContinuationContextOpenParenBefore() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertTrue(invokeIsContinuationContext(p, '(', 'x'));
+    }
+
+    // ================================================================
+    // isNewlineRemovalSafe tests
+    // ================================================================
+
+    @Test
+    void isNewlineRemovalSafeWithContinuation() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        String source = "foo.\nbar";
+        assertTrue(invokeIsNewlineRemovalSafe(p, source, 0, source.length()));
+    }
+
+    @Test
+    void isNewlineRemovalSafeWithoutContinuation() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        String source = "foo\nbar";
+        assertFalse(invokeIsNewlineRemovalSafe(p, source, 0, source.length()));
+    }
+
+    @Test
+    void isNewlineRemovalSafeNoNewline() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertTrue(invokeIsNewlineRemovalSafe(p, "foobar", 0, 6));
+    }
+
+    // ================================================================
+    // detectLineSeparator tests
+    // ================================================================
+
+    @Test
+    void detectLineSeparatorCRLF() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertEquals("\r\n", invokeDetectLineSeparator(p, "hello\r\nworld"));
+    }
+
+    @Test
+    void detectLineSeparatorLF() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertEquals("\n", invokeDetectLineSeparator(p, "hello\nworld"));
+    }
+
+    @Test
+    void detectLineSeparatorNoNewline() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        String result = invokeDetectLineSeparator(p, "hello");
+        assertEquals(System.lineSeparator(), result);
+    }
+
+    // ================================================================
+    // lastNonWhitespaceBefore / firstNonWhitespaceAfter tests
+    // ================================================================
+
+    @Test
+    void lastNonWhitespaceBeforeFindsChar() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertEquals('.', invokeLastNonWhitespaceBefore(p, "foo.  ", 5));
+    }
+
+    @Test
+    void lastNonWhitespaceBeforeReturnsNullChar() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertEquals('\0', invokeLastNonWhitespaceBefore(p, "   ", 3));
+    }
+
+    @Test
+    void firstNonWhitespaceAfterFindsChar() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertEquals('.', invokeFirstNonWhitespaceAfter(p, "  .bar", 0));
+    }
+
+    @Test
+    void firstNonWhitespaceAfterReturnsNullChar() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        assertEquals('\0', invokeFirstNonWhitespaceAfter(p, "   ", 0));
+    }
+
+    // ================================================================
+    // isKeywordAt / hasKeywordBoundaries tests
+    // ================================================================
+
+    @Test
+    void isKeywordAtMatch() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        StringBuilder sb = new StringBuilder("def foo");
+        assertTrue(invokeIsKeywordAt(p, sb, "def", 0, 3));
+    }
+
+    @Test
+    void isKeywordAtNoMatch() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        StringBuilder sb = new StringBuilder("int foo");
+        assertFalse(invokeIsKeywordAt(p, sb, "def", 0, 3));
+    }
+
+    @Test
+    void hasKeywordBoundariesAtStart() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        StringBuilder sb = new StringBuilder("def foo");
+        assertTrue(invokeHasKeywordBoundaries(p, sb, 0, 3));
+    }
+
+    @Test
+    void hasKeywordBoundariesInMiddle() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        StringBuilder sb = new StringBuilder("x def foo");
+        // "def" at index 2 — preceded by space (valid boundary)
+        assertTrue(invokeHasKeywordBoundaries(p, sb, 2, 3));
+    }
+
+    @Test
+    void hasKeywordBoundariesNoValidStart() throws Exception {
+        FormattingProvider p = new FormattingProvider(new DocumentManager());
+        StringBuilder sb = new StringBuilder("adef foo");
+        // "def" at index 1 — preceded by 'a' (identifier char, NOT valid boundary)
+        assertFalse(invokeHasKeywordBoundaries(p, sb, 1, 3));
+    }
+
+    // ================================================================
+    // resolveProfilePath tests
+    // ================================================================
+
+    @Test
+    void resolveProfilePathNull() throws Exception {
+        assertNull(invokeResolveProfilePath(null));
+    }
+
+    @Test
+    void resolveProfilePathEmpty() throws Exception {
+        assertNull(invokeResolveProfilePath(""));
+    }
+
+    @Test
+    void resolveProfilePathAbsolute() throws Exception {
+        java.io.File result = invokeResolveProfilePath(tempDir.resolve("test.xml").toString());
+        assertNotNull(result);
+        assertTrue(result.isAbsolute());
+    }
+
+    @Test
+    void resolveProfilePathRelative() throws Exception {
+        java.io.File result = invokeResolveProfilePath("relative/path.xml");
+        assertNotNull(result);
+    }
+
+    // ================================================================
+    // formatOnType tests
+    // ================================================================
+
+    @Test
+    void formatOnTypeReturnsEmptyForMissingDocument() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier("file:///NoSuchDoc.groovy"));
+        params.setPosition(new Position(0, 5));
+        params.setCh("}");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void formatOnTypeReturnsEmptyForEmptySource() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        String uri = "file:///EmptyOnType.groovy";
+        dm.didOpen(uri, "");
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(0, 0));
+        params.setCh("}");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertTrue(result.isEmpty());
+        dm.didClose(uri);
+    }
+
+    @Test
+    void formatOnTypeReturnsEmptyForUnknownTrigger() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        String uri = "file:///UnknownTrigger.groovy";
+        dm.didOpen(uri, "def x = 1");
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(0, 5));
+        params.setCh("x");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertTrue(result.isEmpty());
+        dm.didClose(uri);
+    }
+
+    @Test
+    void formatOnTypeWithCloseBrace() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        String uri = "file:///CloseBrace.groovy";
+        String source = "class Foo {\n    void bar() {\n        int x = 1\n    }\n}";
+        dm.didOpen(uri, source);
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(3, 5));
+        params.setCh("}");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertNotNull(result);
+        dm.didClose(uri);
+    }
+
+    @Test
+    void formatOnTypeCloseBraceNoMatch() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        String uri = "file:///NoMatchBrace.groovy";
+        dm.didOpen(uri, "}");
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(0, 1));
+        params.setCh("}");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertTrue(result.isEmpty());
+        dm.didClose(uri);
+    }
+
+    @Test
+    void formatOnTypeWithSemicolon() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        String uri = "file:///Semicolon.groovy";
+        dm.didOpen(uri, "int x = 1;");
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(0, 10));
+        params.setCh(";");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertNotNull(result);
+        dm.didClose(uri);
+    }
+
+    @Test
+    void formatOnTypeWithNewline() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        String uri = "file:///Newline.groovy";
+        dm.didOpen(uri, "int x = 1\n");
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(1, 0));
+        params.setCh("\n");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertNotNull(result);
+        dm.didClose(uri);
+    }
+
+    @Test
+    void formatOnTypeNewlineAtStart() {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        String uri = "file:///NewlineStart.groovy";
+        dm.didOpen(uri, "\nint x = 1");
+        DocumentOnTypeFormattingParams params = new DocumentOnTypeFormattingParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(0, 0));
+        params.setCh("\n");
+        params.setOptions(new FormattingOptions(4, true));
+        List<TextEdit> result = p.formatOnType(params);
+        assertTrue(result.isEmpty());
+        dm.didClose(uri);
+    }
+
+    // ================================================================
+    // findMatchingOpenBrace tests
+    // ================================================================
+
+    @Test
+    void findMatchingOpenBraceSimple() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        Method m = FormattingProvider.class.getDeclaredMethod("findMatchingOpenBrace", String.class, int.class);
+        m.setAccessible(true);
+        assertEquals(0, (int) m.invoke(p, "{abc}", 3));
+    }
+
+    @Test
+    void findMatchingOpenBraceNested() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        Method m = FormattingProvider.class.getDeclaredMethod("findMatchingOpenBrace", String.class, int.class);
+        m.setAccessible(true);
+        assertEquals(0, (int) m.invoke(p, "{ { } }", 5));
+    }
+
+    @Test
+    void findMatchingOpenBraceNotFound() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        Method m = FormattingProvider.class.getDeclaredMethod("findMatchingOpenBrace", String.class, int.class);
+        m.setAccessible(true);
+        assertEquals(-1, (int) m.invoke(p, "abc}", 2));
+    }
+
+    // ================================================================
+    // findLineStart tests
+    // ================================================================
+
+    @Test
+    void findLineStartAtBeginning() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        Method m = FormattingProvider.class.getDeclaredMethod("findLineStart", String.class, int.class);
+        m.setAccessible(true);
+        assertEquals(0, (int) m.invoke(p, "hello", 3));
+    }
+
+    @Test
+    void findLineStartSecondLine() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        Method m = FormattingProvider.class.getDeclaredMethod("findLineStart", String.class, int.class);
+        m.setAccessible(true);
+        assertEquals(6, (int) m.invoke(p, "hello\nworld", 8));
+    }
+
+    @Test
+    void findLineStartThirdLine() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        FormattingProvider p = new FormattingProvider(dm);
+        Method m = FormattingProvider.class.getDeclaredMethod("findLineStart", String.class, int.class);
+        m.setAccessible(true);
+        assertEquals(12, (int) m.invoke(p, "hello\nworld\nfoo", 14));
     }
 }

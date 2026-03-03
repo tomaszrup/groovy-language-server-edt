@@ -95,8 +95,8 @@
                 },
                 "groovy.ls.vmargs": {
                     "type": "string",
-                    "default": "-Xmx1G",
-                    "description": "Additional JVM arguments for the language server process (e.g., -Xmx2G for more memory).",
+                    "default": "-Xmx2G",
+                    "description": "JVM arguments for the language server. Default is -Xmx2G. For large workspaces with 50+ projects, consider -Xmx3G or -Xmx4G.",
                     "scope": "machine-overridable"
                 },
                 "groovy.ls.logLevel": {

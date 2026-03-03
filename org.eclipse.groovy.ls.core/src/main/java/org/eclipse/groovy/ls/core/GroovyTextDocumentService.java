@@ -11,7 +11,13 @@ package org.eclipse.groovy.ls.core;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import org.eclipse.groovy.ls.core.providers.CodeActionProvider;
 import org.eclipse.groovy.ls.core.providers.CallHierarchyProvider;
@@ -50,6 +56,47 @@ public class GroovyTextDocumentService implements TextDocumentService {
     private final GroovyLanguageServer server;
     private final DocumentManager documentManager;
     private LanguageClient client;
+
+    /**
+     * Dedicated executor for all LSP request handlers (completion, hover,
+     * semantic tokens, definition, …).  Using {@code ForkJoinPool.commonPool()}
+     * (the default for {@code CompletableFuture.supplyAsync()}) caused pool
+     * exhaustion — the common pool has only {@code availableProcessors - 1}
+     * threads (as few as 1 on 2-core machines), and a single slow
+     * {@code codeSelect()} or {@code getModuleNode()} call would starve
+     * every other feature.
+     * <p>
+     * A bounded thread pool with a work queue prevents thread explosion
+     * under burst load (e.g. rapid file navigation in large workspaces)
+     * while still providing enough concurrency for interactive features.
+     * Idle threads are reclaimed after 60 s.
+     */
+    private final ExecutorService lspRequestExecutor;
+    static {
+        // Initialised in the constructor — see below.
+    }
+    {
+        int corePoolSize = 4;
+        int maxPoolSize = Math.max(8, Runtime.getRuntime().availableProcessors() * 2);
+        lspRequestExecutor = new ThreadPoolExecutor(
+                corePoolSize, maxPoolSize,
+                60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(1024),
+                r -> {
+                    Thread t = new Thread(r, "groovy-ls-request");
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.CallerRunsPolicy());
+    }
+
+    /**
+     * Tracks the latest in-flight semantic-token future per URI so that we
+     * can cancel a superseded request when a new one arrives (VS Code sends
+     * {@code textDocument/semanticTokens/full} after every edit).
+     */
+    private final Map<String, CompletableFuture<?>> pendingSemanticTokens =
+            new ConcurrentHashMap<>();
 
     // Providers
     private final CompletionProvider completionProvider;
@@ -189,7 +236,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 empty.setIsIncomplete(true);
                 return Either.forRight(empty);
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -201,7 +248,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Completion resolve failed", e);
                 return item;
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Hover ----
@@ -215,7 +262,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Hover failed", e);
                 return null;
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Definition ----
@@ -230,7 +277,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Definition failed", e);
                 return Either.forLeft(new ArrayList<>());
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- References ----
@@ -244,7 +291,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("References failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Document Symbols ----
@@ -259,7 +306,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Document symbols failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Document Highlight ----
@@ -274,7 +321,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Document highlight failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Type Definition ----
@@ -289,7 +336,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Type definition failed", e);
                 return Either.forLeft(new ArrayList<>());
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Implementation ----
@@ -304,7 +351,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Implementation failed", e);
                 return Either.forLeft(new ArrayList<>());
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Folding Range ----
@@ -318,7 +365,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Folding range failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Rename ----
@@ -333,7 +380,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Prepare rename failed", e);
                 return null;
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -345,7 +392,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Rename failed", e);
                 return null;
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Signature Help ----
@@ -359,7 +406,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Signature help failed", e);
                 return null;
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Semantic Tokens ----
@@ -367,27 +414,62 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<org.eclipse.lsp4j.SemanticTokens> semanticTokensFull(
             org.eclipse.lsp4j.SemanticTokensParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        // Cancel any previous in-flight semantic token request for this URI.
+        // VS Code sends a new request after every edit; without cancellation
+        // the old requests pile up on the executor and block newer ones.
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingSemanticTokens.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<org.eclipse.lsp4j.SemanticTokens> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return semanticTokensProvider.getSemanticTokensFull(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Semantic tokens (full) failed", e);
                 return new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>());
             }
-        });
+        }, lspRequestExecutor);
+        if (normalizedUri != null) {
+            pendingSemanticTokens.put(normalizedUri, future);
+            future.whenComplete((r, t) -> pendingSemanticTokens.remove(normalizedUri, future));
+        }
+        return future;
     }
 
     @Override
     public CompletableFuture<org.eclipse.lsp4j.SemanticTokens> semanticTokensRange(
             org.eclipse.lsp4j.SemanticTokensRangeParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingSemanticTokens.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<org.eclipse.lsp4j.SemanticTokens> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return semanticTokensProvider.getSemanticTokensRange(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Semantic tokens (range) failed", e);
                 return new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>());
             }
-        });
+        }, lspRequestExecutor);
+        if (normalizedUri != null) {
+            pendingSemanticTokens.put(normalizedUri, future);
+            future.whenComplete((r, t) -> pendingSemanticTokens.remove(normalizedUri, future));
+        }
+        return future;
     }
 
     // ---- Inlay Hints ----
@@ -401,7 +483,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Inlay hints failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Code Actions ----
@@ -415,7 +497,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Code action failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Formatting ----
@@ -430,7 +512,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Formatting failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -443,7 +525,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Range formatting failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -456,7 +538,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("On-type formatting failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Type Hierarchy ----
@@ -471,7 +553,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Prepare type hierarchy failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -484,7 +566,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Type hierarchy supertypes failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -497,7 +579,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Type hierarchy subtypes failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Call Hierarchy ----
@@ -512,7 +594,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Prepare call hierarchy failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -525,7 +607,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Call hierarchy incoming calls failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -538,7 +620,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Call hierarchy outgoing calls failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     // ---- Code Lens ----
@@ -552,7 +634,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Code lens failed", e);
                 return new ArrayList<>();
             }
-        });
+        }, lspRequestExecutor);
     }
 
     @Override
@@ -564,7 +646,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Code lens resolve failed", e);
                 return codeLens;
             }
-        });
+        }, lspRequestExecutor);
     }
 
     /**
@@ -595,5 +677,15 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 diagnosticsProvider.publishDiagnosticsDebounced(documentManager.getClientUri(uri));
             }
         }
+    }
+
+    /**
+     * Shut down executor pools. Called from {@link GroovyLanguageServer#shutdown()}.
+     */
+    void shutdown() {
+        lspRequestExecutor.shutdownNow();
+        pendingSemanticTokens.values().forEach(f -> f.cancel(true));
+        pendingSemanticTokens.clear();
+        diagnosticsProvider.shutdown();
     }
 }

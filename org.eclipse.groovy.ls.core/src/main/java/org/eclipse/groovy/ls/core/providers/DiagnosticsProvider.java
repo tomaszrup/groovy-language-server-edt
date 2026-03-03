@@ -78,6 +78,19 @@ public class DiagnosticsProvider {
     // Simple debounce: track last scheduled publish per URI
     private final java.util.Map<String, java.util.concurrent.ScheduledFuture<?>> pendingPublish =
             new java.util.concurrent.ConcurrentHashMap<>();
+    // Per-URI version counter: incremented on every debounced request.
+    // A running task compares the version it captured against the current
+    // value — if they differ, a newer edit has been made and the task's
+    // results would be stale, so it skips the expensive reconcile.
+    private final java.util.Map<String, java.util.concurrent.atomic.AtomicLong> diagnosticVersions =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    // Per-URI "in-flight" flag: prevents overlapping reconcile tasks for the
+    // same file.  At most ONE diagnostics task can be running per URI.  If a
+    // new task fires while one is already running, it marks "re-run needed"
+    // and returns immediately, letting the in-flight task handle the re-run
+    // when it finishes.
+    private final java.util.Set<String> diagnosticsInFlight =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
     // Use a pool of 4 threads so that one reconcile blocked on the workspace
     // lock doesn't stall diagnostics for every other open file.
     private final java.util.concurrent.ScheduledExecutorService scheduler =
@@ -90,8 +103,12 @@ public class DiagnosticsProvider {
     // (~1-5s per file in large workspaces). If all threads are doing reconcile,
     // no more diagnostics can be scheduled. The semaphore lets us fall back to
     // fast syntax-only diagnostics when the limit is reached.
+    // Scaled to available processors (minimum 2, maximum 6) so that large
+    // workspaces with many open files can reconcile more in parallel.
+    // On a 4-CPU container this yields 3 permits, leaving headroom for other work.
     private final java.util.concurrent.Semaphore reconcileSemaphore =
-            new java.util.concurrent.Semaphore(2);
+            new java.util.concurrent.Semaphore(
+                    Math.max(2, Math.min(6, Runtime.getRuntime().availableProcessors() - 1)));
 
     public DiagnosticsProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -169,6 +186,8 @@ public class DiagnosticsProvider {
     public void clearDiagnostics(String uri) {
         String normalizedUri = DocumentManager.normalizeUri(uri);
         latestDiagnosticsByUri.remove(normalizedUri);
+        diagnosticsInFlight.remove(normalizedUri);
+        diagnosticVersions.remove(normalizedUri);
 
         // Cancel any scheduled but not-yet-started diagnostic task for this URI.
         // Without this, a debounced task from didOpen can fire after didClose,
@@ -183,20 +202,63 @@ public class DiagnosticsProvider {
 
     /**
      * Publish diagnostics after a short delay (debounced).
-     * Subsequent calls for the same URI cancel the previous scheduled publish.
+     * <p>
+     * Subsequent calls for the same URI cancel the previous scheduled publish
+     * and increment a per-URI version counter.  The scheduled task checks the
+     * version before and after doing expensive work (reconcile) — if the version
+     * has changed, a newer edit superseded this one and the results are discarded.
+     * <p>
+     * Additionally, only ONE diagnostics task per URI can be in-flight at a time.
+     * If the previous task is still running when the debounce timer fires, the
+     * new task skips work entirely — the in-flight task will re-schedule
+     * automatically if the version has moved forward while it was running.
      */
     public void publishDiagnosticsDebounced(String uri) {
         GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsDebounced schedule uri=" + uri);
         String normalizedUri = DocumentManager.normalizeUri(uri);
+
+        // Increment version counter — any in-flight or scheduled task for an
+        // older version will see the mismatch and skip its work.
+        java.util.concurrent.atomic.AtomicLong version =
+                diagnosticVersions.computeIfAbsent(normalizedUri,
+                        k -> new java.util.concurrent.atomic.AtomicLong(0));
+        long myVersion = version.incrementAndGet();
+
         java.util.concurrent.ScheduledFuture<?> existing = pendingPublish.remove(normalizedUri);
         if (existing != null) {
             existing.cancel(false);
-            GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsDebounced cancel previous uri=" + uri);
         }
 
-        java.util.concurrent.ScheduledFuture<?> future = scheduler.schedule(
-                () -> publishDiagnostics(uri),
-                500, java.util.concurrent.TimeUnit.MILLISECONDS);
+        java.util.concurrent.ScheduledFuture<?> future = scheduler.schedule(() -> {
+            // Check 1: skip if version has already moved forward
+            if (version.get() != myVersion) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[diag-trace] skipping stale diagnostic task (version moved) uri=" + uri);
+                return;
+            }
+
+            // Check 2: skip if another task for this URI is already running.
+            // That task will re-schedule when it finishes if the version changed.
+            if (!diagnosticsInFlight.add(normalizedUri)) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[diag-trace] skipping diagnostic task (another in-flight) uri=" + uri);
+                return;
+            }
+
+            try {
+                publishDiagnostics(uri);
+            } finally {
+                diagnosticsInFlight.remove(normalizedUri);
+
+                // If the version moved while we were running, a newer edit
+                // came in.  Re-schedule so the latest content gets diagnosed.
+                if (version.get() != myVersion && documentManager.getContent(uri) != null) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[diag-trace] re-scheduling diagnostic task (version changed while running) uri=" + uri);
+                    publishDiagnosticsDebounced(uri);
+                }
+            }
+        }, 500, java.util.concurrent.TimeUnit.MILLISECONDS);
         pendingPublish.put(normalizedUri, future);
     }
 
@@ -214,6 +276,10 @@ public class DiagnosticsProvider {
                     "[diag-trace] collectDiagnostics skipped (document closed) uri=" + uri);
             return diagnostics;
         }
+
+        // Pre-compute line-start offsets once. This turns every subsequent
+        // offset→position conversion from O(fileLength) to O(log lines).
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
 
         // When no classpath is available for this project, report only syntax
         // errors (from the standalone Groovy compiler) and append a warning at
@@ -266,13 +332,13 @@ public class DiagnosticsProvider {
                 boolean gotPermit = reconcileSemaphore.tryAcquire();
                 if (gotPermit) {
                     try {
-                        collectFromWorkingCopy(workingCopy, diagnostics, content);
+                        collectFromWorkingCopy(workingCopy, diagnostics, content, lineIndex);
 
                         // Also get problems from resource markers (for saved files)
                         IFile[] files = ResourcesPlugin.getWorkspace().getRoot()
                                 .findFilesForLocationURI(URI.create(uri));
                         if (files.length > 0) {
-                            collectFromMarkers(files[0], diagnostics, content);
+                            collectFromMarkers(files[0], diagnostics, content, lineIndex);
                         }
                     } finally {
                         reconcileSemaphore.release();
@@ -345,7 +411,8 @@ public class DiagnosticsProvider {
     /**
      * Collect problems from a JDT working copy that has been reconciled.
      */
-    private void collectFromWorkingCopy(ICompilationUnit workingCopy, List<Diagnostic> diagnostics, String content) {
+    private void collectFromWorkingCopy(ICompilationUnit workingCopy, List<Diagnostic> diagnostics,
+            String content, PositionUtils.LineIndex lineIndex) {
         try {
             // Reconcile to get fresh problems
             org.eclipse.jdt.core.dom.CompilationUnit ast = workingCopy.reconcile(
@@ -374,7 +441,7 @@ public class DiagnosticsProvider {
                             astHasNoClasses)) {
                         continue;
                     }
-                    diagnostics.add(toDiagnostic(problem, content));
+                    diagnostics.add(toDiagnostic(problem, lineIndex));
                 }
             }
         } catch (JavaModelException e) {
@@ -388,9 +455,8 @@ public class DiagnosticsProvider {
      */
     private boolean isGroovyASTEmpty(ICompilationUnit workingCopy) {
         try {
-            java.lang.reflect.Method getModuleNode = workingCopy.getClass().getMethod("getModuleNode");
-            Object result = getModuleNode.invoke(workingCopy);
-            if (result instanceof ModuleNode module) {
+            ModuleNode module = ReflectionCache.getModuleNode(workingCopy);
+            if (module != null) {
                 return module.getClasses() == null || module.getClasses().isEmpty();
             }
         } catch (Exception e) {
@@ -402,7 +468,8 @@ public class DiagnosticsProvider {
     /**
      * Collect problems from Eclipse resource markers.
      */
-    private void collectFromMarkers(IFile file, List<Diagnostic> diagnostics, String content) {
+    private void collectFromMarkers(IFile file, List<Diagnostic> diagnostics,
+            String content, PositionUtils.LineIndex lineIndex) {
         try {
             IMarker[] markers = file.findMarkers(IMarker.PROBLEM, true, IResource.DEPTH_ZERO);
             IJavaProject javaProject = JavaCore.create(file.getProject());
@@ -417,7 +484,7 @@ public class DiagnosticsProvider {
                 if (shouldSkipDiagnostic(-1, msg, javaProject, contextUnit)) {
                     continue;
                 }
-                Diagnostic diagnostic = toDiagnostic(marker, content);
+                Diagnostic diagnostic = toDiagnostic(marker, lineIndex);
                 if (diagnostic != null) {
                     diagnostics.add(diagnostic);
                 }
@@ -686,11 +753,13 @@ public class DiagnosticsProvider {
 
     /**
      * Convert a JDT {@link IProblem} to an LSP {@link Diagnostic}.
+     * Uses a pre-computed {@link PositionUtils.LineIndex} for O(log n)
+     * offset→position conversion instead of scanning the full content.
      *
-     * @param problem the JDT problem
-     * @param content the document source text (for offset-to-line/column conversion)
+     * @param problem   the JDT problem
+     * @param lineIndex pre-computed line index for the document
      */
-    private Diagnostic toDiagnostic(IProblem problem, String content) {
+    private Diagnostic toDiagnostic(IProblem problem, PositionUtils.LineIndex lineIndex) {
         Diagnostic diagnostic = new Diagnostic();
 
         // Map severity
@@ -706,9 +775,11 @@ public class DiagnosticsProvider {
         int sourceStart = problem.getSourceStart();
         int sourceEnd = problem.getSourceEnd();
 
-        if (sourceStart >= 0 && sourceEnd >= 0 && content != null) {
-            // Convert absolute character offsets to line:column positions
-            range = offsetRangeToLspRange(content, sourceStart, sourceEnd + 1);
+        if (sourceStart >= 0 && sourceEnd >= 0 && lineIndex != null) {
+            // O(log n) offset→position via pre-computed line index
+            Position start = lineIndex.offsetToPosition(sourceStart);
+            Position end = lineIndex.offsetToPosition(sourceEnd + 1);
+            range = new Range(start, end);
         } else {
             // Fallback: use the line number (1-based from JDT, 0-based for LSP)
             int line = Math.max(0, problem.getSourceLineNumber() - 1);
@@ -726,7 +797,16 @@ public class DiagnosticsProvider {
     }
 
     /**
+     * Backward-compatible overload: converts String content to LineIndex and delegates.
+     */
+    private Diagnostic toDiagnostic(IProblem problem, String content) {
+        PositionUtils.LineIndex idx = content != null ? PositionUtils.buildLineIndex(content) : null;
+        return toDiagnostic(problem, idx);
+    }
+
+    /**
      * Convert an absolute character offset range to an LSP {@link Range}.
+     * Kept for backward compatibility with callers that don't have a LineIndex.
      *
      * @param content the full document text
      * @param start   the start offset (inclusive)
@@ -734,53 +814,22 @@ public class DiagnosticsProvider {
      * @return the corresponding LSP range with correct line/column positions
      */
     private Range offsetRangeToLspRange(String content, int start, int end) {
-        int line = 0;
-        int col = 0;
-        int startLine = 0;
-        int startCol = 0;
-        int endLine = 0;
-        int endCol = 0;
-        boolean foundStart = false;
-        boolean foundEnd = false;
+        PositionUtils.LineIndex idx = PositionUtils.buildLineIndex(content);
+        return new Range(idx.offsetToPosition(start), idx.offsetToPosition(end));
+    }
 
-        for (int i = 0; i < content.length() && !foundEnd; i++) {
-            if (i == start) {
-                startLine = line;
-                startCol = col;
-                foundStart = true;
-            }
-            if (i == end) {
-                endLine = line;
-                endCol = col;
-                foundEnd = true;
-            }
-            if (content.charAt(i) == '\n') {
-                line++;
-                col = 0;
-            } else {
-                col++;
-            }
-        }
-
-        // Handle end-of-file edge case
-        if (!foundEnd) {
-            endLine = line;
-            endCol = col;
-        }
-        if (!foundStart) {
-            startLine = line;
-            startCol = 0;
-        }
-
-        return new Range(
-                new Position(startLine, startCol),
-                new Position(endLine, endCol));
+    /**
+     * Backward-compatible overload: converts String content to LineIndex and delegates.
+     */
+    private Diagnostic toDiagnostic(IMarker marker, String content) {
+        PositionUtils.LineIndex idx = content != null ? PositionUtils.buildLineIndex(content) : null;
+        return toDiagnostic(marker, idx);
     }
 
     /**
      * Convert an Eclipse {@link IMarker} to an LSP {@link Diagnostic}.
      */
-    private Diagnostic toDiagnostic(IMarker marker, String content) {
+    private Diagnostic toDiagnostic(IMarker marker, PositionUtils.LineIndex lineIndex) {
         try {
             Diagnostic diagnostic = new Diagnostic();
 
@@ -802,8 +851,10 @@ public class DiagnosticsProvider {
             int charEnd = marker.getAttribute(IMarker.CHAR_END, -1);
 
             Range range;
-            if (charStart >= 0 && charEnd >= 0 && content != null) {
-                range = offsetRangeToLspRange(content, charStart, charEnd);
+            if (charStart >= 0 && charEnd >= 0 && lineIndex != null) {
+                range = new Range(
+                        lineIndex.offsetToPosition(charStart),
+                        lineIndex.offsetToPosition(charEnd));
             } else {
                 int line = Math.max(0, marker.getAttribute(IMarker.LINE_NUMBER, 1) - 1);
                 range = new Range(
@@ -820,5 +871,15 @@ public class DiagnosticsProvider {
             GroovyLanguageServerPlugin.logError("Failed to convert marker to diagnostic", e);
             return null;
         }
+    }
+
+    /**
+     * Shut down the diagnostics scheduler. Called during server shutdown.
+     */
+    public void shutdown() {
+        scheduler.shutdownNow();
+        pendingPublish.values().forEach(f -> f.cancel(true));
+        pendingPublish.clear();
+        diagnosticsInFlight.clear();
     }
 }

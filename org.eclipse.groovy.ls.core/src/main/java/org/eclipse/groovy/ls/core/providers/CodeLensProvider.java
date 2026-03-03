@@ -57,8 +57,12 @@ public class CodeLensProvider {
 
     /**
      * Generate code lenses for all types and methods in the document.
-     * Reference counting is performed eagerly so that items with 0 references
-     * can be omitted entirely.
+     * <p>
+     * Lenses are returned <em>unresolved</em> — only positions and handle
+     * identifiers are populated.  The expensive reference count is deferred
+     * to {@link #resolveCodeLens(CodeLens)} which VS Code calls lazily as
+     * each lens scrolls into view.  This avoids O(n) workspace searches
+     * per element on every keystroke in large workspaces.
      */
     public List<CodeLens> getCodeLenses(CodeLensParams params) {
         String uri = params.getTextDocument().getUri();
@@ -87,16 +91,15 @@ public class CodeLensProvider {
     }
 
     /**
-     * Resolve a code lens. Since lenses are now resolved eagerly during
-     * {@link #getCodeLenses}, this simply returns the already-resolved lens.
+     * Resolve a code lens by performing the (expensive) reference count.
+     * Called lazily by VS Code when the lens becomes visible in the viewport.
      */
     public CodeLens resolveCodeLens(CodeLens codeLens) {
-        // Lenses are resolved eagerly in getCodeLenses; nothing to do here.
+        // Already resolved?
         if (codeLens.getCommand() != null) {
             return codeLens;
         }
 
-        // Fallback for any unresolved lens (should not happen)
         if (codeLens.getData() == null) {
             return codeLens;
         }
@@ -121,10 +124,8 @@ public class CodeLensProvider {
             }
 
             int count = countReferences(element);
-            if (count > 0) {
-                String label = count == 1 ? "1 reference" : count + " references";
-                codeLens.setCommand(new Command(label, ""));
-            }
+            String label = count == 1 ? "1 reference" : count + " references";
+            codeLens.setCommand(new Command(label, ""));
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("CodeLens resolve failed", e);
         }
@@ -137,14 +138,14 @@ public class CodeLensProvider {
     private void addCodeLensesForType(IType type, String content, List<CodeLens> lenses)
             throws JavaModelException {
         // Code lens for the type itself
-        CodeLens typeLens = createCodeLens(type, content);
+        CodeLens typeLens = createUnresolvedCodeLens(type, content);
         if (typeLens != null) {
             lenses.add(typeLens);
         }
 
         // Code lens for each method
         for (IMethod method : type.getMethods()) {
-            CodeLens methodLens = createCodeLens(method, content);
+            CodeLens methodLens = createUnresolvedCodeLens(method, content);
             if (methodLens != null) {
                 lenses.add(methodLens);
             }
@@ -156,7 +157,12 @@ public class CodeLensProvider {
         }
     }
 
-    private CodeLens createCodeLens(IJavaElement element, String content) {
+    /**
+     * Create an unresolved code lens containing only the position and
+     * a handle identifier for later resolution.  No workspace search
+     * is performed here.
+     */
+    private CodeLens createUnresolvedCodeLens(IJavaElement element, String content) {
         try {
             if (!(element instanceof ISourceReference sourceRef)) {
                 return null;
@@ -167,22 +173,13 @@ public class CodeLensProvider {
                 return null;
             }
 
-            // Count references eagerly — skip if 0
-            int count = countReferences(element);
-            if (count == 0) {
-                return null;
-            }
-
             Position start = offsetToPosition(content, nameRange.getOffset());
             Range range = new Range(start, start);
 
-            String label = count == 1 ? "1 reference" : count + " references";
-
             CodeLens lens = new CodeLens();
             lens.setRange(range);
-            lens.setCommand(new Command(label, ""));
+            // Command is left null — will be populated in resolveCodeLens
 
-            // Store handle identifier (kept for compatibility)
             JsonObject data = new JsonObject();
             data.addProperty(HANDLE_ID_KEY, element.getHandleIdentifier());
             lens.setData(data);
@@ -197,6 +194,7 @@ public class CodeLensProvider {
 
     /**
      * Count references to an element using JDT SearchEngine.
+     * Scoped to the enclosing project to reduce I/O in large workspaces.
      */
     private int countReferences(IJavaElement element) throws org.eclipse.core.runtime.CoreException {
         SearchPattern pattern = SearchPattern.createPattern(
@@ -206,7 +204,13 @@ public class CodeLensProvider {
         }
 
         int[] count = {0};
-        IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
+        // Scope to the enclosing project — cross-project references are rare
+        // for code lens and not worth the I/O cost in large workspaces.
+        org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
+        IJavaSearchScope scope = (javaProject != null)
+                ? SearchEngine.createJavaSearchScope(
+                      new org.eclipse.jdt.core.IJavaElement[]{javaProject})
+                : SearchEngine.createWorkspaceScope();
         SearchEngine engine = new SearchEngine();
 
         engine.search(pattern,
@@ -224,17 +228,6 @@ public class CodeLensProvider {
     }
 
     Position offsetToPosition(String content, int offset) {
-        int line = 0;
-        int col = 0;
-        int safeOffset = Math.min(offset, content.length());
-        for (int i = 0; i < safeOffset; i++) {
-            if (content.charAt(i) == '\n') {
-                line++;
-                col = 0;
-            } else {
-                col++;
-            }
-        }
-        return new Position(line, col);
+        return PositionUtils.offsetToPosition(content, offset);
     }
 }

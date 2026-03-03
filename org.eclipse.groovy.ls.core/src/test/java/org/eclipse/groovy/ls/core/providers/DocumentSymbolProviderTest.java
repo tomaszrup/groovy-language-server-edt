@@ -692,4 +692,132 @@ class DocumentSymbolProviderTest {
         m.setAccessible(true);
         return (DocumentSymbol) m.invoke(provider, type, content);
     }
+
+    // ================================================================
+    // setRanges tests
+    // ================================================================
+
+    @Test
+    void setRangesUsesSourceRangeForFullRange() throws Exception {
+        DocumentSymbol symbol = new DocumentSymbol();
+        org.eclipse.jdt.core.IMethod element = mock(org.eclipse.jdt.core.IMethod.class);
+        org.eclipse.jdt.core.ISourceRange sourceRange = mock(org.eclipse.jdt.core.ISourceRange.class);
+        when(sourceRange.getOffset()).thenReturn(0);
+        when(sourceRange.getLength()).thenReturn(5);
+        when(element.getSourceRange()).thenReturn(sourceRange);
+        org.eclipse.jdt.core.ISourceRange nameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
+        when(nameRange.getOffset()).thenReturn(0);
+        when(nameRange.getLength()).thenReturn(3);
+        when(element.getNameRange()).thenReturn(nameRange);
+
+        Method m = DocumentSymbolProvider.class.getDeclaredMethod(
+                "setRanges", DocumentSymbol.class,
+                org.eclipse.jdt.core.IJavaElement.class, String.class);
+        m.setAccessible(true);
+        m.invoke(provider, symbol, element, "hello world");
+
+        assertNotNull(symbol.getRange());
+        assertNotNull(symbol.getSelectionRange());
+    }
+
+    @Test
+    void setRangesUsesDefaultForNonSourceRef() throws Exception {
+        DocumentSymbol symbol = new DocumentSymbol();
+        org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
+
+        Method m = DocumentSymbolProvider.class.getDeclaredMethod(
+                "setRanges", DocumentSymbol.class,
+                org.eclipse.jdt.core.IJavaElement.class, String.class);
+        m.setAccessible(true);
+        m.invoke(provider, symbol, element, "hello");
+
+        assertEquals(0, symbol.getRange().getStart().getLine());
+        assertEquals(0, symbol.getRange().getStart().getCharacter());
+    }
+
+    @Test
+    void setRangesFallsBackToFullRangeForNullNameRange() throws Exception {
+        DocumentSymbol symbol = new DocumentSymbol();
+        org.eclipse.jdt.core.IMethod element = mock(org.eclipse.jdt.core.IMethod.class);
+        org.eclipse.jdt.core.ISourceRange sourceRange = mock(org.eclipse.jdt.core.ISourceRange.class);
+        when(sourceRange.getOffset()).thenReturn(0);
+        when(sourceRange.getLength()).thenReturn(10);
+        when(element.getSourceRange()).thenReturn(sourceRange);
+        when(element.getNameRange()).thenReturn(null);
+
+        Method m = DocumentSymbolProvider.class.getDeclaredMethod(
+                "setRanges", DocumentSymbol.class,
+                org.eclipse.jdt.core.IJavaElement.class, String.class);
+        m.setAccessible(true);
+        m.invoke(provider, symbol, element, "class Foo {}");
+
+        // selectionRange should fall back to full range when nameRange is null
+        assertEquals(symbol.getRange(), symbol.getSelectionRange());
+    }
+
+    @Test
+    void setRangesHandlesExceptionGracefully() throws Exception {
+        DocumentSymbol symbol = new DocumentSymbol();
+        org.eclipse.jdt.core.IMethod element = mock(org.eclipse.jdt.core.IMethod.class);
+        when(element.getSourceRange()).thenThrow(new org.eclipse.jdt.core.JavaModelException(
+                new RuntimeException("test"), 0));
+
+        Method m = DocumentSymbolProvider.class.getDeclaredMethod(
+                "setRanges", DocumentSymbol.class,
+                org.eclipse.jdt.core.IJavaElement.class, String.class);
+        m.setAccessible(true);
+        m.invoke(provider, symbol, element, "class Foo {}");
+
+        // Should not throw; should set default range
+        assertNotNull(symbol.getRange());
+        assertEquals(0, symbol.getRange().getStart().getLine());
+    }
+
+    // ================================================================
+    // toRange tests
+    // ================================================================
+
+    @Test
+    void toRangeConvertsOffsetToPosition() throws Exception {
+        org.eclipse.jdt.core.ISourceRange sr = mock(org.eclipse.jdt.core.ISourceRange.class);
+        when(sr.getOffset()).thenReturn(6);
+        when(sr.getLength()).thenReturn(5);
+
+        Method m = DocumentSymbolProvider.class.getDeclaredMethod(
+                "toRange", String.class, org.eclipse.jdt.core.ISourceRange.class);
+        m.setAccessible(true);
+        org.eclipse.lsp4j.Range range = (org.eclipse.lsp4j.Range) m.invoke(
+                provider, "hello\nworld", sr);
+
+        assertEquals(1, range.getStart().getLine());
+        assertEquals(0, range.getStart().getCharacter());
+    }
+
+    // ================================================================
+    // offsetToPosition tests
+    // ================================================================
+
+    @Test
+    void offsetToPositionConvertsCorrectly() throws Exception {
+        Method m = DocumentSymbolProvider.class.getDeclaredMethod(
+                "offsetToPosition", String.class, int.class);
+        m.setAccessible(true);
+        org.eclipse.lsp4j.Position pos = (org.eclipse.lsp4j.Position) m.invoke(
+                provider, "abc\ndef\nghi", 5);
+
+        assertEquals(1, pos.getLine());
+        assertEquals(1, pos.getCharacter());
+    }
+
+    @Test
+    void offsetToPositionClampsToEnd() throws Exception {
+        Method m = DocumentSymbolProvider.class.getDeclaredMethod(
+                "offsetToPosition", String.class, int.class);
+        m.setAccessible(true);
+        org.eclipse.lsp4j.Position pos = (org.eclipse.lsp4j.Position) m.invoke(
+                provider, "ab", 100);
+
+        assertEquals(0, pos.getLine());
+        assertEquals(2, pos.getCharacter());
+    }
 }

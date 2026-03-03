@@ -288,8 +288,9 @@ public class TypeDefinitionProvider {
             if (content == null) {
                 return new Range(new Position(0, 0), new Position(0, 0));
             }
-            Position start = offsetToPosition(content, sourceRange.getOffset());
-            Position end = offsetToPosition(content, sourceRange.getOffset() + sourceRange.getLength());
+            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
+            Position start = lineIndex.offsetToPosition(sourceRange.getOffset());
+            Position end = lineIndex.offsetToPosition(sourceRange.getOffset() + sourceRange.getLength());
             return new Range(start, end);
         } catch (Exception e) {
             return new Range(new Position(0, 0), new Position(0, 0));

@@ -74,6 +74,11 @@ public class FormattingProvider {
      */
     private String loadedProfilePath;
 
+    // Cached workspace formatter prefs (.settings/org.eclipse.jdt.core.prefs)
+    private String cachedWorkspacePrefsPath;
+    private long cachedWorkspacePrefsLastModified;
+    private Map<String, String> cachedWorkspacePrefs;
+
     public FormattingProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
     }
@@ -531,16 +536,33 @@ public class FormattingProvider {
             while (dir != null) {
                 File settings = new File(dir, ".settings/org.eclipse.jdt.core.prefs");
                 if (settings.exists() && settings.isFile()) {
+                    String settingsPath = settings.getAbsolutePath();
+                    long lastModified = settings.lastModified();
+
+                    // Re-use cached prefs if file hasn't changed
+                    if (settingsPath.equals(cachedWorkspacePrefsPath)
+                            && lastModified == cachedWorkspacePrefsLastModified
+                            && cachedWorkspacePrefs != null) {
+                        options.putAll(cachedWorkspacePrefs);
+                        return;
+                    }
+
+                    // Parse and cache
                     java.util.Properties props = new java.util.Properties();
                     try (FileInputStream fis = new FileInputStream(settings)) {
                         props.load(fis);
                     }
-                    // Only apply formatter-related properties
+                    Map<String, String> parsed = new HashMap<>();
                     for (String key : props.stringPropertyNames()) {
                         if (key.startsWith("org.eclipse.jdt.core.formatter.")) {
-                            options.put(key, props.getProperty(key));
+                            parsed.put(key, props.getProperty(key));
                         }
                     }
+                    cachedWorkspacePrefsPath = settingsPath;
+                    cachedWorkspacePrefsLastModified = lastModified;
+                    cachedWorkspacePrefs = parsed;
+                    options.putAll(parsed);
+
                     GroovyLanguageServerPlugin.logInfo(
                             "Loaded workspace formatter prefs from: " + settings.getPath());
                     return;

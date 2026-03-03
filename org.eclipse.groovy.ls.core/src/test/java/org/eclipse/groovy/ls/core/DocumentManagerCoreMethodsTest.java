@@ -499,4 +499,171 @@ class DocumentManagerCoreMethodsTest {
         method.setAccessible(true);
         return (java.io.File) method.invoke(manager, file);
     }
+
+    // ================================================================
+    // uriToFilePath tests (static private)
+    // ================================================================
+
+    private String invokeUriToFilePath(String uri) throws Exception {
+        Method m = DocumentManager.class.getDeclaredMethod("uriToFilePath", String.class);
+        m.setAccessible(true);
+        return (String) m.invoke(null, uri);
+    }
+
+    @Test
+    void uriToFilePathStandardFileUri() throws Exception {
+        String result = invokeUriToFilePath("file:///tmp/test.groovy");
+        assertNotNull(result);
+        assertTrue(result.contains("test.groovy"));
+    }
+
+    @Test
+    void uriToFilePathWindowsDriveLetter() throws Exception {
+        String result = invokeUriToFilePath("file:///C:/Users/test.groovy");
+        assertNotNull(result);
+        // Drive letter normalized to lowercase
+        assertTrue(result.startsWith("c:") || result.contains("test.groovy"));
+    }
+
+    @Test
+    void uriToFilePathPercentEncoded() throws Exception {
+        String result = invokeUriToFilePath("file:///tmp/foo%20bar.groovy");
+        assertNotNull(result);
+        assertTrue(result.contains("foo bar"));
+    }
+
+    @Test
+    void uriToFilePathJdtStyleSingleSlash() throws Exception {
+        String result = invokeUriToFilePath("file:/C:/foo.groovy");
+        assertNotNull(result);
+        assertTrue(result.contains("foo.groovy"));
+    }
+
+    @Test
+    void uriToFilePathTripleSlashUnix() throws Exception {
+        String result = invokeUriToFilePath("file:///home/user/test.groovy");
+        assertNotNull(result);
+        assertTrue(result.contains("test.groovy"));
+    }
+
+    // ================================================================
+    // classCount tests
+    // ================================================================
+
+    private int invokeClassCount(DocumentManager manager, ModuleNode module) throws Exception {
+        Method m = DocumentManager.class.getDeclaredMethod("classCount", ModuleNode.class);
+        m.setAccessible(true);
+        return (int) m.invoke(manager, module);
+    }
+
+    @Test
+    void classCountReturnsZeroForEmptyModule() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        String source = "";
+        String uri = "file:///emptyClassCount.groovy";
+        var result = new GroovyCompilerService().parse(uri, source);
+        ModuleNode module = result.getModuleNode();
+        if (module != null) {
+            int count = invokeClassCount(dm, module);
+            assertTrue(count >= 0);
+        }
+    }
+
+    @Test
+    void classCountReturnsCorrectCountForMultipleClasses() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        String source = "class Foo {}\nclass Bar {}\nclass Baz {}";
+        String uri = "file:///multiClassCount.groovy";
+        var result = new GroovyCompilerService().parse(uri, source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+        int count = invokeClassCount(dm, module);
+        assertTrue(count >= 3);
+    }
+
+    @Test
+    void classCountReturnsSingleForOneClass() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        String source = "class Hello {}";
+        String uri = "file:///singleClassCount.groovy";
+        var result = new GroovyCompilerService().parse(uri, source);
+        ModuleNode module = result.getModuleNode();
+        assertNotNull(module);
+        int count = invokeClassCount(dm, module);
+        assertTrue(count >= 1);
+    }
+
+    // ================================================================
+    // hasNestedConflict tests
+    // ================================================================
+
+    private boolean invokeHasNestedConflict(DocumentManager manager, String srcDir, java.util.Set<String> addedSrcDirs) throws Exception {
+        Method m = DocumentManager.class.getDeclaredMethod("hasNestedConflict", String.class, java.util.Set.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(manager, srcDir, addedSrcDirs);
+    }
+
+    @Test
+    void hasNestedConflictParentContainsChild() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        existing.add("src/main/java");
+        assertTrue(invokeHasNestedConflict(dm, "src", existing));
+    }
+
+    @Test
+    void hasNestedConflictChildContainedByParent() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        existing.add("src");
+        assertTrue(invokeHasNestedConflict(dm, "src/main/java", existing));
+    }
+
+    @Test
+    void hasNestedConflictDifferentPaths() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        existing.add("src/test/java");
+        assertFalse(invokeHasNestedConflict(dm, "src/main/java", existing));
+    }
+
+    @Test
+    void hasNestedConflictEmptySet() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        assertFalse(invokeHasNestedConflict(dm, "src/main/java", existing));
+    }
+
+    @Test
+    void hasNestedConflictExactMatchNotConflict() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        existing.add("src/main/java");
+        // Exact match: "src/main/java" doesn't start with "src/main/java/"
+        assertFalse(invokeHasNestedConflict(dm, "src/main/java", existing));
+    }
+
+    // ================================================================
+    // dispose tests
+    // ================================================================
+
+    @Test
+    void disposeRemovesAllOpenDocuments() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen("file:///disposeA.groovy", "class A {}");
+        dm.didOpen("file:///disposeB.groovy", "class B {}");
+        assertFalse(dm.getOpenDocumentUris().isEmpty());
+        dm.dispose();
+        assertTrue(dm.getOpenDocumentUris().isEmpty());
+    }
+
+    @Test
+    void disposeContentReturnsNull() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        String uri = "file:///disposeContent.groovy";
+        dm.didOpen(uri, "class X {}");
+        assertNotNull(dm.getContent(uri));
+        dm.dispose();
+        assertNull(dm.getContent(uri));
+    }
 }

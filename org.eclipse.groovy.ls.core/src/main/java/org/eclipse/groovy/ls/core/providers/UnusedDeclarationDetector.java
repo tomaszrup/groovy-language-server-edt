@@ -163,7 +163,12 @@ public class UnusedDeclarationDetector {
     }
 
     /**
-     * Check if an element has zero references in the workspace.
+     * Check if an element has zero references in the enclosing project.
+     * <p>
+     * Scoped to the project (not the whole workspace) to avoid scanning
+     * all subprojects in large multi-project builds — a private member
+     * can only be referenced within its own project anyway.
+     * The search is cancelled as soon as the first match is found.
      */
     private static boolean isUnreferenced(IJavaElement element) {
         try {
@@ -173,9 +178,26 @@ public class UnusedDeclarationDetector {
                 return false;
             }
 
+            // Scope to the enclosing project instead of the whole workspace.
+            org.eclipse.jdt.core.IJavaProject javaProject =
+                    element.getJavaProject();
+            IJavaSearchScope scope = (javaProject != null)
+                    ? SearchEngine.createJavaSearchScope(
+                          new org.eclipse.jdt.core.IJavaElement[]{javaProject})
+                    : SearchEngine.createWorkspaceScope();
+
             boolean[] found = {false};
-            IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
             SearchEngine engine = new SearchEngine();
+
+            // Use a progress monitor that cancels after the first match
+            // to avoid scanning the entire index needlessly.
+            org.eclipse.core.runtime.IProgressMonitor cancelOnFound =
+                    new org.eclipse.core.runtime.NullProgressMonitor() {
+                        @Override
+                        public boolean isCanceled() {
+                            return found[0];
+                        }
+                    };
 
             engine.search(pattern,
                     new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
@@ -186,9 +208,12 @@ public class UnusedDeclarationDetector {
                             found[0] = true;
                         }
                     },
-                    null);
+                    cancelOnFound);
 
             return !found[0];
+        } catch (org.eclipse.core.runtime.OperationCanceledException ignored) {
+            // Cancelled because we found a reference — not unused.
+            return false;
         } catch (Exception e) {
             // If search fails, don't flag as unused
             return false;
@@ -368,17 +393,6 @@ public class UnusedDeclarationDetector {
     }
 
     private static Position offsetToPosition(String content, int offset) {
-        int line = 0;
-        int col = 0;
-        int safeOffset = Math.min(offset, content.length());
-        for (int i = 0; i < safeOffset; i++) {
-            if (content.charAt(i) == '\n') {
-                line++;
-                col = 0;
-            } else {
-                col++;
-            }
-        }
-        return new Position(line, col);
+        return PositionUtils.offsetToPosition(content, offset);
     }
 }

@@ -99,8 +99,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private volatile boolean diagnosticsEnabled = false;
     private volatile boolean firstFullBuildComplete = false;
     private volatile boolean buildInProgress = false;
-    private java.util.concurrent.ScheduledFuture<?> initialBuildTimer;
-    private volatile java.util.concurrent.ScheduledFuture<?> debouncedBuildFuture;
+    private volatile java.util.concurrent.ScheduledFuture<?> initialBuildTimer;
+    private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<?>>
+            debouncedBuildFuture = new java.util.concurrent.atomic.AtomicReference<>();
     private static final long BUILD_DEBOUNCE_MS = 3000;
     private final java.util.concurrent.ScheduledExecutorService initialBuildScheduler =
             java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
@@ -113,8 +114,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * Maps normalized filesystem paths (lowercase, forward slashes, trailing slash)
      * to Eclipse project names. Used for per-subproject classpath isolation.
      */
-    private final java.util.Map<String, String> subprojectPathToEclipseName
-            = new java.util.LinkedHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, String> subprojectPathToEclipseName
+            = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Tracks which Eclipse project names have received at least one successful
@@ -344,7 +345,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * workspace lock is held for the shortest possible time.
      */
     void triggerFullBuild() {
-        java.util.concurrent.CompletableFuture.runAsync(() -> {
+        initialBuildScheduler.submit(() -> {
             int buildKind;
             if (!firstFullBuildComplete) {
                 buildKind = org.eclipse.core.resources.IncrementalProjectBuilder.FULL_BUILD;
@@ -370,7 +371,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
             // Now that the workspace lock is released, publish full JDT-based
             // diagnostics for every open file.
-            textDocumentService.publishDiagnosticsForOpenDocuments();
+            try {
+                textDocumentService.publishDiagnosticsForOpenDocuments();
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Post-build diagnostics failed", e);
+            }
         });
     }
 
@@ -381,24 +386,24 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * send their classpaths in quick succession.
      */
     void scheduleDebouncedBuild() {
-        java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture;
+        java.util.concurrent.ScheduledFuture<?> newFuture =
+                initialBuildScheduler.schedule(() -> {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[debounced-build] Debounce window elapsed — triggering build.");
+                    triggerFullBuild();
+                }, BUILD_DEBOUNCE_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture.getAndSet(newFuture);
         if (prev != null) {
             prev.cancel(false);
         }
-        // No per-call status message — the initial "Receiving classpaths..."
-        // from classpathUpdate() is sufficient.  Sending status 50 times
-        // just spams the output channel.
-        debouncedBuildFuture = initialBuildScheduler.schedule(() -> {
-            GroovyLanguageServerPlugin.logInfo(
-                    "[debounced-build] Debounce window elapsed — triggering build.");
-            triggerFullBuild();
-        }, BUILD_DEBOUNCE_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     @Override
     public CompletableFuture<Object> shutdown() {
         GroovyLanguageServerPlugin.logInfo("Shutting down Groovy Language Server...");
         initialBuildScheduler.shutdownNow();
+        textDocumentService.shutdown();
+        documentManager.dispose();
         exitCode = 0; // clean shutdown
         return CompletableFuture.completedFuture(null);
     }
@@ -671,7 +676,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     public void classpathBatchComplete(JsonObject params) {
         GroovyLanguageServerPlugin.logInfo(
                 "[classpathBatchComplete] All initial classpaths received. Triggering build now.");
-        java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture;
+        java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture.getAndSet(null);
         if (prev != null) {
             prev.cancel(false);
         }
@@ -912,7 +917,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * without waiting for the full workspace build.
      */
     private void publishDiagnosticsForProjectFiles(String projectName) {
-        CompletableFuture.runAsync(() -> {
+        initialBuildScheduler.submit(() -> {
             try {
                 for (String uri : documentManager.getOpenDocumentUris()) {
                     String ownerProject = getProjectNameForUri(
@@ -1263,11 +1268,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     /**
-     * Find subdirectories that contain source folders (up to 3 levels deep).
+     * Find subdirectories that contain source folders (up to 5 levels deep).
+     * Depth 5 covers patterns like {@code root/modules/group/subgroup/project}.
      */
     private List<java.io.File> findSubprojectsWithSources(java.io.File root, String[] srcDirSuffixes) {
         List<java.io.File> result = new ArrayList<>();
-        scanForSubprojects(root, result, srcDirSuffixes, 0, 3);
+        scanForSubprojects(root, result, srcDirSuffixes, 0, 5);
         return result;
     }
 
@@ -1279,9 +1285,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         if (children == null) return;
 
         for (java.io.File child : children) {
-            if (!child.isDirectory() || child.getName().startsWith(".")
-                    || child.getName().equals("build") || child.getName().equals("node_modules")
-                    || child.getName().equals("bin") || child.getName().equals("out")) {
+            String childName = child.getName();
+            if (!child.isDirectory() || childName.startsWith(".")
+                    || childName.equals("build") || childName.equals("target")
+                    || childName.equals("node_modules") || childName.equals("dist")
+                    || childName.equals("bin") || childName.equals("out")) {
                 continue;
             }
             // Check if any source dir suffix exists

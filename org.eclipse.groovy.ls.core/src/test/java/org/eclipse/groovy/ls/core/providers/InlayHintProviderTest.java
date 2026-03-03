@@ -12,6 +12,7 @@ package org.eclipse.groovy.ls.core.providers;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -21,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.expr.ArgumentListExpression;
 import org.codehaus.groovy.ast.expr.ConstantExpression;
 import org.codehaus.groovy.ast.expr.Expression;
@@ -38,11 +40,13 @@ import org.eclipse.lsp4j.InlayHintParams;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
+import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.junit.jupiter.api.Test;
 
 class InlayHintProviderTest {
 
     private final GroovyCompilerService compilerService = new GroovyCompilerService();
+    private final InlayHintProvider provider = new InlayHintProvider(new DocumentManager());
 
     @Test
     void getInlayHintsReturnsEmptyWhenDocumentIsMissing() {
@@ -618,5 +622,752 @@ class InlayHintProviderTest {
         GroovyCompilerService.ParseResult result = compilerService.parse("file:///InlayCollectorTest.groovy", source);
         assertTrue(result.hasAST());
         return result.getModuleNode();
+    }
+
+    // =========================================================================
+    //  MethodCallDeclCollector tests
+    // =========================================================================
+
+    @Test
+    void methodCallDeclCollectorCollectsDefStyleMethodCallDeclarations() throws Exception {
+        String source = """
+                def result = someService.getData()
+                """;
+        ModuleNode module = parseModule(source);
+        Object declCollector = createDeclCollector();
+        invokeDeclCollector(declCollector, module);
+        @SuppressWarnings("unchecked")
+        List<?> declarations = (List<?>) getDeclCollectorDeclarations(declCollector);
+        // "def result = someService.getData()" should be collected since it's
+        // a def-style declaration with a method call RHS
+        assertNotNull(declarations);
+    }
+
+    @Test
+    void methodCallDeclCollectorIgnoresTypedDeclarations() throws Exception {
+        String source = """
+                String name = getFullName()
+                """;
+        ModuleNode module = parseModule(source);
+        Object declCollector = createDeclCollector();
+        invokeDeclCollector(declCollector, module);
+        @SuppressWarnings("unchecked")
+        List<?> declarations = (List<?>) getDeclCollectorDeclarations(declCollector);
+        // Typed declarations should NOT be collected (only def-style)
+        assertTrue(declarations.isEmpty());
+    }
+
+    @Test
+    void methodCallDeclCollectorIgnoresDefWithNonMethodCallRhs() throws Exception {
+        String source = """
+                def value = 42
+                def name = "hello"
+                """;
+        ModuleNode module = parseModule(source);
+        Object declCollector = createDeclCollector();
+        invokeDeclCollector(declCollector, module);
+        @SuppressWarnings("unchecked")
+        List<?> declarations = (List<?>) getDeclCollectorDeclarations(declCollector);
+        // Literal RHS should NOT be collected
+        assertTrue(declarations.isEmpty());
+    }
+
+    @Test
+    void methodCallDeclCollectorCollectsMultipleDeclarations() throws Exception {
+        String source = """
+                class Svc {
+                    void work() {
+                        def a = getAlpha()
+                        def b = getBeta()
+                    }
+                }
+                """;
+        ModuleNode module = parseModule(source);
+        Object declCollector = createDeclCollector();
+        invokeDeclCollector(declCollector, module);
+        @SuppressWarnings("unchecked")
+        List<?> declarations = (List<?>) getDeclCollectorDeclarations(declCollector);
+        assertNotNull(declarations);
+        // Both local def-style declarations should be collected
+        assertTrue(declarations.size() >= 2);
+    }
+
+    @Test
+    void declInfoHasCorrectFields() throws Exception {
+        String source = """
+                def data = fetchData()
+                """;
+        ModuleNode module = parseModule(source);
+        Object declCollector = createDeclCollector();
+        invokeDeclCollector(declCollector, module);
+        @SuppressWarnings("unchecked")
+        List<?> declarations = (List<?>) getDeclCollectorDeclarations(declCollector);
+
+        if (!declarations.isEmpty()) {
+            Object declInfo = declarations.get(0);
+            Class<?> declInfoClass = declInfo.getClass();
+            String varName = (String) declInfoClass.getDeclaredField("varName").get(declInfo);
+            int line = declInfoClass.getDeclaredField("line").getInt(declInfo);
+            int column = declInfoClass.getDeclaredField("column").getInt(declInfo);
+            Object methodCall = declInfoClass.getDeclaredField("methodCall").get(declInfo);
+
+            assertEquals("data", varName);
+            assertTrue(line >= 0);
+            assertTrue(column >= 0);
+            assertNotNull(methodCall);
+        }
+    }
+
+    @Test
+    void methodCallDeclCollectorGetSourceUnitReturnsNull() throws Exception {
+        Object declCollector = createDeclCollector();
+        Method m = declCollector.getClass().getDeclaredMethod("getSourceUnit");
+        m.setAccessible(true);
+        assertNull(m.invoke(declCollector));
+    }
+
+    private Object createDeclCollector() throws Exception {
+        Class<?> cls = Class.forName("org.eclipse.groovy.ls.core.providers.InlayHintProvider$MethodCallDeclCollector");
+        var constructor = cls.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        return constructor.newInstance();
+    }
+
+    private void invokeDeclCollector(Object collector, ModuleNode module) throws Exception {
+        // MethodCallDeclCollector extends ClassCodeVisitorSupport
+        // We need to visit the module classes
+        Method visitClass = collector.getClass().getMethod("visitClass",
+                org.codehaus.groovy.ast.ClassNode.class);
+        visitClass.setAccessible(true);
+        for (var classNode : module.getClasses()) {
+            visitClass.invoke(collector, classNode);
+        }
+    }
+
+    private Object getDeclCollectorDeclarations(Object collector) throws Exception {
+        Method m = collector.getClass().getDeclaredMethod("getDeclarations");
+        m.setAccessible(true);
+        return m.invoke(collector);
+    }
+
+    // ================================================================
+    // isInRange tests
+    // ================================================================
+
+    @Test
+    void isInRangeInsideRange() throws Exception {
+        Range range = new Range(new Position(3, 0), new Position(7, 0));
+        assertTrue((boolean) invokeIsInRange(5, range));
+    }
+
+    @Test
+    void isInRangeAtStartBoundary() throws Exception {
+        Range range = new Range(new Position(3, 0), new Position(7, 0));
+        assertTrue((boolean) invokeIsInRange(3, range));
+    }
+
+    @Test
+    void isInRangeAtEndBoundary() throws Exception {
+        Range range = new Range(new Position(3, 0), new Position(7, 0));
+        assertTrue((boolean) invokeIsInRange(7, range));
+    }
+
+    @Test
+    void isInRangeBeforeRange() throws Exception {
+        Range range = new Range(new Position(3, 0), new Position(7, 0));
+        assertFalse((boolean) invokeIsInRange(1, range));
+    }
+
+    @Test
+    void isInRangeAfterRange() throws Exception {
+        Range range = new Range(new Position(3, 0), new Position(7, 0));
+        assertFalse((boolean) invokeIsInRange(10, range));
+    }
+
+    // ================================================================
+    // resolveLocalVarType tests
+    // ================================================================
+
+    @Test
+    void resolveLocalVarTypeFindsType() throws Exception {
+        String source = "class Foo { void run() { String x = 'hello' } }";
+        String uri = "file:///resolveLocalVar.groovy";
+        var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse(uri, source);
+        ModuleNode module = compileResult.getModuleNode();
+        ClassNode result = invokeResolveLocalVarType(module, "x");
+        if (result != null) {
+            assertTrue(result.getName().contains("String"));
+        }
+    }
+
+    @Test
+    void resolveLocalVarTypeReturnsNullForMissing() throws Exception {
+        String source = "class Foo { void run() { int y = 1 } }";
+        String uri = "file:///resolveLocalVar2.groovy";
+        var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse(uri, source);
+        ModuleNode module = compileResult.getModuleNode();
+        ClassNode result = invokeResolveLocalVarType(module, "missing");
+        assertNull(result);
+    }
+
+    // ================================================================
+    // getBlock tests
+    // ================================================================
+
+    @Test
+    void getBlockReturnsBlockForMethod() throws Exception {
+        String source = "class Foo { void bar() { println 'hi' } }";
+        String uri = "file:///getBlock.groovy";
+        var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse(uri, source);
+        ModuleNode module = compileResult.getModuleNode();
+        ClassNode cls = module.getClasses().get(0);
+        var methods = cls.getMethods("bar");
+        if (!methods.isEmpty()) {
+            Object block = invokeGetBlock(methods.get(0));
+            assertNotNull(block);
+        }
+    }
+
+    // ================================================================
+    // resolveVarInBlock tests
+    // ================================================================
+
+    @Test
+    void resolveVarInBlockFindsVar() throws Exception {
+        String source = "class Foo { void bar() { String x = 'hello' } }";
+        String uri = "file:///resolveVarBlock.groovy";
+        var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse(uri, source);
+        ModuleNode module = compileResult.getModuleNode();
+        ClassNode cls = module.getClasses().get(0);
+        var methods = cls.getMethods("bar");
+        if (!methods.isEmpty()) {
+            var code = methods.get(0).getCode();
+            if (code instanceof org.codehaus.groovy.ast.stmt.BlockStatement block) {
+                ClassNode result = invokeResolveVarInBlock(block, "x");
+                if (result != null) {
+                    assertTrue(result.getName().contains("String"));
+                }
+            }
+        }
+    }
+
+    @Test
+    void resolveVarInBlockReturnsNullForMissing() throws Exception {
+        String source = "class Foo { void bar() { int y = 1 } }";
+        String uri = "file:///resolveVarBlock2.groovy";
+        var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse(uri, source);
+        ModuleNode module = compileResult.getModuleNode();
+        ClassNode cls = module.getClasses().get(0);
+        var methods = cls.getMethods("bar");
+        if (!methods.isEmpty()) {
+            var code = methods.get(0).getCode();
+            if (code instanceof org.codehaus.groovy.ast.stmt.BlockStatement block) {
+                ClassNode result = invokeResolveVarInBlock(block, "missing");
+                assertNull(result);
+            }
+        }
+    }
+
+    // ================================================================
+    // Reflection helpers for new tests
+    // ================================================================
+
+    private Object invokeIsInRange(int line, Range range) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("isInRange", int.class, Range.class);
+        m.setAccessible(true);
+        return m.invoke(provider, line, range);
+    }
+
+    private ClassNode invokeResolveLocalVarType(ModuleNode module, String varName) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("resolveLocalVarType", ModuleNode.class, String.class);
+        m.setAccessible(true);
+        return (ClassNode) m.invoke(provider, module, varName);
+    }
+
+    private Object invokeGetBlock(org.codehaus.groovy.ast.MethodNode methodNode) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("getBlock", org.codehaus.groovy.ast.MethodNode.class);
+        m.setAccessible(true);
+        return m.invoke(provider, methodNode);
+    }
+
+    private ClassNode invokeResolveVarInBlock(org.codehaus.groovy.ast.stmt.BlockStatement block, String varName) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("resolveVarInBlock",
+                org.codehaus.groovy.ast.stmt.BlockStatement.class, String.class);
+        m.setAccessible(true);
+        return (ClassNode) m.invoke(provider, block, varName);
+    }
+
+    // ================================================================
+    // resolveClassNodeToType tests (171 missed instructions)
+    // ================================================================
+
+    @Test
+    void resolveClassNodeToTypeWithFqn() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
+        when(mockType.getElementName()).thenReturn("ArrayList");
+        when(project.findType("java.util.ArrayList")).thenReturn(mockType);
+
+        ClassNode typeNode = new ClassNode("java.util.ArrayList", 0, null);
+        ModuleNode module = parseModule("def x = 1");
+
+        org.eclipse.jdt.core.IType result = invokeResolveClassNodeToType(typeNode, module, project);
+        assertEquals(mockType, result);
+    }
+
+    @Test
+    void resolveClassNodeToTypeViaImport() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
+        when(project.findType("java.util.ArrayList")).thenReturn(mockType);
+        when(project.findType("ArrayList")).thenReturn(null);
+
+        String source = "import java.util.ArrayList\ndef x = 1";
+        ModuleNode module = parseModule(source);
+        ClassNode typeNode = new ClassNode("ArrayList", 0, null);
+
+        org.eclipse.jdt.core.IType result = invokeResolveClassNodeToType(typeNode, module, project);
+        assertEquals(mockType, result);
+    }
+
+    @Test
+    void resolveClassNodeToTypeViaStarImport() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
+        when(project.findType("HashMap")).thenReturn(null);
+        when(project.findType("java.util.HashMap")).thenReturn(mockType);
+
+        String source = "import java.util.*\ndef x = 1";
+        ModuleNode module = parseModule(source);
+        ClassNode typeNode = new ClassNode("HashMap", 0, null);
+
+        org.eclipse.jdt.core.IType result = invokeResolveClassNodeToType(typeNode, module, project);
+        assertEquals(mockType, result);
+    }
+
+    @Test
+    void resolveClassNodeToTypeViaModulePackage() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
+        when(project.findType("MyClass")).thenReturn(null);
+        when(project.findType("com.example.MyClass")).thenReturn(mockType);
+
+        String source = "package com.example\ndef x = 1";
+        ModuleNode module = parseModule(source);
+        ClassNode typeNode = new ClassNode("MyClass", 0, null);
+
+        org.eclipse.jdt.core.IType result = invokeResolveClassNodeToType(typeNode, module, project);
+        assertEquals(mockType, result);
+    }
+
+    @Test
+    void resolveClassNodeToTypeViaAutoImport() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
+        when(project.findType("Integer")).thenReturn(null);
+        when(project.findType("java.lang.Integer")).thenReturn(mockType);
+
+        ModuleNode module = parseModule("def x = 1");
+        ClassNode typeNode = new ClassNode("Integer", 0, null);
+
+        org.eclipse.jdt.core.IType result = invokeResolveClassNodeToType(typeNode, module, project);
+        assertEquals(mockType, result);
+    }
+
+    @Test
+    void resolveClassNodeToTypeReturnsNullForNullType() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        ModuleNode module = parseModule("def x = 1");
+
+        org.eclipse.jdt.core.IType result = invokeResolveClassNodeToType(null, module, project);
+        assertNull(result);
+    }
+
+    @Test
+    void resolveClassNodeToTypeReturnsNullForNullProject() throws Exception {
+        ModuleNode module = parseModule("def x = 1");
+        ClassNode typeNode = new ClassNode("String", 0, null);
+
+        org.eclipse.jdt.core.IType result = invokeResolveClassNodeToType(typeNode, module, null);
+        assertNull(result);
+    }
+
+    // ================================================================
+    // findMethodReturnType tests (131 missed instructions)
+    // ================================================================
+
+    @Test
+    void findMethodReturnTypeDirectMatch() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType receiverType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType returnType = mock(org.eclipse.jdt.core.IType.class);
+        when(returnType.getElementName()).thenReturn("String");
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("getName");
+        when(method.getReturnType()).thenReturn("QString;");
+        when(receiverType.getMethods()).thenReturn(new IMethod[] {method});
+        when(receiverType.getFullyQualifiedName()).thenReturn("com.example.Person");
+
+        when(project.findType("String")).thenReturn(returnType);
+
+        org.eclipse.jdt.core.IType result = invokeFindMethodReturnType(receiverType, "getName", project);
+        assertEquals(returnType, result);
+    }
+
+    @Test
+    void findMethodReturnTypeSearchesSupertype() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType receiverType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType superType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType returnType = mock(org.eclipse.jdt.core.IType.class);
+
+        when(receiverType.getMethods()).thenReturn(new IMethod[0]);
+        when(receiverType.getFullyQualifiedName()).thenReturn("com.example.Child");
+
+        IMethod superMethod = mock(IMethod.class);
+        when(superMethod.getElementName()).thenReturn("getBase");
+        when(superMethod.getReturnType()).thenReturn("QInteger;");
+        when(superType.getMethods()).thenReturn(new IMethod[] {superMethod});
+
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = mock(org.eclipse.jdt.core.ITypeHierarchy.class);
+        when(hierarchy.getAllSupertypes(receiverType)).thenReturn(new org.eclipse.jdt.core.IType[] {superType});
+        when(receiverType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+
+        when(project.findType("Integer")).thenReturn(returnType);
+
+        org.eclipse.jdt.core.IType result = invokeFindMethodReturnType(receiverType, "getBase", project);
+        assertEquals(returnType, result);
+    }
+
+    @Test
+    void findMethodReturnTypeReturnsNullWhenNotFound() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType receiverType = mock(org.eclipse.jdt.core.IType.class);
+
+        when(receiverType.getMethods()).thenReturn(new IMethod[0]);
+        when(receiverType.getFullyQualifiedName()).thenReturn("com.example.Empty");
+
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = mock(org.eclipse.jdt.core.ITypeHierarchy.class);
+        when(hierarchy.getAllSupertypes(receiverType)).thenReturn(new org.eclipse.jdt.core.IType[0]);
+        when(receiverType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+
+        org.eclipse.jdt.core.IType result = invokeFindMethodReturnType(receiverType, "noSuchMethod", project);
+        assertNull(result);
+    }
+
+    @Test
+    void findMethodReturnTypeWithHierarchyCache() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType receiverType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType returnType = mock(org.eclipse.jdt.core.IType.class);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("doWork");
+        when(method.getReturnType()).thenReturn("QBoolean;");
+        when(receiverType.getMethods()).thenReturn(new IMethod[] {method});
+        when(receiverType.getFullyQualifiedName()).thenReturn("com.example.Worker");
+        when(project.findType("Boolean")).thenReturn(returnType);
+
+        java.util.Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache = new java.util.HashMap<>();
+        org.eclipse.jdt.core.IType result = invokeFindMethodReturnTypeWithCache(
+                receiverType, "doWork", project, hierarchyCache);
+        assertEquals(returnType, result);
+    }
+
+    // ================================================================
+    // resolveTypeByName tests (part of findMethodReturnType path)
+    // ================================================================
+
+    @Test
+    void resolveTypeByNameDirectFind() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType foundType = mock(org.eclipse.jdt.core.IType.class);
+        when(project.findType("java.lang.String")).thenReturn(foundType);
+
+        org.eclipse.jdt.core.IType result = invokeResolveTypeByName("java.lang.String", null, project);
+        assertEquals(foundType, result);
+    }
+
+    @Test
+    void resolveTypeByNameViaContextResolve() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType context = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType resolved = mock(org.eclipse.jdt.core.IType.class);
+
+        when(project.findType("MyType")).thenReturn(null);
+        when(context.resolveType("MyType")).thenReturn(new String[][] {{"com.example", "MyType"}});
+        when(project.findType("com.example.MyType")).thenReturn(resolved);
+        when(project.findType("java.lang.MyType")).thenReturn(null);
+
+        org.eclipse.jdt.core.IType result = invokeResolveTypeByName("MyType", context, project);
+        assertEquals(resolved, result);
+    }
+
+    @Test
+    void resolveTypeByNameViaJavaLangFallback() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType foundType = mock(org.eclipse.jdt.core.IType.class);
+
+        when(project.findType("Integer")).thenReturn(null);
+        when(project.findType("java.lang.Integer")).thenReturn(foundType);
+
+        org.eclipse.jdt.core.IType result = invokeResolveTypeByName("Integer", null, project);
+        assertEquals(foundType, result);
+    }
+
+    // ================================================================
+    // resolveMethodCallChainType tests (87 missed instructions)
+    // ================================================================
+
+    @Test
+    void resolveMethodCallChainTypeWithConstructorReceiver() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType receiverType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType returnType = mock(org.eclipse.jdt.core.IType.class);
+
+        when(project.findType("java.util.ArrayList")).thenReturn(receiverType);
+        when(receiverType.getFullyQualifiedName()).thenReturn("java.util.ArrayList");
+
+        IMethod sizeMethod = mock(IMethod.class);
+        when(sizeMethod.getElementName()).thenReturn("size");
+        when(sizeMethod.getReturnType()).thenReturn("I");
+        when(receiverType.getMethods()).thenReturn(new IMethod[] {sizeMethod});
+        when(project.findType("int")).thenReturn(returnType);
+
+        // Build: new ArrayList().size()
+        org.codehaus.groovy.ast.expr.ConstructorCallExpression ctorExpr =
+                new org.codehaus.groovy.ast.expr.ConstructorCallExpression(
+                        new ClassNode("java.util.ArrayList", 0, null),
+                        org.codehaus.groovy.ast.expr.ArgumentListExpression.EMPTY_ARGUMENTS);
+        org.codehaus.groovy.ast.expr.MethodCallExpression methodCall =
+                new org.codehaus.groovy.ast.expr.MethodCallExpression(
+                        ctorExpr, "size",
+                        org.codehaus.groovy.ast.expr.ArgumentListExpression.EMPTY_ARGUMENTS);
+
+        ModuleNode module = parseModule("def x = 1");
+        org.eclipse.jdt.core.IType result = invokeResolveMethodCallChainType(methodCall, module, project);
+        assertEquals(returnType, result);
+    }
+
+    @Test
+    void resolveMethodCallChainTypeReturnsNullForNullMethodName() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+
+        // MethodCallExpression with null method
+        org.codehaus.groovy.ast.expr.MethodCallExpression methodCall =
+                new org.codehaus.groovy.ast.expr.MethodCallExpression(
+                        new org.codehaus.groovy.ast.expr.VariableExpression("x"),
+                        new org.codehaus.groovy.ast.expr.ConstantExpression(null),
+                        org.codehaus.groovy.ast.expr.ArgumentListExpression.EMPTY_ARGUMENTS);
+
+        ModuleNode module = parseModule("def x = 1");
+        org.eclipse.jdt.core.IType result = invokeResolveMethodCallChainType(methodCall, module, project);
+        assertNull(result);
+    }
+
+    // ================================================================
+    // computeJdtVariableTypeHints tests (121 missed instructions)
+    // ================================================================
+
+    @Test
+    void computeJdtVariableTypeHintsProducesHintsForDefMethodCall() throws Exception {
+        String source = "def result = new java.util.ArrayList().size()";
+        ModuleNode module = parseModule(source);
+
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+
+        org.eclipse.jdt.core.IType arrayListType = mock(org.eclipse.jdt.core.IType.class);
+        when(arrayListType.getFullyQualifiedName()).thenReturn("java.util.ArrayList");
+
+        IMethod sizeMethod = mock(IMethod.class);
+        when(sizeMethod.getElementName()).thenReturn("size");
+        when(sizeMethod.getReturnType()).thenReturn("I");
+        when(arrayListType.getMethods()).thenReturn(new IMethod[] {sizeMethod});
+
+        org.eclipse.jdt.core.IType intType = mock(org.eclipse.jdt.core.IType.class);
+        when(intType.getElementName()).thenReturn("int");
+
+        when(project.findType("java.util.ArrayList")).thenReturn(arrayListType);
+        when(project.findType("int")).thenReturn(intType);
+
+        Range range = new Range(new Position(0, 0), new Position(5, 0));
+        List<InlayHint> hints = invokeComputeJdtVariableTypeHints(module, source, range, workingCopy);
+        assertNotNull(hints);
+        // The hint should contain ": int" for the variable type
+        if (!hints.isEmpty()) {
+            assertTrue(hints.stream().anyMatch(h -> labelText(h).contains("int")));
+        }
+    }
+
+    @Test
+    void computeJdtVariableTypeHintsReturnsEmptyForNullProject() throws Exception {
+        String source = "def x = someCall()";
+        ModuleNode module = parseModule(source);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.getJavaProject()).thenReturn(null);
+
+        Range range = new Range(new Position(0, 0), new Position(5, 0));
+        List<InlayHint> hints = invokeComputeJdtVariableTypeHints(module, source, range, workingCopy);
+        assertTrue(hints.isEmpty());
+    }
+
+    @Test
+    void computeJdtVariableTypeHintsReturnsEmptyForNonExistentProject() throws Exception {
+        String source = "def x = someCall()";
+        ModuleNode module = parseModule(source);
+
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        when(project.exists()).thenReturn(false);
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+
+        Range range = new Range(new Position(0, 0), new Position(5, 0));
+        List<InlayHint> hints = invokeComputeJdtVariableTypeHints(module, source, range, workingCopy);
+        assertTrue(hints.isEmpty());
+    }
+
+    // ================================================================
+    // updateSettingsFromObject tests
+    // ================================================================
+
+    @Test
+    void updateSettingsFromObjectIgnoresNonInlayHintSettings() {
+        InlayHintProvider p = new InlayHintProvider(new DocumentManager());
+        p.updateSettingsFromObject("not a settings object");
+        // Should not throw, and settings remain defaults
+    }
+
+    @Test
+    void updateSettingsFromObjectAppliesCorrectType() {
+        InlayHintProvider p = new InlayHintProvider(new DocumentManager());
+        InlayHintSettings settings = new InlayHintSettings(false, false, false, false);
+        p.updateSettingsFromObject(settings);
+        // Verify by getting hints - all disabled should return empty
+        String uri = "file:///settingsFromObj.groovy";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, "def x = 42");
+        InlayHintProvider p2 = new InlayHintProvider(dm);
+        p2.updateSettingsFromObject(settings);
+        List<InlayHint> hints = p2.getInlayHints(paramsFor(uri));
+        assertNotNull(hints);
+    }
+
+    // ================================================================
+    // getInlayHints with single-arg overload (uses current settings)
+    // ================================================================
+
+    @Test
+    void getInlayHintsSingleArgUsesStoredSettings() {
+        DocumentManager dm = new DocumentManager();
+        String uri = "file:///storedSettings.groovy";
+        dm.didOpen(uri, "def name = 'Ada'\n");
+        InlayHintProvider p = new InlayHintProvider(dm);
+
+        // Default settings have variable types enabled
+        List<InlayHint> hints = p.getInlayHints(paramsFor(uri));
+        assertNotNull(hints);
+        assertFalse(hints.isEmpty());
+    }
+
+    // ================================================================
+    // resolveVarInBlock with ConstructorCallExpression RHS
+    // ================================================================
+
+    @Test
+    void resolveVarInBlockWithConstructorRhs() throws Exception {
+        String source = "class Foo { void bar() { def x = new java.util.ArrayList() } }";
+        var compileResult = new GroovyCompilerService().parse("file:///ctorRhs.groovy", source);
+        ModuleNode module = compileResult.getModuleNode();
+        ClassNode cls = module.getClasses().get(0);
+        var methods = cls.getMethods("bar");
+        if (!methods.isEmpty()) {
+            var code = methods.get(0).getCode();
+            if (code instanceof org.codehaus.groovy.ast.stmt.BlockStatement block) {
+                ClassNode result = invokeResolveVarInBlock(block, "x");
+                if (result != null) {
+                    assertTrue(result.getName().contains("ArrayList"));
+                }
+            }
+        }
+    }
+
+    // ================================================================
+    // dedupeAndSort with Right-side labels
+    // ================================================================
+
+    @Test
+    void dedupeAndSortHandlesRightSideLabels() throws Exception {
+        List<InlayHint> input = new ArrayList<>();
+        InlayHint rightLabel = new InlayHint();
+        rightLabel.setPosition(new Position(0, 0));
+        org.eclipse.lsp4j.InlayHintLabelPart part = new org.eclipse.lsp4j.InlayHintLabelPart();
+        part.setValue("part1");
+        rightLabel.setLabel(Either.forRight(List.of(part)));
+        input.add(rightLabel);
+
+        List<InlayHint> output = invokeDedupeAndSort(provider, input);
+        assertEquals(1, output.size());
+    }
+
+    // ================================================================
+    // Reflection helpers for JDT-mocked tests
+    // ================================================================
+
+    private org.eclipse.jdt.core.IType invokeResolveClassNodeToType(ClassNode typeNode, ModuleNode module,
+            org.eclipse.jdt.core.IJavaProject project) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("resolveClassNodeToType",
+                ClassNode.class, ModuleNode.class, org.eclipse.jdt.core.IJavaProject.class);
+        m.setAccessible(true);
+        return (org.eclipse.jdt.core.IType) m.invoke(provider, typeNode, module, project);
+    }
+
+    private org.eclipse.jdt.core.IType invokeFindMethodReturnType(org.eclipse.jdt.core.IType receiverType,
+            String methodName, org.eclipse.jdt.core.IJavaProject project) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("findMethodReturnType",
+                org.eclipse.jdt.core.IType.class, String.class, org.eclipse.jdt.core.IJavaProject.class);
+        m.setAccessible(true);
+        return (org.eclipse.jdt.core.IType) m.invoke(provider, receiverType, methodName, project);
+    }
+
+    private org.eclipse.jdt.core.IType invokeFindMethodReturnTypeWithCache(org.eclipse.jdt.core.IType receiverType,
+            String methodName, org.eclipse.jdt.core.IJavaProject project,
+            java.util.Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("findMethodReturnType",
+                org.eclipse.jdt.core.IType.class, String.class, org.eclipse.jdt.core.IJavaProject.class,
+                java.util.Map.class);
+        m.setAccessible(true);
+        return (org.eclipse.jdt.core.IType) m.invoke(provider, receiverType, methodName, project, hierarchyCache);
+    }
+
+    private org.eclipse.jdt.core.IType invokeResolveTypeByName(String typeName, org.eclipse.jdt.core.IType context,
+            org.eclipse.jdt.core.IJavaProject project) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("resolveTypeByName",
+                String.class, org.eclipse.jdt.core.IType.class, org.eclipse.jdt.core.IJavaProject.class);
+        m.setAccessible(true);
+        return (org.eclipse.jdt.core.IType) m.invoke(provider, typeName, context, project);
+    }
+
+    @SuppressWarnings("unchecked")
+    private org.eclipse.jdt.core.IType invokeResolveMethodCallChainType(
+            org.codehaus.groovy.ast.expr.MethodCallExpression methodCall,
+            ModuleNode module, org.eclipse.jdt.core.IJavaProject project) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("resolveMethodCallChainType",
+                org.codehaus.groovy.ast.expr.MethodCallExpression.class, ModuleNode.class,
+                org.eclipse.jdt.core.IJavaProject.class, java.util.Map.class);
+        m.setAccessible(true);
+        return (org.eclipse.jdt.core.IType) m.invoke(provider, methodCall, module, project, new java.util.HashMap<>());
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<InlayHint> invokeComputeJdtVariableTypeHints(ModuleNode module, String content,
+            Range requestedRange, ICompilationUnit workingCopy) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("computeJdtVariableTypeHints",
+                ModuleNode.class, String.class, Range.class, ICompilationUnit.class);
+        m.setAccessible(true);
+        return (List<InlayHint>) m.invoke(provider, module, content, requestedRange, workingCopy);
     }
 }

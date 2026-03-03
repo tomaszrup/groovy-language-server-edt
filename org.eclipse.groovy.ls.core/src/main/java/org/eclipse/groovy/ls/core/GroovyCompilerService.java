@@ -10,9 +10,10 @@
 package org.eclipse.groovy.ls.core;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.control.CompilationUnit;
@@ -70,8 +71,37 @@ public class GroovyCompilerService {
         }
     }
 
-    /** Cache of parse results keyed by document URI. */
-    private final Map<String, ParseResult> cache = new ConcurrentHashMap<>();
+    /**
+     * Maximum number of cached parse results.  When the cache exceeds this
+     * size the least-recently-used entry is evicted automatically.  This
+     * prevents unbounded memory growth when hundreds of files are parsed
+     * over a long session.
+     */
+    private static final int MAX_CACHE_SIZE = 500;
+
+    /**
+     * Bounded LRU cache of parse results keyed by document URI.
+     * Wrapped in {@link Collections#synchronizedMap} for thread safety.
+     */
+    private final Map<String, ParseResult> cache =
+            Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ParseResult> eldest) {
+                    return size() > MAX_CACHE_SIZE;
+                }
+            });
+
+    /**
+     * Reusable compiler configuration.  Creating a new
+     * {@code CompilerConfiguration} on every parse is wasteful — the settings
+     * (tolerance, source encoding, etc.) do not change between invocations.
+     */
+    private final CompilerConfiguration sharedConfig;
+
+    public GroovyCompilerService() {
+        sharedConfig = new CompilerConfiguration();
+        sharedConfig.setTolerance(10); // collect up to 10 errors before giving up
+    }
 
     /**
      * Parse Groovy source code and return the AST and any errors.
@@ -90,10 +120,7 @@ public class GroovyCompilerService {
         ModuleNode moduleNode = null;
 
         try {
-            CompilerConfiguration config = new CompilerConfiguration();
-            config.setTolerance(10); // collect up to 10 errors before giving up
-
-            CompilationUnit compilationUnit = new CompilationUnit(config);
+            CompilationUnit compilationUnit = new CompilationUnit(sharedConfig);
             String fileName = extractFileName(uri);
             compilationUnit.addSource(fileName, source);
 

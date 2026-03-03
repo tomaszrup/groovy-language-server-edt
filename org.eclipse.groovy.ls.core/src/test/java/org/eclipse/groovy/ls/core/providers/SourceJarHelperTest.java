@@ -267,4 +267,216 @@ class SourceJarHelperTest {
         }
         return jarPath.toFile();
     }
+
+    // ================================================================
+    // Batch 6 — additional SourceJarHelper coverage
+    // ================================================================
+
+    // ---- cleanJavadoc edge cases ----
+
+    @Test
+    void extractJavadocHandlesLinkTags() {
+        String source = """
+                /**
+                 * See {@link java.util.List} for details.
+                 * Also {@linkplain String text}.
+                 */
+                public class Demo {}
+                """;
+        String doc = SourceJarHelper.extractJavadoc(source, "Demo");
+        assertNotNull(doc);
+        assertTrue(doc.contains("List") || doc.contains("java.util.List"));
+    }
+
+    @Test
+    void extractJavadocHandlesParamAndReturnTags() {
+        String source = """
+                class Demo {
+                    /**
+                     * Computes something.
+                     * @param input the input value
+                     * @param count how many times
+                     * @return the result
+                     * @throws IllegalArgumentException if input is null
+                     */
+                    String compute(String input, int count) { return "" }
+                }
+                """;
+        String doc = SourceJarHelper.extractMemberJavadoc(source, "compute");
+        assertNotNull(doc);
+        assertTrue(doc.contains("Computes something"));
+        assertTrue(doc.contains("input"));
+    }
+
+    @Test
+    void extractJavadocHandlesHtmlTags() {
+        String source = """
+                /**
+                 * A <b>bold</b> class with <code>code</code> in it.
+                 * <ul><li>Item 1</li><li>Item 2</li></ul>
+                 */
+                public class Demo {}
+                """;
+        String doc = SourceJarHelper.extractJavadoc(source, "Demo");
+        assertNotNull(doc);
+        assertTrue(doc.contains("bold") || doc.contains("class"));
+    }
+
+    @Test
+    void extractJavadocReturnsNullForNoDoc() {
+        String source = "public class Demo {}";
+        assertNull(SourceJarHelper.extractJavadoc(source, "Demo"));
+    }
+
+    @Test
+    void extractJavadocReturnsNullForNullSource() {
+        assertNull(SourceJarHelper.extractJavadoc(null, "Demo"));
+    }
+
+    // ---- extractMemberJavadoc edge cases ----
+
+    @Test
+    void extractMemberJavadocForField() {
+        String source = """
+                class Demo {
+                    /**
+                     * The user's name.
+                     */
+                    String name;
+                }
+                """;
+        String doc = SourceJarHelper.extractMemberJavadoc(source, "name");
+        assertNotNull(doc);
+        assertTrue(doc.contains("name"));
+    }
+
+    @Test
+    void extractMemberJavadocReturnsNullWhenNoMatchingMember() {
+        String source = """
+                class Demo {
+                    /** Docs for foo */
+                    void foo() {}
+                }
+                """;
+        assertNull(SourceJarHelper.extractMemberJavadoc(source, "bar"));
+    }
+
+    @Test
+    void extractMemberJavadocHandlesStaticModifier() {
+        String source = """
+                class Demo {
+                    /**
+                     * Static factory.
+                     */
+                    public static Demo create() { return new Demo() }
+                }
+                """;
+        String doc = SourceJarHelper.extractMemberJavadoc(source, "create");
+        assertNotNull(doc, "Should find doc for static method through modifier");
+    }
+
+    @Test
+    void extractMemberJavadocHandlesAnnotationBetweenDocAndMember() {
+        String source = """
+                class Demo {
+                    /**
+                     * Deprecated method.
+                     */
+                    @Deprecated
+                    void old() {}
+                }
+                """;
+        String doc = SourceJarHelper.extractMemberJavadoc(source, "old");
+        assertNotNull(doc, "Should find doc through @annotation gap");
+    }
+
+    // ---- buildGroovySourceUri edge cases ----
+
+    @Test
+    void buildGroovySourceUriWithJavaExtension() {
+        String uri = SourceJarHelper.buildGroovySourceUri("com.example.Util", ".java", null, false, "class Util {}");
+        assertEquals("groovy-source:///com/example/Util.java", uri);
+        assertEquals("class Util {}", SourceJarHelper.getCachedContent("com.example.Util"));
+    }
+
+    @Test
+    void buildGroovySourceUriForJdkType() {
+        String uri = SourceJarHelper.buildGroovySourceUri("java.lang.String", ".java", null, true, "class String {}");
+        assertTrue(uri.startsWith("groovy-source:///"));
+    }
+
+    // ---- extractFqnFromUri edge cases ----
+
+    @Test
+    void extractFqnFromUriReturnsNullForNull() {
+        assertNull(SourceJarHelper.extractFqnFromUri(null));
+    }
+
+    @Test
+    void extractFqnFromUriReturnsNullForNonGroovyScheme() {
+        assertNull(SourceJarHelper.extractFqnFromUri("file:///some/path.java"));
+    }
+
+    @Test
+    void extractFqnFromUriHandlesDeepPackage() {
+        assertEquals("org.apache.commons.lang3.StringUtils",
+                SourceJarHelper.extractFqnFromUri("groovy-source:///org/apache/commons/lang3/StringUtils.java"));
+    }
+
+    // ---- resolveSourceContent ----
+
+    @Test
+    void resolveSourceContentReturnsNullForUnknownUri() {
+        assertNull(SourceJarHelper.resolveSourceContent("groovy-source:///unknown/Type.java"));
+    }
+
+    @Test
+    void resolveSourceContentReturnsCachedValue() {
+        String fqn = "com.test.Cached" + System.nanoTime();
+        SourceJarHelper.buildGroovySourceUri(fqn, ".java", null, false, "cached-content");
+        String uri = "groovy-source:///" + fqn.replace('.', '/') + ".java";
+        String content = SourceJarHelper.resolveSourceContent(uri);
+        assertEquals("cached-content", content);
+    }
+
+    // ---- readSourceFromJar with groovy extension ----
+
+    @Test
+    void readSourceFromJarReadsGroovyEntry() throws IOException {
+        File jar = createJar(tempDir.resolve("groovy-src.jar"),
+                "com/example/GroovyClass.groovy", "class GroovyClass {}");
+        String source = SourceJarHelper.readSourceFromJar(jar, "com.example.GroovyClass");
+        assertNotNull(source);
+        assertTrue(source.contains("GroovyClass"));
+    }
+
+    @Test
+    void readSourceFromJarReturnsNullForNullJar() {
+        // null jar causes NPE during processing
+        try {
+            String result = SourceJarHelper.readSourceFromJar(null, "com.example.X");
+            // If it returns null (caught internally), that's also acceptable
+            assertNull(result);
+        } catch (NullPointerException e) {
+            // Expected: null jar is not a valid input
+        }
+    }
+
+    // ---- findSourcesJarForBinaryJar edge cases ----
+
+    @Test
+    void findSourcesJarForBinaryJarNonexistentFile() {
+        File fake = new File(tempDir.toFile(), "nonexistent-1.0.jar");
+        assertNull(SourceJarHelper.findSourcesJarForBinaryJar(fake));
+    }
+
+    // ---- writeSourceToTemp edge cases ----
+
+    @Test
+    void writeSourceToTempWritesJavaFile() throws IOException {
+        File written = SourceJarHelper.writeSourceToTemp("com.example.JavaFile", "class JavaFile {}", ".java");
+        assertNotNull(written);
+        assertTrue(written.exists());
+        assertTrue(written.getName().endsWith(".java"));
+    }
 }

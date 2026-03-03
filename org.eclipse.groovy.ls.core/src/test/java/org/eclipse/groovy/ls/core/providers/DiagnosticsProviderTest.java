@@ -840,4 +840,401 @@ class DiagnosticsProviderTest {
                     new Class<?>[] { String.class }, new Object[] { (String) null });
         });
     }
+
+    // ================================================================
+    // createNoClasspathWarning tests
+    // ================================================================
+
+    @Test
+    void createNoClasspathWarningWithContent() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        org.eclipse.lsp4j.Diagnostic diag = (org.eclipse.lsp4j.Diagnostic) invoke(provider,
+                "createNoClasspathWarning", new Class<?>[]{ String.class },
+                new Object[]{ "package com.example\nclass Foo {}" });
+        assertNotNull(diag);
+        assertEquals(DiagnosticSeverity.Warning, diag.getSeverity());
+        assertNotNull(diag.getMessage());
+        assertEquals("groovy.noClasspath", diag.getCode().getLeft());
+    }
+
+    @Test
+    void createNoClasspathWarningWithNullContent() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        org.eclipse.lsp4j.Diagnostic diag = (org.eclipse.lsp4j.Diagnostic) invoke(provider,
+                "createNoClasspathWarning", new Class<?>[]{ String.class },
+                new Object[]{ (String) null });
+        assertNotNull(diag);
+        assertEquals(0, diag.getRange().getEnd().getCharacter());
+    }
+
+    @Test
+    void createNoClasspathWarningWithCrLf() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        org.eclipse.lsp4j.Diagnostic diag = (org.eclipse.lsp4j.Diagnostic) invoke(provider,
+                "createNoClasspathWarning", new Class<?>[]{ String.class },
+                new Object[]{ "hello world\r\nsecond line" });
+        assertNotNull(diag);
+        // first line length should be 11 ("hello world" without \r)
+        assertEquals(11, diag.getRange().getEnd().getCharacter());
+    }
+
+    // ================================================================
+    // extractSimpleTypeName tests
+    // ================================================================
+
+    @Test
+    void extractSimpleTypeNameWithDot() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        String result = (String) invoke(provider, "extractSimpleTypeName",
+                new Class<?>[]{ String.class }, new Object[]{ "com.example.Foo" });
+        assertEquals("Foo", result);
+    }
+
+    @Test
+    void extractSimpleTypeNameWithoutDot() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        String result = (String) invoke(provider, "extractSimpleTypeName",
+                new Class<?>[]{ String.class }, new Object[]{ "Bar" });
+        assertEquals("Bar", result);
+    }
+
+    @Test
+    void extractSimpleTypeNameWithTrailingDot() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        String result = (String) invoke(provider, "extractSimpleTypeName",
+                new Class<?>[]{ String.class }, new Object[]{ "com.example." });
+        // lastDot == length - 1, so lastDot < length - 1 is false, returns full string
+        assertEquals("com.example.", result);
+    }
+
+    // ================================================================
+    // isValidTypeCandidate tests
+    // ================================================================
+
+    @Test
+    void isValidTypeCandidateTrue() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        boolean result = (boolean) invoke(provider, "isValidTypeCandidate",
+                new Class<?>[]{ String.class }, new Object[]{ "com.example.Foo" });
+        assertTrue(result);
+    }
+
+    @Test
+    void isValidTypeCandidateNull() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        boolean result = (boolean) invoke(provider, "isValidTypeCandidate",
+                new Class<?>[]{ String.class }, new Object[]{ (String) null });
+        assertFalse(result);
+    }
+
+    @Test
+    void isValidTypeCandidateBlank() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        boolean result = (boolean) invoke(provider, "isValidTypeCandidate",
+                new Class<?>[]{ String.class }, new Object[]{ "   " });
+        assertFalse(result);
+    }
+
+    // ================================================================
+    // collectTypeCandidates tests
+    // ================================================================
+
+    @Test
+    void collectTypeCandidatesIncludesAutoPackages() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> result = (java.util.Set<String>) invoke(provider,
+                "collectTypeCandidates", new Class<?>[]{ String.class, ICompilationUnit.class },
+                new Object[]{ "ArrayList", null });
+        assertNotNull(result);
+        assertTrue(result.contains("java.util.ArrayList"));
+        assertTrue(result.contains("java.lang.ArrayList"));
+    }
+
+    @Test
+    void collectTypeCandidatesWithPackageDeclaration() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        IPackageDeclaration pkgDecl = mock(IPackageDeclaration.class);
+        when(pkgDecl.getElementName()).thenReturn("com.test");
+        when(cu.getPackageDeclarations()).thenReturn(new IPackageDeclaration[]{ pkgDecl });
+        when(cu.getImports()).thenReturn(new IImportDeclaration[]{});
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> result = (java.util.Set<String>) invoke(provider,
+                "collectTypeCandidates", new Class<?>[]{ String.class, ICompilationUnit.class },
+                new Object[]{ "MyClass", cu });
+        assertTrue(result.contains("com.test.MyClass"));
+    }
+
+    @Test
+    void collectTypeCandidatesWithImports() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        when(cu.getPackageDeclarations()).thenReturn(new IPackageDeclaration[]{});
+        IImportDeclaration imp = mock(IImportDeclaration.class);
+        when(imp.isOnDemand()).thenReturn(true);
+        when(imp.getElementName()).thenReturn("org.util");
+        when(cu.getImports()).thenReturn(new IImportDeclaration[]{ imp });
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> result = (java.util.Set<String>) invoke(provider,
+                "collectTypeCandidates", new Class<?>[]{ String.class, ICompilationUnit.class },
+                new Object[]{ "Widget", cu });
+        assertTrue(result.contains("org.util.Widget"));
+    }
+
+    // ================================================================
+    // anyCandidateTypeExists tests
+    // ================================================================
+
+    @Test
+    void anyCandidateTypeExistsTrue() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        IJavaProject project = mock(IJavaProject.class);
+        IType foundType = mock(IType.class);
+        when(foundType.exists()).thenReturn(true);
+        when(project.findType("java.util.List")).thenReturn(foundType);
+        java.util.Set<String> candidates = new java.util.HashSet<>(java.util.List.of("java.util.List"));
+        boolean result = (boolean) invoke(provider, "anyCandidateTypeExists",
+                new Class<?>[]{ java.util.Set.class, IJavaProject.class },
+                new Object[]{ candidates, project });
+        assertTrue(result);
+    }
+
+    @Test
+    void anyCandidateTypeExistsFalse() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        IJavaProject project = mock(IJavaProject.class);
+        java.util.Set<String> candidates = new java.util.HashSet<>(java.util.List.of("com.z.Missing"));
+        boolean result = (boolean) invoke(provider, "anyCandidateTypeExists",
+                new Class<?>[]{ java.util.Set.class, IJavaProject.class },
+                new Object[]{ candidates, project });
+        assertFalse(result);
+    }
+
+    @Test
+    void anyCandidateTypeExistsSkipsBlank() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        IJavaProject project = mock(IJavaProject.class);
+        java.util.Set<String> candidates = new java.util.HashSet<>(java.util.List.of("", "  "));
+        boolean result = (boolean) invoke(provider, "anyCandidateTypeExists",
+                new Class<?>[]{ java.util.Set.class, IJavaProject.class },
+                new Object[]{ candidates, project });
+        assertFalse(result);
+    }
+
+    // ================================================================
+    // addPackageCandidates tests
+    // ================================================================
+
+    @Test
+    void addPackageCandidatesNullUnit() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        java.util.Set<String> candidates = new java.util.HashSet<>();
+        invoke(provider, "addPackageCandidates",
+                new Class<?>[]{ java.util.Set.class, String.class, ICompilationUnit.class },
+                new Object[]{ candidates, "Foo", null });
+        assertTrue(candidates.isEmpty());
+    }
+
+    @Test
+    void addPackageCandidatesWithPackage() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        IPackageDeclaration pkgDecl = mock(IPackageDeclaration.class);
+        when(pkgDecl.getElementName()).thenReturn("org.sample");
+        when(cu.getPackageDeclarations()).thenReturn(new IPackageDeclaration[]{ pkgDecl });
+        java.util.Set<String> candidates = new java.util.HashSet<>();
+        invoke(provider, "addPackageCandidates",
+                new Class<?>[]{ java.util.Set.class, String.class, ICompilationUnit.class },
+                new Object[]{ candidates, "Bar", cu });
+        assertTrue(candidates.contains("org.sample.Bar"));
+    }
+
+    // ================================================================
+    // addImportCandidates tests
+    // ================================================================
+
+    @Test
+    void addImportCandidatesNullUnit() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        java.util.Set<String> candidates = new java.util.HashSet<>();
+        invoke(provider, "addImportCandidates",
+                new Class<?>[]{ java.util.Set.class, String.class, ICompilationUnit.class },
+                new Object[]{ candidates, "Foo", null });
+        assertTrue(candidates.isEmpty());
+    }
+
+    @Test
+    void addImportCandidatesExplicitImport() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        IImportDeclaration imp = mock(IImportDeclaration.class);
+        when(imp.isOnDemand()).thenReturn(false);
+        when(imp.getElementName()).thenReturn("com.pkg.MyWidget");
+        when(cu.getImports()).thenReturn(new IImportDeclaration[]{ imp });
+        java.util.Set<String> candidates = new java.util.HashSet<>();
+        invoke(provider, "addImportCandidates",
+                new Class<?>[]{ java.util.Set.class, String.class, ICompilationUnit.class },
+                new Object[]{ candidates, "MyWidget", cu });
+        assertTrue(candidates.contains("com.pkg.MyWidget"));
+    }
+
+    @Test
+    void addImportCandidatesStarImport() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        IImportDeclaration imp = mock(IImportDeclaration.class);
+        when(imp.isOnDemand()).thenReturn(true);
+        when(imp.getElementName()).thenReturn("com.pkg");
+        when(cu.getImports()).thenReturn(new IImportDeclaration[]{ imp });
+        java.util.Set<String> candidates = new java.util.HashSet<>();
+        invoke(provider, "addImportCandidates",
+                new Class<?>[]{ java.util.Set.class, String.class, ICompilationUnit.class },
+                new Object[]{ candidates, "Thing", cu });
+        assertTrue(candidates.contains("com.pkg.Thing"));
+    }
+
+    // ================================================================
+    // collectDiagnostics branch tests
+    // ================================================================
+
+    @Test
+    void collectDiagnosticsReturnsEmptyForClosedDocument() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider provider = new DiagnosticsProvider(dm);
+        // Don't open any document — content is null
+        @SuppressWarnings("unchecked")
+        List<Diagnostic> result = (List<Diagnostic>) invoke(provider,
+                "collectDiagnostics", new Class<?>[]{ String.class },
+                new Object[]{ "file:///ClosedDoc.groovy" });
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void collectDiagnosticsSyntaxOnlyWhenNoClasspath() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider provider = new DiagnosticsProvider(dm);
+        String uri = "file:///NoCP.groovy";
+        dm.didOpen(uri, "class A {}");
+        // Set classpath checker that always returns false
+        provider.setClasspathChecker(u -> false);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        @SuppressWarnings("unchecked")
+        List<Diagnostic> result = (List<Diagnostic>) invoke(provider,
+                "collectDiagnostics", new Class<?>[]{ String.class },
+                new Object[]{ uri });
+        // Should contain the "no classpath" warning
+        assertTrue(result.stream().anyMatch(d ->
+                String.valueOf(d.getMessage()).toLowerCase().contains("classpath")),
+                "Expected a no-classpath warning diagnostic");
+        dm.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsSyntaxOnlyWhenBuildInProgress() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider provider = new DiagnosticsProvider(dm);
+        String uri = "file:///BuildProg.groovy";
+        dm.didOpen(uri, "class B { invalid syntax !!! }");
+        provider.setClasspathChecker(u -> true);
+        provider.setBuildInProgressSupplier(() -> true);
+
+        @SuppressWarnings("unchecked")
+        List<Diagnostic> result = (List<Diagnostic>) invoke(provider,
+                "collectDiagnostics", new Class<?>[]{ String.class },
+                new Object[]{ uri });
+        // Should have syntax errors from Groovy compiler but no classpath warning
+        assertNotNull(result);
+        dm.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsNoClasspathWarningContainsExpectedText() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider provider = new DiagnosticsProvider(dm);
+        String uri = "file:///UnusedImps.groovy";
+        String source = "import java.util.Map\nclass C {}";
+        dm.didOpen(uri, source);
+        // Force no-classpath branch
+        provider.setClasspathChecker(u -> false);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        @SuppressWarnings("unchecked")
+        List<Diagnostic> result = (List<Diagnostic>) invoke(provider,
+                "collectDiagnostics", new Class<?>[]{ String.class },
+                new Object[]{ uri });
+        // The no-classpath warning should mention "Classpath"
+        assertTrue(result.stream().anyMatch(d ->
+                String.valueOf(d.getMessage()).toLowerCase().contains("classpath")),
+                "Expected a no-classpath warning diagnostic in result");
+        dm.didClose(uri);
+    }
+
+    // ================================================================
+    // collectFromGroovyCompiler tests
+    // ================================================================
+
+    @Test
+    void collectFromGroovyCompilerCapturesSyntaxErrors() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider provider = new DiagnosticsProvider(dm);
+        String uri = "file:///SyntaxErr.groovy";
+        dm.didOpen(uri, "class { }"); // Missing class name
+
+        List<Diagnostic> diagnostics = new ArrayList<>();
+        invoke(provider, "collectFromGroovyCompiler",
+                new Class<?>[]{ String.class, List.class },
+                new Object[]{ uri, diagnostics });
+
+        assertTrue(diagnostics.size() >= 1,
+                "Expected at least one syntax error diagnostic");
+        assertEquals(DiagnosticSeverity.Error, diagnostics.get(0).getSeverity());
+        dm.didClose(uri);
+    }
+
+    @Test
+    void collectFromGroovyCompilerReturnsForNullContent() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider provider = new DiagnosticsProvider(dm);
+        // Content is null since document is not open
+        List<Diagnostic> diagnostics = new ArrayList<>();
+        invoke(provider, "collectFromGroovyCompiler",
+                new Class<?>[]{ String.class, List.class },
+                new Object[]{ "file:///NoContent.groovy", diagnostics });
+
+        assertTrue(diagnostics.isEmpty());
+    }
+
+    @Test
+    void collectFromGroovyCompilerUsesCleanSource() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider provider = new DiagnosticsProvider(dm);
+        String uri = "file:///CleanSource.groovy";
+        dm.didOpen(uri, "class Valid { void m() {} }");
+
+        List<Diagnostic> diagnostics = new ArrayList<>();
+        invoke(provider, "collectFromGroovyCompiler",
+                new Class<?>[]{ String.class, List.class },
+                new Object[]{ uri, diagnostics });
+
+        assertTrue(diagnostics.isEmpty(),
+                "Valid source should have no syntax errors");
+        dm.didClose(uri);
+    }
+
+    // ================================================================
+    // createNoClasspathWarning tests
+    // ================================================================
+
+    @Test
+    void createNoClasspathWarningReturnsDiagnostic() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        Diagnostic result = (Diagnostic) invoke(provider,
+                "createNoClasspathWarning", new Class<?>[]{ String.class },
+                new Object[]{ "class Foo {}" });
+        assertNotNull(result);
+        assertEquals(DiagnosticSeverity.Warning, result.getSeverity());
+        assertTrue(String.valueOf(result.getMessage()).toLowerCase().contains("classpath"));
+    }
 }

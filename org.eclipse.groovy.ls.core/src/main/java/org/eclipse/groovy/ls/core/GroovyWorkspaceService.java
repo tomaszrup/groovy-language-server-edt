@@ -234,7 +234,11 @@ public class GroovyWorkspaceService implements WorkspaceService {
     @Override
     public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
         GroovyLanguageServerPlugin.logInfo("Watched files changed: " + params.getChanges().size() + " changes");
-        CompletableFuture.runAsync(() -> handleWatchedFileChanges(params));
+        CompletableFuture.runAsync(() -> handleWatchedFileChanges(params))
+                .exceptionally(e -> {
+                    GroovyLanguageServerPlugin.logError("Watched file changes handler failed", (Exception) e);
+                    return null;
+                });
     }
 
     private void handleWatchedFileChanges(DidChangeWatchedFilesParams params) {
@@ -571,6 +575,9 @@ public class GroovyWorkspaceService implements WorkspaceService {
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Failed to refresh diagnostics after file rename", e);
             }
+        }).exceptionally(e -> {
+            GroovyLanguageServerPlugin.logError("File rename handler failed", (Exception) e);
+            return null;
         });
     }
 

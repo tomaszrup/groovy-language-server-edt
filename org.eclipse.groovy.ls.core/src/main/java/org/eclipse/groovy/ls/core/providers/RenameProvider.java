@@ -289,78 +289,77 @@ public class RenameProvider {
 
     /**
      * When renaming a type, update all import statements that reference it.
-     * The SearchEngine ALL_OCCURRENCES search may not find import statements in all cases,
-     * so we scan workspace files explicitly.
+     * <p>
+     * Uses JDT {@link SearchEngine} to find import references instead of
+     * manually walking the entire workspace file tree, which is O(n) over
+     * all files in all projects and extremely slow in large workspaces.
      */
     private void addImportRenameEdits(IType type, String newName,
                                        Map<String, List<TextEdit>> editsByUri) {
         try {
-            String oldFqn = type.getFullyQualifiedName();
             String oldSimpleName = type.getElementName();
 
-            // Scan all workspace source files
-            org.eclipse.core.resources.IProject[] projects =
-                    org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot().getProjects();
-            for (org.eclipse.core.resources.IProject project : projects) {
-                if (!project.isOpen()) continue;
-                scanProjectForImportRenames(project.members(), oldFqn, oldSimpleName, newName, editsByUri);
+            // Search for import declarations of this type across the workspace
+            SearchPattern pattern = SearchPattern.createPattern(
+                    type, IJavaSearchConstants.REFERENCES,
+                    SearchPattern.R_EXACT_MATCH);
+            if (pattern == null) {
+                return;
             }
+
+            SearchEngine engine = new SearchEngine();
+            engine.search(pattern,
+                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                    SearchEngine.createWorkspaceScope(),
+                    new SearchRequestor() {
+                        @Override
+                        public void acceptSearchMatch(SearchMatch match) {
+                            try {
+                                if (match.getResource() == null
+                                        || match.getResource().getLocationURI() == null) {
+                                    return;
+                                }
+                                // Only process import statement matches
+                                org.eclipse.core.resources.IResource res = match.getResource();
+                                String uri = res.getLocationURI().toString();
+                                String content = readContent(uri,
+                                        res instanceof org.eclipse.core.resources.IFile f ? f : null);
+                                if (content == null) return;
+
+                                int startOffset = match.getOffset();
+                                int endOffset = startOffset + match.getLength();
+
+                                // Check if this match is inside an import statement
+                                int lineStart = content.lastIndexOf('\n', startOffset) + 1;
+                                String linePrefix = content.substring(lineStart, startOffset).trim();
+                                if (!linePrefix.startsWith("import")) {
+                                    return; // Not an import — handled by ALL_OCCURRENCES search
+                                }
+
+                                // Find just the simple name part within the match
+                                String matchText = content.substring(startOffset, endOffset);
+                                int simpleIdx = matchText.lastIndexOf(oldSimpleName);
+                                if (simpleIdx < 0) return;
+
+                                int nameStart = startOffset + simpleIdx;
+                                int nameEnd = nameStart + oldSimpleName.length();
+
+                                Position start = offsetToPosition(content, nameStart);
+                                Position end = offsetToPosition(content, nameEnd);
+
+                                List<TextEdit> existingEdits = editsByUri.get(uri);
+                                if (!hasEditAt(existingEdits, start.getLine(), start.getCharacter())) {
+                                    editsByUri.computeIfAbsent(uri, k -> new ArrayList<>())
+                                            .add(new TextEdit(new Range(start, end), newName));
+                                }
+                            } catch (Exception e) {
+                                // Silently skip problematic matches
+                            }
+                        }
+                    },
+                    null);
         } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("Import rename scan failed", e);
-        }
-    }
-
-    private void scanProjectForImportRenames(IResource[] resources, String oldFqn,
-                                              String oldSimpleName, String newName,
-                                              Map<String, List<TextEdit>> editsByUri) throws Exception {
-        for (IResource resource : resources) {
-            if (resource instanceof org.eclipse.core.resources.IFile file) {
-                String fileName = file.getName();
-                if (fileName.endsWith(".groovy") || fileName.endsWith(".java")) {
-                    scanFileForImportRename(file, oldFqn, oldSimpleName, newName, editsByUri);
-                }
-            } else if (resource instanceof org.eclipse.core.resources.IFolder folder) {
-                if (folder.isAccessible()) {
-                    scanProjectForImportRenames(folder.members(), oldFqn, oldSimpleName, newName, editsByUri);
-                }
-            }
-        }
-    }
-
-    private void scanFileForImportRename(org.eclipse.core.resources.IFile file, String oldFqn,
-                                          String oldSimpleName, String newName,
-                                          Map<String, List<TextEdit>> editsByUri) {
-        try {
-            String uri = file.getLocationURI().toString();
-            String content = readContent(uri, file);
-            if (content == null) return;
-
-            // Look for import statements containing the old FQN
-            String importLine = "import " + oldFqn;
-            int idx = content.indexOf(importLine);
-            while (idx >= 0) {
-                // Find the position of just the simple name within the import
-                int nameStart = idx + "import ".length() + oldFqn.length() - oldSimpleName.length();
-                int nameEnd = nameStart + oldSimpleName.length();
-
-                // Verify it's actually the simple name
-                String found = content.substring(nameStart, nameEnd);
-                if (found.equals(oldSimpleName)) {
-                    Position start = offsetToPosition(content, nameStart);
-                    Position end = offsetToPosition(content, nameEnd);
-
-                    // Only add if not already covered by the search edit
-                    List<TextEdit> existingEdits = editsByUri.get(uri);
-                    if (!hasEditAt(existingEdits, start.getLine(), start.getCharacter())) {
-                        editsByUri.computeIfAbsent(uri, k -> new ArrayList<>())
-                                .add(new TextEdit(new Range(start, end), newName));
-                    }
-                }
-
-                idx = content.indexOf(importLine, idx + 1);
-            }
-        } catch (Exception e) {
-            // Silently skip files we can't process
+            GroovyLanguageServerPlugin.logError("Import rename search failed", e);
         }
     }
 

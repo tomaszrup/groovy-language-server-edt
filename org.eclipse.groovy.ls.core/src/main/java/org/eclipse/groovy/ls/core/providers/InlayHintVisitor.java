@@ -59,6 +59,8 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
     private final List<InlayHint> hints = new ArrayList<>();
     private final Set<String> emittedHints = new HashSet<>();
     private final Map<String, List<MethodNode>> methodsByName = new HashMap<>();
+    /** Pre-computed line index for O(1) line lookups. */
+    private final PositionUtils.LineIndex lineIndex;
 
     private SourceUnit sourceUnit;
 
@@ -66,6 +68,8 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         this.source = source;
         this.requestedRange = requestedRange;
         this.settings = settings != null ? settings : InlayHintSettings.defaults();
+        this.lineIndex = (source != null && !source.isEmpty())
+                ? PositionUtils.buildLineIndex(source) : null;
     }
 
     @Override
@@ -609,33 +613,17 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         return leftBoundary && rightBoundary;
     }
 
+    /**
+     * Get the text of a specific line using the pre-computed line index.
+     * O(1) lookup instead of O(n) linear scan from the start of the source.
+     */
     private String getLineText(int targetLine) {
-        if (targetLine < 0 || source == null || source.isEmpty()) {
+        if (lineIndex == null || targetLine < 0) {
             return null;
         }
-
-        int line = 0;
-        int lineStart = 0;
-        for (int index = 0; index < source.length(); index++) {
-            if (line == targetLine) {
-                break;
-            }
-            if (source.charAt(index) == '\n') {
-                line++;
-                lineStart = index + 1;
-            }
-        }
-        if (line != targetLine) {
+        if (targetLine >= lineIndex.lineCount()) {
             return null;
         }
-
-        int lineEnd = source.indexOf('\n', lineStart);
-        if (lineEnd < 0) {
-            lineEnd = source.length();
-        }
-        if (lineStart > lineEnd || lineStart >= source.length()) {
-            return "";
-        }
-        return source.substring(lineStart, lineEnd);
+        return lineIndex.getLineText(source, targetLine);
     }
 }

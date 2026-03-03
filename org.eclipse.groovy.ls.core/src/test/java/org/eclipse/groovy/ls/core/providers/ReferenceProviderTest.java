@@ -10,6 +10,7 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -250,5 +251,137 @@ class ReferenceProviderTest {
         method.setAccessible(true);
         return (int) method.invoke(provider, content, position);
     }
-}
 
+    // ================================================================
+    // toLocation tests (via reflection)
+    // ================================================================
+
+    @Test
+    void toLocationWithResource() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        ReferenceProvider rp = new ReferenceProvider(dm);
+
+        SearchMatch match = mock(SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(new java.net.URI("file:///RefTarget.groovy"));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(0);
+        when(match.getLength()).thenReturn(5);
+
+        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
+        m.setAccessible(true);
+        Location loc = (Location) m.invoke(rp, match);
+
+        assertNotNull(loc);
+        assertEquals("file:///RefTarget.groovy", loc.getUri());
+    }
+
+    @Test
+    void toLocationWithContentReturnsAccurateRange() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        ReferenceProvider rp = new ReferenceProvider(dm);
+        String uri = "file:///RefContent.groovy";
+        dm.didOpen(uri, "class MyRef {}");
+
+        SearchMatch match = mock(SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(new java.net.URI(uri));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(6);
+        when(match.getLength()).thenReturn(5);
+
+        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
+        m.setAccessible(true);
+        Location loc = (Location) m.invoke(rp, match);
+
+        assertNotNull(loc);
+        assertEquals(0, loc.getRange().getStart().getLine());
+        assertEquals(6, loc.getRange().getStart().getCharacter());
+        dm.didClose(uri);
+    }
+
+    @Test
+    void toLocationReturnsNullForNullResource() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        ReferenceProvider rp = new ReferenceProvider(dm);
+
+        SearchMatch match = mock(SearchMatch.class);
+        when(match.getResource()).thenReturn(null);
+
+        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
+        m.setAccessible(true);
+        Location loc = (Location) m.invoke(rp, match);
+
+        assertNull(loc);
+    }
+
+    @Test
+    void toLocationReturnsNullForNullLocationURI() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        ReferenceProvider rp = new ReferenceProvider(dm);
+
+        SearchMatch match = mock(SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(null);
+        when(match.getResource()).thenReturn(resource);
+
+        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
+        m.setAccessible(true);
+        Location loc = (Location) m.invoke(rp, match);
+
+        assertNull(loc);
+    }
+
+    @Test
+    void toLocationDefaultsRangeForMissingContent() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        ReferenceProvider rp = new ReferenceProvider(dm);
+
+        SearchMatch match = mock(SearchMatch.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+        when(resource.getLocationURI()).thenReturn(new java.net.URI("file:///UnknownRef.groovy"));
+        when(match.getResource()).thenReturn(resource);
+        when(match.getOffset()).thenReturn(10);
+        when(match.getLength()).thenReturn(3);
+
+        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
+        m.setAccessible(true);
+        Location loc = (Location) m.invoke(rp, match);
+
+        assertNotNull(loc);
+        assertEquals(0, loc.getRange().getStart().getLine());
+    }
+
+    // ================================================================
+    // readContent tests (via reflection)
+    // ================================================================
+
+    @Test
+    void readContentFromDocumentManager() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        ReferenceProvider rp = new ReferenceProvider(dm);
+        String uri = "file:///ReadContent.groovy";
+        dm.didOpen(uri, "content here");
+
+        Method m = ReferenceProvider.class.getDeclaredMethod("readContent", String.class,
+                org.eclipse.core.resources.IResource.class);
+        m.setAccessible(true);
+        String content = (String) m.invoke(rp, uri, null);
+
+        assertEquals("content here", content);
+        dm.didClose(uri);
+    }
+
+    @Test
+    void readContentReturnsNullForUnknownUri() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        ReferenceProvider rp = new ReferenceProvider(dm);
+
+        Method m = ReferenceProvider.class.getDeclaredMethod("readContent", String.class,
+                org.eclipse.core.resources.IResource.class);
+        m.setAccessible(true);
+        String content = (String) m.invoke(rp, "file:///NonExistent.groovy", null);
+
+        assertNull(content);
+    }
+}

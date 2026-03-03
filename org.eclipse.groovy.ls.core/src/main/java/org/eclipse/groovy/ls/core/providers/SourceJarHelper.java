@@ -14,7 +14,6 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Enumeration;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -52,8 +51,18 @@ public class SourceJarHelper {
         }
     }
 
+    /** Maximum number of source entries to cache. LRU eviction keeps memory bounded. */
+    private static final int MAX_CACHE_SIZE = 200;
+
     /** Cache of virtual document content keyed by FQN (e.g. "spock.lang.Specification"). */
-    private static final ConcurrentHashMap<String, CacheEntry> contentCache = new ConcurrentHashMap<>();
+    private static final java.util.Map<String, CacheEntry> contentCache =
+            java.util.Collections.synchronizedMap(
+                    new java.util.LinkedHashMap<String, CacheEntry>(64, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(java.util.Map.Entry<String, CacheEntry> eldest) {
+                            return size() > MAX_CACHE_SIZE;
+                        }
+                    });
 
     /**
      * Build a {@code groovy-source://} URI for a binary type's source.

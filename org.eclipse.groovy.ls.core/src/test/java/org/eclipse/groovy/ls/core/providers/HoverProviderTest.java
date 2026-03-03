@@ -847,4 +847,128 @@ class HoverProviderTest {
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("Property not found: " + propName));
     }
+
+    // ================================================================
+    // resolveTraitMemberHover tests — field and property paths
+    // ================================================================
+
+    @Test
+    void resolveTraitMemberHoverForTraitField() throws Exception {
+        String source = "trait HasCount {\n"
+                + "    int counter = 0\n"
+                + "}\n"
+                + "class Impl implements HasCount {}\n";
+        String uri = "file:///TraitFieldHover.groovy";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, source);
+        HoverProvider hp = new HoverProvider(dm);
+
+        GroovyCompilerService.ParseResult pr = compilerService.parse(uri, source);
+        ModuleNode ast = pr.getModuleNode();
+        ClassNode impl = findClass(ast, "Impl");
+
+        Method m = HoverProvider.class.getDeclaredMethod(
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+        m.setAccessible(true);
+        Hover hover = (Hover) m.invoke(hp, impl, ast, "counter", 4);
+
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("counter"));
+        dm.didClose(uri);
+    }
+
+    @Test
+    void resolveTraitMemberHoverForTraitProperty() throws Exception {
+        String source = "trait Named {\n"
+                + "    String name\n"
+                + "}\n"
+                + "class Person implements Named {}\n";
+        String uri = "file:///TraitPropHover.groovy";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, source);
+        HoverProvider hp = new HoverProvider(dm);
+
+        GroovyCompilerService.ParseResult pr = compilerService.parse(uri, source);
+        ModuleNode ast = pr.getModuleNode();
+        ClassNode person = findClass(ast, "Person");
+
+        Method m = HoverProvider.class.getDeclaredMethod(
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+        m.setAccessible(true);
+        Hover hover = (Hover) m.invoke(hp, person, ast, "name", 4);
+
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("name"));
+        dm.didClose(uri);
+    }
+
+    @Test
+    void resolveTraitMemberHoverReturnsNullForOutOfRangeLine() throws Exception {
+        String source = "trait T { void foo() {} }\nclass C implements T {}\n";
+        String uri = "file:///TraitOOR.groovy";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, source);
+        HoverProvider hp = new HoverProvider(dm);
+
+        GroovyCompilerService.ParseResult pr = compilerService.parse(uri, source);
+        ModuleNode ast = pr.getModuleNode();
+        ClassNode c = findClass(ast, "C");
+
+        Method m = HoverProvider.class.getDeclaredMethod(
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+        m.setAccessible(true);
+        // Target line 100 is way beyond the class
+        Hover hover = (Hover) m.invoke(hp, c, ast, "foo", 100);
+
+        assertNull(hover);
+        dm.didClose(uri);
+    }
+
+    @Test
+    void resolveTraitMemberHoverReturnsNullForNonMatch() throws Exception {
+        String source = "trait T { void foo() {} }\nclass C implements T {}\n";
+        String uri = "file:///TraitNoMatch.groovy";
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, source);
+        HoverProvider hp = new HoverProvider(dm);
+
+        GroovyCompilerService.ParseResult pr = compilerService.parse(uri, source);
+        ModuleNode ast = pr.getModuleNode();
+        ClassNode c = findClass(ast, "C");
+
+        Method m = HoverProvider.class.getDeclaredMethod(
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+        m.setAccessible(true);
+        Hover hover = (Hover) m.invoke(hp, c, ast, "nonexistent", 2);
+
+        assertNull(hover);
+        dm.didClose(uri);
+    }
+
+    // ================================================================
+    // buildASTHover tests
+    // ================================================================
+
+    @Test
+    void buildASTHoverReturnsNullForEmptyText() throws Exception {
+        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class);
+        m.setAccessible(true);
+        assertNull(m.invoke(provider, ""));
+    }
+
+    @Test
+    void buildASTHoverReturnsNullForNullText() throws Exception {
+        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class);
+        m.setAccessible(true);
+        assertNull(m.invoke(provider, (Object) null));
+    }
+
+    @Test
+    void buildASTHoverReturnsMarkdown() throws Exception {
+        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class);
+        m.setAccessible(true);
+        Hover hover = (Hover) m.invoke(provider, "some hover text");
+        assertNotNull(hover);
+        assertEquals("some hover text", hover.getContents().getRight().getValue());
+    }
 }

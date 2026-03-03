@@ -6,7 +6,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import { execFileSync, ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
+import { execFileSync, execFile, ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
 import * as vscode from 'vscode';
 import { workspace, ExtensionContext, window, commands, OutputChannel, StatusBarItem, StatusBarAlignment, ThemeColor } from 'vscode';
 import {
@@ -49,6 +49,15 @@ let cachedJavaApi: any = null;
 /** Scheme for virtual source documents from JARs/JDK. */
 const GROOVY_SOURCE_SCHEME = 'groovy-source';
 const GRADLE_CLASSPATH_LINE_PREFIX = 'GROOVY_LS_CP::';
+
+/**
+ * Cached project root map to avoid repeatedly scanning the workspace for
+ * build.gradle / pom.xml on every classpath event.  Invalidated by the
+ * file system watcher for build files so it stays up-to-date.
+ */
+let cachedProjectRootMap: Map<string, string> | undefined;
+/** Timestamp of the last cache refresh — used for staleness checks. */
+let projectRootMapTimestamp = 0;
 
 /**
  * Content provider for groovy-source:// virtual documents.
@@ -95,6 +104,13 @@ function toFileSystemPath(uriValue: string): string | undefined {
 }
 
 async function collectProjectRootMap(): Promise<Map<string, string>> {
+    // Return the cached map if it's fresh (less than 30 s old).
+    // Invalidation also happens via file system watcher on build file changes.
+    const now = Date.now();
+    if (cachedProjectRootMap && (now - projectRootMapTimestamp) < 30_000) {
+        return cachedProjectRootMap;
+    }
+
     const rootMap = new Map<string, string>();
     const buildFiles = await vscode.workspace.findFiles(
         '{**/build.gradle,**/pom.xml}',
@@ -106,7 +122,15 @@ async function collectProjectRootMap(): Promise<Map<string, string>> {
         rootMap.set(normalizeFsPath(projectDir), projectDir);
     }
 
+    cachedProjectRootMap = rootMap;
+    projectRootMapTimestamp = now;
     return rootMap;
+}
+
+/** Invalidate the cached project root map (called when build files change). */
+function invalidateProjectRootMapCache(): void {
+    cachedProjectRootMap = undefined;
+    projectRootMapTimestamp = 0;
 }
 
 function resolveProjectPathFromUri(
@@ -241,7 +265,7 @@ function extractEntriesFromSettings(
     return { jars, outputDirs };
 }
 
-function resolveGradleClasspath(projectPath: string): string[] {
+async function resolveGradleClasspath(projectPath: string): Promise<string[]> {
     const normalizedProjectPath = path.resolve(projectPath);
     const wrapper = findGradleWrapper(normalizedProjectPath);
     if (!wrapper) {
@@ -292,9 +316,20 @@ function resolveGradleClasspath(projectPath: string): string[] {
             stdio: ['ignore', 'pipe', 'pipe'],
         };
 
-        const stdout = (process.platform === 'win32' && wrapper.toLowerCase().endsWith('.bat'))
-            ? execFileSync(wrapper, gradleArgs, { ...execOptions, shell: true })
-            : execFileSync(wrapper, gradleArgs, execOptions);
+        // Use async execFile to avoid blocking the VS Code extension host
+        // (single-threaded) for up to 120 seconds during Gradle resolution.
+        const stdout = await new Promise<string>((resolve, reject) => {
+            const useShell = process.platform === 'win32' && wrapper.toLowerCase().endsWith('.bat');
+            const opts = { ...execOptions, shell: useShell };
+            execFile(wrapper, gradleArgs, opts, (error, stdout, stderr) => {
+                if (error) {
+                    (error as any).stderr = stderr;
+                    reject(error);
+                } else {
+                    resolve(stdout);
+                }
+            });
+        });
 
         const lines = stdout.split(/\r?\n/)
             .map(line => line.trim())
@@ -618,7 +653,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     fs.mkdirSync(dataDir, { recursive: true });
 
     // 6. Build JVM arguments
-    const vmargs = workspace.getConfiguration('groovy').get<string>('ls.vmargs', '-Xmx1G');
+    const vmargs = workspace.getConfiguration('groovy').get<string>('ls.vmargs', '-Xmx2G');
     const args: string[] = [];
 
     // JVM module access flags (required for JDK 17+)
@@ -673,6 +708,13 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         outputChannel: outputChannel,
         traceOutputChannel: outputChannel,
     };
+
+    // Invalidate the cached project root map when build files change so that
+    // subsequent classpath events pick up new or removed subprojects.
+    const buildFileWatcher = workspace.createFileSystemWatcher('{**/build.gradle,**/pom.xml}');
+    buildFileWatcher.onDidCreate(() => invalidateProjectRootMapCache());
+    buildFileWatcher.onDidDelete(() => invalidateProjectRootMapCache());
+    context.subscriptions.push(buildFileWatcher);
 
     // 9. Create and start the language client
     client = new LanguageClient(
@@ -837,9 +879,9 @@ async function initJavaExtensionClasspath(
             }
         }
 
-        // Approach 3: Gradle wrapper fallback
+        // Approach 3: Gradle wrapper fallback (async — does not block extension host)
         if ((rawEntries.length === 0 || !hasJars) && target.projectPath) {
-            const gradleEntries = resolveGradleClasspath(target.projectPath);
+            const gradleEntries = await resolveGradleClasspath(target.projectPath);
             if (gradleEntries.length > 0) {
                 rawEntries = Array.from(new Set([...rawEntries, ...gradleEntries]));
                 hasJars = rawEntries.some(e => e.toLowerCase().endsWith('.jar'));
@@ -1011,9 +1053,9 @@ async function initJavaExtensionClasspath(
             }
 
             let fetched = 0;
-            // Fetch classpaths in parallel batches of 10 to avoid
+            // Fetch classpaths in parallel batches of 20 to avoid
             // sequential round-trips for large multi-project workspaces.
-            const BATCH_SIZE = 10;
+            const BATCH_SIZE = 20;
             for (let i = 0; i < targets.length; i += BATCH_SIZE) {
                 const batch = targets.slice(i, i + BATCH_SIZE);
                 const results = await Promise.allSettled(

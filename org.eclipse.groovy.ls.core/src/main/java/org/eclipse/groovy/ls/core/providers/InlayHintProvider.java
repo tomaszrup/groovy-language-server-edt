@@ -12,8 +12,10 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
@@ -202,6 +204,10 @@ public class InlayHintProvider {
             IJavaProject project = workingCopy.getJavaProject();
             if (project == null || !project.exists()) return hints;
 
+            // Per-request cache: avoids recomputing the same supertype hierarchy
+            // when many variables share the same receiver type.
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache = new HashMap<>();
+
             MethodCallDeclCollector collector = new MethodCallDeclCollector();
             for (ClassNode classNode : module.getClasses()) {
                 collector.visitClass(classNode);
@@ -215,7 +221,7 @@ public class InlayHintProvider {
                 if (requestedRange != null && !isInRange(info.line, requestedRange)) {
                     continue;
                 }
-                IType returnType = resolveMethodCallChainType(info.methodCall, module, project);
+                IType returnType = resolveMethodCallChainType(info.methodCall, module, project, hierarchyCache);
                 if (returnType != null) {
                     String typeName = returnType.getElementName();
                     Position hintPos = new Position(info.line, info.column + info.varName.length());
@@ -241,7 +247,8 @@ public class InlayHintProvider {
      * Resolve a method call expression chain to a JDT IType.
      */
     private IType resolveMethodCallChainType(MethodCallExpression methodCall,
-                                              ModuleNode module, IJavaProject project) {
+                                              ModuleNode module, IJavaProject project,
+                                              Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) {
         try {
             Expression objectExpr = methodCall.getObjectExpression();
             String methodName = methodCall.getMethodAsString();
@@ -253,7 +260,7 @@ public class InlayHintProvider {
                 ClassNode ctorType = ctorCall.getType();
                 receiverType = resolveClassNodeToType(ctorType, module, project);
             } else if (objectExpr instanceof MethodCallExpression nestedCall) {
-                receiverType = resolveMethodCallChainType(nestedCall, module, project);
+                receiverType = resolveMethodCallChainType(nestedCall, module, project, hierarchyCache);
             } else if (objectExpr instanceof VariableExpression varExpr) {
                 String receiverVarName = varExpr.getName();
                 if (!"this".equals(receiverVarName)) {
@@ -267,8 +274,8 @@ public class InlayHintProvider {
 
             if (receiverType == null) return null;
 
-            // Find the method return type via JDT
-            return findMethodReturnType(receiverType, methodName, project);
+            // Find the method return type via JDT, with per-request hierarchy cache
+            return findMethodReturnType(receiverType, methodName, project, hierarchyCache);
         } catch (Exception e) {
             return null;
         }
@@ -276,7 +283,20 @@ public class InlayHintProvider {
 
     private IType findMethodReturnType(IType receiverType, String methodName, IJavaProject project)
             throws JavaModelException {
-        // Search in the type and its supertypes
+        return findMethodReturnType(receiverType, methodName, project, null);
+    }
+
+    /**
+     * Find the return type of a method on the given receiver type, searching
+     * supertypes if needed.  An optional per-request hierarchy cache avoids
+     * re-computing the same expensive type hierarchy for the same receiver
+     * multiple times within a single inlay-hints request.
+     */
+    private IType findMethodReturnType(IType receiverType, String methodName,
+            IJavaProject project,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache)
+            throws JavaModelException {
+        // Search in the type itself first
         IMethod[] methods = receiverType.getMethods();
         for (IMethod method : methods) {
             if (methodName.equals(method.getElementName())) {
@@ -289,8 +309,19 @@ public class InlayHintProvider {
             }
         }
 
-        // Check supertypes
-        org.eclipse.jdt.core.ITypeHierarchy hierarchy = receiverType.newSupertypeHierarchy(null);
+        // Check supertypes — cache the hierarchy per receiver FQN
+        String cacheKey = receiverType.getFullyQualifiedName();
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = null;
+        if (hierarchyCache != null) {
+            hierarchy = hierarchyCache.get(cacheKey);
+        }
+        if (hierarchy == null) {
+            hierarchy = receiverType.newSupertypeHierarchy(null);
+            if (hierarchyCache != null && hierarchy != null) {
+                hierarchyCache.put(cacheKey, hierarchy);
+            }
+        }
+
         if (hierarchy != null) {
             for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
                 for (IMethod method : superType.getMethods()) {

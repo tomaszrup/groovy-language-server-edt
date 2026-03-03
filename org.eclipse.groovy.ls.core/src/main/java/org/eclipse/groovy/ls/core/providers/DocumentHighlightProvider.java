@@ -87,7 +87,11 @@ public class DocumentHighlightProvider {
                 return highlights;
             }
 
-            IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
+            // Limit search scope to the current working copy — document
+            // highlights only need occurrences within a single file, so a
+            // workspace-wide search is wasteful in large projects.
+            IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
+                    new org.eclipse.jdt.core.IJavaElement[]{workingCopy});
             SearchEngine engine = new SearchEngine();
 
             // Normalize the target URI for comparison
@@ -185,30 +189,11 @@ public class DocumentHighlightProvider {
     }
 
     Position offsetToPosition(String content, int offset) {
-        int line = 0;
-        int col = 0;
-        int safeOffset = Math.min(offset, content.length());
-        for (int i = 0; i < safeOffset; i++) {
-            if (content.charAt(i) == '\n') {
-                line++;
-                col = 0;
-            } else {
-                col++;
-            }
-        }
-        return new Position(line, col);
+        return PositionUtils.offsetToPosition(content, offset);
     }
 
     int positionToOffset(String content, Position position) {
-        int line = 0;
-        int offset = 0;
-        while (offset < content.length() && line < position.getLine()) {
-            if (content.charAt(offset) == '\n') {
-                line++;
-            }
-            offset++;
-        }
-        return Math.min(offset + position.getCharacter(), content.length());
+        return PositionUtils.positionToOffset(content, position);
     }
 
     String extractWordAt(String content, int offset) {

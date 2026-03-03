@@ -78,7 +78,8 @@ public class DocumentManager {
      * file previewing doesn't exhaust the shared ForkJoinPool.
      */
     private final java.util.concurrent.ExecutorService didOpenExecutor =
-            java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+            java.util.concurrent.Executors.newFixedThreadPool(
+                    Math.max(2, Math.min(3, Runtime.getRuntime().availableProcessors() - 1)), r -> {
                 Thread t = new Thread(r, "groovy-ls-didOpen");
                 t.setDaemon(true);
                 return t;
@@ -333,6 +334,7 @@ public class DocumentManager {
         openDocuments.remove(uri);
         clientUris.remove(uri);
         compilerService.invalidate(uri);
+        compilerService.invalidate(uri + "#semantic-patched");
 
         // Cancel any in-flight didOpen background task for this URI.
         // This prevents the background task from creating a working copy
@@ -442,15 +444,13 @@ public class DocumentManager {
 
     private ModuleNode extractModuleNodeFromWorkingCopy(ICompilationUnit workingCopy, String uri) {
         try {
-            java.lang.reflect.Method getModuleNode = workingCopy.getClass().getMethod("getModuleNode");
-            Object result = getModuleNode.invoke(workingCopy);
-            if (result instanceof ModuleNode module) {
+            ModuleNode module = org.eclipse.groovy.ls.core.providers.ReflectionCache.getModuleNode(workingCopy);
+            if (module != null) {
                 GroovyLanguageServerPlugin.logInfo("[ast] JDT module for " + uri
                         + CLASSES_LOG_SEGMENT + classCount(module));
                 return module;
             }
-            GroovyLanguageServerPlugin.logInfo("[ast] JDT getModuleNode() returned "
-                    + (result != null ? result.getClass().getName() : "null") + " for " + uri);
+            GroovyLanguageServerPlugin.logInfo("[ast] JDT getModuleNode() returned null for " + uri);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logInfo("[ast] JDT reflection failed for " + uri + ": " + e.getMessage());
         }
@@ -803,5 +803,25 @@ public class DocumentManager {
         }
 
         return offset + position.getCharacter();
+    }
+
+    /**
+     * Dispose all resources. Called during server shutdown.
+     * Shuts down the didOpen executor and discards all working copies.
+     */
+    public void dispose() {
+        didOpenExecutor.shutdownNow();
+        pendingOpenFutures.values().forEach(f -> f.cancel(true));
+        pendingOpenFutures.clear();
+        for (var entry : workingCopies.entrySet()) {
+            try {
+                entry.getValue().discardWorkingCopy();
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                        "Failed to discard working copy on dispose: " + entry.getKey(), e);
+            }
+        }
+        workingCopies.clear();
+        openDocuments.clear();
     }
 }

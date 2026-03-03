@@ -14,10 +14,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.jdt.core.IMethod;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.SignatureHelp;
 import org.eclipse.lsp4j.SignatureHelpParams;
@@ -366,5 +369,105 @@ class SignatureHelpProviderTest {
         method.setAccessible(true);
         return (int) method.invoke(provider, content, position);
     }
-}
 
+    // ================================================================
+    // toSignatureInformation tests (108 missed instructions)
+    // ================================================================
+
+    @Test
+    void toSignatureInformationWithMethodParams() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("greet");
+        when(method.getParameterTypes()).thenReturn(new String[] {"QString;", "I"});
+        when(method.getParameterNames()).thenReturn(new String[] {"name", "age"});
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getReturnType()).thenReturn("V");
+
+        SignatureInformation sig = invokeToSignatureInformation(provider, method);
+        assertNotNull(sig);
+        assertTrue(sig.getLabel().contains("greet"));
+        assertTrue(sig.getLabel().contains("String"));
+        assertTrue(sig.getLabel().contains("name"));
+        assertTrue(sig.getLabel().contains("age"));
+        assertEquals(2, sig.getParameters().size());
+    }
+
+    @Test
+    void toSignatureInformationConstructor() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("Person");
+        when(method.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(method.getParameterNames()).thenReturn(new String[] {"name"});
+        when(method.isConstructor()).thenReturn(true);
+        when(method.getReturnType()).thenReturn("V");
+
+        SignatureInformation sig = invokeToSignatureInformation(provider, method);
+        assertNotNull(sig);
+        assertTrue(sig.getLabel().contains("Person"));
+        assertTrue(sig.getLabel().contains("String"));
+        // constructors don't show return type
+        assertFalse(sig.getLabel().contains(": void"));
+        assertEquals(1, sig.getParameters().size());
+    }
+
+    @Test
+    void toSignatureInformationNoParams() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("doWork");
+        when(method.getParameterTypes()).thenReturn(new String[0]);
+        when(method.getParameterNames()).thenReturn(new String[0]);
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getReturnType()).thenReturn("QString;");
+
+        SignatureInformation sig = invokeToSignatureInformation(provider, method);
+        assertNotNull(sig);
+        assertTrue(sig.getLabel().startsWith("doWork()"));
+        assertTrue(sig.getLabel().contains("String"));
+        assertTrue(sig.getParameters().isEmpty());
+    }
+
+    @Test
+    void toSignatureInformationFallbackParamNames() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("fn");
+        when(method.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(method.getParameterNames()).thenReturn(null);
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getReturnType()).thenReturn("V");
+
+        SignatureInformation sig = invokeToSignatureInformation(provider, method);
+        assertNotNull(sig);
+        assertTrue(sig.getLabel().contains("arg0"));
+    }
+
+    @Test
+    void toSignatureInformationExceptionReturnsNull() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenThrow(new RuntimeException("broken"));
+
+        SignatureInformation sig = invokeToSignatureInformation(provider, method);
+        assertNull(sig);
+    }
+
+    private SignatureInformation invokeToSignatureInformation(SignatureHelpProvider provider, IMethod method) throws Exception {
+        Method m = SignatureHelpProvider.class.getDeclaredMethod("toSignatureInformation", IMethod.class);
+        m.setAccessible(true);
+        return (SignatureInformation) m.invoke(provider, method);
+    }
+
+}

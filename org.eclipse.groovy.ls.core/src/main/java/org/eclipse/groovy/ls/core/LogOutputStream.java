@@ -46,8 +46,31 @@ public class LogOutputStream extends OutputStream {
 
     @Override
     public void write(byte[] b, int off, int len) throws IOException {
-        for (int i = off; i < off + len; i++) {
-            write(b[i]);
+        // Process the byte range in bulk instead of byte-by-byte.
+        // For large bursts (e.g., Groovy compiler error dumps) this is
+        // dramatically faster than delegating to write(int) in a loop.
+        int start = off;
+        int end = off + len;
+        for (int i = off; i < end; i++) {
+            byte c = b[i];
+            if (c == '\n') {
+                // Append everything before the newline, then flush the line
+                if (i > start) {
+                    buffer.append(new String(b, start, i - start));
+                }
+                flush();
+                start = i + 1;
+            } else if (c == '\r') {
+                // Skip carriage returns
+                if (i > start) {
+                    buffer.append(new String(b, start, i - start));
+                }
+                start = i + 1;
+            }
+        }
+        // Append any remaining bytes after the last newline
+        if (start < end) {
+            buffer.append(new String(b, start, end - start));
         }
     }
 
