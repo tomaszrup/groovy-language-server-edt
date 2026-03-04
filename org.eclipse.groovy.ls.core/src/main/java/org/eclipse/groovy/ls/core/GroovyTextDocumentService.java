@@ -15,7 +15,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -67,26 +67,30 @@ public class GroovyTextDocumentService implements TextDocumentService {
      * {@code codeSelect()} or {@code getModuleNode()} call would starve
      * every other feature.
      * <p>
-     * A {@link SynchronousQueue} is used instead of a bounded queue so that
-     * the pool actually scales up to {@code maxPoolSize} under load.  With a
-     * {@code LinkedBlockingQueue} the pool would <em>never</em> create threads
-     * beyond {@code corePoolSize} until the queue was completely full, which
-     * caused thread starvation when {@code codeSelect()} calls blocked on the
-     * Eclipse workspace lock.
-     * <p>
-     * Idle threads are reclaimed after 60 s.
+     * Uses {@code corePoolSize == maxPoolSize} with
+     * {@link ThreadPoolExecutor#allowCoreThreadTimeOut(boolean)} so that the
+     * pool scales up immediately under load (no SynchronousQueue needed)
+     * while idle threads are still reclaimed after 60 s.  A bounded
+     * {@link LinkedBlockingQueue} absorbs request bursts (e.g. opening
+     * 4 files simultaneously) instead of rejecting them.
      */
-    private final ExecutorService lspRequestExecutor;
+    private volatile ExecutorService lspRequestExecutor;
     static {
         // Initialised in the instance initialiser — see below.
     }
     {
-        int corePoolSize = 4;
-        int maxPoolSize = Math.max(8, Runtime.getRuntime().availableProcessors() * 2);
-        lspRequestExecutor = new ThreadPoolExecutor(
-                corePoolSize, maxPoolSize,
+        int poolSize = Math.max(8, Runtime.getRuntime().availableProcessors() * 2);
+        int queueCapacity = 128;
+        lspRequestExecutor = createLspExecutor(poolSize, queueCapacity);
+        GroovyLanguageServerPlugin.logInfo(
+                "LSP request executor: poolSize=" + poolSize + ", queueCapacity=" + queueCapacity);
+    }
+
+    private static ExecutorService createLspExecutor(int poolSize, int queueCapacity) {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                poolSize, poolSize,
                 60L, TimeUnit.SECONDS,
-                new SynchronousQueue<>(),
+                new LinkedBlockingQueue<>(queueCapacity),
                 r -> {
                     Thread t = new Thread(r, "groovy-ls-request");
                     t.setDaemon(true);
@@ -98,6 +102,22 @@ public class GroovyTextDocumentService implements TextDocumentService {
                     GroovyLanguageServerPlugin.logError(
                             "LSP request executor saturated — rejecting task", null);
                 });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
+
+    /**
+     * Reconfigure the LSP request thread pool.  Called from
+     * {@link GroovyLanguageServer#initialize} when the client sends
+     * custom {@code initializationOptions}.
+     */
+    void configureRequestPool(int poolSize, int queueCapacity) {
+        ExecutorService old = this.lspRequestExecutor;
+        this.lspRequestExecutor = createLspExecutor(poolSize, queueCapacity);
+        old.shutdownNow();
+        GroovyLanguageServerPlugin.logInfo(
+                "LSP request executor reconfigured: poolSize=" + poolSize
+                + ", queueCapacity=" + queueCapacity);
     }
 
     /**
@@ -114,6 +134,26 @@ public class GroovyTextDocumentService implements TextDocumentService {
      * cursor movement).  Mirrors the {@link #pendingSemanticTokens} pattern.
      */
     private final Map<String, CompletableFuture<?>> pendingHovers =
+            new ConcurrentHashMap<>();
+
+    /** Per-URI cancellation for document symbols. */
+    private final Map<String, CompletableFuture<?>> pendingDocumentSymbols =
+            new ConcurrentHashMap<>();
+
+    /** Per-URI cancellation for code lenses. */
+    private final Map<String, CompletableFuture<?>> pendingCodeLenses =
+            new ConcurrentHashMap<>();
+
+    /** Per-URI cancellation for folding ranges. */
+    private final Map<String, CompletableFuture<?>> pendingFoldingRanges =
+            new ConcurrentHashMap<>();
+
+    /** Per-URI cancellation for inlay hints. */
+    private final Map<String, CompletableFuture<?>> pendingInlayHints =
+            new ConcurrentHashMap<>();
+
+    /** Per-URI cancellation for code actions. */
+    private final Map<String, CompletableFuture<?>> pendingCodeActions =
             new ConcurrentHashMap<>();
 
     // Providers
@@ -247,20 +287,33 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<Either<List<CompletionItem>, CompletionList>> completion(
             CompletionParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<Either<List<CompletionItem>, CompletionList>> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 CompletionList completionList = new CompletionList();
                 completionList.setItems(completionProvider.getCompletions(params));
                 completionList.setIsIncomplete(true);
-                return Either.forRight(completionList);
+                return Either.<List<CompletionItem>, CompletionList>forRight(completionList);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Completion failed", e);
                 CompletionList empty = new CompletionList();
                 empty.setItems(new ArrayList<>());
                 empty.setIsIncomplete(true);
-                return Either.forRight(empty);
+                return Either.<List<CompletionItem>, CompletionList>forRight(empty);
             }
         }, lspRequestExecutor);
+        return future
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError("Completion timed out", null);
+                    }
+                    CompletionList empty = new CompletionList();
+                    empty.setItems(new ArrayList<>());
+                    empty.setIsIncomplete(true);
+                    return Either.forRight(empty);
+                });
     }
 
     @Override
@@ -272,7 +325,15 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Completion resolve failed", e);
                 return item;
             }
-        }, lspRequestExecutor);
+        }, lspRequestExecutor)
+                .orTimeout(10, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError("Completion resolve timed out", null);
+                    }
+                    return item;
+                });
     }
 
     // ---- Hover ----
@@ -298,7 +359,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 return null;
             }
         }, lspRequestExecutor)
-                .orTimeout(5, TimeUnit.SECONDS)
+                .orTimeout(10, TimeUnit.SECONDS)
                 .exceptionally(ex -> {
                     if (ex instanceof TimeoutException
                             || (ex.getCause() instanceof TimeoutException)) {
@@ -320,14 +381,28 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> definition(
             DefinitionParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<Either<List<? extends Location>, List<? extends LocationLink>>> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
-                return Either.forLeft(definitionProvider.getDefinition(params));
+                return Either.<List<? extends Location>, List<? extends LocationLink>>forLeft(
+                        definitionProvider.getDefinition(params));
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Definition failed", e);
-                return Either.forLeft(new ArrayList<>());
+                return Either.<List<? extends Location>, List<? extends LocationLink>>forLeft(
+                        new ArrayList<>());
             }
         }, lspRequestExecutor);
+        return future
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "Definition timed out for "
+                                + params.getTextDocument().getUri(), null);
+                    }
+                    return Either.forLeft(new ArrayList<>());
+                });
     }
 
     // ---- References ----
@@ -346,7 +421,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
         }, lspRequestExecutor);
 
         return future
-                .orTimeout(15, TimeUnit.SECONDS)
+                .orTimeout(60, TimeUnit.SECONDS)
                 .exceptionally(ex -> {
                     if (ex instanceof TimeoutException
                             || (ex.getCause() instanceof TimeoutException)) {
@@ -363,14 +438,41 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<List<Either<SymbolInformation, DocumentSymbol>>> documentSymbol(
             DocumentSymbolParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingDocumentSymbols.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<List<Either<SymbolInformation, DocumentSymbol>>> baseFuture =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return documentSymbolProvider.getDocumentSymbols(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Document symbols failed", e);
-                return new ArrayList<>();
+                return new ArrayList<Either<SymbolInformation, DocumentSymbol>>();
             }
         }, lspRequestExecutor);
+        CompletableFuture<List<Either<SymbolInformation, DocumentSymbol>>> future = baseFuture
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "Document symbols timed out for " + uri, null);
+                    }
+                    return new ArrayList<>();
+                });
+
+        if (normalizedUri != null) {
+            pendingDocumentSymbols.put(normalizedUri, baseFuture);
+            future.whenComplete((r, t) -> pendingDocumentSymbols.remove(normalizedUri, baseFuture));
+        }
+        return future;
     }
 
     // ---- Document Highlight ----
@@ -378,14 +480,24 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<List<? extends DocumentHighlight>> documentHighlight(
             DocumentHighlightParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<List<? extends DocumentHighlight>> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return documentHighlightProvider.getDocumentHighlights(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Document highlight failed", e);
-                return new ArrayList<>();
+                return new ArrayList<DocumentHighlight>();
             }
         }, lspRequestExecutor);
+        return future
+                .orTimeout(10, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError("Document highlight timed out", null);
+                    }
+                    return new ArrayList<>();
+                });
     }
 
     // ---- Type Definition ----
@@ -422,14 +534,47 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
     @Override
     public CompletableFuture<List<FoldingRange>> foldingRange(FoldingRangeRequestParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        // Folding ranges are non-essential during build — return empty to avoid
+        // blocking a thread on the workspace lock.  VS Code will re-request
+        // after the next edit or focus change.
+        if (server.isBuildInProgress()) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingFoldingRanges.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<List<FoldingRange>> baseFuture = CompletableFuture.supplyAsync(() -> {
             try {
                 return foldingRangeProvider.getFoldingRanges(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Folding range failed", e);
-                return new ArrayList<>();
+                return new ArrayList<FoldingRange>();
             }
         }, lspRequestExecutor);
+        CompletableFuture<List<FoldingRange>> future = baseFuture
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "Folding range timed out for " + uri, null);
+                    }
+                    return new ArrayList<>();
+                });
+
+        if (normalizedUri != null) {
+            pendingFoldingRanges.put(normalizedUri, baseFuture);
+            future.whenComplete((r, t) -> pendingFoldingRanges.remove(normalizedUri, baseFuture));
+        }
+        return future;
     }
 
     // ---- Rename ----
@@ -470,7 +615,15 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 GroovyLanguageServerPlugin.logError("Signature help failed", e);
                 return null;
             }
-        }, lspRequestExecutor);
+        }, lspRequestExecutor)
+                .orTimeout(10, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError("Signature help timed out", null);
+                    }
+                    return null;
+                });
     }
 
     // ---- Semantic Tokens ----
@@ -478,6 +631,14 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<org.eclipse.lsp4j.SemanticTokens> semanticTokensFull(
             org.eclipse.lsp4j.SemanticTokensParams params) {
+        // Semantic tokens are non-essential during build — return empty to avoid
+        // blocking a thread on the workspace lock.  VS Code will re-request
+        // via workspace/semanticTokens/refresh after the build completes.
+        if (server.isBuildInProgress()) {
+            return CompletableFuture.completedFuture(
+                    new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>()));
+        }
+
         String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
         String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
 
@@ -540,28 +701,86 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
     @Override
     public CompletableFuture<List<InlayHint>> inlayHint(InlayHintParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        // Inlay hints are non-essential during build.
+        if (server.isBuildInProgress()) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingInlayHints.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<List<InlayHint>> baseFuture = CompletableFuture.supplyAsync(() -> {
             try {
                 return inlayHintProvider.getInlayHints(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Inlay hints failed", e);
-                return new ArrayList<>();
+                return new ArrayList<InlayHint>();
             }
         }, lspRequestExecutor);
+        CompletableFuture<List<InlayHint>> future = baseFuture
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "Inlay hints timed out for " + uri, null);
+                    }
+                    return new ArrayList<>();
+                });
+
+        if (normalizedUri != null) {
+            pendingInlayHints.put(normalizedUri, baseFuture);
+            future.whenComplete((r, t) -> pendingInlayHints.remove(normalizedUri, baseFuture));
+        }
+        return future;
     }
 
     // ---- Code Actions ----
 
     @Override
     public CompletableFuture<List<Either<Command, CodeAction>>> codeAction(CodeActionParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingCodeActions.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<List<Either<Command, CodeAction>>> baseFuture =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return codeActionProvider.getCodeActions(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Code action failed", e);
-                return new ArrayList<>();
+                return new ArrayList<Either<Command, CodeAction>>();
             }
         }, lspRequestExecutor);
+        CompletableFuture<List<Either<Command, CodeAction>>> future = baseFuture
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "Code action timed out for " + uri, null);
+                    }
+                    return new ArrayList<>();
+                });
+
+        if (normalizedUri != null) {
+            pendingCodeActions.put(normalizedUri, baseFuture);
+            future.whenComplete((r, t) -> pendingCodeActions.remove(normalizedUri, baseFuture));
+        }
+        return future;
     }
 
     // ---- Formatting ----
@@ -569,40 +788,70 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<List<? extends TextEdit>> formatting(
             DocumentFormattingParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<List<? extends TextEdit>> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return formattingProvider.format(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Formatting failed", e);
-                return new ArrayList<>();
+                return new ArrayList<TextEdit>();
             }
         }, lspRequestExecutor);
+        return future
+                .orTimeout(10, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError("Formatting timed out", null);
+                    }
+                    return new ArrayList<>();
+                });
     }
 
     @Override
     public CompletableFuture<List<? extends TextEdit>> rangeFormatting(
             DocumentRangeFormattingParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<List<? extends TextEdit>> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return formattingProvider.formatRange(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Range formatting failed", e);
-                return new ArrayList<>();
+                return new ArrayList<TextEdit>();
             }
         }, lspRequestExecutor);
+        return future
+                .orTimeout(10, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError("Range formatting timed out", null);
+                    }
+                    return new ArrayList<>();
+                });
     }
 
     @Override
     public CompletableFuture<List<? extends TextEdit>> onTypeFormatting(
             DocumentOnTypeFormattingParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<List<? extends TextEdit>> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return formattingProvider.formatOnType(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("On-type formatting failed", e);
-                return new ArrayList<>();
+                return new ArrayList<TextEdit>();
             }
         }, lspRequestExecutor);
+        return future
+                .orTimeout(5, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError("On-type formatting timed out", null);
+                    }
+                    return new ArrayList<>();
+                });
     }
 
     // ---- Type Hierarchy ----
@@ -644,7 +893,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 return new ArrayList<>();
             }
         }, lspRequestExecutor);
-        return future.orTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        return future.orTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .exceptionally(ex -> {
             GroovyLanguageServerPlugin.logError("Type hierarchy subtypes timed out", ex);
             return new ArrayList<>();
@@ -696,14 +945,45 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
     @Override
     public CompletableFuture<List<? extends CodeLens>> codeLens(CodeLensParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        // Code lenses are non-essential during build.
+        if (server.isBuildInProgress()) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingCodeLenses.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<List<? extends CodeLens>> baseFuture = CompletableFuture.supplyAsync(() -> {
             try {
                 return codeLensProvider.getCodeLenses(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Code lens failed", e);
-                return new ArrayList<>();
+                return new ArrayList<CodeLens>();
             }
         }, lspRequestExecutor);
+        CompletableFuture<List<? extends CodeLens>> future = baseFuture
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "Code lens timed out for " + uri, null);
+                    }
+                    return new ArrayList<>();
+                });
+
+        if (normalizedUri != null) {
+            pendingCodeLenses.put(normalizedUri, baseFuture);
+            future.whenComplete((r, t) -> pendingCodeLenses.remove(normalizedUri, baseFuture));
+        }
+        return future;
     }
 
     @Override
@@ -716,7 +996,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 return codeLens;
             }
         }, lspRequestExecutor);
-        return future.orTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        return future.orTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                 .exceptionally(ex -> {
                     GroovyLanguageServerPlugin.logError("Code lens resolve timed out", ex);
                     return codeLens;
@@ -762,6 +1042,16 @@ public class GroovyTextDocumentService implements TextDocumentService {
         pendingHovers.clear();
         pendingSemanticTokens.values().forEach(f -> f.cancel(true));
         pendingSemanticTokens.clear();
+        pendingDocumentSymbols.values().forEach(f -> f.cancel(true));
+        pendingDocumentSymbols.clear();
+        pendingCodeLenses.values().forEach(f -> f.cancel(true));
+        pendingCodeLenses.clear();
+        pendingFoldingRanges.values().forEach(f -> f.cancel(true));
+        pendingFoldingRanges.clear();
+        pendingInlayHints.values().forEach(f -> f.cancel(true));
+        pendingInlayHints.clear();
+        pendingCodeActions.values().forEach(f -> f.cancel(true));
+        pendingCodeActions.clear();
         diagnosticsProvider.shutdown();
     }
 }

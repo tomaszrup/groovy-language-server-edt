@@ -715,6 +715,18 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     const pomWatcher = workspace.createFileSystemWatcher('**/pom.xml');
     context.subscriptions.push(groovyWatcher, javaWatcher, gradleWatcher, pomWatcher);
 
+    // Build initializationOptions from user settings
+    const config = workspace.getConfiguration('groovy');
+    const initOptions: Record<string, unknown> = {};
+    const requestPoolSize = config.get<number>('ls.requestPoolSize', 0);
+    const requestQueueSize = config.get<number>('ls.requestQueueSize', 128);
+    if (requestPoolSize > 0) {
+        initOptions.lspRequestPoolSize = requestPoolSize;
+    }
+    if (requestQueueSize !== 128) {
+        initOptions.lspRequestQueueSize = requestQueueSize;
+    }
+
     const clientOptions: LanguageClientOptions = {
         documentSelector: [
             { scheme: 'file', language: 'groovy' },
@@ -722,6 +734,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
             { scheme: GROOVY_SOURCE_SCHEME, language: 'groovy' },
             { scheme: GROOVY_SOURCE_SCHEME, language: 'java' },
         ],
+        initializationOptions: Object.keys(initOptions).length > 0 ? initOptions : undefined,
         synchronize: {
             fileEvents: [groovyWatcher, javaWatcher, gradleWatcher, pomWatcher],
         },

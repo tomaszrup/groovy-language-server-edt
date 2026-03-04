@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.0.17",
+    "version": "1.0.18",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -159,6 +159,20 @@
                     "default": true,
                     "description": "Show inferred return type hints for methods declared with def.",
                     "scope": "window"
+                },
+                "groovy.ls.requestPoolSize": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "markdownDescription": "Max threads for LSP request handlers (completion, hover, definition, …). `0` = auto (`max(8, cpus×2)`). Increase to **24–32** for very large workspaces (50+ subprojects) on machines with 8+ cores.",
+                    "scope": "machine-overridable"
+                },
+                "groovy.ls.requestQueueSize": {
+                    "type": "integer",
+                    "default": 128,
+                    "minimum": 16,
+                    "markdownDescription": "Bounded queue capacity that absorbs request bursts (e.g. opening many files at once). Increase if you still see 'executor saturated' warnings in the output channel.",
+                    "scope": "machine-overridable"
                 }
             }
         },

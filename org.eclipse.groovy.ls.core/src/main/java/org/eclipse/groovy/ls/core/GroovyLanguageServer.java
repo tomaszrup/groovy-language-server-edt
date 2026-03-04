@@ -169,6 +169,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         return CompletableFuture.supplyAsync(() -> {
             GroovyLanguageServerPlugin.logInfo("Initializing Groovy Language Server...");
 
+            // Read optional pool tuning from initializationOptions
+            applyInitializationOptions(params.getInitializationOptions());
+
             // Capture workspace root
             if (params.getRootUri() != null) {
                 workspaceRoot = params.getRootUri();
@@ -907,6 +910,53 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     public boolean isBuildInProgress() {
         return buildInProgress;
+    }
+
+    /**
+     * Read optional tuning parameters from the client's
+     * {@code initializationOptions} JSON and reconfigure the LSP request
+     * executor if custom values are provided.
+     * <p>
+     * Recognised keys (all optional):
+     * <ul>
+     *   <li>{@code lspRequestPoolSize} — max threads for LSP handlers (default: {@code max(8, cpus*2)})</li>
+     *   <li>{@code lspRequestQueueSize} — bounded queue capacity (default: 128)</li>
+     * </ul>
+     */
+    private void applyInitializationOptions(Object initializationOptions) {
+        if (initializationOptions == null) {
+            return;
+        }
+        try {
+            JsonObject opts;
+            if (initializationOptions instanceof JsonObject) {
+                opts = (JsonObject) initializationOptions;
+            } else if (initializationOptions instanceof com.google.gson.JsonElement) {
+                opts = ((com.google.gson.JsonElement) initializationOptions).getAsJsonObject();
+            } else {
+                return;
+            }
+
+            int poolSize = -1;
+            int queueSize = -1;
+
+            if (opts.has("lspRequestPoolSize") && opts.get("lspRequestPoolSize").isJsonPrimitive()) {
+                poolSize = opts.get("lspRequestPoolSize").getAsInt();
+            }
+            if (opts.has("lspRequestQueueSize") && opts.get("lspRequestQueueSize").isJsonPrimitive()) {
+                queueSize = opts.get("lspRequestQueueSize").getAsInt();
+            }
+
+            if (poolSize > 0 || queueSize > 0) {
+                int defaultPoolSize = Math.max(8, Runtime.getRuntime().availableProcessors() * 2);
+                int effectivePool = poolSize > 0 ? poolSize : defaultPoolSize;
+                int effectiveQueue = queueSize > 0 ? queueSize : 128;
+                textDocumentService.configureRequestPool(effectivePool, effectiveQueue);
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to parse initializationOptions for pool config", e);
+        }
     }
 
     /**
