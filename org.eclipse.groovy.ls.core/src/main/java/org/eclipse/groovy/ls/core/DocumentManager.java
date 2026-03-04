@@ -38,6 +38,7 @@ import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.WorkingCopyOwner;
 import org.eclipse.lsp4j.TextDocumentContentChangeEvent;
+import org.eclipse.lsp4j.services.LanguageClient;
 
 /**
  * Manages open document state and JDT working copies.
@@ -96,6 +97,62 @@ public class DocumentManager {
      * the Eclipse workspace, to avoid re-importing the same project.
      */
     private final Set<String> importedProjectRoots = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Reference to the LSP client for sending notifications (e.g.,
+     * workspace/semanticTokens/refresh after background working copy creation).
+     */
+    private volatile LanguageClient languageClient;
+
+    /**
+     * Debounce guard for workspace/semanticTokens/refresh notifications.
+     * When multiple files are opened in rapid succession (e.g., on startup),
+     * we coalesce into a single refresh notification. A scheduled future
+     * fires the notification after a short delay; each new working copy
+     * creation resets the timer.
+     */
+    private final java.util.concurrent.ScheduledExecutorService refreshScheduler =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "groovy-ls-semantic-refresh");
+                t.setDaemon(true);
+                return t;
+            });
+    private volatile java.util.concurrent.ScheduledFuture<?> pendingRefresh;
+
+    // ---- Client connection ----
+
+    /**
+     * Set the language client for sending notifications.
+     * Called from {@code GroovyTextDocumentService.connect()}.
+     */
+    public void setLanguageClient(LanguageClient client) {
+        this.languageClient = client;
+    }
+
+    /**
+     * Schedule a debounced {@code workspace/semanticTokens/refresh} notification.
+     * If multiple working copies are created in quick succession, only one
+     * refresh notification is sent (300 ms after the last creation).
+     */
+    private void scheduleSemanticTokensRefresh() {
+        java.util.concurrent.ScheduledFuture<?> existing = pendingRefresh;
+        if (existing != null) {
+            existing.cancel(false);
+        }
+        pendingRefresh = refreshScheduler.schedule(() -> {
+            LanguageClient client = languageClient;
+            if (client != null) {
+                try {
+                    client.refreshSemanticTokens();
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[semantic] Sent workspace/semanticTokens/refresh");
+                } catch (Exception e) {
+                    GroovyLanguageServerPlugin.logError(
+                            "[semantic] Failed to send semanticTokens/refresh", e);
+                }
+            }
+        }, 300, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
 
     // ---- URI normalization ----
 
@@ -261,6 +318,9 @@ public class DocumentManager {
                         workingCopies.put(bgUri, workingCopy);
                         GroovyLanguageServerPlugin.logInfo("JDT working copy created for " + bgUri
                                 + " (type: " + workingCopy.getClass().getName() + ")");
+                        // Notify the client to re-request semantic tokens now that
+                        // the fully type-resolved JDT AST is available.
+                        scheduleSemanticTokensRefresh();
                     } else {
                         workingCopy.discardWorkingCopy();
                         GroovyLanguageServerPlugin.logInfo(

@@ -922,25 +922,56 @@ public class DefinitionProvider {
             org.eclipse.jdt.core.IJavaProject project = workingCopy.getJavaProject();
             if (project == null || !project.exists()) return null;
 
-            // Try text-based receiver extraction first
+            // Extract the full dotted chain before the cursor word.
+            // E.g., for "SomeClass.InnerClass.STATIC_MEMBER" with cursor on
+            // STATIC_MEMBER, extract ["SomeClass", "InnerClass"] as receiver parts.
             int dotPos = wordStart - 1;
-            int receiverEnd = dotPos;
-            int receiverStart = receiverEnd - 1;
-            while (receiverStart >= 0 && Character.isJavaIdentifierPart(content.charAt(receiverStart))) {
-                receiverStart--;
+            List<String> receiverParts = new ArrayList<>();
+            int pos = dotPos;
+            while (pos >= 0) {
+                int partEnd = pos; // just before the dot (or start of word)
+                int partStart = partEnd - 1;
+                while (partStart >= 0 && Character.isJavaIdentifierPart(content.charAt(partStart))) {
+                    partStart--;
+                }
+                partStart++;
+                if (partStart < partEnd) {
+                    receiverParts.add(0, content.substring(partStart, partEnd));
+                    // Check if there's another dot before this part
+                    if (partStart > 0 && content.charAt(partStart - 1) == '.') {
+                        pos = partStart - 2;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
-            receiverStart++;
 
             IType receiverType = null;
 
-            if (receiverStart < receiverEnd) {
-                String receiverName = content.substring(receiverStart, receiverEnd);
-                GroovyLanguageServerPlugin.logInfo("[definition-ast] Dot call: receiver='"
-                        + receiverName + "' method='" + word + "'");
+            if (!receiverParts.isEmpty()) {
+                String firstPart = receiverParts.get(0);
+                GroovyLanguageServerPlugin.logInfo("[definition-ast] Dot call: receiverParts="
+                        + receiverParts + " word='" + word + "'");
 
-                ClassNode receiverClassNode = resolveReceiverClassNode(ast, receiverName);
+                // Resolve the first part as a type
+                ClassNode receiverClassNode = resolveReceiverClassNode(ast, firstPart);
                 if (receiverClassNode != null) {
                     receiverType = resolveClassNodeToIType(receiverClassNode, ast, project);
+                }
+
+                // Walk remaining parts as inner classes/types
+                if (receiverType != null) {
+                    for (int i = 1; i < receiverParts.size(); i++) {
+                        IType innerType = receiverType.getType(receiverParts.get(i));
+                        if (innerType != null && innerType.exists()) {
+                            receiverType = innerType;
+                        } else {
+                            receiverType = null;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -951,10 +982,28 @@ public class DefinitionProvider {
 
             if (receiverType == null) return null;
 
+            // If word starts with uppercase, it might be an inner class reference
+            // (e.g., SomeClass.InnerClass)
+            if (!word.isEmpty() && Character.isUpperCase(word.charAt(0))) {
+                IType innerType = receiverType.getType(word);
+                if (innerType != null && innerType.exists()) {
+                    Location loc = toLocation(innerType);
+                    if (loc != null) return loc;
+                }
+            }
+
             // Find the method and navigate to it
             for (org.eclipse.jdt.core.IMethod method : receiverType.getMethods()) {
                 if (word.equals(method.getElementName())) {
                     Location loc = toLocation(method);
+                    if (loc != null) return loc;
+                }
+            }
+
+            // Check fields (e.g., SomeClass.STATIC_MEMBER or SomeClass.InnerClass.FIELD)
+            for (org.eclipse.jdt.core.IField field : receiverType.getFields()) {
+                if (word.equals(field.getElementName())) {
+                    Location loc = toLocation(field);
                     if (loc != null) return loc;
                 }
             }
@@ -966,6 +1015,12 @@ public class DefinitionProvider {
                     for (org.eclipse.jdt.core.IMethod method : superType.getMethods()) {
                         if (word.equals(method.getElementName())) {
                             Location loc = toLocation(method);
+                            if (loc != null) return loc;
+                        }
+                    }
+                    for (org.eclipse.jdt.core.IField field : superType.getFields()) {
+                        if (word.equals(field.getElementName())) {
+                            Location loc = toLocation(field);
                             if (loc != null) return loc;
                         }
                     }
@@ -1173,6 +1228,12 @@ public class DefinitionProvider {
             if (typeName.contains(".")) {
                 IType type = project.findType(typeName);
                 if (type != null) return type;
+                // Groovy AST uses '$' for inner classes, but JDT findType
+                // expects '.' — try replacing '$' with '.'
+                if (typeName.contains("$")) {
+                    type = project.findType(typeName.replace('$', '.'));
+                    if (type != null) return type;
+                }
             }
 
             // Check imports
@@ -1325,7 +1386,15 @@ public class DefinitionProvider {
         while (innerIter.hasNext()) {
             ClassNode inner = innerIter.next();
             if (inner.getLineNumber() < 0) continue;
-            if (inner.getNameWithoutPackage().equals(word)) {
+            // getNameWithoutPackage() for inner classes returns "Outer$Inner",
+            // so also extract the simple name after the last '$' for matching.
+            String nameWithoutPkg = inner.getNameWithoutPackage();
+            String simpleName = nameWithoutPkg;
+            int dollarIdx = nameWithoutPkg.lastIndexOf('$');
+            if (dollarIdx >= 0 && dollarIdx < nameWithoutPkg.length() - 1) {
+                simpleName = nameWithoutPkg.substring(dollarIdx + 1);
+            }
+            if (nameWithoutPkg.equals(word) || simpleName.equals(word)) {
                 Location loc = astNodeToLocation(uri, inner);
                 if (loc != null) {
                     return loc;
@@ -1362,7 +1431,12 @@ public class DefinitionProvider {
         if (loc != null) {
             return loc;
         }
-        return findPropertyDeclaration(classNode, word, uri);
+        loc = findPropertyDeclaration(classNode, word, uri);
+        if (loc != null) {
+            return loc;
+        }
+        // Also check inner classes declared inside this class
+        return scanInnerClassesForSymbol(classNode, word, uri);
     }
 
     private Location findMethodDeclaration(ClassNode classNode, String word, String uri) {

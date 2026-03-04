@@ -92,6 +92,53 @@ public class UnusedDeclarationDetector {
         "spock.",
     };
 
+    /**
+     * Annotation simple names that mark a method as a framework entry point.
+     * These methods are invoked by the framework (e.g., Spring, Jakarta/CDI)
+     * at runtime and should not be flagged as unused.
+     */
+    private static final String[] FRAMEWORK_ANNOTATIONS = {
+        // Spring
+        "Bean",
+        "PostConstruct",
+        "PreDestroy",
+        "EventListener",
+        "Scheduled",
+        "Async",
+        "RequestMapping",
+        "GetMapping",
+        "PostMapping",
+        "PutMapping",
+        "DeleteMapping",
+        "PatchMapping",
+        "ExceptionHandler",
+        "InitBinder",
+        "ModelAttribute",
+        "ResponseBody",
+        "Transactional",
+        // Jakarta / javax
+        "Inject",
+        "Produces",
+        "Observes",
+        // Micronaut
+        "Singleton",
+        "Factory",
+    };
+
+    /**
+     * FQN prefixes for framework annotations.
+     */
+    private static final String[] FRAMEWORK_ANNOTATION_FQ_PREFIXES = {
+        "org.springframework.",
+        "jakarta.annotation.",
+        "javax.annotation.",
+        "jakarta.inject.",
+        "javax.inject.",
+        "jakarta.enterprise.",
+        "javax.enterprise.",
+        "io.micronaut.",
+    };
+
     private UnusedDeclarationDetector() {
         // utility class
     }
@@ -145,7 +192,7 @@ public class UnusedDeclarationDetector {
 
         // Check methods
         for (IMethod method : type.getMethods()) {
-            if (isTestMethod(method) || isMainMethod(method)) {
+            if (isTestMethod(method) || isMainMethod(method) || isFrameworkMethod(method)) {
                 continue;
             }
             if (isUnreferenced(method)) {
@@ -331,6 +378,43 @@ public class UnusedDeclarationDetector {
 
         // Check FQN prefixes
         for (String prefix : TEST_ANNOTATION_FQ_PREFIXES) {
+            if (name.startsWith(prefix)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Determine if a method is a framework-managed entry point (should not be faded).
+     */
+    private static boolean isFrameworkMethod(IMethod method) {
+        try {
+            for (IAnnotation annotation : method.getAnnotations()) {
+                if (isFrameworkAnnotation(annotation)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            return true; // err on the side of not fading
+        }
+    }
+
+    /**
+     * Check if an annotation is a framework entry-point annotation.
+     */
+    private static boolean isFrameworkAnnotation(IAnnotation annotation) {
+        String name = annotation.getElementName();
+
+        for (String frameworkAnnotation : FRAMEWORK_ANNOTATIONS) {
+            if (frameworkAnnotation.equals(name)) {
+                return true;
+            }
+        }
+
+        for (String prefix : FRAMEWORK_ANNOTATION_FQ_PREFIXES) {
             if (name.startsWith(prefix)) {
                 return true;
             }

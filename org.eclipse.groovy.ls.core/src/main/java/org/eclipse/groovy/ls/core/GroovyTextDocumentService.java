@@ -152,6 +152,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
     void connect(LanguageClient client) {
         this.client = client;
         this.diagnosticsProvider.connect(client);
+        this.documentManager.setLanguageClient(client);
     }
 
     // ---- Document synchronization ----
