@@ -8,6 +8,10 @@ webpack.config.js
 *.map
 .gitignore
 
+# Exclude OSGi runtime cache (regenerated on first launch)
+server/**/org.eclipse.osgi/**
+server/**/org.eclipse.equinox.app/**
+
 # Keep the server directory, syntaxes, and license
 !server/**
 !syntaxes/**

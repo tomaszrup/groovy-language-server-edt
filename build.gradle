@@ -35,6 +35,11 @@ tasks.register('copyServerToExtension', Sync) {
     dependsOn ':org.eclipse.groovy.ls.product:assembleProduct'
     from productDir
     into serverDestDir
+
+    // Exclude OSGi runtime cache — it is regenerated on first launch and
+    // adds ~11 MB of unnecessary extracted JARs and lock files to the VSIX.
+    exclude '**/org.eclipse.osgi/**'
+    exclude '**/org.eclipse.equinox.app/**'
 }
 
 // ---- Copy LICENSE into the VS Code extension so vsce includes it ----
