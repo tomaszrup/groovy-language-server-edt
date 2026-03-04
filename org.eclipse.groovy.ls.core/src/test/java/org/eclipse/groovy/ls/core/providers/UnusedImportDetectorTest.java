@@ -132,8 +132,7 @@ class UnusedImportDetectorTest {
 
         List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
 
-        // Should detect unused static import (may or may not depending on implementation)
-        assertNotNull(diagnostics);
+        assertEquals(1, diagnostics.size(), "Unused static import PI should be flagged");
     }
 
     @Test
@@ -147,8 +146,8 @@ class UnusedImportDetectorTest {
 
         List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
 
-        // Method call on imported type may or may not be detected as used
-        assertNotNull(diagnostics);
+        assertTrue(diagnostics.isEmpty(),
+                "LocalDate used via static method call should not be flagged as unused");
     }
 
     @Test
@@ -557,5 +556,122 @@ class UnusedImportDetectorTest {
                 """;
         List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
         assertTrue(diagnostics.isEmpty(), "ToString used as class annotation should not be unused");
+    }
+
+    // ================================================================
+    // Static member access — these are parsed as VariableExpression at
+    // CONVERSION phase (no classpath) and previously caused false positives.
+    // ================================================================
+
+    @Test
+    void staticMethodCallOnImportedClassNotFlaggedAsUnused() {
+        String source = """
+                import java.time.LocalDate
+                class Example {
+                    def today() { LocalDate.now() }
+                }
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertTrue(diagnostics.isEmpty(),
+                "LocalDate used via static method call should not be flagged as unused");
+    }
+
+    @Test
+    void enumConstantAccessNotFlaggedAsUnused() {
+        String source = """
+                import java.time.DayOfWeek
+                class Example {
+                    def day = DayOfWeek.MONDAY
+                }
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertTrue(diagnostics.isEmpty(),
+                "DayOfWeek used via enum constant access should not be flagged as unused");
+    }
+
+    @Test
+    void staticFieldAccessNotFlaggedAsUnused() {
+        String source = """
+                import java.util.Collections
+                class Example {
+                    def empty = Collections.EMPTY_LIST
+                }
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertTrue(diagnostics.isEmpty(),
+                "Collections used via static field access should not be flagged as unused");
+    }
+
+    @Test
+    void staticMethodCallInScriptNotFlaggedAsUnused() {
+        // Groovy scripts have no wrapping class — code is in the module's
+        // statement block.
+        String source = """
+                import java.time.LocalDate
+                def today = LocalDate.now()
+                println today
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertTrue(diagnostics.isEmpty(),
+                "LocalDate used in script-level static call should not be flagged as unused");
+    }
+
+    @Test
+    void multipleStaticAccessPatternsOnlyUnusedOneFlagged() {
+        String source = """
+                import java.time.LocalDate
+                import java.time.LocalTime
+                import java.time.Duration
+                class Example {
+                    def d = LocalDate.now()
+                    def t = LocalTime.of(12, 0)
+                }
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertEquals(1, diagnostics.size(), "Only Duration should be flagged as unused");
+        assertTrue(String.valueOf(diagnostics.get(0).getMessage()).contains("Duration"));
+    }
+
+    @Test
+    void staticMethodOnClassUsedAsQualifierInChain() {
+        String source = """
+                import java.time.LocalDate
+                class Example {
+                    String dateStr() { LocalDate.now().toString() }
+                }
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertTrue(diagnostics.isEmpty(),
+                "LocalDate used in chained static call should not be flagged as unused");
+    }
+
+    @Test
+    void actuallyUnusedImportStillFlaggedWithSafetyNet() {
+        // Confirm the safety net does not prevent truly unused imports
+        // from being flagged.
+        String source = """
+                import java.time.Duration
+                class Example {
+                    String value = "hello"
+                }
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertEquals(1, diagnostics.size(), "Duration is truly unused and should be flagged");
+        assertTrue(String.valueOf(diagnostics.get(0).getMessage()).contains("Duration"));
+    }
+
+    @Test
+    void importUsedOnlyInEnumComparisonNotFlagged() {
+        String source = """
+                import java.time.DayOfWeek
+                class Example {
+                    boolean isWeekend(def day) {
+                        day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY
+                    }
+                }
+                """;
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+        assertTrue(diagnostics.isEmpty(),
+                "DayOfWeek used in enum constant comparison should not be flagged");
     }
 }

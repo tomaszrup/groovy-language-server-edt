@@ -124,6 +124,11 @@ public class CodeLensProvider {
             }
 
             int count = countReferences(element);
+            if (count == 0) {
+                // Hide "0 references" — set empty title so the lens is invisible
+                codeLens.setCommand(new Command("", ""));
+                return codeLens;
+            }
             String label = count == 1 ? "1 reference" : count + " references";
             codeLens.setCommand(new Command(label, ""));
         } catch (Exception e) {

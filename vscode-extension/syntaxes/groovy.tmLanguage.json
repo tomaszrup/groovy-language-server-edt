@@ -5,6 +5,7 @@
     "patterns": [
         { "include": "#comments" },
         { "include": "#strings" },
+        { "include": "#spock-labels" },
         { "include": "#keywords" },
         { "include": "#annotations" },
         { "include": "#numbers" },
@@ -126,6 +127,17 @@
                 {
                     "name": "constant.character.escape.groovy",
                     "match": "\\\\(u[0-9a-fA-F]{4}|[btnfr\"'\\\\$]|[0-3]?[0-7]{1,2})"
+                }
+            ]
+        },
+        "spock-labels": {
+            "patterns": [
+                {
+                    "name": "keyword.control.spock.groovy",
+                    "match": "^\\s*(given|when|then|expect|where)\\s*:",
+                    "captures": {
+                        "1": { "name": "keyword.control.spock.groovy" }
+                    }
                 }
             ]
         },

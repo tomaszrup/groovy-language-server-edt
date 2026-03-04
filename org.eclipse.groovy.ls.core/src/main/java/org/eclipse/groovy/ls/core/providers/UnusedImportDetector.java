@@ -16,6 +16,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.codehaus.groovy.ast.AnnotationNode;
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
@@ -149,6 +150,13 @@ public class UnusedImportDetector {
         collectReferencedTypeNames(ast, referencedSimpleNames, referencedFullNames);
         markUsedImports(imports, referencedSimpleNames, referencedFullNames);
 
+        // Safety net: for any imports still unmarked, check whether the
+        // simple name appears as a whole word in the non-import source lines.
+        // This catches edge cases the AST visitor can miss at CONVERSION phase
+        // (e.g. static method calls parsed as VariableExpression, GString
+        // interpolation, script-level code, etc.).
+        textBasedSafetyNet(imports, content);
+
         String[] lines = content.split("\n", -1);
         diagnostics.addAll(buildUnusedImportDiagnostics(imports, lines));
 
@@ -223,6 +231,41 @@ public class UnusedImportDetector {
 
     private static boolean isLineInBounds(int line, int lineCount) {
         return line >= 0 && line < lineCount;
+    }
+
+    /**
+     * Text-based safety net: for imports still marked unused after AST analysis,
+     * scan the non-import lines for whole-word occurrences of the import's simple
+     * name.  This catches references the AST visitor misses when the Groovy
+     * compiler is at CONVERSION phase (no type resolution), e.g.:
+     * <ul>
+     *   <li>{@code ClassName.staticMethod()} parsed as
+     *       {@code VariableExpression("ClassName")} instead of
+     *       {@code ClassExpression}</li>
+     *   <li>Enum constant access {@code MyEnum.VALUE}</li>
+     *   <li>Static field access {@code SomeClass.CONSTANT}</li>
+     * </ul>
+     */
+    private static void textBasedSafetyNet(List<ImportInfo> imports, String content) {
+        // Build the body text (everything that is NOT an import line)
+        StringBuilder bodyBuilder = new StringBuilder();
+        for (String line : content.split("\n", -1)) {
+            String trimmed = line.trim();
+            if (!trimmed.startsWith("import ")) {
+                bodyBuilder.append(line).append('\n');
+            }
+        }
+        String body = bodyBuilder.toString();
+
+        for (ImportInfo info : imports) {
+            if (info.isUsed()) continue;
+            // Use word-boundary matching so e.g. "Duration" doesn't match
+            // "DurationUtils" accidentally.
+            Pattern pattern = Pattern.compile("\\b" + Pattern.quote(info.simpleName) + "\\b");
+            if (pattern.matcher(body).find()) {
+                info.markUsed();
+            }
+        }
     }
 
     /**
@@ -371,6 +414,18 @@ public class UnusedImportDetector {
         public void visitVariableExpression(VariableExpression expr) {
             collectTypeRef(expr.getType());
             collectTypeRef(expr.getOriginType());
+
+            // At CONVERSION phase, ClassName.method() / EnumType.VALUE are
+            // parsed as VariableExpression("ClassName") with type Object
+            // instead of ClassExpression.  Record uppercase-initial names as
+            // potential type references — by convention Groovy/Java class
+            // names start with an uppercase letter.
+            String name = expr.getName();
+            if (name != null && !name.isEmpty()
+                    && Character.isUpperCase(name.charAt(0))) {
+                simpleNames.add(name);
+            }
+
             super.visitVariableExpression(expr);
         }
 
@@ -402,6 +457,14 @@ public class UnusedImportDetector {
         public void visitMethodCallExpression(MethodCallExpression expr) {
             if (expr.getObjectExpression() instanceof ClassExpression classExpression) {
                 collectTypeRef(classExpression.getType());
+            } else if (expr.getObjectExpression() instanceof VariableExpression varExpr) {
+                // At CONVERSION phase, SomeClass.method() may produce
+                // VariableExpression("SomeClass") instead of ClassExpression.
+                String name = varExpr.getName();
+                if (name != null && !name.isEmpty()
+                        && Character.isUpperCase(name.charAt(0))) {
+                    simpleNames.add(name);
+                }
             }
             super.visitMethodCallExpression(expr);
         }
@@ -418,6 +481,14 @@ public class UnusedImportDetector {
         public void visitPropertyExpression(PropertyExpression expr) {
             if (expr.getObjectExpression() instanceof ClassExpression classExpression) {
                 collectTypeRef(classExpression.getType());
+            } else if (expr.getObjectExpression() instanceof VariableExpression varExpr) {
+                // At CONVERSION phase, EnumType.VALUE or SomeClass.FIELD may
+                // produce VariableExpression("EnumType") instead of ClassExpression.
+                String name = varExpr.getName();
+                if (name != null && !name.isEmpty()
+                        && Character.isUpperCase(name.charAt(0))) {
+                    simpleNames.add(name);
+                }
             }
             // Property name — might match a static import field name
             if (expr.getProperty() instanceof ConstantExpression constantExpression) {
