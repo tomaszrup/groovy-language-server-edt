@@ -30,6 +30,7 @@ import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.search.IJavaSearchConstants;
+import org.eclipse.jdt.core.search.IJavaSearchScope;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
 import org.eclipse.jdt.core.search.SearchParticipant;
@@ -142,6 +143,24 @@ public class RenameProvider {
         return new Range(offsetToPosition(content, start), offsetToPosition(content, end));
     }
 
+    /**
+     * Create a search scope from the working copy's project.
+     * Falls back to workspace scope if the project is unavailable.
+     */
+    private IJavaSearchScope createProjectScope(ICompilationUnit workingCopy) {
+        try {
+            org.eclipse.jdt.core.IJavaProject javaProject = workingCopy.getJavaProject();
+            if (javaProject != null) {
+                return SearchEngine.createJavaSearchScope(
+                        new IJavaElement[]{javaProject},
+                        IJavaSearchScope.SOURCES);
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return SearchEngine.createWorkspaceScope();
+    }
+
     private WorkspaceEdit renameWithJdt(String uri, Position position, String newName) {
         ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
         if (workingCopy == null) {
@@ -169,10 +188,11 @@ public class RenameProvider {
 
             Map<String, List<TextEdit>> editsByUri = new HashMap<>();
             SearchEngine engine = new SearchEngine();
+            IJavaSearchScope scope = createProjectScope(workingCopy);
 
             engine.search(pattern,
                     new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                    SearchEngine.createWorkspaceScope(),
+                    scope,
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
@@ -310,7 +330,7 @@ public class RenameProvider {
             SearchEngine engine = new SearchEngine();
             engine.search(pattern,
                     new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                    SearchEngine.createWorkspaceScope(),
+                    SearchEngine.createWorkspaceScope(), // workspace-wide: imports can be in any project
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
@@ -386,9 +406,18 @@ public class RenameProvider {
                             method, IJavaSearchConstants.ALL_OCCURRENCES);
                     if (pattern != null) {
                         SearchEngine engine = new SearchEngine();
+                        IJavaSearchScope ctorScope;
+                        try {
+                            org.eclipse.jdt.core.IJavaProject proj = type.getJavaProject();
+                            ctorScope = proj != null
+                                    ? SearchEngine.createJavaSearchScope(new IJavaElement[]{proj}, IJavaSearchScope.SOURCES)
+                                    : SearchEngine.createWorkspaceScope();
+                        } catch (Exception e) {
+                            ctorScope = SearchEngine.createWorkspaceScope();
+                        }
                         engine.search(pattern,
                                 new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                                SearchEngine.createWorkspaceScope(),
+                                ctorScope,
                                 new SearchRequestor() {
                                     @Override
                                     public void acceptSearchMatch(SearchMatch match) {
@@ -438,9 +467,18 @@ public class RenameProvider {
                         method, IJavaSearchConstants.ALL_OCCURRENCES);
                 if (pattern != null) {
                     SearchEngine engine = new SearchEngine();
+                    IJavaSearchScope methodScope;
+                    try {
+                        org.eclipse.jdt.core.IJavaProject proj = type.getJavaProject();
+                        methodScope = proj != null
+                                ? SearchEngine.createJavaSearchScope(new IJavaElement[]{proj}, IJavaSearchScope.SOURCES)
+                                : SearchEngine.createWorkspaceScope();
+                    } catch (Exception e) {
+                        methodScope = SearchEngine.createWorkspaceScope();
+                    }
                     engine.search(pattern,
                             new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                            SearchEngine.createWorkspaceScope(),
+                            methodScope,
                             new SearchRequestor() {
                                 @Override
                                 public void acceptSearchMatch(SearchMatch match) {

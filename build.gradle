@@ -90,6 +90,14 @@ tasks.register('packageVsix', Exec) {
     commandLine findExe('npx'), '@vscode/vsce', 'package', '--no-dependencies'
 }
 
+// ---- Performance tests ----
+
+tasks.register('perfTest') {
+    description = 'Run integration-level performance tests against the assembled language server'
+    group = 'verification'
+    dependsOn ':org.eclipse.groovy.ls.perf:perfTest'
+}
+
 // ---- Convenience lifecycle aliases ----
 
 tasks.register('buildServer') {

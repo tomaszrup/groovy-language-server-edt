@@ -258,7 +258,7 @@ public class DiagnosticsProvider {
                     publishDiagnosticsDebounced(uri);
                 }
             }
-        }, 500, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }, 200, java.util.concurrent.TimeUnit.MILLISECONDS);
         pendingPublish.put(normalizedUri, future);
     }
 

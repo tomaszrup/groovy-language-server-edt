@@ -121,13 +121,18 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
 
             // 2. Check if cursor is on a class declaration or type reference in the AST
-            String fqnFromAST = resolveTypeFromAST(module, word);
-            if (fqnFromAST != null) {
-                IType type = javaProject.findType(fqnFromAST);
-                if (type != null) {
-                    results.add(type);
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved type from AST: " + fqnFromAST);
-                    return results.toArray(new IJavaElement[0]);
+            //    Skip for words starting with lowercase — they are method/field/variable names,
+            //    not type references, so the full AST walk would be wasted work.
+            boolean startsLowerCase = Character.isLowerCase(word.charAt(0));
+            if (!startsLowerCase) {
+                String fqnFromAST = resolveTypeFromAST(module, word);
+                if (fqnFromAST != null) {
+                    IType type = javaProject.findType(fqnFromAST);
+                    if (type != null) {
+                        results.add(type);
+                        GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved type from AST: " + fqnFromAST);
+                        return results.toArray(new IJavaElement[0]);
+                    }
                 }
             }
 
@@ -158,11 +163,14 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
 
             // 4. Last resort — try to find a type by simple name using imports as context
-            IType typeFromSearch = searchTypeBySimpleName(javaProject, module, word);
-            if (typeFromSearch != null) {
-                results.add(typeFromSearch);
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved by type search: " + typeFromSearch.getFullyQualifiedName());
-                return results.toArray(new IJavaElement[0]);
+            //    Only for uppercase-starting words (type names); lowercase words won't match types.
+            if (!startsLowerCase) {
+                IType typeFromSearch = searchTypeBySimpleName(javaProject, module, word);
+                if (typeFromSearch != null) {
+                    results.add(typeFromSearch);
+                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved by type search: " + typeFromSearch.getFullyQualifiedName());
+                    return results.toArray(new IJavaElement[0]);
+                }
             }
 
         } catch (Exception e) {

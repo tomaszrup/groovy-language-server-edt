@@ -1,0 +1,72 @@
+plugins {
+    id 'java'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+def lsp4jVersion = project.property('lsp4jVersion')
+def gsonVersion = project.property('gsonVersion')
+
+dependencies {
+    // LSP4J — used as the JSON-RPC / LSP client library
+    testImplementation "org.eclipse.lsp4j:org.eclipse.lsp4j:${lsp4jVersion}"
+    testImplementation "org.eclipse.lsp4j:org.eclipse.lsp4j.jsonrpc:${lsp4jVersion}"
+
+    // Gson (transitive from LSP4J, but explicit for our reporter)
+    testImplementation "com.google.code.gson:gson:${gsonVersion}"
+
+    // JUnit 5
+    testImplementation platform('org.junit:junit-bom:5.11.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// ---------------------------------------------------------------------------
+// Performance test task — isolated from the normal 'test' task
+// ---------------------------------------------------------------------------
+
+// Ensure the language-server product is assembled before perf tests run
+tasks.named('test') {
+    enabled = false // disable the default test task; use perfTest instead
+}
+
+tasks.register('perfTest', Test) {
+    description = 'Run integration-level performance tests against the assembled language server'
+    group = 'verification'
+
+    dependsOn ':org.eclipse.groovy.ls.product:assembleProduct'
+
+    useJUnitPlatform()
+
+    // Each test class gets its own JVM to avoid cross-contamination
+    forkEvery = 1
+    maxHeapSize = '4g'
+
+    // Pass the assembled product directory and JAVA_HOME to the test JVM
+    def productDir = project(':org.eclipse.groovy.ls.product').layout.buildDirectory.dir('product').get().asFile.absolutePath
+    systemProperty 'groovy.ls.server.dir', productDir
+    systemProperty 'groovy.ls.java.home', System.getProperty('java.home')
+
+    // Long timeouts — the initial workspace build can take minutes
+    systemProperty 'groovy.ls.perf.server.timeout.seconds', '180'
+
+    // Report output
+    reports {
+        html.required = true
+        junitXml.required = true
+    }
+
+    testLogging {
+        events 'started', 'passed', 'failed', 'skipped'
+        showStandardStreams = true
+        exceptionFormat = 'full'
+    }
+
+    // Ensure performance report directory exists
+    doFirst {
+        file("${project.layout.buildDirectory.get().asFile}/reports/performance").mkdirs()
+    }
+}

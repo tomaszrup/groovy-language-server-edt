@@ -2,6 +2,7 @@ rootProject.name = 'groovy-language-server'
 
 include 'org.eclipse.groovy.ls.core'
 include 'org.eclipse.groovy.ls.product'
+include 'org.eclipse.groovy.ls.perf'
 
 // The VS Code extension is built separately via npm/webpack,
 // not as a Gradle subproject.
