@@ -25,8 +25,7 @@ import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
-import org.eclipse.jdt.core.search.SearchEngine;
-import org.eclipse.jdt.core.search.SearchMatch;
+import org.eclipse.jdt.core.search.SearchEngine;import org.eclipse.jdt.core.search.IJavaSearchScope;import org.eclipse.jdt.core.search.SearchMatch;
 import org.eclipse.jdt.core.search.SearchParticipant;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchRequestor;
@@ -225,12 +224,14 @@ public class UnusedDeclarationDetector {
                 return false;
             }
 
-            // Scope to the enclosing project instead of the whole workspace.
+            // Scope to the enclosing project's sources only – we only care
+            // whether the declaration is referenced in source code, not in JARs.
             org.eclipse.jdt.core.IJavaProject javaProject =
                     element.getJavaProject();
             IJavaSearchScope scope = (javaProject != null)
                     ? SearchEngine.createJavaSearchScope(
-                          new org.eclipse.jdt.core.IJavaElement[]{javaProject})
+                          new org.eclipse.jdt.core.IJavaElement[]{javaProject},
+                          IJavaSearchScope.SOURCES)
                     : SearchEngine.createWorkspaceScope();
 
             boolean[] found = {false};

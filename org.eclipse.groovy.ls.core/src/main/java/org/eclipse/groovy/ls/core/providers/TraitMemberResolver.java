@@ -368,7 +368,10 @@ public final class TraitMemberResolver {
 
         String fqn = ifaceRef.getName();
         for (String uri : documentManager.getOpenDocumentUris()) {
-            ModuleNode otherModule = documentManager.getGroovyAST(uri);
+            // Use cached ASTs only — never trigger on-demand parsing here.
+            // In large workspaces this loop covers many files; parsing each
+            // uncached file would cause severe CPU spikes and hover latency.
+            ModuleNode otherModule = documentManager.getCachedGroovyAST(uri);
             ClassNode matched = findMatchingClass(otherModule, currentModule, fqn, simpleName);
             if (matched != null) {
                 return matched;
@@ -387,7 +390,7 @@ public final class TraitMemberResolver {
 
         String fqn = ifaceRef.getName();
         for (String uri : documentManager.getOpenDocumentUris()) {
-            ModuleNode otherModule = documentManager.getGroovyAST(uri);
+            ModuleNode otherModule = documentManager.getCachedGroovyAST(uri);
             if (findMatchingClass(otherModule, currentModule, fqn, simpleName) != null) {
                 return uri;
             }
@@ -442,7 +445,7 @@ public final class TraitMemberResolver {
         }
 
         for (String uri : documentManager.getOpenDocumentUris()) {
-            ModuleNode otherModule = documentManager.getGroovyAST(uri);
+            ModuleNode otherModule = documentManager.getCachedGroovyAST(uri);
             if (otherModule != null && otherModule != currentModule) {
                 helper = findFieldHelperNode(traitNode, otherModule);
                 if (helper != null) {

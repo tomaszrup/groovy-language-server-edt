@@ -107,6 +107,13 @@ public class CompletionProvider {
     private final DocumentManager documentManager;
 
     /**
+     * Per-request cache for type hierarchy chains. Cleared at the start of
+     * each {@link #getCompletions} call to avoid stale data while preventing
+     * redundant {@code newSupertypeHierarchy()} calls within a single request.
+     */
+    private final java.util.Map<String, List<IType>> hierarchyCache = new java.util.HashMap<>();
+
+    /**
      * Find a usable IJavaProject. The working copy's own project may be stale/non-existent
      * (e.g. due to URI encoding issues with special characters in paths).
      * Falls back to iterating all open workspace projects.
@@ -179,6 +186,7 @@ public class CompletionProvider {
      * Compute completion items at the cursor position.
      */
     public List<CompletionItem> getCompletions(CompletionParams params) {
+        hierarchyCache.clear();
         List<CompletionItem> items = new ArrayList<>();
 
         String uri = params.getTextDocument().getUri();
@@ -458,7 +466,7 @@ public class CompletionProvider {
                                    List<CompletionItem> items) throws JavaModelException {
         Set<String> seen = new HashSet<>();
 
-        List<IType> chain = buildTypeHierarchyChain(type);
+        List<IType> chain = buildTypeHierarchyChain(type, hierarchyCache);
         for (int typeIndex = 0; typeIndex < chain.size() && items.size() < MAX_MEMBER_RESULTS; typeIndex++) {
             IType currentType = chain.get(typeIndex);
             String sortPrefix = (typeIndex == 0) ? "0" : "1";
@@ -471,12 +479,18 @@ public class CompletionProvider {
                 + " hierarchy (" + chain.size() + " types)");
     }
 
-    private List<IType> buildTypeHierarchyChain(IType type) throws JavaModelException {
+    private List<IType> buildTypeHierarchyChain(IType type,
+            java.util.Map<String, List<IType>> cache) throws JavaModelException {
+        String key = type.getFullyQualifiedName();
+        List<IType> cached = cache.get(key);
+        if (cached != null) return cached;
+
         ITypeHierarchy hierarchy = type.newSupertypeHierarchy(null);
         IType[] supertypes = hierarchy.getAllSupertypes(type);
         List<IType> chain = new ArrayList<>();
         chain.add(type);
         chain.addAll(Arrays.asList(supertypes));
+        cache.put(key, chain);
         return chain;
     }
 
@@ -1762,8 +1776,7 @@ public class CompletionProvider {
             IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
                     new IJavaElement[]{project},
                     IJavaSearchScope.SOURCES
-                        | IJavaSearchScope.APPLICATION_LIBRARIES
-                        | IJavaSearchScope.SYSTEM_LIBRARIES);
+                        | IJavaSearchScope.APPLICATION_LIBRARIES);
 
             engine.searchAllTypeNames(
                     null, // any package

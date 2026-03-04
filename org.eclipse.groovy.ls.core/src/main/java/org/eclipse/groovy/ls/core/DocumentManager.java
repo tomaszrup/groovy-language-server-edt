@@ -511,6 +511,40 @@ public class DocumentManager {
         return null;
     }
 
+    /**
+     * Returns the Groovy AST for a document <em>only if it is already cached</em>,
+     * either from a JDT working copy or the standalone compiler cache.
+     * <p>
+     * Unlike {@link #getGroovyAST(String)}, this method <strong>never triggers
+     * on-demand parsing</strong>.  It is intended for performance-sensitive
+     * callers (e.g.&nbsp;trait resolution during hover) that iterate over many
+     * documents and must not pay the cost of parsing uncached files.
+     *
+     * @param uri the document URI
+     * @return the cached AST, or {@code null} if not available without parsing
+     */
+    public ModuleNode getCachedGroovyAST(String uri) {
+        uri = normalizeUri(uri);
+
+        // 1. Try JDT working copy (already reconciled)
+        ICompilationUnit workingCopy = workingCopies.get(uri);
+        if (workingCopy != null) {
+            ModuleNode jdtModule = extractModuleNodeFromWorkingCopy(workingCopy, uri);
+            if (jdtModule != null) {
+                return jdtModule;
+            }
+        }
+
+        // 2. Try standalone compiler LRU cache
+        GroovyCompilerService.ParseResult cached = compilerService.getCachedResult(uri);
+        if (cached != null && cached.hasAST()) {
+            return cached.getModuleNode();
+        }
+
+        // 3. Do NOT parse on demand — return null
+        return null;
+    }
+
     private ModuleNode extractModuleNodeFromWorkingCopy(ICompilationUnit workingCopy, String uri) {
         try {
             ModuleNode module = org.eclipse.groovy.ls.core.providers.ReflectionCache.getModuleNode(workingCopy);

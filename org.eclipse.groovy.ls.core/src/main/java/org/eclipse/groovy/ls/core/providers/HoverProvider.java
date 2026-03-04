@@ -26,6 +26,10 @@ import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.Signature;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import org.eclipse.lsp4j.Hover;
 import org.eclipse.lsp4j.HoverParams;
 import org.eclipse.lsp4j.MarkupContent;
@@ -42,6 +46,23 @@ import org.eclipse.lsp4j.Position;
 public class HoverProvider {
 
     private final DocumentManager documentManager;
+
+    /**
+     * Short-lived LRU cache for hover results.  Avoids redundant
+     * {@code codeSelect()} calls when the user hovers the same position
+     * repeatedly.  Key: {@code "uri#offset"}, Value: computed Hover.
+     */
+    private static final int HOVER_CACHE_SIZE = 200;
+    private final Map<String, Hover> hoverCache =
+            Collections.synchronizedMap(new LinkedHashMap<>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Hover> eldest) {
+                    return size() > HOVER_CACHE_SIZE;
+                }
+            });
+
+    /** Sentinel object representing a cached "no hover" result. */
+    private static final Hover NO_HOVER = new Hover();
 
     private static final String GROOVY_FENCE_OPEN = "```groovy\n";
     private static final String FENCE_CLOSE = "\n```\n";
@@ -66,6 +87,18 @@ public class HoverProvider {
                 if (content != null) {
                     int offset = positionToOffset(content, position);
 
+                    // Check cache first — avoids a full codeSelect() round-trip
+                    String cacheKey = uri + "#" + offset;
+                    Hover cached = hoverCache.get(cacheKey);
+                    if (cached != null) {
+                        return cached == NO_HOVER ? null : cached;
+                    }
+
+                    // Bail out early if the future was cancelled / timed out
+                    if (Thread.currentThread().isInterrupted()) {
+                        return null;
+                    }
+
                     // codeSelect resolves the element at the given offset
                     IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
                     if (elements != null && elements.length > 0) {
@@ -76,9 +109,14 @@ public class HoverProvider {
                             MarkupContent markup = new MarkupContent();
                             markup.setKind(MarkupKind.MARKDOWN);
                             markup.setValue(hoverContent);
-                            return new Hover(markup);
+                            Hover result = new Hover(markup);
+                            hoverCache.put(cacheKey, result);
+                            return result;
                         }
                     }
+
+                    // Cache the "no JDT hover" sentinel so we don't retry
+                    hoverCache.put(cacheKey, NO_HOVER);
                 }
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Hover JDT failed for " + uri + ", falling back to AST", e);
@@ -87,6 +125,15 @@ public class HoverProvider {
 
         // Fallback: try hover from Groovy AST
         return getHoverFromGroovyAST(uri, position);
+    }
+
+    /**
+     * Invalidate cached hover results for a document.
+     * Called from {@code GroovyTextDocumentService.didChange()} when the
+     * document content changes.
+     */
+    public void invalidateHoverCache(String uri) {
+        hoverCache.entrySet().removeIf(e -> e.getKey().startsWith(uri + "#"));
     }
 
     /**

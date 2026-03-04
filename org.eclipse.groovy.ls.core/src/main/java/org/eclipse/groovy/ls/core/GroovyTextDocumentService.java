@@ -15,9 +15,10 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.eclipse.groovy.ls.core.providers.CodeActionProvider;
 import org.eclipse.groovy.ls.core.providers.CallHierarchyProvider;
@@ -66,14 +67,18 @@ public class GroovyTextDocumentService implements TextDocumentService {
      * {@code codeSelect()} or {@code getModuleNode()} call would starve
      * every other feature.
      * <p>
-     * A bounded thread pool with a work queue prevents thread explosion
-     * under burst load (e.g. rapid file navigation in large workspaces)
-     * while still providing enough concurrency for interactive features.
+     * A {@link SynchronousQueue} is used instead of a bounded queue so that
+     * the pool actually scales up to {@code maxPoolSize} under load.  With a
+     * {@code LinkedBlockingQueue} the pool would <em>never</em> create threads
+     * beyond {@code corePoolSize} until the queue was completely full, which
+     * caused thread starvation when {@code codeSelect()} calls blocked on the
+     * Eclipse workspace lock.
+     * <p>
      * Idle threads are reclaimed after 60 s.
      */
     private final ExecutorService lspRequestExecutor;
     static {
-        // Initialised in the constructor — see below.
+        // Initialised in the instance initialiser — see below.
     }
     {
         int corePoolSize = 4;
@@ -81,13 +86,18 @@ public class GroovyTextDocumentService implements TextDocumentService {
         lspRequestExecutor = new ThreadPoolExecutor(
                 corePoolSize, maxPoolSize,
                 60L, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(1024),
+                new SynchronousQueue<>(),
                 r -> {
                     Thread t = new Thread(r, "groovy-ls-request");
                     t.setDaemon(true);
                     return t;
                 },
-                new ThreadPoolExecutor.CallerRunsPolicy());
+                (r, executor) -> {
+                    // Reject instead of running on the LSP dispatch thread
+                    // (CallerRunsPolicy would freeze ALL message processing).
+                    GroovyLanguageServerPlugin.logError(
+                            "LSP request executor saturated — rejecting task", null);
+                });
     }
 
     /**
@@ -96,6 +106,14 @@ public class GroovyTextDocumentService implements TextDocumentService {
      * {@code textDocument/semanticTokens/full} after every edit).
      */
     private final Map<String, CompletableFuture<?>> pendingSemanticTokens =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Tracks the latest in-flight hover future per URI so that we can
+     * cancel a superseded request when a new one arrives (e.g. rapid
+     * cursor movement).  Mirrors the {@link #pendingSemanticTokens} pattern.
+     */
+    private final Map<String, CompletableFuture<?>> pendingHovers =
             new ConcurrentHashMap<>();
 
     // Providers
@@ -183,6 +201,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
             + " changes=" + (params.getContentChanges() != null ? params.getContentChanges().size() : 0));
         documentManager.didChange(uri, params.getContentChanges());
 
+        // Invalidate hover cache so stale results are not served
+        hoverProvider.invalidateHoverCache(uri);
+
         // Re-publish diagnostics after changes
         if (server.areDiagnosticsEnabled()) {
             diagnosticsProvider.publishDiagnosticsDebounced(uri);
@@ -256,14 +277,40 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
     @Override
     public CompletableFuture<Hover> hover(HoverParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
+        String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
+
+        // Cancel any previous in-flight hover for this URI
+        if (normalizedUri != null) {
+            CompletableFuture<?> prev = pendingHovers.get(normalizedUri);
+            if (prev != null) {
+                prev.cancel(true);
+            }
+        }
+
+        CompletableFuture<Hover> future = CompletableFuture.supplyAsync(() -> {
             try {
                 return hoverProvider.getHover(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Hover failed", e);
                 return null;
             }
-        }, lspRequestExecutor);
+        }, lspRequestExecutor)
+                .orTimeout(5, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "Hover timed out for " + uri, null);
+                    }
+                    return null;
+                });
+
+        if (normalizedUri != null) {
+            pendingHovers.put(normalizedUri, future);
+            future.whenComplete((r, t) -> pendingHovers.remove(normalizedUri, future));
+        }
+        return future;
     }
 
     // ---- Definition ----
@@ -285,14 +332,28 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
     @Override
     public CompletableFuture<List<? extends Location>> references(ReferenceParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<List<? extends Location>> future =
+                CompletableFuture.supplyAsync(() -> {
             try {
                 return referenceProvider.getReferences(params);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("References failed", e);
-                return new ArrayList<>();
+                List<Location> empty = new ArrayList<>();
+                return empty;
             }
         }, lspRequestExecutor);
+
+        return future
+                .orTimeout(15, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException
+                            || (ex.getCause() instanceof TimeoutException)) {
+                        GroovyLanguageServerPlugin.logError(
+                                "References timed out for "
+                                + params.getTextDocument().getUri(), null);
+                    }
+                    return new ArrayList<>();
+                });
     }
 
     // ---- Document Symbols ----
@@ -573,7 +634,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<List<TypeHierarchyItem>> typeHierarchySubtypes(
             TypeHierarchySubtypesParams params) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<List<TypeHierarchyItem>> future = CompletableFuture.supplyAsync(() -> {
             try {
                 return typeHierarchyProvider.getSubtypes(params);
             } catch (Exception e) {
@@ -581,6 +642,11 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 return new ArrayList<>();
             }
         }, lspRequestExecutor);
+        return future.orTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .exceptionally(ex -> {
+            GroovyLanguageServerPlugin.logError("Type hierarchy subtypes timed out", ex);
+            return new ArrayList<>();
+        });
     }
 
     // ---- Call Hierarchy ----
@@ -685,6 +751,8 @@ public class GroovyTextDocumentService implements TextDocumentService {
      */
     void shutdown() {
         lspRequestExecutor.shutdownNow();
+        pendingHovers.values().forEach(f -> f.cancel(true));
+        pendingHovers.clear();
         pendingSemanticTokens.values().forEach(f -> f.cancel(true));
         pendingSemanticTokens.clear();
         diagnosticsProvider.shutdown();

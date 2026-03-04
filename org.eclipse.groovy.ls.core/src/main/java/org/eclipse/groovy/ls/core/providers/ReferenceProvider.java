@@ -94,7 +94,21 @@ public class ReferenceProvider {
                 return locations;
             }
 
-            IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
+            // Scope the search to source files in the current project only.
+            // Library JARs don't need scanning — we want *usages*, not definitions.
+            IJavaSearchScope scope;
+            try {
+                org.eclipse.jdt.core.IJavaProject javaProject = workingCopy.getJavaProject();
+                if (javaProject != null) {
+                    scope = SearchEngine.createJavaSearchScope(
+                            new org.eclipse.jdt.core.IJavaElement[]{javaProject},
+                            IJavaSearchScope.SOURCES);
+                } else {
+                    scope = SearchEngine.createWorkspaceScope();
+                }
+            } catch (Exception scopeEx) {
+                scope = SearchEngine.createWorkspaceScope();
+            }
             SearchEngine engine = new SearchEngine();
             engine.search(pattern,
                     new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},

@@ -62,6 +62,18 @@ public class DefinitionProvider {
     private static final String EXT_GROOVY = ".groovy";
     private static final String STATIC_PREFIX = "static ";
 
+    /**
+     * Per-request cache for {@link #canResolveSource(String)} results.
+     * Cleared at the start of each {@link #getDefinition} call.
+     */
+    private final java.util.Map<String, Boolean> canResolveSourceCache = new java.util.HashMap<>();
+
+    /**
+     * Tracks the project that last successfully resolved a definition so that
+     * {@link #navigateViaJdtProject} can try it first on the next call.
+     */
+    private volatile IProject currentDefinitionProject;
+
     public DefinitionProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
     }
@@ -70,6 +82,7 @@ public class DefinitionProvider {
      * Compute the definition location(s) for the element at the cursor.
      */
     public List<Location> getDefinition(DefinitionParams params) {
+        canResolveSourceCache.clear();
         String uri = params.getTextDocument().getUri();
         Position position = params.getPosition();
 
@@ -551,6 +564,14 @@ public class DefinitionProvider {
      * Check if we can find source for a given FQN (in sources JARs, JDK, or workspace).
      */
     private boolean canResolveSource(String fqn) {
+        Boolean cached = canResolveSourceCache.get(fqn);
+        if (cached != null) return cached;
+        boolean result = canResolveSourceUncached(fqn);
+        canResolveSourceCache.put(fqn, result);
+        return result;
+    }
+
+    private boolean canResolveSourceUncached(String fqn) {
         // Quick check: JDK types
         String jdkSource = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
         if (jdkSource != null) return true;
@@ -559,15 +580,27 @@ public class DefinitionProvider {
         Location wsLoc = findSourceInWorkspace(fqn);
         if (wsLoc != null) return true;
 
-        // Check if any project's classpath has this type
+        // Try the project that last resolved successfully first
+        IProject remembered = currentDefinitionProject;
+        if (remembered != null && remembered.isOpen()) {
+            try {
+                org.eclipse.jdt.core.IJavaProject jp = JavaCore.create(remembered);
+                if (jp != null && jp.exists() && jp.findType(fqn) != null) return true;
+            } catch (Exception e) { /* ignore */ }
+        }
+
+        // Check remaining projects
         try {
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject project : projects) {
-                if (!project.isOpen()) continue;
+                if (!project.isOpen() || project.equals(remembered)) continue;
                 org.eclipse.jdt.core.IJavaProject javaProject = JavaCore.create(project);
                 if (javaProject != null && javaProject.exists()) {
                     IType type = javaProject.findType(fqn);
-                    if (type != null) return true;
+                    if (type != null) {
+                        currentDefinitionProject = project;
+                        return true;
+                    }
                 }
             }
         } catch (Exception e) {
@@ -597,11 +630,19 @@ public class DefinitionProvider {
 
     private Location navigateViaJdtProject(String fqn, String simpleName) {
         try {
+            // Try the project that last succeeded first to avoid iterating all 50+.
+            IProject remembered = currentDefinitionProject;
+            if (remembered != null && remembered.isOpen()) {
+                Location loc = navigateViaProject(remembered, fqn, simpleName);
+                if (loc != null) return loc;
+            }
+
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject project : projects) {
-                if (!project.isOpen()) continue;
+                if (!project.isOpen() || project.equals(remembered)) continue;
                 Location loc = navigateViaProject(project, fqn, simpleName);
                 if (loc != null) {
+                    currentDefinitionProject = project;
                     return loc;
                 }
             }
