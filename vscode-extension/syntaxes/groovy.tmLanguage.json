@@ -134,7 +134,7 @@
             "patterns": [
                 {
                     "name": "keyword.control.spock.groovy",
-                    "match": "^\\s*(given|when|then|expect|where)\\s*:",
+                    "match": "\\b(given|when|then|expect|where)\\s*:",
                     "captures": {
                         "1": { "name": "keyword.control.spock.groovy" }
                     }

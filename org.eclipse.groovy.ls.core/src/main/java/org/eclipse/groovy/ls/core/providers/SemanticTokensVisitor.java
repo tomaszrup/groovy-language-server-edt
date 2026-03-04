@@ -10,9 +10,12 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.AnnotatedNode;
@@ -40,6 +43,7 @@ import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.codehaus.groovy.ast.expr.StaticMethodCallExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
+import org.codehaus.groovy.ast.stmt.Statement;
 import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
@@ -63,6 +67,10 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     private static final String VOID_TYPE = "void";
     private static final String TRAIT_KEYWORD = "trait";
     private static final int[] NO_POSITION = new int[0];
+
+    /** Spock framework block labels that should be highlighted as keywords. */
+    private static final Set<String> SPOCK_LABELS = new HashSet<>(Arrays.asList(
+            "given", "when", "then", "expect", "where"));
 
     /**
      * Raw token before delta encoding. Stores absolute position.
@@ -142,6 +150,67 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
                 visitMethod(method);
             }
         }
+    }
+
+    // ================================================================
+    // Spock labels
+    // ================================================================
+
+    @Override
+    public void visitBlockStatement(BlockStatement block) {
+        for (Statement stmt : block.getStatements()) {
+            List<String> labels = stmt.getStatementLabels();
+            if (labels != null) {
+                for (String label : labels) {
+                    if (SPOCK_LABELS.contains(label)) {
+                        emitSpockLabelToken(stmt, label);
+                    }
+                }
+            }
+        }
+        super.visitBlockStatement(block);
+    }
+
+    private void emitSpockLabelToken(Statement stmt, String label) {
+        if (stmt.getLineNumber() < 1) return;
+        int stmtLine = stmt.getLineNumber() - 1; // 0-based
+        // The label appears on or before the statement line
+        for (int searchLine = stmtLine; searchLine >= Math.max(0, stmtLine - 5); searchLine--) {
+            int col = findLabelInLine(searchLine, label);
+            if (col >= 0) {
+                addToken(searchLine, col, label.length(),
+                        SemanticTokensProvider.TYPE_KEYWORD, 0);
+                return;
+            }
+        }
+    }
+
+    private int findLabelInLine(int line, String label) {
+        if (source == null || line < 0) return -1;
+        int lineStart = findLineStart(line);
+        if (lineStart < 0) return -1;
+        int lineEnd = source.indexOf('\n', lineStart);
+        if (lineEnd < 0) lineEnd = source.length();
+        String lineText = source.substring(lineStart, lineEnd);
+
+        int idx = 0;
+        while ((idx = lineText.indexOf(label, idx)) >= 0) {
+            if (isLabelMatch(lineText, idx, label.length())) {
+                return idx;
+            }
+            idx++;
+        }
+        return -1;
+    }
+
+    private boolean isLabelMatch(String lineText, int idx, int labelLength) {
+        boolean leftBound = idx == 0 || !Character.isJavaIdentifierPart(lineText.charAt(idx - 1));
+        if (!leftBound) return false;
+        int pos = idx + labelLength;
+        if (pos >= lineText.length()) return false;
+        // skip optional whitespace then expect ':'
+        while (pos < lineText.length() && lineText.charAt(pos) == ' ') pos++;
+        return pos < lineText.length() && lineText.charAt(pos) == ':';
     }
 
     private void visitModuleStatements(ModuleNode module) {

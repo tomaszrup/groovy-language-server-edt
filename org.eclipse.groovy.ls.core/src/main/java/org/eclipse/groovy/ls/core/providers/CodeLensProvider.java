@@ -95,8 +95,10 @@ public class CodeLensProvider {
      * Called lazily by VS Code when the lens becomes visible in the viewport.
      */
     public CodeLens resolveCodeLens(CodeLens codeLens) {
-        // Already resolved?
-        if (codeLens.getCommand() != null) {
+        // Already resolved? (placeholder commands have an empty title)
+        if (codeLens.getCommand() != null
+                && codeLens.getCommand().getTitle() != null
+                && !codeLens.getCommand().getTitle().isEmpty()) {
             return codeLens;
         }
 
@@ -183,7 +185,9 @@ public class CodeLensProvider {
 
             CodeLens lens = new CodeLens();
             lens.setRange(range);
-            // Command is left null — will be populated in resolveCodeLens
+            // Set an empty-title placeholder command so VS Code does not
+            // flash "no commands" while waiting for resolveCodeLens.
+            lens.setCommand(new Command("", ""));
 
             JsonObject data = new JsonObject();
             data.addProperty(HANDLE_ID_KEY, element.getHandleIdentifier());
