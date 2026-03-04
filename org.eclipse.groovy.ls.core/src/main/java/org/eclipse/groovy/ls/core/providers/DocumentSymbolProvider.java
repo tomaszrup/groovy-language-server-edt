@@ -481,15 +481,14 @@ public class DocumentSymbolProvider {
      * The LSP spec requires selectionRange to be within the enclosing range.
      */
     private Range clampSelectionRange(Range selection, Range full) {
-        Position selStart = selection.getStart();
-        Position selEnd = selection.getEnd();
         Position fullStart = full.getStart();
         Position fullEnd = full.getEnd();
 
-        Position clampedStart = maxPosition(selStart, fullStart);
-        Position clampedEnd = minPosition(selEnd, fullEnd);
+        // Clamp both endpoints into [fullStart, fullEnd]
+        Position clampedStart = minPosition(maxPosition(selection.getStart(), fullStart), fullEnd);
+        Position clampedEnd = minPosition(maxPosition(selection.getEnd(), fullStart), fullEnd);
 
-        // If clamping made the range invalid (start after end), collapse to start
+        // Defensive: if start somehow still after end, collapse to start
         if (comparePositions(clampedStart, clampedEnd) > 0) {
             clampedEnd = clampedStart;
         }

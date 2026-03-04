@@ -14,6 +14,8 @@ import java.util.List;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
+import org.eclipse.core.runtime.OperationCanceledException;
+
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -50,7 +52,7 @@ public class CodeLensProvider {
 
     private static final String HANDLE_ID_KEY = "handleId";
     private static final String URI_KEY = "uri";
-    private static final String SHOW_REFERENCES_COMMAND = "editor.action.showReferences";
+    private static final String SHOW_REFERENCES_COMMAND = "groovy.showReferences";
 
     private final DocumentManager documentManager;
 
@@ -129,11 +131,6 @@ public class CodeLensProvider {
             // Single search pass: collect locations and derive count
             List<Location> locations = findReferenceLocations(element);
             int count = locations.size();
-            if (count == 0) {
-                // Hide "0 references" — set empty title so the lens is invisible
-                codeLens.setCommand(new Command("", ""));
-                return codeLens;
-            }
 
             String label = count == 1 ? "1 reference" : count + " references";
 
@@ -184,8 +181,9 @@ public class CodeLensProvider {
 
     /**
      * Create an unresolved code lens containing only the position and
-     * a handle identifier for later resolution.  No workspace search
-     * is performed here.
+     * a handle identifier for later resolution.  A quick short-circuit
+     * reference check is performed to skip elements with zero references
+     * (since LSP does not allow removing a lens during resolution).
      */
     private CodeLens createUnresolvedCodeLens(IJavaElement element, String content) {
         try {
@@ -195,6 +193,12 @@ public class CodeLensProvider {
 
             ISourceRange nameRange = sourceRef.getNameRange();
             if (nameRange == null || nameRange.getOffset() < 0) {
+                return null;
+            }
+
+            // Skip elements with zero references — once emitted, a lens
+            // cannot be removed during resolveCodeLens.
+            if (!hasReferences(element)) {
                 return null;
             }
 
@@ -216,6 +220,49 @@ public class CodeLensProvider {
             GroovyLanguageServerPlugin.logError(
                     "Failed to create code lens for " + element.getElementName(), e);
             return null;
+        }
+    }
+
+    /**
+     * Quick short-circuit check: does this element have at least one reference?
+     * Cancels the search as soon as the first match is found, avoiding a full
+     * workspace scan for elements with many references.
+     */
+    private boolean hasReferences(IJavaElement element) {
+        try {
+            SearchPattern pattern = SearchPattern.createPattern(
+                    element, IJavaSearchConstants.REFERENCES);
+            if (pattern == null) {
+                return false;
+            }
+
+            org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
+            IJavaSearchScope scope = (javaProject != null)
+                    ? SearchEngine.createJavaSearchScope(
+                          new org.eclipse.jdt.core.IJavaElement[]{javaProject})
+                    : SearchEngine.createWorkspaceScope();
+            SearchEngine engine = new SearchEngine();
+            boolean[] found = {false};
+
+            try {
+                engine.search(pattern,
+                        new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                        scope,
+                        new SearchRequestor() {
+                            @Override
+                            public void acceptSearchMatch(SearchMatch match) {
+                                found[0] = true;
+                                throw new OperationCanceledException("found");
+                            }
+                        },
+                        null);
+            } catch (OperationCanceledException e) {
+                // Expected — short-circuit on first match
+            }
+
+            return found[0];
+        } catch (Exception e) {
+            return false;
         }
     }
 

@@ -429,6 +429,20 @@ export async function activate(context: ExtensionContext): Promise<void> {
         commands.registerCommand('groovy.showOutputChannel', () => {
             outputChannel.show(true);
         }),
+        commands.registerCommand('groovy.showReferences', async (uri: string, position: { line: number; character: number }, locations: Array<{ uri: string; range: { start: { line: number; character: number }; end: { line: number; character: number } } }>) => {
+            const vsUri = vscode.Uri.parse(uri);
+            const vsPos = new vscode.Position(position.line, position.character);
+            const vsLocations = (locations || []).map(loc =>
+                new vscode.Location(
+                    vscode.Uri.parse(loc.uri),
+                    new vscode.Range(
+                        new vscode.Position(loc.range.start.line, loc.range.start.character),
+                        new vscode.Position(loc.range.end.line, loc.range.end.character)
+                    )
+                )
+            );
+            await vscode.commands.executeCommand('editor.action.showReferences', vsUri, vsPos, vsLocations);
+        }),
         commands.registerCommand('groovy.restartServer', async () => {
             outputChannel.appendLine('Restarting Groovy Language Server...');
             updateStatusBar('Starting', 'Restarting...');
@@ -707,6 +721,15 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         },
         outputChannel: outputChannel,
         traceOutputChannel: outputChannel,
+        middleware: {
+            executeCommand: async (command, args, next) => {
+                // Handle client-side commands directly instead of forwarding to server
+                if (command === 'groovy.showReferences') {
+                    return vscode.commands.executeCommand(command, ...(args || []));
+                }
+                return next(command, args);
+            },
+        },
     };
 
     // Invalidate the cached project root map when build files change so that

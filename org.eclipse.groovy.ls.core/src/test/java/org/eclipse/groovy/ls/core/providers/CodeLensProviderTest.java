@@ -159,7 +159,7 @@ class CodeLensProviderTest {
     // ================================================================
 
     @Test
-    void createUnresolvedCodeLensForType() throws Exception {
+    void createUnresolvedCodeLensReturnsNullForZeroReferences() throws Exception {
         org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
         org.eclipse.jdt.core.ISourceRange nameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
         when(nameRange.getOffset()).thenReturn(6);
@@ -173,10 +173,8 @@ class CodeLensProviderTest {
         m.setAccessible(true);
         CodeLens lens = (CodeLens) m.invoke(provider, mockType, "class MyType {}");
 
-        assertNotNull(lens);
-        assertNotNull(lens.getRange());
-        assertEquals(0, lens.getRange().getStart().getLine());
-        assertEquals(6, lens.getRange().getStart().getCharacter());
+        // No references in test context → null (element correctly filtered out)
+        assertNull(lens);
     }
 
     @Test
@@ -253,8 +251,8 @@ class CodeLensProviderTest {
         m.setAccessible(true);
         m.invoke(provider, mockType, "class Foo {\n    void bar() {}\n}", lenses);
 
-        // Should have 2 lenses: one for type, one for method
-        assertEquals(2, lenses.size());
+        // No references in test context → no lenses emitted
+        assertEquals(0, lenses.size());
     }
 
     @Test
@@ -287,7 +285,7 @@ class CodeLensProviderTest {
         m.setAccessible(true);
         m.invoke(provider, outerType, content, lenses);
 
-        // 2 lenses: outer + inner
-        assertEquals(2, lenses.size());
+        // No references in test context → no lenses emitted
+        assertEquals(0, lenses.size());
     }
 }
