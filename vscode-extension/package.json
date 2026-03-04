@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.0.12",
+    "version": "1.0.13",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -30,7 +30,7 @@
         "LSP"
     ],
     "extensionDependencies": [
-        "java.redhat"
+        "redhat.java"
     ],
     "extensionKind": [
         "workspace"
