@@ -750,11 +750,11 @@ class GroovyLanguageServerTest {
         GroovyLanguageServer server = new GroovyLanguageServer();
         java.lang.reflect.Field field = GroovyLanguageServer.class.getDeclaredField("initialBuildDone");
         field.setAccessible(true);
-        assertFalse((boolean) field.get(server));
+        assertFalse(((java.util.concurrent.atomic.AtomicBoolean) field.get(server)).get());
         java.lang.reflect.Method m = GroovyLanguageServer.class.getDeclaredMethod("triggerBuildAfterClasspathUpdate");
         m.setAccessible(true);
         m.invoke(server);
-        assertTrue((boolean) field.get(server));
+        assertTrue(((java.util.concurrent.atomic.AtomicBoolean) field.get(server)).get());
     }
 
     @Test
@@ -767,7 +767,7 @@ class GroovyLanguageServerTest {
         m.invoke(server);
         java.lang.reflect.Field field = GroovyLanguageServer.class.getDeclaredField("initialBuildDone");
         field.setAccessible(true);
-        assertTrue((boolean) field.get(server));
+        assertTrue(((java.util.concurrent.atomic.AtomicBoolean) field.get(server)).get());
     }
 
     // ================================================================

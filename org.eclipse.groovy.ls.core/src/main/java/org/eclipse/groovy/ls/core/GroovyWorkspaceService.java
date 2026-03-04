@@ -148,7 +148,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
         com.google.gson.JsonElement levelElem = ls.get("logLevel");
         String level = (levelElem != null && !levelElem.isJsonNull()) ? levelElem.getAsString() : null;
         GroovyLanguageServerPlugin.setLogLevelFromString(level);
-        GroovyLanguageServerPlugin.logError("Log level set to: " + level);
+        GroovyLanguageServerPlugin.logInfo("Log level set to: " + level);
     }
 
     private void applyFormatterSettings(com.google.gson.JsonObject groovy) {

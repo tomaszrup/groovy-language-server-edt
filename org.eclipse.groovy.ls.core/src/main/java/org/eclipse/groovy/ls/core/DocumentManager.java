@@ -353,17 +353,21 @@ public class DocumentManager {
             return;
         }
 
-        for (TextDocumentContentChangeEvent change : changes) {
-            if (change.getRange() == null) {
-                // Full document replacement
-                content.setLength(0);
-                content.append(change.getText());
-            } else {
-                // Incremental change — convert LSP range to offsets
-                int startOffset = positionToOffset(content, change.getRange().getStart());
-                int endOffset = positionToOffset(content, change.getRange().getEnd());
-                if (startOffset >= 0 && endOffset >= startOffset && endOffset <= content.length()) {
-                    content.replace(startOffset, endOffset, change.getText());
+        // Synchronize on the StringBuilder instance to prevent concurrent
+        // reads (getContent) from seeing partially-applied incremental edits.
+        synchronized (content) {
+            for (TextDocumentContentChangeEvent change : changes) {
+                if (change.getRange() == null) {
+                    // Full document replacement
+                    content.setLength(0);
+                    content.append(change.getText());
+                } else {
+                    // Incremental change — convert LSP range to offsets
+                    int startOffset = positionToOffset(content, change.getRange().getStart());
+                    int endOffset = positionToOffset(content, change.getRange().getEnd());
+                    if (startOffset >= 0 && endOffset >= startOffset && endOffset <= content.length()) {
+                        content.replace(startOffset, endOffset, change.getText());
+                    }
                 }
             }
         }
@@ -420,7 +424,12 @@ public class DocumentManager {
      */
     public String getContent(String uri) {
         StringBuilder content = openDocuments.get(normalizeUri(uri));
-        return (content != null) ? content.toString() : null;
+        if (content == null) return null;
+        // Synchronize on the StringBuilder to get a consistent snapshot
+        // while didChange may be applying incremental edits.
+        synchronized (content) {
+            return content.toString();
+        }
     }
 
     /**
@@ -862,7 +871,7 @@ public class DocumentManager {
             offset++;
         }
 
-        return offset + position.getCharacter();
+        return Math.min(offset + position.getCharacter(), content.length());
     }
 
     /**
@@ -871,6 +880,7 @@ public class DocumentManager {
      */
     public void dispose() {
         didOpenExecutor.shutdownNow();
+        refreshScheduler.shutdownNow();
         pendingOpenFutures.values().forEach(f -> f.cancel(true));
         pendingOpenFutures.clear();
         for (var entry : workingCopies.entrySet()) {

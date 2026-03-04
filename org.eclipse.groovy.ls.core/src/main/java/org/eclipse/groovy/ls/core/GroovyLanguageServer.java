@@ -95,7 +95,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private int exitCode = 1; // non-zero until clean shutdown
     private Endpoint remoteEndpoint;
 
-    private volatile boolean initialBuildDone = false;
+    private final java.util.concurrent.atomic.AtomicBoolean initialBuildDone = new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile boolean diagnosticsEnabled = false;
     private volatile boolean firstFullBuildComplete = false;
     private volatile boolean buildInProgress = false;
@@ -328,12 +328,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     private void runInitialBuildIfNeeded() {
-        if (initialBuildDone) {
+        if (!initialBuildDone.compareAndSet(false, true)) {
             return;
         }
         GroovyLanguageServerPlugin.logInfo("Initial build timer fired (no classpath received). Building now.");
         diagnosticsEnabled = true;
-        initialBuildDone = true;
         sendStatus(STATUS_COMPILING, "Building workspace...");
         triggerFullBuild();
     }
@@ -485,7 +484,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
             // Only send "Importing" status once (on the first classpath arrival),
             // not 50 times for 50 subprojects.
-            if (!initialBuildDone) {
+            if (!initialBuildDone.get()) {
                 sendStatus(STATUS_IMPORTING, "Receiving classpaths...");
             }
 
@@ -651,8 +650,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     private void triggerBuildAfterClasspathUpdate() {
-        if (!initialBuildDone) {
-            initialBuildDone = true;
+        if (!initialBuildDone.get()) {
+            initialBuildDone.set(true);
             if (initialBuildTimer != null) {
                 initialBuildTimer.cancel(false);
             }
@@ -1280,6 +1279,14 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private void scanForSubprojects(java.io.File dir, List<java.io.File> result,
                                      String[] srcDirSuffixes, int depth, int maxDepth) {
         if (depth >= maxDepth || dir == null || !dir.isDirectory()) return;
+
+        // Skip symbolic links to prevent infinite loops from circular symlinks
+        try {
+            if (java.nio.file.Files.isSymbolicLink(dir.toPath())) return;
+        } catch (Exception ignored) {
+            // If we can't check, skip to be safe
+            return;
+        }
 
         java.io.File[] children = dir.listFiles();
         if (children == null) return;

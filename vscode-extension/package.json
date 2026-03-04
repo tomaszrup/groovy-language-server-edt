@@ -30,7 +30,10 @@
         "LSP"
     ],
     "extensionDependencies": [
-        "redhat.java"
+        "java.redhat"
+    ],
+    "extensionKind": [
+        "workspace"
     ],
     "activationEvents": [
         "workspaceContains:**/*.groovy"

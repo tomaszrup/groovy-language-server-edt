@@ -11,6 +11,7 @@ package org.eclipse.groovy.ls.core;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 import org.eclipse.core.runtime.ILog;
 import org.eclipse.core.runtime.IStatus;
@@ -56,21 +57,21 @@ public class LogOutputStream extends OutputStream {
             if (c == '\n') {
                 // Append everything before the newline, then flush the line
                 if (i > start) {
-                    buffer.append(new String(b, start, i - start));
+                    buffer.append(new String(b, start, i - start, StandardCharsets.UTF_8));
                 }
                 flush();
                 start = i + 1;
             } else if (c == '\r') {
                 // Skip carriage returns
                 if (i > start) {
-                    buffer.append(new String(b, start, i - start));
+                    buffer.append(new String(b, start, i - start, StandardCharsets.UTF_8));
                 }
                 start = i + 1;
             }
         }
         // Append any remaining bytes after the last newline
         if (start < end) {
-            buffer.append(new String(b, start, end - start));
+            buffer.append(new String(b, start, end - start, StandardCharsets.UTF_8));
         }
     }
 

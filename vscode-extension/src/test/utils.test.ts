@@ -13,15 +13,42 @@ describe('utils', () => {
         assert.equal(normalizeFsPath('/Users/Dev/Project///'), '/users/dev/project');
     });
 
+    it('normalizes paths with multiple trailing slashes', () => {
+        assert.equal(normalizeFsPath('C:\\Work\\Proj\\\\\\'), 'c:/work/proj');
+    });
+
+    it('normalizes empty string', () => {
+        assert.equal(normalizeFsPath(''), '');
+    });
+
+    it('normalizes single character path', () => {
+        assert.equal(normalizeFsPath('/'), '');
+        assert.equal(normalizeFsPath('C'), 'c');
+    });
+
+    it('normalizes UNC paths', () => {
+        assert.equal(normalizeFsPath('\\\\server\\share\\dir'), '//server/share/dir');
+    });
+
     it('detects jdt workspace URIs', () => {
         assert.equal(isJdtWorkspaceUri('file:///tmp/jdt_ws/project/src/Foo.groovy'), true);
         assert.equal(isJdtWorkspaceUri('file:///tmp/workspace/src/Foo.groovy'), false);
+    });
+
+    it('detects jdt workspace URIs case-insensitively', () => {
+        assert.equal(isJdtWorkspaceUri('file:///tmp/JDT_WS/project/src/Foo.groovy'), true);
     });
 
     it('checks path prefix with segment boundaries', () => {
         assert.equal(pathStartsWith('/a/b/c', '/a/b'), true);
         assert.equal(pathStartsWith('/a/b', '/a/b'), true);
         assert.equal(pathStartsWith('/a/beta', '/a/b'), false);
+    });
+
+    it('pathStartsWith handles empty strings', () => {
+        assert.equal(pathStartsWith('', ''), true);
+        assert.equal(pathStartsWith('/a/b', ''), true);
+        assert.equal(pathStartsWith('', '/a'), false);
     });
 
     it('infers best project path from classpath entries', () => {
@@ -44,9 +71,31 @@ describe('utils', () => {
         assert.equal(inferProjectPathFromEntries([], new Map()), undefined);
     });
 
+    it('returns undefined when entries match no project', () => {
+        const map = new Map<string, string>([
+            ['/workspace/root', '/workspace/root'],
+        ]);
+        const entries = ['/other/path/build/classes'];
+        assert.equal(inferProjectPathFromEntries(entries, map), undefined);
+    });
+
+    it('handles single entry inference', () => {
+        const map = new Map<string, string>([
+            ['/workspace/root', '/workspace/root'],
+        ]);
+        const entries = ['/workspace/root/build/classes/java/main'];
+        assert.equal(inferProjectPathFromEntries(entries, map), '/workspace/root');
+    });
+
     it('maps platform to config dir name', () => {
         assert.equal(getConfigNameForPlatform('win32'), 'config_win');
         assert.equal(getConfigNameForPlatform('darwin'), 'config_mac');
         assert.equal(getConfigNameForPlatform('linux'), 'config_linux');
+    });
+
+    it('maps uncommon platforms to linux config', () => {
+        assert.equal(getConfigNameForPlatform('freebsd'), 'config_linux');
+        assert.equal(getConfigNameForPlatform('aix'), 'config_linux');
+        assert.equal(getConfigNameForPlatform('sunos'), 'config_linux');
     });
 });

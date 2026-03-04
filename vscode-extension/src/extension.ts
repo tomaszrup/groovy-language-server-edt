@@ -6,7 +6,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import { execFileSync, execFile, ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
+import { execFile, ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
 import * as vscode from 'vscode';
 import { workspace, ExtensionContext, window, commands, OutputChannel, StatusBarItem, StatusBarAlignment, ThemeColor } from 'vscode';
 import {
@@ -425,6 +425,7 @@ export async function activate(context: ExtensionContext): Promise<void> {
     statusBarItem = window.createStatusBarItem(StatusBarAlignment.Left, 0);
     statusBarItem.name = 'Groovy Language Server';
     context.subscriptions.push(
+        outputChannel,
         statusBarItem,
         commands.registerCommand('groovy.showOutputChannel', () => {
             outputChannel.show(true);
@@ -587,7 +588,11 @@ async function preFetchClasspaths(javaApi: any): Promise<void> {
 
 export async function deactivate(): Promise<void> {
     if (client) {
-        await client.stop();
+        try {
+            await client.stop();
+        } catch (e) {
+            outputChannel.appendLine(`Error stopping language server: ${e}`);
+        }
         client = undefined;
     }
     updateStatusBar('Stopped');
@@ -704,6 +709,12 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     } as Executable;
 
     // 8. Define client options
+    const groovyWatcher = workspace.createFileSystemWatcher('**/*.groovy');
+    const javaWatcher = workspace.createFileSystemWatcher('**/*.java');
+    const gradleWatcher = workspace.createFileSystemWatcher('**/build.gradle');
+    const pomWatcher = workspace.createFileSystemWatcher('**/pom.xml');
+    context.subscriptions.push(groovyWatcher, javaWatcher, gradleWatcher, pomWatcher);
+
     const clientOptions: LanguageClientOptions = {
         documentSelector: [
             { scheme: 'file', language: 'groovy' },
@@ -712,12 +723,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
             { scheme: GROOVY_SOURCE_SCHEME, language: 'java' },
         ],
         synchronize: {
-            fileEvents: [
-                workspace.createFileSystemWatcher('**/*.groovy'),
-                workspace.createFileSystemWatcher('**/*.java'),
-                workspace.createFileSystemWatcher('**/build.gradle'),
-                workspace.createFileSystemWatcher('**/pom.xml'),
-            ],
+            fileEvents: [groovyWatcher, javaWatcher, gradleWatcher, pomWatcher],
         },
         outputChannel: outputChannel,
         traceOutputChannel: outputChannel,
@@ -748,8 +754,36 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     );
 
     outputChannel.appendLine('Starting Groovy Language Server...');
-    await client.start();
+    try {
+        await client.start();
+    } catch (e) {
+        updateStatusBar('Error', `Failed to start: ${e}`);
+        outputChannel.appendLine(`Failed to start Groovy Language Server: ${e}`);
+        window.showErrorMessage(
+            `Groovy Language Server failed to start: ${e instanceof Error ? e.message : String(e)}. ` +
+            'Check the output channel for details.'
+        );
+        client = undefined;
+        return;
+    }
     outputChannel.appendLine('Groovy Language Server started successfully.');
+
+    // Monitor client state for unexpected crashes
+    client.onDidChangeState((e) => {
+        if (e.newState === 1 /* Stopped */ && e.oldState === 2 /* Running */) {
+            outputChannel.appendLine('Groovy Language Server stopped unexpectedly.');
+            updateStatusBar('Error', 'Server stopped unexpectedly');
+            window.showErrorMessage(
+                'Groovy Language Server stopped unexpectedly. ' +
+                'Use "Groovy: Restart Language Server" to restart.',
+                'Restart'
+            ).then(choice => {
+                if (choice === 'Restart') {
+                    vscode.commands.executeCommand('groovy.restartServer');
+                }
+            });
+        }
+    });
 
     // Register the virtual document content provider for groovy-source:// URIs
     const sourceProvider = new GroovySourceContentProvider(client);
@@ -1153,7 +1187,9 @@ async function initJavaExtensionClasspath(
             `[java-ext] No JARs yet (attempt ${attempt}/${maxAttempts}). ` +
             `Retrying in ${delay / 1000}s...`
         );
-        setTimeout(() => fetchWithRetry(attempt + 1, maxAttempts), delay);
+        setTimeout(() => fetchWithRetry(attempt + 1, maxAttempts).catch(e =>
+            outputChannel.appendLine(`[java-ext] fetchWithRetry error: ${e}`)
+        ), delay);
     };
 
     // Listen for classpath changes from the Java extension
@@ -1201,7 +1237,7 @@ async function initJavaExtensionClasspath(
                             source: 'onDidProjectsImport',
                         }, projectRootMap);
                     }
-                })();
+                })().catch(e => outputChannel.appendLine(`[java-ext] onDidProjectsImport error: ${e}`));
             })
         );
         outputChannel.appendLine('[java-ext] Registered onDidProjectsImport listener.');
@@ -1251,8 +1287,16 @@ function resolveJavaHome(): string | undefined {
         });
 
     if (pathJava) {
+        const javaBinPath = path.join(pathJava, process.platform === 'win32' ? 'java.exe' : 'java');
+        // Resolve symlinks to find the real location
+        let resolvedBin: string;
+        try {
+            resolvedBin = fs.realpathSync(javaBinPath);
+        } catch {
+            resolvedBin = javaBinPath;
+        }
         // Walk up from bin/ to get java home
-        const binDir = pathJava;
+        const binDir = path.dirname(resolvedBin);
         const home = path.dirname(binDir);
         if (fs.existsSync(path.join(home, 'bin'))) {
             return home;
