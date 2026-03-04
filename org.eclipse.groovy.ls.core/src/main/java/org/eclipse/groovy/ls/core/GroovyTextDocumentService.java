@@ -204,6 +204,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
         // Invalidate hover cache so stale results are not served
         hoverProvider.invalidateHoverCache(uri);
 
+        // Invalidate code lens resolve cache so stale reference counts are refreshed
+        codeLensProvider.invalidateCodeLensCache(uri);
+
         // Re-publish diagnostics after changes
         if (server.areDiagnosticsEnabled()) {
             diagnosticsProvider.publishDiagnosticsDebounced(uri);
@@ -706,7 +709,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
     @Override
     public CompletableFuture<CodeLens> resolveCodeLens(CodeLens codeLens) {
-        return CompletableFuture.supplyAsync(() -> {
+        CompletableFuture<CodeLens> future = CompletableFuture.supplyAsync(() -> {
             try {
                 return codeLensProvider.resolveCodeLens(codeLens);
             } catch (Exception e) {
@@ -714,6 +717,11 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 return codeLens;
             }
         }, lspRequestExecutor);
+        return future.orTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    GroovyLanguageServerPlugin.logError("Code lens resolve timed out", ex);
+                    return codeLens;
+                });
     }
 
     /**

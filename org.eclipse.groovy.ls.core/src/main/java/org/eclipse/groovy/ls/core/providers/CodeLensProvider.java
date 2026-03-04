@@ -10,7 +10,10 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
@@ -51,11 +54,39 @@ public class CodeLensProvider {
     private static final String HANDLE_ID_KEY = "handleId";
     private static final String URI_KEY = "uri";
     private static final String SHOW_REFERENCES_COMMAND = "groovy.showReferences";
+    private static final int RESOLVE_CACHE_SIZE = 300;
 
     private final DocumentManager documentManager;
 
+    /**
+     * LRU cache for resolved reference locations, keyed by JDT handle ID.
+     * Avoids redundant {@link SearchEngine} searches when the user scrolls
+     * away and back.  Invalidated per-URI via {@link #invalidateCodeLensCache(String)}.
+     */
+    @SuppressWarnings("serial")
+    private final Map<String, List<Location>> resolveCache =
+            Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, List<Location>> eldest) {
+                    return size() > RESOLVE_CACHE_SIZE;
+                }
+            });
+
     public CodeLensProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
+    }
+
+    /**
+     * Invalidate cached resolve results for the given document URI.
+     * Called from {@code didChange} so that stale counts are never served.
+     */
+    public void invalidateCodeLensCache(String uri) {
+        if (uri == null) return;
+        resolveCache.entrySet().removeIf(entry -> {
+            // Handle IDs produced by JDT contain the project-relative path;
+            // a simple URI suffix check covers the common case.
+            return entry.getKey().contains(uri) || uri.contains(entry.getKey());
+        });
     }
 
     /**
@@ -126,8 +157,15 @@ public class CodeLensProvider {
                 return codeLens;
             }
 
-            // Single search pass: collect locations and derive count
-            List<Location> locations = findReferenceLocations(element);
+            // Check cache first to avoid redundant searches
+            List<Location> cached = resolveCache.get(handleId);
+            List<Location> locations;
+            if (cached != null) {
+                locations = cached;
+            } else {
+                locations = findReferenceLocations(element);
+                resolveCache.put(handleId, locations);
+            }
             int count = locations.size();
 
             String label = count == 1 ? "1 reference" : count + " references";
@@ -231,7 +269,8 @@ public class CodeLensProvider {
             org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
             IJavaSearchScope scope = (javaProject != null)
                     ? SearchEngine.createJavaSearchScope(
-                          new org.eclipse.jdt.core.IJavaElement[]{javaProject})
+                          new org.eclipse.jdt.core.IJavaElement[]{javaProject},
+                          IJavaSearchScope.SOURCES)
                     : SearchEngine.createWorkspaceScope();
             SearchEngine engine = new SearchEngine();
 
