@@ -34,6 +34,7 @@ import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.CodeLens;
 import org.eclipse.lsp4j.CodeLensParams;
 import org.eclipse.lsp4j.Command;
+import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 
@@ -48,6 +49,8 @@ import org.eclipse.lsp4j.Range;
 public class CodeLensProvider {
 
     private static final String HANDLE_ID_KEY = "handleId";
+    private static final String URI_KEY = "uri";
+    private static final String SHOW_REFERENCES_COMMAND = "editor.action.showReferences";
 
     private final DocumentManager documentManager;
 
@@ -95,10 +98,8 @@ public class CodeLensProvider {
      * Called lazily by VS Code when the lens becomes visible in the viewport.
      */
     public CodeLens resolveCodeLens(CodeLens codeLens) {
-        // Already resolved? (placeholder commands have an empty title)
-        if (codeLens.getCommand() != null
-                && codeLens.getCommand().getTitle() != null
-                && !codeLens.getCommand().getTitle().isEmpty()) {
+        // Already resolved?
+        if (codeLens.getCommand() != null) {
             return codeLens;
         }
 
@@ -125,14 +126,31 @@ public class CodeLensProvider {
                 return codeLens;
             }
 
-            int count = countReferences(element);
+            // Single search pass: collect locations and derive count
+            List<Location> locations = findReferenceLocations(element);
+            int count = locations.size();
             if (count == 0) {
                 // Hide "0 references" — set empty title so the lens is invisible
                 codeLens.setCommand(new Command("", ""));
                 return codeLens;
             }
+
             String label = count == 1 ? "1 reference" : count + " references";
-            codeLens.setCommand(new Command(label, ""));
+
+            // Extract URI from data for the command arguments
+            String uri = null;
+            if (dataElement.isJsonObject()) {
+                JsonObject obj = dataElement.getAsJsonObject();
+                if (obj.has(URI_KEY)) {
+                    uri = obj.get(URI_KEY).getAsString();
+                }
+            }
+
+            Command cmd = new Command(label, SHOW_REFERENCES_COMMAND);
+            if (uri != null) {
+                cmd.setArguments(List.of(uri, codeLens.getRange().getStart(), locations));
+            }
+            codeLens.setCommand(cmd);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("CodeLens resolve failed", e);
         }
@@ -185,12 +203,12 @@ public class CodeLensProvider {
 
             CodeLens lens = new CodeLens();
             lens.setRange(range);
-            // Set an empty-title placeholder command so VS Code does not
-            // flash "no commands" while waiting for resolveCodeLens.
-            lens.setCommand(new Command("", ""));
+            // Command left null — resolved lazily via resolveCodeLens
 
             JsonObject data = new JsonObject();
             data.addProperty(HANDLE_ID_KEY, element.getHandleIdentifier());
+            data.addProperty(URI_KEY, element.getResource() != null
+                    ? element.getResource().getLocationURI().toString() : "");
             lens.setData(data);
 
             return lens;
@@ -202,38 +220,92 @@ public class CodeLensProvider {
     }
 
     /**
-     * Count references to an element using JDT SearchEngine.
-     * Scoped to the enclosing project to reduce I/O in large workspaces.
+     * Find reference locations for an element using JDT SearchEngine.
+     * Returns a list of LSP {@link Location} objects for the peek view.
      */
-    private int countReferences(IJavaElement element) throws org.eclipse.core.runtime.CoreException {
-        SearchPattern pattern = SearchPattern.createPattern(
-                element, IJavaSearchConstants.REFERENCES);
-        if (pattern == null) {
-            return 0;
+    private List<Location> findReferenceLocations(IJavaElement element) {
+        List<Location> locations = new ArrayList<>();
+        try {
+            SearchPattern pattern = SearchPattern.createPattern(
+                    element, IJavaSearchConstants.REFERENCES);
+            if (pattern == null) {
+                return locations;
+            }
+
+            org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
+            IJavaSearchScope scope = (javaProject != null)
+                    ? SearchEngine.createJavaSearchScope(
+                          new org.eclipse.jdt.core.IJavaElement[]{javaProject})
+                    : SearchEngine.createWorkspaceScope();
+            SearchEngine engine = new SearchEngine();
+
+            engine.search(pattern,
+                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                    scope,
+                    new SearchRequestor() {
+                        @Override
+                        public void acceptSearchMatch(SearchMatch match) {
+                            Location location = toLocation(match);
+                            if (location != null) {
+                                locations.add(location);
+                            }
+                        }
+                    },
+                    null);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to find reference locations for " + element.getElementName(), e);
+        }
+        return locations;
+    }
+
+    /**
+     * Convert a JDT {@link SearchMatch} to an LSP {@link Location}.
+     */
+    private Location toLocation(SearchMatch match) {
+        try {
+            org.eclipse.core.resources.IResource resource = match.getResource();
+            if (resource == null || resource.getLocationURI() == null) {
+                return null;
+            }
+
+            String targetUri = resource.getLocationURI().toString();
+            String content = readContent(targetUri, resource);
+
+            int startOffset = match.getOffset();
+            int endOffset = startOffset + match.getLength();
+
+            Range range;
+            if (content != null) {
+                Position start = offsetToPosition(content, startOffset);
+                Position end = offsetToPosition(content, endOffset);
+                range = new Range(start, end);
+            } else {
+                range = new Range(new Position(0, 0), new Position(0, 0));
+            }
+
+            return new Location(targetUri, range);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to convert search match to location", e);
+            return null;
+        }
+    }
+
+    private String readContent(String targetUri, org.eclipse.core.resources.IResource resource) {
+        String content = documentManager.getContent(targetUri);
+        if (content != null) {
+            return content;
         }
 
-        int[] count = {0};
-        // Scope to the enclosing project — cross-project references are rare
-        // for code lens and not worth the I/O cost in large workspaces.
-        org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
-        IJavaSearchScope scope = (javaProject != null)
-                ? SearchEngine.createJavaSearchScope(
-                      new org.eclipse.jdt.core.IJavaElement[]{javaProject})
-                : SearchEngine.createWorkspaceScope();
-        SearchEngine engine = new SearchEngine();
+        if (resource instanceof org.eclipse.core.resources.IFile file) {
+            try (java.io.InputStream is = file.getContents()) {
+                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                return null;
+            }
+        }
 
-        engine.search(pattern,
-                new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                scope,
-                new SearchRequestor() {
-                    @Override
-                    public void acceptSearchMatch(SearchMatch match) {
-                        count[0]++;
-                    }
-                },
-                null);
-
-        return count[0];
+        return null;
     }
 
     Position offsetToPosition(String content, int offset) {
