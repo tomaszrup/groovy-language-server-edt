@@ -201,6 +201,50 @@ public class DiagnosticsProvider {
     }
 
     /**
+     * Publish diagnostics immediately (no debounce delay).
+     * <p>
+     * Use this for {@code didOpen} where there is nothing to coalesce —
+     * the file content is already complete and no rapid-fire edits follow.
+     * The task still runs asynchronously on the scheduler thread and
+     * respects the same version / in-flight guards as the debounced path.
+     */
+    public void publishDiagnosticsImmediate(String uri) {
+        GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsImmediate uri=" + uri);
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+
+        java.util.concurrent.atomic.AtomicLong version =
+                diagnosticVersions.computeIfAbsent(normalizedUri,
+                        k -> new java.util.concurrent.atomic.AtomicLong(0));
+        long myVersion = version.incrementAndGet();
+
+        // Cancel any pending debounced publish for the same URI
+        java.util.concurrent.ScheduledFuture<?> existing = pendingPublish.remove(normalizedUri);
+        if (existing != null) {
+            existing.cancel(false);
+        }
+
+        // Submit with zero delay — runs on the scheduler thread without
+        // blocking the LSP dispatch thread.
+        java.util.concurrent.ScheduledFuture<?> future = scheduler.schedule(() -> {
+            if (version.get() != myVersion) {
+                return;
+            }
+            if (!diagnosticsInFlight.add(normalizedUri)) {
+                return;
+            }
+            try {
+                publishDiagnostics(uri);
+            } finally {
+                diagnosticsInFlight.remove(normalizedUri);
+                if (version.get() != myVersion && documentManager.getContent(uri) != null) {
+                    publishDiagnosticsDebounced(uri);
+                }
+            }
+        }, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
+        pendingPublish.put(normalizedUri, future);
+    }
+
+    /**
      * Publish diagnostics after a short delay (debounced).
      * <p>
      * Subsequent calls for the same URI cancel the previous scheduled publish

@@ -141,41 +141,168 @@ public class WorkspaceGenerator {
     }
 
     /**
-     * Emit the smallest valid Java class file that JDT will index.
-     * Format: magic, version 61.0, minimal constant pool (this_class,
-     * super_class = java/lang/Object), ACC_PUBLIC, no fields/methods.
+     * Emit a valid Java 17 class file with fields and methods so that
+     * JDT's indexer sees realistic member counts and generic signatures.
+     * <p>
+     * Each stub class gets:
+     * <ul>
+     *   <li>3 fields with varied types (String, List&lt;T&gt;, Map&lt;K,V&gt;)</li>
+     *   <li>8 methods with generic signatures, parameters, return types</li>
+     * </ul>
+     * This makes completion lists, hover, and search index sizes closer
+     * to what a real library produces.
      */
     private byte[] buildMinimalClassFile(String fullyQualifiedName) {
         String internalName = fullyQualifiedName.replace('.', '/');
-        String superName = "java/lang/Object";
 
-        byte[] nameBytes = internalName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        byte[] superBytes = superName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        // We build the constant pool as a list then emit it.
+        // Each entry: tag byte + data.  Index 0 is unused (1-based).
+        var cpEntries = new java.util.ArrayList<byte[]>();
+        var utf8Index = new java.util.LinkedHashMap<String, Integer>();
 
-        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream(128 + nameBytes.length + superBytes.length);
-        java.io.DataOutputStream out = new java.io.DataOutputStream(buf);
+        // Helper to add a Utf8 entry and return its 1-based index
+        // (reuses existing entry if already present)
+        class CpHelper {
+            int utf8(String s) {
+                return utf8Index.computeIfAbsent(s, k -> {
+                    byte[] bytes = k.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    var entry = new java.io.ByteArrayOutputStream(3 + bytes.length);
+                    entry.write(1); // CONSTANT_Utf8
+                    entry.write((bytes.length >> 8) & 0xFF);
+                    entry.write(bytes.length & 0xFF);
+                    entry.write(bytes, 0, bytes.length);
+                    cpEntries.add(entry.toByteArray());
+                    return cpEntries.size(); // 1-based
+                });
+            }
+            int classRef(String internalClassName) {
+                int nameIdx = utf8(internalClassName);
+                var entry = new byte[] { 7, (byte)((nameIdx >> 8) & 0xFF), (byte)(nameIdx & 0xFF) };
+                cpEntries.add(entry);
+                return cpEntries.size();
+            }
+        }
+        var cp = new CpHelper();
+
+        // Core class/super entries
+        int thisClass = cp.classRef(internalName);
+        int superClass = cp.classRef("java/lang/Object");
+
+        // ---- Field descriptors ----
+        String[][] fields = {
+            { "name",     "Ljava/lang/String;" },
+            { "items",    "Ljava/util/List;",    "Ljava/util/List<Ljava/lang/String;>;" },
+            { "metadata", "Ljava/util/Map;",     "Ljava/util/Map<Ljava/lang/String;Ljava/lang/Object;>;" },
+        };
+
+        // ---- Method descriptors (name, descriptor, optional generic signature) ----
+        String[][] methods = {
+            { "getName",        "()Ljava/lang/String;",                                    null },
+            { "setName",        "(Ljava/lang/String;)V",                                   null },
+            { "getItems",       "()Ljava/util/List;",                                      "()Ljava/util/List<Ljava/lang/String;>;" },
+            { "addItem",        "(Ljava/lang/String;)Z",                                   null },
+            { "process",        "(Ljava/util/Map;)Ljava/lang/Object;",                     "(Ljava/util/Map<Ljava/lang/String;+Ljava/lang/Object;>;)Ljava/lang/Object;" },
+            { "transform",      "(Ljava/util/function/Function;)Ljava/lang/Object;",       "<R:Ljava/lang/Object;>(Ljava/util/function/Function<-Ljava/lang/String;+TR;>;)TR;" },
+            { "merge",          "(Ljava/util/Collection;Ljava/util/Comparator;)Ljava/util/List;",
+                                "<T:Ljava/lang/Object;>(Ljava/util/Collection<+TT;>;Ljava/util/Comparator<-TT;>;)Ljava/util/List<TT;>;" },
+            { "toMap",          "()Ljava/util/Map;",                                       "()Ljava/util/Map<Ljava/lang/String;Ljava/lang/Object;>;" },
+        };
+
+        // Pre-register all Utf8 entries we'll need
+        int sigAttrName = cp.utf8("Signature");
+        int codeAttrName = cp.utf8("Code");
+
+        int[][] fieldCpIdx = new int[fields.length][];
+        for (int i = 0; i < fields.length; i++) {
+            fieldCpIdx[i] = new int[] {
+                cp.utf8(fields[i][0]),
+                cp.utf8(fields[i][1]),
+                fields[i].length > 2 ? cp.utf8(fields[i][2]) : 0
+            };
+        }
+
+        int[][] methodCpIdx = new int[methods.length][];
+        for (int i = 0; i < methods.length; i++) {
+            methodCpIdx[i] = new int[] {
+                cp.utf8(methods[i][0]),
+                cp.utf8(methods[i][1]),
+                methods[i][2] != null ? cp.utf8(methods[i][2]) : 0
+            };
+        }
+
+        int cpCount = cpEntries.size() + 1; // constant_pool_count = last index + 1
+        int totalCpBytes = 0;
+        for (byte[] e : cpEntries) totalCpBytes += e.length;
+
+        // Estimate buffer size
+        var buf = new java.io.ByteArrayOutputStream(256 + totalCpBytes);
+        var out = new java.io.DataOutputStream(buf);
+
         try {
-            out.writeInt(0xCAFEBABE);          // magic
-            out.writeShort(0);                  // minor version
-            out.writeShort(61);                 // major version (Java 17)
-            out.writeShort(5);                  // constant_pool_count (entries 1..4)
+            out.writeInt(0xCAFEBABE);
+            out.writeShort(0);                  // minor
+            out.writeShort(61);                 // major (Java 17)
+            out.writeShort(cpCount);
 
-            // #1 Class -> #3
-            out.writeByte(7); out.writeShort(3);
-            // #2 Class -> #4
-            out.writeByte(7); out.writeShort(4);
-            // #3 Utf8
-            out.writeByte(1); out.writeShort(nameBytes.length); out.write(nameBytes);
-            // #4 Utf8
-            out.writeByte(1); out.writeShort(superBytes.length); out.write(superBytes);
+            for (byte[] entry : cpEntries) {
+                out.write(entry);
+            }
 
-            out.writeShort(0x0021);             // access_flags: ACC_PUBLIC | ACC_SUPER
-            out.writeShort(1);                  // this_class -> #1
-            out.writeShort(2);                  // super_class -> #2
+            out.writeShort(0x0021);             // ACC_PUBLIC | ACC_SUPER
+            out.writeShort(thisClass);
+            out.writeShort(superClass);
             out.writeShort(0);                  // interfaces_count
-            out.writeShort(0);                  // fields_count
-            out.writeShort(0);                  // methods_count
-            out.writeShort(0);                  // attributes_count
+
+            // ---- Fields ----
+            out.writeShort(fields.length);
+            for (int i = 0; i < fields.length; i++) {
+                out.writeShort(0x0002);         // ACC_PRIVATE
+                out.writeShort(fieldCpIdx[i][0]); // name
+                out.writeShort(fieldCpIdx[i][1]); // descriptor
+                if (fieldCpIdx[i][2] != 0) {
+                    out.writeShort(1);          // attributes_count = 1 (Signature)
+                    out.writeShort(sigAttrName);
+                    out.writeInt(2);            // attribute_length
+                    out.writeShort(fieldCpIdx[i][2]); // signature index
+                } else {
+                    out.writeShort(0);          // no attributes
+                }
+            }
+
+            // ---- Methods ----
+            out.writeShort(methods.length);
+            for (int i = 0; i < methods.length; i++) {
+                out.writeShort(0x0001);         // ACC_PUBLIC
+                out.writeShort(methodCpIdx[i][0]); // name
+                out.writeShort(methodCpIdx[i][1]); // descriptor
+
+                // Count attributes: always Code, optionally Signature
+                boolean hasSig = methodCpIdx[i][2] != 0;
+                out.writeShort(hasSig ? 2 : 1);
+
+                // Minimal Code attribute: max_stack=1, max_locals=1+params,
+                // code = { aconst_null, areturn } or { return } for void
+                boolean isVoid = methods[i][1].endsWith(")V");
+                byte[] code = isVoid
+                        ? new byte[] { (byte) 0xB1 }          // return
+                        : new byte[] { 0x01, (byte) 0xB0 };   // aconst_null, areturn
+                out.writeShort(codeAttrName);
+                out.writeInt(12 + code.length);  // attr length
+                out.writeShort(1);               // max_stack
+                out.writeShort(10);              // max_locals (generous)
+                out.writeInt(code.length);
+                out.write(code);
+                out.writeShort(0);               // exception_table_length
+                out.writeShort(0);               // code attributes_count
+
+                if (hasSig) {
+                    out.writeShort(sigAttrName);
+                    out.writeInt(2);
+                    out.writeShort(methodCpIdx[i][2]);
+                }
+            }
+
+            out.writeShort(0);                  // class attributes_count
             out.flush();
         } catch (IOException e) {
             throw new RuntimeException(e);
