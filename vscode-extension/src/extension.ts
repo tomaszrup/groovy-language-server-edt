@@ -682,27 +682,6 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     const configDir = getConfigDir(serverDir);
     outputChannel.appendLine(`Config directory: ${configDir}`);
 
-    // 4b. Clean stale OSGi framework cache from the configuration directory.
-    // Equinox writes bundle metadata (org.eclipse.osgi/, org.eclipse.core.runtime/,
-    // org.eclipse.equinox.app/, *.log) into the -configuration directory.
-    // If bundles in plugins/ change (e.g. after an extension update), stale cache
-    // causes bundle resolution failures → exit code 13.
-    try {
-        const configEntries = fs.readdirSync(configDir);
-        for (const entry of configEntries) {
-            if (entry === 'config.ini') continue; // keep the shipped config
-            const entryPath = path.join(configDir, entry);
-            try {
-                fs.rmSync(entryPath, { recursive: true, force: true });
-            } catch { /* best effort */ }
-        }
-        if (configEntries.length > 1) {
-            outputChannel.appendLine(`Cleaned stale OSGi cache from config directory: ${configDir}`);
-        }
-    } catch (e) {
-        outputChannel.appendLine(`Warning: failed to clean OSGi cache: ${e}`);
-    }
-
     // 5. Build the workspace data directory.
     // Wipe the previous Eclipse workspace data on every start so that stale
     // metadata (linked-folder resource trees, build state, etc.) never
