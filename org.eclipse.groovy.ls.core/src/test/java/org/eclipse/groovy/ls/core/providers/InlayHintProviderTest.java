@@ -599,9 +599,17 @@ class InlayHintProviderTest {
 
     private Object createCollector(String source, Range requestedRange, ICompilationUnit workingCopy) throws Exception {
         Class<?> collectorClass = Class.forName("org.eclipse.groovy.ls.core.providers.InlayHintProvider$ParameterHintCollector");
-        var constructor = collectorClass.getDeclaredConstructor(String.class, Range.class, ICompilationUnit.class);
+        var constructor = collectorClass.getDeclaredConstructor(String.class, Range.class, ICompilationUnit.class, DocumentManager.class);
         constructor.setAccessible(true);
-        return constructor.newInstance(source, requestedRange, workingCopy);
+        // Configure mock DocumentManager to delegate cachedCodeSelect → workingCopy.codeSelect
+        DocumentManager mockDm = mock(DocumentManager.class);
+        when(mockDm.cachedCodeSelect(org.mockito.ArgumentMatchers.any(ICompilationUnit.class),
+                org.mockito.ArgumentMatchers.anyInt())).thenAnswer(inv -> {
+            ICompilationUnit unit = inv.getArgument(0);
+            int offset = inv.getArgument(1);
+            return unit.codeSelect(offset, 0);
+        });
+        return constructor.newInstance(source, requestedRange, workingCopy, mockDm);
     }
 
     private Object invokeCollector(Object collector, String methodName, Class<?>[] paramTypes, Object[] args) throws Exception {

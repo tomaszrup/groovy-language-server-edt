@@ -105,7 +105,24 @@ dependencies {
 
 test {
     useJUnitPlatform()
+    // Exclude heavy simulation / saturation tests from the default test run.
+    // Run them explicitly via:  ./gradlew :org.eclipse.groovy.ls.core:perfTest
+    exclude '**/ExecutorSaturationTest*'
     finalizedBy jacocoTestReport
+    testLogging {
+        showStandardStreams = true
+    }
+}
+
+// Separate task for performance / saturation tests
+task perfTest(type: Test) {
+    useJUnitPlatform()
+    include '**/ExecutorSaturationTest*'
+    testLogging {
+        showStandardStreams = true
+    }
+    // Give extra heap for sustained workload tests
+    maxHeapSize = '1g'
 }
 
 jacocoTestReport {

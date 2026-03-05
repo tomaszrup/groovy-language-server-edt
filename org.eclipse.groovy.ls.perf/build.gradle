@@ -70,3 +70,47 @@ tasks.register('perfTest', Test) {
         file("${project.layout.buildDirectory.get().asFile}/reports/performance").mkdirs()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stress test task — escalating-load tests to find saturation thresholds
+// ---------------------------------------------------------------------------
+
+tasks.register('stressTest', Test) {
+    description = 'Run integration-level stress tests to detect executor saturation thresholds'
+    group = 'verification'
+
+    dependsOn ':org.eclipse.groovy.ls.product:assembleProduct'
+
+    useJUnitPlatform {
+        includeTags 'stress'
+    }
+
+    // Only run stress test classes
+    include '**/GroovyLsStressTest*'
+
+    // Each test class gets its own JVM
+    forkEvery = 1
+    maxHeapSize = '4g'
+
+    def productDir = project(':org.eclipse.groovy.ls.product').layout.buildDirectory.dir('product').get().asFile.absolutePath
+    systemProperty 'groovy.ls.server.dir', productDir
+    systemProperty 'groovy.ls.java.home', System.getProperty('java.home')
+
+    // Longer timeouts for stress tests — sustained load runs 60s+
+    systemProperty 'groovy.ls.perf.server.timeout.seconds', '300'
+
+    reports {
+        html.required = true
+        junitXml.required = true
+    }
+
+    testLogging {
+        events 'started', 'passed', 'failed', 'skipped'
+        showStandardStreams = true
+        exceptionFormat = 'full'
+    }
+
+    doFirst {
+        file("${project.layout.buildDirectory.get().asFile}/reports/performance").mkdirs()
+    }
+}

@@ -15,10 +15,14 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+
+import org.eclipse.jdt.core.IJavaElement;
 
 import org.codehaus.groovy.ast.ModuleNode;
 import org.eclipse.core.resources.IFile;
@@ -50,6 +54,29 @@ import org.eclipse.lsp4j.services.LanguageClient;
 public class DocumentManager {
 
     private static final String CLASSES_LOG_SEGMENT = " classes=";
+
+    // ── codeSelect result cache ───────────────────────────────────────────
+    //  Avoids redundant codeSelect() calls when multiple providers resolve
+    //  the same offset simultaneously (hover + documentHighlight + signatureHelp).
+    //  Entries are keyed by "normalizedUri#offset" and expire after TTL_MS.
+    //  The cache is invalidated eagerly on every didChange / didClose.
+
+    private static final int CODE_SELECT_CACHE_SIZE = 1000;
+    private static final long CODE_SELECT_TTL_MS = 5_000;
+
+    private record CodeSelectEntry(IJavaElement[] elements, long timestampMs) {
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestampMs > CODE_SELECT_TTL_MS;
+        }
+    }
+
+    private final Map<String, CodeSelectEntry> codeSelectCache =
+            Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CodeSelectEntry> eldest) {
+                    return size() > CODE_SELECT_CACHE_SIZE;
+                }
+            });
 
     /**
      * Tracks open documents: URI → current source text.
@@ -348,6 +375,11 @@ public class DocumentManager {
         if (clientUri != null) {
             clientUris.put(uri, clientUri);
         }
+
+        // Invalidate cached codeSelect results — the file content changed,
+        // so previously resolved elements at any offset may be stale.
+        invalidateCodeSelectCache(uri);
+
         StringBuilder content = openDocuments.get(uri);
         if (content == null) {
             return;
@@ -397,6 +429,7 @@ public class DocumentManager {
         uri = normalizeUri(uri);
         openDocuments.remove(uri);
         clientUris.remove(uri);
+        invalidateCodeSelectCache(uri);
         compilerService.invalidate(uri);
         compilerService.invalidate(uri + "#semantic-patched");
 
@@ -468,6 +501,70 @@ public class DocumentManager {
             throws JavaModelException {
         workingCopy.getBuffer().setContents(content);
         workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
+    }
+
+    // ── Shared codeSelect cache API ──────────────────────────────────────
+
+    /**
+     * Returns the result of {@code workingCopy.codeSelect(offset, 0)}, using a
+     * short-lived cache to avoid redundant JDT calls when multiple LSP features
+     * (hover, document-highlight, signature-help, …) resolve the same offset
+     * within a brief time window.
+     * <p>
+     * The cache is keyed by {@code "normalizedUri#offset"} with a 5-second TTL
+     * and is invalidated eagerly on every {@link #didChange} and {@link #didClose}.
+     */
+    public IJavaElement[] cachedCodeSelect(ICompilationUnit workingCopy, int offset)
+            throws org.eclipse.jdt.core.JavaModelException {
+        String uri = resolveUri(workingCopy);
+        String key = uri + "#" + offset;
+
+        CodeSelectEntry entry = codeSelectCache.get(key);
+        if (entry != null && !entry.isExpired()) {
+            return entry.elements();
+        }
+
+        IJavaElement[] result = workingCopy.codeSelect(offset, 0);
+        codeSelectCache.put(key, new CodeSelectEntry(result, System.currentTimeMillis()));
+        return result;
+    }
+
+    /**
+     * Invalidate all cached codeSelect results for the given URI.
+     */
+    public void invalidateCodeSelectCache(String uri) {
+        String normalized = normalizeUri(uri);
+        String prefix = normalized + "#";
+        codeSelectCache.entrySet().removeIf(e -> e.getKey().startsWith(prefix));
+    }
+
+    /**
+     * Clear the entire codeSelect cache.
+     */
+    public void clearCodeSelectCache() {
+        codeSelectCache.clear();
+    }
+
+    /**
+     * Resolve a working copy to its normalized URI string.
+     */
+    private String resolveUri(ICompilationUnit workingCopy) {
+        // Try reverse lookup via the workingCopies map first (O(n) but small map)
+        for (Map.Entry<String, ICompilationUnit> e : workingCopies.entrySet()) {
+            if (e.getValue() == workingCopy) {
+                return normalizeUri(e.getKey());
+            }
+        }
+        // Fallback: derive from JDT resource
+        try {
+            if (workingCopy.getResource() != null) {
+                return normalizeUri(workingCopy.getResource().getLocationURI().toString());
+            }
+        } catch (Exception ignored) {
+            // ignored
+        }
+        // Last resort — use identity hash to avoid collisions
+        return "unknown-" + System.identityHashCode(workingCopy);
     }
 
     /**

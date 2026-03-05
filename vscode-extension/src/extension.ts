@@ -719,12 +719,20 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     const config = workspace.getConfiguration('groovy');
     const initOptions: Record<string, unknown> = {};
     const requestPoolSize = config.get<number>('ls.requestPoolSize', 0);
-    const requestQueueSize = config.get<number>('ls.requestQueueSize', 128);
+    const requestQueueSize = config.get<number>('ls.requestQueueSize', 64);
+    const backgroundPoolSize = config.get<number>('ls.backgroundPoolSize', 0);
+    const backgroundQueueSize = config.get<number>('ls.backgroundQueueSize', 128);
     if (requestPoolSize > 0) {
         initOptions.lspRequestPoolSize = requestPoolSize;
     }
-    if (requestQueueSize !== 128) {
+    if (requestQueueSize !== 64) {
         initOptions.lspRequestQueueSize = requestQueueSize;
+    }
+    if (backgroundPoolSize > 0) {
+        initOptions.lspBackgroundPoolSize = backgroundPoolSize;
+    }
+    if (backgroundQueueSize !== 128) {
+        initOptions.lspBackgroundQueueSize = backgroundQueueSize;
     }
 
     const clientOptions: LanguageClientOptions = {

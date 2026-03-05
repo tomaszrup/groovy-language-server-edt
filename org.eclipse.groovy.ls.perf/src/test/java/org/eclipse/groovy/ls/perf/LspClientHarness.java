@@ -293,6 +293,28 @@ public class LspClientHarness implements AutoCloseable {
         return server.getTextDocumentService().documentSymbol(params);
     }
 
+    /** Request code lenses for the given document. */
+    public CompletableFuture<List<? extends CodeLens>> codeLens(String uri) {
+        CodeLensParams params = new CodeLensParams(
+                new TextDocumentIdentifier(uri));
+        return server.getTextDocumentService().codeLens(params);
+    }
+
+    /** Request folding ranges for the given document. */
+    public CompletableFuture<List<FoldingRange>> foldingRange(String uri) {
+        FoldingRangeRequestParams params = new FoldingRangeRequestParams(
+                new TextDocumentIdentifier(uri));
+        return server.getTextDocumentService().foldingRange(params);
+    }
+
+    /** Request inlay hints for the given document and range. */
+    public CompletableFuture<List<InlayHint>> inlayHint(String uri, int startLine, int endLine) {
+        InlayHintParams params = new InlayHintParams(
+                new TextDocumentIdentifier(uri),
+                new Range(new Position(startLine, 0), new Position(endLine, 0)));
+        return server.getTextDocumentService().inlayHint(params);
+    }
+
     // ========================================================================
     // Diagnostics observation
     // ========================================================================

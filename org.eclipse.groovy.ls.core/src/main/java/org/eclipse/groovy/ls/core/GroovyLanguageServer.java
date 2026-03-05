@@ -919,8 +919,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * <p>
      * Recognised keys (all optional):
      * <ul>
-     *   <li>{@code lspRequestPoolSize} — max threads for LSP handlers (default: {@code max(8, cpus*2)})</li>
-     *   <li>{@code lspRequestQueueSize} — bounded queue capacity (default: 128)</li>
+     *   <li>{@code lspRequestPoolSize} — max threads for interactive LSP handlers (default: {@code max(4, cpus)})</li>
+     *   <li>{@code lspRequestQueueSize} — bounded queue for the fast pool (default: 64)</li>
+     *   <li>{@code lspBackgroundPoolSize} — max threads for background/decorative handlers (default: {@code max(3, cpus-1)})</li>
+     *   <li>{@code lspBackgroundQueueSize} — bounded queue for the background pool (default: 128)</li>
      * </ul>
      */
     private void applyInitializationOptions(Object initializationOptions) {
@@ -948,10 +950,30 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             }
 
             if (poolSize > 0 || queueSize > 0) {
-                int defaultPoolSize = Math.max(8, Runtime.getRuntime().availableProcessors() * 2);
+                int cpus = Runtime.getRuntime().availableProcessors();
+                int defaultPoolSize = Math.max(4, cpus);
                 int effectivePool = poolSize > 0 ? poolSize : defaultPoolSize;
-                int effectiveQueue = queueSize > 0 ? queueSize : 128;
+                int effectiveQueue = queueSize > 0 ? queueSize : 64;
                 textDocumentService.configureRequestPool(effectivePool, effectiveQueue);
+            }
+
+            // Background pool configuration
+            int bgPoolSize = -1;
+            int bgQueueSize = -1;
+
+            if (opts.has("lspBackgroundPoolSize") && opts.get("lspBackgroundPoolSize").isJsonPrimitive()) {
+                bgPoolSize = opts.get("lspBackgroundPoolSize").getAsInt();
+            }
+            if (opts.has("lspBackgroundQueueSize") && opts.get("lspBackgroundQueueSize").isJsonPrimitive()) {
+                bgQueueSize = opts.get("lspBackgroundQueueSize").getAsInt();
+            }
+
+            if (bgPoolSize > 0 || bgQueueSize > 0) {
+                int cpus = Runtime.getRuntime().availableProcessors();
+                int defaultBgPool = Math.max(3, cpus - 1);
+                int effectiveBgPool = bgPoolSize > 0 ? bgPoolSize : defaultBgPool;
+                int effectiveBgQueue = bgQueueSize > 0 ? bgQueueSize : 128;
+                textDocumentService.configureBackgroundPool(effectiveBgPool, effectiveBgQueue);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(

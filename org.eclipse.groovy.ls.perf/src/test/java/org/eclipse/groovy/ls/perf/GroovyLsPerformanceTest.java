@@ -38,7 +38,7 @@ public class GroovyLsPerformanceTest {
     // ---- Thresholds (p95 in milliseconds) ----
 
     private static final long COMPLETION_DOT_P95_MS         = 2000;
-    private static final long COMPLETION_TYPE_P95_MS         = 2000;
+    private static final long COMPLETION_TYPE_P95_MS         = 500;
     private static final long HOVER_P95_MS                   = 1000;
     private static final long HOVER_CACHE_HIT_P95_MS         = 200;
     private static final long DIAGNOSTICS_EDIT_P95_MS        = 3000;

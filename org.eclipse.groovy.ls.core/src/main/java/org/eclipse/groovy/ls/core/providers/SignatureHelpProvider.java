@@ -105,7 +105,7 @@ public class SignatureHelpProvider {
     private List<SignatureInformation> collectJdtSignatures(ICompilationUnit workingCopy, int methodNameEnd)
             throws JavaModelException {
         List<SignatureInformation> signatures = new ArrayList<>();
-        IJavaElement[] elements = workingCopy.codeSelect(methodNameEnd, 0);
+        IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, methodNameEnd);
         if (elements == null || elements.length == 0) {
             return signatures;
         }

@@ -100,7 +100,7 @@ public class HoverProvider {
                     }
 
                     // codeSelect resolves the element at the given offset
-                    IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+                    IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
                     if (elements != null && elements.length > 0) {
                         IJavaElement element = elements[0];
                         String hoverContent = buildHoverContent(element);

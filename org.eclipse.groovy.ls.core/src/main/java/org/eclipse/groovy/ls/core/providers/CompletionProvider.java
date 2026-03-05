@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.codehaus.groovy.ast.ClassNode;
@@ -107,11 +108,35 @@ public class CompletionProvider {
     private final DocumentManager documentManager;
 
     /**
-     * Per-request cache for type hierarchy chains. Cleared at the start of
-     * each {@link #getCompletions} call to avoid stale data while preventing
-     * redundant {@code newSupertypeHierarchy()} calls within a single request.
+     * Persistent LRU cache for type hierarchy chains. Entries have a 60-second
+     * TTL so that structural changes (new supertypes, removed interfaces) are
+     * eventually picked up without requiring explicit invalidation on every edit.
+     * <p>
+     * Key: {@code IType.getFullyQualifiedName()}, Value: hierarchy chain + timestamp.
      */
-    private final java.util.Map<String, List<IType>> hierarchyCache = new java.util.HashMap<>();
+    private static final int HIERARCHY_CACHE_SIZE = 300;
+    private static final long HIERARCHY_TTL_MS = 60_000;
+
+    private record CachedHierarchy(List<IType> chain, long timestampMs) {
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestampMs > HIERARCHY_TTL_MS;
+        }
+    }
+
+    private final Map<String, CachedHierarchy> hierarchyCache =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedHierarchy> eldest) {
+                    return size() > HIERARCHY_CACHE_SIZE;
+                }
+            });
+
+    /**
+     * Invalidate the hierarchy cache (e.g. after a build or save).
+     */
+    public void invalidateHierarchyCache() {
+        hierarchyCache.clear();
+    }
 
     /**
      * Find a usable IJavaProject. The working copy's own project may be stale/non-existent
@@ -174,6 +199,89 @@ public class CompletionProvider {
     /** Maximum number of member results per type hierarchy. */
     private static final int MAX_MEMBER_RESULTS = 300;
 
+    // ---- Type-name search result cache (key = projectName:prefix) ----
+
+    private static final int TYPE_NAME_CACHE_SIZE = 200;
+    private static final long TYPE_NAME_CACHE_TTL_MS = 30_000;
+
+    private record CachedTypeNames(List<CompletionItem> items, long timestampMs) {
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestampMs > TYPE_NAME_CACHE_TTL_MS;
+        }
+    }
+
+    private final Map<String, CachedTypeNames> typeNameCache =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedTypeNames> eldest) {
+                    return size() > TYPE_NAME_CACHE_SIZE;
+                }
+            });
+
+    /**
+     * Tracks which projects have had their type search index warmed.
+     * Once a project is warmed, type-name cache entries for it are valid.
+     */
+    private final Set<String> warmedProjects = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Invalidate the type-name cache (e.g. after a save or classpath change).
+     */
+    public void invalidateTypeNameCache() {
+        typeNameCache.clear();
+    }
+
+    /**
+     * Warm the JDT search index for a specific project by issuing a dummy
+     * {@code searchAllTypeNames("*")} with {@code WAIT_UNTIL_READY_TO_SEARCH}.
+     * <p>
+     * Should be called on a low-priority background thread — NOT on the LSP
+     * request thread. After the warm completes, subsequent type-name completions
+     * for this project will return full results via {@code FORCE_IMMEDIATE_SEARCH}.
+     *
+     * @param project the Java project to warm (typically from the file just opened)
+     */
+    public void warmTypeIndex(IJavaProject project) {
+        if (project == null) return;
+        String projectName = project.getElementName();
+        if (warmedProjects.contains(projectName)) return;
+
+        try {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] Warming type index for project: " + projectName);
+            long start = System.currentTimeMillis();
+
+            SearchEngine engine = new SearchEngine();
+            IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
+                    new IJavaElement[]{project},
+                    IJavaSearchScope.SOURCES | IJavaSearchScope.APPLICATION_LIBRARIES);
+
+            engine.searchAllTypeNames(
+                    null, SearchPattern.R_PATTERN_MATCH,
+                    "*".toCharArray(), SearchPattern.R_PATTERN_MATCH,
+                    IJavaSearchConstants.TYPE,
+                    scope,
+                    new TypeNameRequestor() {
+                        @Override
+                        public void acceptType(int modifiers, char[] packageName,
+                                              char[] simpleTypeName,
+                                              char[][] enclosingTypeNames, String path) {
+                            // Discard results — we just want the index built.
+                        }
+                    },
+                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+                    null);
+
+            warmedProjects.add(projectName);
+            long elapsed = System.currentTimeMillis() - start;
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] Type index warm for '" + projectName + "' completed in " + elapsed + " ms");
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] Type index warm failed for '" + projectName + "': " + e.getMessage());
+        }
+    }
+
     public CompletionProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
     }
@@ -186,7 +294,6 @@ public class CompletionProvider {
      * Compute completion items at the cursor position.
      */
     public List<CompletionItem> getCompletions(CompletionParams params) {
-        hierarchyCache.clear();
         List<CompletionItem> items = new ArrayList<>();
 
         String uri = params.getTextDocument().getUri();
@@ -381,11 +488,13 @@ public class CompletionProvider {
 
     /**
      * Restore the original source content in the working copy buffer.
+     * Only sets the buffer contents without a full reconcile — the next
+     * diagnostics debounce pass (200ms) will reconcile with the real content.
      */
     private void restoreOriginalContent(ICompilationUnit workingCopy,
                                          String originalContent) {
         try {
-            documentManager.reconcileWithContent(workingCopy, originalContent);
+            workingCopy.getBuffer().setContents(originalContent);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "[completion] Failed to restore content after dot completion", e);
@@ -480,17 +589,17 @@ public class CompletionProvider {
     }
 
     private List<IType> buildTypeHierarchyChain(IType type,
-            java.util.Map<String, List<IType>> cache) throws JavaModelException {
+            Map<String, CachedHierarchy> cache) throws JavaModelException {
         String key = type.getFullyQualifiedName();
-        List<IType> cached = cache.get(key);
-        if (cached != null) return cached;
+        CachedHierarchy cached = cache.get(key);
+        if (cached != null && !cached.isExpired()) return cached.chain();
 
         ITypeHierarchy hierarchy = type.newSupertypeHierarchy(null);
         IType[] supertypes = hierarchy.getAllSupertypes(type);
         List<IType> chain = new ArrayList<>();
         chain.add(type);
         chain.addAll(Arrays.asList(supertypes));
-        cache.put(key, chain);
+        cache.put(key, new CachedHierarchy(chain, System.currentTimeMillis()));
         return chain;
     }
 
@@ -1727,7 +1836,7 @@ public class CompletionProvider {
                             }
                         }
                     },
-                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
                     null);
 
             String chosen = (preferredFqn[0] != null) ? preferredFqn[0] : firstFqn[0];
@@ -1749,6 +1858,10 @@ public class CompletionProvider {
 
     /**
      * Search for types matching the prefix using the JDT search engine.
+     * <p>
+     * Uses {@code FORCE_IMMEDIATE_SEARCH} so this never blocks waiting for
+     * the JDT indexer. Results are cached (30s TTL) once the project's index
+     * has been warmed by {@link #warmTypeIndex(IJavaProject)}.
      */
     private List<CompletionItem> getTypeCompletions(ICompilationUnit workingCopy,
                                  String uri,
@@ -1761,6 +1874,17 @@ public class CompletionProvider {
         try {
             IJavaProject project = findWorkingProject(workingCopy);
             if (project == null) return items;
+
+            // ---- Cache lookup (only valid for warmed projects) ----
+            String projectName = project.getElementName();
+            String cacheKey = projectName + ":" + (annotationOnly ? "@" : "") + prefix;
+            if (warmedProjects.contains(projectName)) {
+                CachedTypeNames cached = typeNameCache.get(cacheKey);
+                if (cached != null && !cached.isExpired()) {
+                    return new ArrayList<>(cached.items());
+                }
+            }
+
             Set<String> existingImports = getExistingImports(uri, content);
             String currentPackage = getCurrentPackageName(content);
             int importInsertLine = findImportInsertLine(content);
@@ -1804,11 +1928,17 @@ public class CompletionProvider {
                             }
                         }
                     },
-                    IJavaSearchConstants.WAIT_UNTIL_READY_TO_SEARCH,
+                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
                     null);
 
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"
                     + prefix + "': " + items.size() + " results");
+
+            // Cache results if this project's index is fully warmed
+            if (warmedProjects.contains(projectName)) {
+                typeNameCache.put(cacheKey,
+                        new CachedTypeNames(new ArrayList<>(items), System.currentTimeMillis()));
+            }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[completion] Type search failed", e);
         }

@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.0.18",
+    "version": "1.0.19",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -164,14 +164,28 @@
                     "type": "integer",
                     "default": 0,
                     "minimum": 0,
-                    "markdownDescription": "Max threads for LSP request handlers (completion, hover, definition, …). `0` = auto (`max(8, cpus×2)`). Increase to **24–32** for very large workspaces (50+ subprojects) on machines with 8+ cores.",
+                    "markdownDescription": "Max threads for the **fast** (interactive) pool handling hover, completion, definition, semanticTokens, codeAction, etc. `0` = auto (`max(4, cpus)`). The fast pool is isolated from background work so interactive requests are never starved.",
                     "scope": "machine-overridable"
                 },
                 "groovy.ls.requestQueueSize": {
                     "type": "integer",
+                    "default": 64,
+                    "minimum": 16,
+                    "markdownDescription": "Bounded queue capacity for the fast pool. Interactive requests should fail fast rather than wait in a deep queue.",
+                    "scope": "machine-overridable"
+                },
+                "groovy.ls.backgroundPoolSize": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "markdownDescription": "Max threads for the **background** pool handling decorative features (documentSymbol, codeLens, foldingRange, inlayHint). `0` = auto (`max(3, cpus-1)`). These features render in the gutter/outline and tolerate higher latency.",
+                    "scope": "machine-overridable"
+                },
+                "groovy.ls.backgroundQueueSize": {
+                    "type": "integer",
                     "default": 128,
                     "minimum": 16,
-                    "markdownDescription": "Bounded queue capacity that absorbs request bursts (e.g. opening many files at once). Increase if you still see 'executor saturated' warnings in the output channel.",
+                    "markdownDescription": "Bounded queue capacity for the background pool. A larger queue is acceptable here since background requests are not user-blocking.",
                     "scope": "machine-overridable"
                 }
             }

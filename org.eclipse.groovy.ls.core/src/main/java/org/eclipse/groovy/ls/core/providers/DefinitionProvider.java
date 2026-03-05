@@ -120,9 +120,7 @@ public class DefinitionProvider {
             GroovyLanguageServerPlugin.logInfo("[definition] codeSelect at offset " + offset
                     + " word='" + word + "' workingCopy=" + workingCopy.getClass().getName());
 
-            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
-            GroovyLanguageServerPlugin.logInfo("[definition] codeSelect returned "
-                    + (elements != null ? elements.length : 0) + " element(s)");
+            IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
             if (elements != null) {
                 resolveElementLocations(elements, locations);
             }

@@ -136,7 +136,8 @@ public class InlayHintProvider {
 
                 if (workingCopy != null) {
                     ParameterHintCollector jdtCollector =
-                            new ParameterHintCollector(content, requestedRange, workingCopy);
+                            new ParameterHintCollector(content, requestedRange, workingCopy,
+                                    documentManager);
                     jdtCollector.visitModule(module);
                     parameterHints.addAll(jdtCollector.getHints());
                 }
@@ -531,14 +532,17 @@ public class InlayHintProvider {
         private final String source;
         private final Range requestedRange;
         private final ICompilationUnit workingCopy;
+        private final DocumentManager documentManager;
         private final List<InlayHint> hints = new ArrayList<>();
         private final Set<String> emitted = new HashSet<>();
         private SourceUnit sourceUnit;
 
-        ParameterHintCollector(String source, Range requestedRange, ICompilationUnit workingCopy) {
+        ParameterHintCollector(String source, Range requestedRange, ICompilationUnit workingCopy,
+                               DocumentManager documentManager) {
             this.source = source;
             this.requestedRange = requestedRange;
             this.workingCopy = workingCopy;
+            this.documentManager = documentManager;
         }
 
         @Override
@@ -698,7 +702,7 @@ public class InlayHintProvider {
 
         private IMethod resolveBestMethodTarget(int offset, String methodName, int argumentCount) {
             try {
-                IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+                IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
                 List<IMethod> methods = new ArrayList<>();
                 if (elements != null) {
                     for (IJavaElement element : elements) {
@@ -717,7 +721,7 @@ public class InlayHintProvider {
 
         private IMethod resolveBestConstructorTarget(int offset, int argumentCount) {
             try {
-                IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+                IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
                 List<IMethod> constructors = collectConstructorCandidates(elements);
                 return chooseBestMethod(constructors, argumentCount);
             } catch (Exception ignored) {

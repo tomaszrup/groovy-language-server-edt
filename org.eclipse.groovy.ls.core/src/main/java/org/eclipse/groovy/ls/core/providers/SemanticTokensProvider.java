@@ -190,8 +190,8 @@ public class SemanticTokensProvider {
         }
 
         if (moduleNode == null) {
-            // Fallback: use standalone Groovy compiler AST
-            moduleNode = documentManager.getGroovyAST(uri);
+            // Fallback: use cached Groovy AST if available (avoids on-demand parsing)
+            moduleNode = documentManager.getCachedGroovyAST(uri);
         }
 
         // If we have no module at all, or a module with 0 classes, try the
