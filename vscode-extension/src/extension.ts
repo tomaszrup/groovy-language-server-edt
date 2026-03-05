@@ -647,9 +647,61 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
 
     outputChannel.appendLine(`Launcher JAR: ${launcherJar}`);
 
+    // 3b. Validate critical plugin JARs are not corrupt (truncated downloads).
+    // A corrupt JAR (e.g. truncated during download from JFrog) causes Equinox
+    // to fail with a ZipException and exit code 13 — a confusing error with no
+    // actionable message.  Check the most critical JARs upfront.
+    const pluginsDir = path.join(serverDir, 'plugins');
+    const criticalJars = fs.readdirSync(pluginsDir).filter(
+        name => name.endsWith('.jar') && (
+            name.startsWith('org.eclipse.jdt.core_') ||
+            name.startsWith('org.eclipse.jdt.groovy.core_') ||
+            name.startsWith('org.eclipse.groovy.ls.core_') ||
+            name.startsWith('org.codehaus.groovy_')
+        )
+    );
+    const MIN_JAR_SIZE = 50_000; // 50 KB — legitimate JARs are much larger
+    for (const jar of criticalJars) {
+        const jarPath = path.join(pluginsDir, jar);
+        try {
+            const stat = fs.statSync(jarPath);
+            if (stat.size < MIN_JAR_SIZE) {
+                const sizeMB = (stat.size / 1024).toFixed(1);
+                outputChannel.appendLine(`WARNING: ${jar} appears corrupt (${sizeMB} KB — expected several MB)`);
+                updateStatusBar('Error', `Corrupt JAR: ${jar}`);
+                window.showErrorMessage(
+                    `Groovy Language Server: ${jar} appears corrupt (only ${sizeMB} KB). ` +
+                    'Please rebuild the server with: ./gradlew :org.eclipse.groovy.ls.product:assembleProduct'
+                );
+                return;
+            }
+        } catch { /* best effort — let Equinox report the error */ }
+    }
+
     // 4. Determine platform-specific config directory
     const configDir = getConfigDir(serverDir);
     outputChannel.appendLine(`Config directory: ${configDir}`);
+
+    // 4b. Clean stale OSGi framework cache from the configuration directory.
+    // Equinox writes bundle metadata (org.eclipse.osgi/, org.eclipse.core.runtime/,
+    // org.eclipse.equinox.app/, *.log) into the -configuration directory.
+    // If bundles in plugins/ change (e.g. after an extension update), stale cache
+    // causes bundle resolution failures → exit code 13.
+    try {
+        const configEntries = fs.readdirSync(configDir);
+        for (const entry of configEntries) {
+            if (entry === 'config.ini') continue; // keep the shipped config
+            const entryPath = path.join(configDir, entry);
+            try {
+                fs.rmSync(entryPath, { recursive: true, force: true });
+            } catch { /* best effort */ }
+        }
+        if (configEntries.length > 1) {
+            outputChannel.appendLine(`Cleaned stale OSGi cache from config directory: ${configDir}`);
+        }
+    } catch (e) {
+        outputChannel.appendLine(`Warning: failed to clean OSGi cache: ${e}`);
+    }
 
     // 5. Build the workspace data directory.
     // Wipe the previous Eclipse workspace data on every start so that stale
@@ -693,6 +745,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         '-Declipse.product=org.eclipse.groovy.ls.core.product',
         '-Dosgi.bundles.defaultStartLevel=4',
         '-Dosgi.checkConfiguration=true',
+        '-Dosgi.clean=true',
         '-Dfile.encoding=UTF-8',
         '-jar', launcherJar,
         '-configuration', configDir,

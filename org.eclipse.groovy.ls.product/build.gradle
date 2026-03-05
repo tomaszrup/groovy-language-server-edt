@@ -122,7 +122,19 @@ tasks.register('downloadGroovyEclipsePlugins') {
                         output << input
                     }
                 }
-                logger.lifecycle("  -> ${String.format('%.1f', targetFile.length() / (1024.0 * 1024.0))} MB")
+                def sizeMB = String.format('%.1f', targetFile.length() / (1024.0 * 1024.0))
+                logger.lifecycle("  -> ${sizeMB} MB")
+
+                // Validate the JAR is a valid ZIP (catches truncated downloads)
+                try {
+                    def zipFile = new java.util.zip.ZipFile(targetFile)
+                    zipFile.close()
+                } catch (Exception e) {
+                    targetFile.delete()
+                    throw new GradleException(
+                        "Downloaded JAR is corrupt (not a valid ZIP): ${jarName} — ${e.message}. " +
+                        "Re-run the build to retry the download.")
+                }
             } else {
                 logger.lifecycle("Already downloaded: ${jarName}")
             }
