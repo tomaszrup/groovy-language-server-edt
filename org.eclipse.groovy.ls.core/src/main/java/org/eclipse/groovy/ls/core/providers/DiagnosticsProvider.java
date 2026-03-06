@@ -48,6 +48,34 @@ public class DiagnosticsProvider {
     private static final int GROOVY_RUN_SCRIPT_PROBLEM_ID = 67108964;
     /** IProblem.PackageIsNotExpectedPackage — false positive when AST has zero classes. */
     private static final int PACKAGE_IS_NOT_EXPECTED_PROBLEM_ID = 536871240;
+    /**
+     * IProblem.IsClassPathCorrect (16777540) — "The type X cannot be resolved.
+     * It is indirectly referenced from required .class files".  Groovy-compiled
+     * classes always reference internal Groovy runtime types (GroovyObject,
+     * MetaClass, etc.) that may not be on the JDT classpath yet (or at all,
+     * when the Groovy plugin provides them implicitly).
+     */
+    private static final int IS_CLASSPATH_CORRECT_PROBLEM_ID = 16777540;
+    /**
+     * Groovy runtime type prefixes whose "indirectly referenced" errors are
+     * always suppressed.  These are compiler-internal references injected by
+     * the Groovy compiler into every .class file — users cannot act on them
+     * regardless of which Groovy version they use.
+     */
+    private static final String[] GROOVY_RUNTIME_TYPE_PREFIXES = {
+        "groovy.lang.GroovyObject",
+        "groovy.lang.MetaClass",
+        "groovy.lang.GroovyCallable",
+        "groovy.lang.Closure",
+        "groovy.lang.GString",
+        "groovy.lang.Range",
+        "groovy.lang.Script",
+        "groovy.lang.MetaObjectProtocol",
+        "groovy.transform.Generated",
+        "groovy.transform.Internal",
+        "groovy.transform.stc.",
+        "org.codehaus.groovy.",
+    };
     private static final String GENERAL_CONVERSION_ERROR_PREFIX =
             "Groovy:General error during conversion:";
     private static final String NO_SUCH_CLASS_PREFIX = "No such class: ";
@@ -580,6 +608,19 @@ public class DiagnosticsProvider {
             return true;
         }
 
+        // Suppress "indirectly referenced from required .class files" for
+        // Groovy runtime types.  Every compiled Groovy class references
+        // GroovyObject, MetaClass, Generated, Internal, etc.  If the Groovy
+        // runtime JAR hasn't been sent via classpathUpdate yet (timing) or
+        // is provided implicitly by the build tool's Groovy plugin, these
+        // errors are false positives the user cannot fix.  The check is
+        // version-agnostic — it matches type prefixes, not specific JARs.
+        if (problemId == IS_CLASSPATH_CORRECT_PROBLEM_ID
+                && message != null
+                && isGroovyRuntimeIndirectReference(message)) {
+            return true;
+        }
+
         // Filter a known transient Groovy-Eclipse issue: a source type exists in the
         // project but JDTClassNode.getTypeClass() cannot load it through transform loader.
         if (isExistingTypeTransformLoaderFailure(message, javaProject, contextUnit)) {
@@ -589,6 +630,40 @@ public class DiagnosticsProvider {
         // Filter transient unresolved-class diagnostics when the target type
         // is actually present in the project and resolvable from context.
         return isResolvableUnableToResolveClassFailure(message, javaProject, contextUnit);
+    }
+
+    /**
+     * Test whether an "indirectly referenced" error message refers to a
+     * well-known Groovy runtime type.  The message format is:
+     * <pre>
+     * The type groovy.lang.GroovyObject cannot be resolved.
+     * It is indirectly referenced from required .class files
+     * </pre>
+     * We extract the fully-qualified type name and check it against
+     * {@link #GROOVY_RUNTIME_TYPE_PREFIXES}.
+     */
+    private static boolean isGroovyRuntimeIndirectReference(String message) {
+        // Fast pre-check: avoid regex for messages that clearly don't match.
+        if (!message.contains("groovy.") && !message.contains("org.codehaus.groovy.")) {
+            return false;
+        }
+        // Extract the type name between "The type " and " cannot be resolved"
+        int start = message.indexOf("The type ");
+        if (start < 0) {
+            return false;
+        }
+        start += "The type ".length();
+        int end = message.indexOf(" cannot be resolved", start);
+        if (end < 0) {
+            return false;
+        }
+        String typeName = message.substring(start, end).trim();
+        for (String prefix : GROOVY_RUNTIME_TYPE_PREFIXES) {
+            if (typeName.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean isExistingTypeTransformLoaderFailure(
