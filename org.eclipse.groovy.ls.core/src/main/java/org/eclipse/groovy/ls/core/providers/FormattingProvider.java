@@ -12,6 +12,7 @@ package org.eclipse.groovy.ls.core.providers;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -49,7 +50,8 @@ import org.xml.sax.SAXException;
  * Supports Eclipse formatter profile XML files — the same {@code .xml} files
  * used by Eclipse IDE's Java/Groovy formatter settings. When a profile file
  * path is set (via the {@code groovy.format.settingsUrl} configuration), its
- * settings are loaded and applied. Otherwise, sensible defaults are used,
+ * settings are loaded and applied. Otherwise, the bundled IntelliJ-style
+ * profile is used as the default,
  * respecting the LSP {@link FormattingOptions} (tab size, insert spaces).
  * <p>
  * The JDT CodeFormatter handles core formatting: indentation, brace placement,
@@ -60,6 +62,9 @@ import org.xml.sax.SAXException;
  * what it cannot parse rather than mangling it.
  */
 public class FormattingProvider {
+
+    private static final String BUNDLED_DEFAULT_PROFILE_RESOURCE =
+            "/org/eclipse/groovy/ls/core/providers/intellij-formatter.xml";
 
     private final DocumentManager documentManager;
 
@@ -81,6 +86,7 @@ public class FormattingProvider {
 
     public FormattingProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
+        loadBundledDefaultProfile();
     }
 
     // ================================================================
@@ -220,13 +226,15 @@ public class FormattingProvider {
 
     /**
      * Set or update the formatter profile path. Called when the configuration
-     * changes. Pass {@code null} to clear and use defaults.
+      * changes. Pass {@code null} to clear and use the bundled default profile.
      */
     public void setFormatterProfilePath(String path) {
         if (path == null || path.isEmpty()) {
+            // Clearing user config falls back to the bundled default profile.
             profileOptions = null;
             loadedProfilePath = null;
-            GroovyLanguageServerPlugin.logInfo("Formatter profile cleared; using defaults.");
+            loadBundledDefaultProfile();
+            GroovyLanguageServerPlugin.logInfo("Formatter profile cleared; using bundled default profile.");
             return;
         }
 
@@ -250,6 +258,36 @@ public class FormattingProvider {
         } catch (IOException | ParserConfigurationException | SAXException e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to load Eclipse formatter profile from: " + path, e);
+        }
+    }
+
+    private void loadBundledDefaultProfile() {
+        try (InputStream stream = FormattingProvider.class
+                .getResourceAsStream(BUNDLED_DEFAULT_PROFILE_RESOURCE)) {
+            if (stream == null) {
+                GroovyLanguageServerPlugin.logWarning(
+                        "Bundled formatter profile resource not found: "
+                                + BUNDLED_DEFAULT_PROFILE_RESOURCE);
+                return;
+            }
+
+            Map<String, String> loaded = loadEclipseFormatterProfile(stream);
+            if (!loaded.isEmpty()) {
+                profileOptions = loaded;
+                loadedProfilePath = "classpath:" + BUNDLED_DEFAULT_PROFILE_RESOURCE;
+                GroovyLanguageServerPlugin.logInfo(
+                        "Loaded bundled default formatter profile (" + loaded.size()
+                                + " settings) from: " + loadedProfilePath);
+            } else {
+                GroovyLanguageServerPlugin.logWarning(
+                        "Bundled formatter profile has no settings: "
+                                + BUNDLED_DEFAULT_PROFILE_RESOURCE);
+            }
+        } catch (IOException | ParserConfigurationException | SAXException e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to load bundled default formatter profile: "
+                            + BUNDLED_DEFAULT_PROFILE_RESOURCE,
+                    e);
         }
     }
 
@@ -471,7 +509,7 @@ public class FormattingProvider {
     /**
      * Build the formatter options map. Priority order:
      * <ol>
-     *   <li>Eclipse formatter profile XML settings (highest)</li>
+        *   <li>Loaded profile settings (bundled default or user-provided) (highest)</li>
      *   <li>LSP formatting options (tab size, insert spaces)</li>
      *   <li>JDT/JavaCore defaults (lowest)</li>
      * </ol>
@@ -593,9 +631,8 @@ public class FormattingProvider {
      * }</pre>
      * We extract all {@code <setting>} elements and map {@code id → value}.
      */
-        static Map<String, String> loadEclipseFormatterProfile(String path)
+    static Map<String, String> loadEclipseFormatterProfile(String path)
             throws IOException, ParserConfigurationException, SAXException {
-        Map<String, String> settings = new HashMap<>();
         File file = resolveProfilePath(path);
 
         if (file == null || !file.exists()) {
@@ -603,14 +640,22 @@ public class FormattingProvider {
                     "Formatter profile not found: " + path);
         }
 
-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-        // Security: disable external entities
-        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        try (InputStream input = new FileInputStream(file)) {
+            return loadEclipseFormatterProfile(input);
+        }
+    }
 
+    static Map<String, String> loadEclipseFormatterProfile(InputStream profileInput)
+            throws IOException, ParserConfigurationException, SAXException {
+        if (profileInput == null) {
+            throw new IllegalArgumentException("profileInput must not be null");
+        }
+
+        Map<String, String> settings = new HashMap<>();
+
+        DocumentBuilderFactory factory = createSecureDocumentBuilderFactory();
         DocumentBuilder builder = factory.newDocumentBuilder();
-        Document doc = builder.parse(file);
+        Document doc = builder.parse(profileInput);
 
         // Find all <setting> elements (could be under <profile> or directly)
         NodeList settingNodes = doc.getElementsByTagName("setting");
@@ -624,6 +669,16 @@ public class FormattingProvider {
         }
 
         return settings;
+    }
+
+    private static DocumentBuilderFactory createSecureDocumentBuilderFactory()
+            throws ParserConfigurationException {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        // Security: disable external entities
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        return factory;
     }
 
     /**

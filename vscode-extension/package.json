@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.0.22",
+    "version": "1.0.23",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -127,7 +127,7 @@
                 "groovy.format.settingsUrl": {
                     "type": "string",
                     "default": null,
-                    "markdownDescription": "Path to an Eclipse formatter profile XML file. Supports absolute paths, workspace-relative paths, and `file://` URIs. This is the same XML format exported by Eclipse IDE's **Java > Code Style > Formatter** preferences.",
+                    "markdownDescription": "Path to an Eclipse formatter profile XML file. Supports absolute paths, workspace-relative paths, and `file://` URIs. This is the same XML format exported by Eclipse IDE's **Java > Code Style > Formatter** preferences. If unset, the language server uses its bundled IntelliJ-style default profile.",
                     "scope": "resource"
                 },
                 "groovy.format.enabled": {

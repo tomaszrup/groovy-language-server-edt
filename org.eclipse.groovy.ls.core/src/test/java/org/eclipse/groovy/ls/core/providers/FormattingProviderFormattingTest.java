@@ -453,12 +453,12 @@ class FormattingProviderFormattingTest {
     }
 
     // ================================================================
-    // Various formatting rules via Eclipse profile XML
+    // Various formatting rules via default IntelliJ-style profile XML
     // ================================================================
 
     @Test
     void formatWithRealEclipseProfileSimpleClass() throws Exception {
-        // The Red Hat Eclipse formatter profile uses tabs (size 4), end_of_line braces,
+        // The default profile uses spaces (size 4), end_of_line braces,
         // 120-char line split, continuation indent of 2, blank line between methods, etc.
         provider.setFormatterProfilePath(getEclipseProfilePath());
 
@@ -469,12 +469,11 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        // The profile uses tabs — pass insertSpaces=false to agree
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
         assertFalse(formatted.isEmpty());
-        // The Eclipse profile uses tabs for indentation
-        assertTrue(formatted.contains("\t"), "Eclipse profile should produce tab indentation");
+        assertFalse(formatted.contains("\t"), "Default profile should use spaces for indentation");
+        assertTrue(formatted.contains("    void method"), "Default profile should keep 4-space indentation");
         assertTrue(formatted.contains("class Simple"));
     }
 
@@ -493,9 +492,9 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
-        // Eclipse profile sets brace_position_for_type_declaration=end_of_line,
+        // Default profile sets brace_position_for_type_declaration=end_of_line,
         // so the opening brace should be on the same line as the class keyword
         boolean classAndBraceOnSameLine = false;
         for (String line : formatted.split("\n")) {
@@ -505,7 +504,7 @@ class FormattingProviderFormattingTest {
             }
         }
         assertTrue(classAndBraceOnSameLine,
-                "Eclipse profile should keep braces on end-of-line");
+            "Default profile should keep braces on end-of-line");
     }
 
     @Test
@@ -525,9 +524,9 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
-        // Eclipse profile sets blank_lines_before_method=1,
+        // Default profile sets blank_lines_before_method=1,
         // so there should be a blank line between methods
         assertTrue(formatted.contains("class BlankLines"));
         assertTrue(formatted.contains("first"));
@@ -539,7 +538,7 @@ class FormattingProviderFormattingTest {
     void formatWithRealEclipseProfileLineWrapping() throws Exception {
         provider.setFormatterProfilePath(getEclipseProfilePath());
 
-        // Eclipse profile sets lineSplit=120
+        // Default profile sets lineSplit=120
         String source = """
                 class LineWrap {
                 void method(int parameterOne, int parameterTwo, int parameterThree, int parameterFour, int parameterFive, int parameterSix, int parameterSeven) {
@@ -547,7 +546,7 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
         assertFalse(formatted.isEmpty());
         assertTrue(formatted.contains("class LineWrap"));
@@ -555,7 +554,7 @@ class FormattingProviderFormattingTest {
 
     @Test
     void formatWithRealEclipseProfileSpockSpec() throws Exception {
-        // Use the real Eclipse profile to format a Spock-style spec
+        // Use the default profile to format a Spock-style spec
         provider.setFormatterProfilePath(getEclipseProfilePath());
 
         String source = """
@@ -584,7 +583,7 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
         assertTrue(formatted.contains("class ServiceSpec"));
         // Block labels should survive formatting with real profile
@@ -604,7 +603,7 @@ class FormattingProviderFormattingTest {
                 PENDING
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
         assertTrue(formatted.contains("enum Status"));
         assertTrue(formatted.contains("ACTIVE"));
@@ -629,16 +628,16 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
-        // Eclipse profile: insert_new_line_before_catch_in_try_statement = "do not insert"
+        // Default profile: insert_new_line_before_catch_in_try_statement = "do not insert"
         // so catch should be on the same line as the closing brace of try
         assertTrue(formatted.contains("try"));
         assertTrue(formatted.contains("catch"));
         assertTrue(formatted.contains("finally"));
         // Verify "} catch" pattern (no newline before catch)
         assertTrue(formatted.contains("} catch"),
-                "Eclipse profile keeps catch on same line as closing brace");
+            "Default profile keeps catch on same line as closing brace");
     }
 
     @Test
@@ -659,7 +658,7 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
         assertTrue(formatted.contains("switch"));
         assertTrue(formatted.contains("case 1"));
@@ -694,7 +693,7 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
         assertTrue(formatted.contains("class CalculationSpec"));
         assertTrue(formatted.contains("expect:"));
@@ -725,7 +724,7 @@ class FormattingProviderFormattingTest {
                 }
                 }
                 """;
-        String formatted = formatContent(source, new FormattingOptions(4, false));
+        String formatted = formatContent(source, new FormattingOptions(4, true));
         assertNotNull(formatted);
         assertTrue(formatted.contains("class StatefulSpec"));
         assertTrue(formatted.contains("given:"));
@@ -737,8 +736,8 @@ class FormattingProviderFormattingTest {
 
     @Test
     void formatWithCustomSpacesProfileOverridesEclipseDefaults() throws Exception {
-        // Create a custom profile that differs from the real Eclipse profile:
-        // use spaces instead of tabs, 2-space indent
+        // Create a custom profile that differs from the default profile:
+        // use 2-space indentation instead of the default 4-space indentation
         String profilePath = createProfileXml(Map.of(
                 "org.eclipse.jdt.core.formatter.tabulation.char", "space",
                 "org.eclipse.jdt.core.formatter.tabulation.size", "2",
@@ -845,7 +844,7 @@ class FormattingProviderFormattingTest {
 
     @Test
     void formatLspOptionsOverrideProfile() throws Exception {
-        // Load the real Eclipse profile (uses tabs)
+        // Load the default profile (uses spaces)
         provider.setFormatterProfilePath(getEclipseProfilePath());
 
         String source = """
@@ -1261,10 +1260,10 @@ class FormattingProviderFormattingTest {
                 }
                 """;
 
-        // First: format with the real Eclipse profile (tabs)
+        // First: format with the default profile (spaces)
         provider.setFormatterProfilePath(getEclipseProfilePath());
-        String withEclipse = formatContent(source, new FormattingOptions(4, false));
-        assertNotNull(withEclipse);
+        String withDefaultProfile = formatContent(source, new FormattingOptions(4, true));
+        assertNotNull(withDefaultProfile);
 
         // Second: switch to a custom 2-space profile
         String spacesProfile = createProfileXml(Map.of(
@@ -1275,7 +1274,7 @@ class FormattingProviderFormattingTest {
         assertNotNull(withSpaces);
 
         // Both should produce valid output
-        assertTrue(withEclipse.contains("class ProfileSwitch"));
+        assertTrue(withDefaultProfile.contains("class ProfileSwitch"));
         assertTrue(withSpaces.contains("class ProfileSwitch"));
     }
 
@@ -1289,9 +1288,9 @@ class FormattingProviderFormattingTest {
                 }
                 """;
 
-        // Load the real Eclipse profile
+        // Load the default profile
         provider.setFormatterProfilePath(getEclipseProfilePath());
-        String withProfile = formatContent(source, new FormattingOptions(4, false));
+        String withProfile = formatContent(source, new FormattingOptions(4, true));
 
         // Clear the profile
         provider.setFormatterProfilePath(null);

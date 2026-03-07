@@ -27,7 +27,7 @@ The following LSP capabilities are supported:
 - **Inlay Hints** — inline type annotations for `def` variables, parameter name hints, closure parameter types, and method return types
 - **Semantic Highlighting** — semantic-aware syntax highlighting with custom `typeKeyword` token type for `class`, `interface`, `enum`, `trait` keywords
 - **Document Highlight** — highlights all occurrences of a symbol in the current file
-- **Formatting** — document formatting (full, range, and on-type for `}`, `;`, `\n`) with optional Eclipse formatter XML profile support
+- **Formatting** — document formatting (full, range, and on-type for `}`, `;`, `\n`) using a bundled IntelliJ-style default profile, with optional Eclipse formatter XML profile override support
 - **Folding Ranges** — code folding for classes, methods, imports, and region markers
 - **Type Hierarchy** — explore supertypes and subtypes of a class or interface
 - **Call Hierarchy** — explore incoming and outgoing calls for a method
@@ -65,7 +65,7 @@ The extension ships a `language-configuration.json` that enables rich editing su
 | `groovy.ls.vmargs` | `string` | Extra JVM arguments for the language server (default: `"-Xmx1G"`) |
 | `groovy.trace.server` | `string` | Traces communication between VS Code and the server. Values: `off` (default), `messages`, `verbose` |
 | `groovy.format.enabled` | `boolean` | Enable or disable document formatting (default: `true`) |
-| `groovy.format.settingsUrl` | `string` | Path to an Eclipse formatter XML profile. Supports absolute paths, workspace-relative paths, and `file://` URIs |
+| `groovy.format.settingsUrl` | `string` | Path to an Eclipse formatter XML profile. Supports absolute paths, workspace-relative paths, and `file://` URIs. If unset, the bundled IntelliJ-style default profile is used |
 | `groovy.inlayHints.variableTypes.enabled` | `boolean` | Show inferred type hints for variables declared with `def` (default: `true`) |
 | `groovy.inlayHints.parameterNames.enabled` | `boolean` | Show parameter name hints at method and constructor call sites (default: `true`) |
 | `groovy.inlayHints.closureParameterTypes.enabled` | `boolean` | Show inferred types for closure parameters (default: `true`) |
@@ -73,7 +73,7 @@ The extension ships a `language-configuration.json` that enables rich editing su
 
 ### Eclipse Formatter XML
 
-You can point the formatter to an Eclipse formatter XML profile:
+By default, the formatter uses the bundled IntelliJ-style profile. You can override it by pointing to an Eclipse formatter XML profile:
 
 ```json
 {

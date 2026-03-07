@@ -373,8 +373,29 @@ class FormattingProviderTest {
     @Test
     void setFormatterProfilePathClearsOnNull() {
         FormattingProvider provider = new FormattingProvider(new DocumentManager());
+
+        // First override bundled defaults with a temporary tabs profile.
+        Path profile = tempDir.resolve("tabs_profile.xml");
+        try {
+            Files.writeString(profile, """
+                    <profiles>
+                      <profile kind=\"CodeFormatterProfile\" name=\"Tabs\" version=\"21\">
+                        <setting id=\"org.eclipse.jdt.core.formatter.tabulation.char\" value=\"tab\"/>
+                      </profile>
+                    </profiles>
+                    """);
+            provider.setFormatterProfilePath(profile.toString());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
         provider.setFormatterProfilePath(null);
-        // No exception, profile cleared
+        try {
+            Map<String, String> options = invokeBuildFormatterOptions(provider, null, null);
+            assertEquals("space", options.get("org.eclipse.jdt.core.formatter.tabulation.char"));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Test
@@ -646,6 +667,15 @@ class FormattingProviderTest {
         // No exception, empty settings handled
     }
 
+    @Test
+    void constructorLoadsBundledDefaultProfile() throws Exception {
+        FormattingProvider provider = new FormattingProvider(new DocumentManager());
+
+        Map<String, String> options = invokeBuildFormatterOptions(provider, null, null);
+        assertEquals("space", options.get("org.eclipse.jdt.core.formatter.tabulation.char"));
+        assertEquals("120", options.get("org.eclipse.jdt.core.formatter.lineSplit"));
+    }
+
     // ================================================================
     // Reflection helpers
     // ================================================================
@@ -686,6 +716,15 @@ class FormattingProviderTest {
                 org.eclipse.text.edits.TextEdit.class, String.class);
         m.setAccessible(true);
         return m.invoke(target, edit, source);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, String> invokeBuildFormatterOptions(Object target, FormattingOptions formattingOptions,
+            String documentUri) throws Exception {
+        Method m = FormattingProvider.class.getDeclaredMethod(
+                "buildFormatterOptions", FormattingOptions.class, String.class);
+        m.setAccessible(true);
+        return (Map<String, String>) m.invoke(target, formattingOptions, documentUri);
     }
 
     private boolean invokeIsContinuationContext(Object target, char before, char after) throws Exception {
