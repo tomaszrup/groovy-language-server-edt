@@ -496,16 +496,26 @@ async function waitForJavaExtension(): Promise<boolean> {
     outputChannel.appendLine('[java-ext] Activated. API version: ' + (javaApi.apiVersion ?? 'unknown'));
     outputChannel.appendLine('[java-ext] Server mode: ' + (javaApi.serverMode ?? 'unknown'));
 
-    // Wait for Standard mode to be ready (projects imported, indices built)
+    // Wait for Standard mode to be ready (projects imported, indices built).
+    // If the Java server is already in Standard mode when we activate, the
+    // serverReady() promise may never resolve (it was meant to be awaited
+    // *before* the server finishes).  Use a short timeout in that case.
     if (typeof javaApi.serverReady === 'function') {
-        outputChannel.appendLine('[java-ext] Waiting for serverReady()...');
+        const alreadyStandard = javaApi.serverMode === 'Standard';
+        const timeoutMs = alreadyStandard ? 5_000 : 120_000;
+        outputChannel.appendLine(
+            `[java-ext] Waiting for serverReady() (mode=${javaApi.serverMode ?? 'unknown'}, timeout=${timeoutMs}ms)...`);
         updateStatusBar('WaitingForJava', 'Waiting for Java: importing projects...');
-        try {
-            await javaApi.serverReady();
+        const ready = await Promise.race([
+            javaApi.serverReady().then(() => 'ready' as const),
+            new Promise<'timeout'>(resolve =>
+                setTimeout(() => resolve('timeout'), timeoutMs)),
+        ]);
+        if (ready === 'ready') {
             outputChannel.appendLine('[java-ext] Server is ready (Standard mode, imports done).');
-        } catch (e) {
-            outputChannel.appendLine(`[java-ext] serverReady() failed: ${e}`);
-            return false;
+        } else {
+            outputChannel.appendLine(
+                `[java-ext] serverReady() timed out (alreadyStandard=${alreadyStandard}) — proceeding.`);
         }
     } else {
         outputChannel.appendLine('[java-ext] serverReady() not available — waiting 10s as fallback.');

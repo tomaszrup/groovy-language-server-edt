@@ -90,6 +90,15 @@ public class CodeLensProvider {
     }
 
     /**
+     * Invalidate the entire resolve cache.  Called when a file change may
+     * affect reference counts in <em>other</em> files (e.g. editing file B
+     * changes the count shown in file A's code lens).
+     */
+    public void invalidateAllResolveCache() {
+        resolveCache.clear();
+    }
+
+    /**
      * Generate code lenses for all types and methods in the document.
      * <p>
      * Lenses are returned <em>unresolved</em> — only positions and handle
@@ -135,25 +144,32 @@ public class CodeLensProvider {
         }
 
         if (codeLens.getData() == null) {
+            codeLens.setCommand(fallbackCommand());
             return codeLens;
         }
 
         try {
             JsonElement dataElement = (JsonElement) codeLens.getData();
             String handleId = null;
+            String uri = null;
             if (dataElement.isJsonObject()) {
                 JsonObject obj = dataElement.getAsJsonObject();
                 if (obj.has(HANDLE_ID_KEY)) {
                     handleId = obj.get(HANDLE_ID_KEY).getAsString();
                 }
+                if (obj.has(URI_KEY)) {
+                    uri = obj.get(URI_KEY).getAsString();
+                }
             }
 
             if (handleId == null) {
+                codeLens.setCommand(fallbackCommand());
                 return codeLens;
             }
 
             IJavaElement element = JavaCore.create(handleId);
             if (element == null || !element.exists()) {
+                codeLens.setCommand(fallbackCommand());
                 return codeLens;
             }
 
@@ -163,21 +179,12 @@ public class CodeLensProvider {
             if (cached != null) {
                 locations = cached;
             } else {
-                locations = findReferenceLocations(element);
+                locations = findReferenceLocations(element, uri);
                 resolveCache.put(handleId, locations);
             }
             int count = locations.size();
 
             String label = count == 1 ? "1 reference" : count + " references";
-
-            // Extract URI from data for the command arguments
-            String uri = null;
-            if (dataElement.isJsonObject()) {
-                JsonObject obj = dataElement.getAsJsonObject();
-                if (obj.has(URI_KEY)) {
-                    uri = obj.get(URI_KEY).getAsString();
-                }
-            }
 
             Command cmd = new Command(label, SHOW_REFERENCES_COMMAND);
             if (uri != null) {
@@ -186,9 +193,16 @@ public class CodeLensProvider {
             codeLens.setCommand(cmd);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("CodeLens resolve failed", e);
+            if (codeLens.getCommand() == null) {
+                codeLens.setCommand(fallbackCommand());
+            }
         }
 
         return codeLens;
+    }
+
+    private static Command fallbackCommand() {
+        return new Command("0 references", SHOW_REFERENCES_COMMAND);
     }
 
     // ---- Helpers ----
@@ -256,8 +270,12 @@ public class CodeLensProvider {
     /**
      * Find reference locations for an element using JDT SearchEngine.
      * Returns a list of LSP {@link Location} objects for the peek view.
+     *
+     * @param element the element to search references for
+     * @param uri     the URI of the document containing the element (used for
+     *                test-scope narrowing)
      */
-    private List<Location> findReferenceLocations(IJavaElement element) {
+    private List<Location> findReferenceLocations(IJavaElement element, String uri) {
         List<Location> locations = new ArrayList<>();
         try {
             SearchPattern pattern = SearchPattern.createPattern(
@@ -267,11 +285,7 @@ public class CodeLensProvider {
             }
 
             org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
-            IJavaSearchScope scope = (javaProject != null)
-                    ? SearchEngine.createJavaSearchScope(
-                          new org.eclipse.jdt.core.IJavaElement[]{javaProject},
-                          IJavaSearchScope.SOURCES)
-                    : SearchEngine.createWorkspaceScope();
+            IJavaSearchScope scope = SearchScopeHelper.createSourceScope(javaProject, uri);
             SearchEngine engine = new SearchEngine();
 
             engine.search(pattern,

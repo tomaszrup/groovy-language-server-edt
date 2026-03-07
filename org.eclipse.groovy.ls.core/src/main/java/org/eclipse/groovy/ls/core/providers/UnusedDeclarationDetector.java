@@ -138,6 +138,31 @@ public class UnusedDeclarationDetector {
         "io.micronaut.",
     };
 
+    /**
+     * Annotation simple names that mark a <em>type</em> as framework-managed.
+     * When a class carries one of these annotations the framework instantiates
+     * the bean (calling its constructor), so constructors in such classes
+     * should not be flagged as unused.
+     */
+    private static final String[] FRAMEWORK_TYPE_ANNOTATIONS = {
+        // Spring stereotypes
+        "Component",
+        "Service",
+        "Repository",
+        "Controller",
+        "RestController",
+        "Configuration",
+        "SpringBootApplication",
+        // Jakarta / javax CDI
+        "ApplicationScoped",
+        "RequestScoped",
+        "SessionScoped",
+        "Dependent",
+        "Singleton",
+        // Micronaut
+        "Factory",
+    };
+
     private UnusedDeclarationDetector() {
         // utility class
     }
@@ -167,7 +192,7 @@ public class UnusedDeclarationDetector {
         try {
             IType[] types = workingCopy.getTypes();
             for (IType type : types) {
-                collectUnusedDeclarations(type, content, diagnostics);
+                collectUnusedDeclarations(type, content, uri, diagnostics);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -178,11 +203,11 @@ public class UnusedDeclarationDetector {
     }
 
     private static void collectUnusedDeclarations(
-            IType type, String content, List<Diagnostic> diagnostics)
+            IType type, String content, String uri, List<Diagnostic> diagnostics)
             throws JavaModelException {
 
         // Check the type itself — but skip if it's in a test class context
-        if (!isTestType(type) && isUnreferenced(type)) {
+        if (!isTestType(type) && isUnreferenced(type, uri)) {
             Diagnostic diag = createUnusedDiagnostic(type, content);
             if (diag != null) {
                 diagnostics.add(diag);
@@ -190,11 +215,17 @@ public class UnusedDeclarationDetector {
         }
 
         // Check methods
+        boolean frameworkType = isFrameworkManagedType(type);
         for (IMethod method : type.getMethods()) {
             if (isTestMethod(method) || isMainMethod(method) || isFrameworkMethod(method)) {
                 continue;
             }
-            if (isUnreferenced(method)) {
+            // Constructors in framework-managed types (e.g. @Component) are
+            // invoked by the framework at runtime — never flag them as unused.
+            if (frameworkType && method.isConstructor()) {
+                continue;
+            }
+            if (isUnreferenced(method, uri)) {
                 Diagnostic diag = createUnusedDiagnostic(method, content);
                 if (diag != null) {
                     diagnostics.add(diag);
@@ -204,7 +235,7 @@ public class UnusedDeclarationDetector {
 
         // Recurse into inner types
         for (IType innerType : type.getTypes()) {
-            collectUnusedDeclarations(innerType, content, diagnostics);
+            collectUnusedDeclarations(innerType, content, uri, diagnostics);
         }
     }
 
@@ -216,7 +247,7 @@ public class UnusedDeclarationDetector {
      * can only be referenced within its own project anyway.
      * The search is cancelled as soon as the first match is found.
      */
-    private static boolean isUnreferenced(IJavaElement element) {
+    private static boolean isUnreferenced(IJavaElement element, String uri) {
         try {
             SearchPattern pattern = SearchPattern.createPattern(
                     element, IJavaSearchConstants.REFERENCES);
@@ -226,13 +257,10 @@ public class UnusedDeclarationDetector {
 
             // Scope to the enclosing project's sources only – we only care
             // whether the declaration is referenced in source code, not in JARs.
+            // When the file is under src/test/, narrow scope to test sources.
             org.eclipse.jdt.core.IJavaProject javaProject =
                     element.getJavaProject();
-            IJavaSearchScope scope = (javaProject != null)
-                    ? SearchEngine.createJavaSearchScope(
-                          new org.eclipse.jdt.core.IJavaElement[]{javaProject},
-                          IJavaSearchScope.SOURCES)
-                    : SearchEngine.createWorkspaceScope();
+            IJavaSearchScope scope = SearchScopeHelper.createSourceScope(javaProject, uri);
 
             boolean[] found = {false};
             SearchEngine engine = new SearchEngine();
@@ -422,6 +450,32 @@ public class UnusedDeclarationDetector {
         }
 
         return false;
+    }
+
+    /**
+     * Determine if a type is a framework-managed bean (e.g. annotated with
+     * {@code @Component}, {@code @Service}, etc.).  Constructors in such
+     * types are invoked by the framework and should not be flagged as unused.
+     */
+    private static boolean isFrameworkManagedType(IType type) {
+        try {
+            for (IAnnotation annotation : type.getAnnotations()) {
+                String name = annotation.getElementName();
+                for (String typeAnnotation : FRAMEWORK_TYPE_ANNOTATIONS) {
+                    if (typeAnnotation.equals(name)) {
+                        return true;
+                    }
+                }
+                for (String prefix : FRAMEWORK_ANNOTATION_FQ_PREFIXES) {
+                    if (name.startsWith(prefix)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            return true; // err on the side of not fading
+        }
     }
 
     /**

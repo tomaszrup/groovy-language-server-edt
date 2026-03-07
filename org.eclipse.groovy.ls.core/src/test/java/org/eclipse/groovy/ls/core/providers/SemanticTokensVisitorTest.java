@@ -808,6 +808,37 @@ class SemanticTokensVisitorTest {
         assertTrue(hasTokenType(tokens, SemanticTokensProvider.TYPE_CLASS));
     }
 
+    @Test
+    void emitsKeywordTokenForSpockAndLabel() {
+        String source = """
+                class MySpec extends Object {
+                    def 'test something'() {
+                        given:
+                        def x = 1
+
+                        and:
+                        def y = 2
+
+                        when:
+                        def z = x + y
+
+                        then:
+                        z == 3
+                    }
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+        // given, and, when, then should all be keyword tokens
+        List<DecodedToken> keywordTokens = tokens.stream()
+                .filter(t -> t.tokenType == SemanticTokensProvider.TYPE_KEYWORD)
+                .toList();
+        assertTrue(keywordTokens.size() >= 4,
+                "Expected at least 4 keyword tokens (given, and, when, then), got " + keywordTokens.size());
+        // Verify 'and' is present as a keyword at line 5 (0-based)
+        assertTrue(keywordTokens.stream().anyMatch(t -> t.line == 5 && t.length == 3),
+                "Expected 'and' keyword token at line 5");
+    }
+
     private List<DecodedToken> collectTokens(String source, Range range) {
         ModuleNode moduleNode = parseModule(source);
         SemanticTokensVisitor visitor = new SemanticTokensVisitor(source, range);

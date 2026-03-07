@@ -12,9 +12,7 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -110,38 +108,8 @@ public class SemanticTokensProvider {
 
     private final DocumentManager documentManager;
 
-    /**
-     * Maximum number of cached semantic token results.  With a large workspace
-     * users may browse many files over a session; unbounded caching would
-     * leak memory.
-     */
-    private static final int MAX_TOKEN_CACHE_SIZE = 500;
-
-    /**
-     * Bounded LRU cache of the last successfully computed (non-empty) semantic tokens per URI.
-     * When a transient syntax error causes the AST to have zero classes, we return
-     * the cached tokens instead of wiping all highlighting.
-     * Wrapped in {@code synchronizedMap} for thread safety.
-     */
-    private final Map<String, SemanticTokens> lastGoodTokensCache =
-            Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, SemanticTokens> eldest) {
-                    return size() > MAX_TOKEN_CACHE_SIZE;
-                }
-            });
-
     public SemanticTokensProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
-    }
-
-    /**
-     * Removes cached semantic tokens for a document (e.g. on didClose).
-     */
-    public void invalidate(String uri) {
-        if (uri != null) {
-            lastGoodTokensCache.remove(DocumentManager.normalizeUri(uri));
-        }
     }
 
     /**
@@ -174,7 +142,6 @@ public class SemanticTokensProvider {
      * @param range optional LSP range to restrict tokens to (null = full document)
      */
     private SemanticTokens computeTokens(String uri, org.eclipse.lsp4j.Range range) {
-        String normalizedUri = DocumentManager.normalizeUri(uri);
         String content = documentManager.getContent(uri);
         if (content == null) {
             return new SemanticTokens(Collections.emptyList());
@@ -194,63 +161,48 @@ public class SemanticTokensProvider {
             moduleNode = documentManager.getCachedGroovyAST(uri);
         }
 
-        // If we have no module at all, or a module with 0 classes, try the
-        // standalone compiler with error-line-blanking to recover structure.
-        boolean needsFallback = moduleNode == null
-                || moduleNode.getClasses() == null
-                || moduleNode.getClasses().isEmpty();
-
-        if (needsFallback) {
-            GroovyLanguageServerPlugin.logInfo(
-                    "[semantic] AST is " + (moduleNode == null ? "null" : "empty (0 classes)")
-                            + " for " + uri + ", trying standalone compiler fallback");
-            ModuleNode fallback = getStandaloneAST(uri, content);
-            if (fallback != null
-                    && fallback.getClasses() != null
-                    && !fallback.getClasses().isEmpty()) {
-                moduleNode = fallback;
-            }
+        // First attempt: try to produce tokens from the JDT/cached module
+        List<Integer> tokens = tryVisitModule(moduleNode, content, range, uri);
+        if (tokens != null && !tokens.isEmpty()) {
+            return new SemanticTokens(tokens);
         }
 
-        if (moduleNode == null
-                || moduleNode.getClasses() == null
-                || moduleNode.getClasses().isEmpty()) {
-            GroovyLanguageServerPlugin.logInfo(
-                    "[semantic] No usable AST for " + uri + ", returning cached tokens");
-            return returnCachedOrEmpty(normalizedUri);
+        // JDT/cached module produced nothing useful — try standalone compiler
+        // with error-line-blanking to recover structure.
+        GroovyLanguageServerPlugin.logInfo(
+                "[semantic] AST produced no tokens for " + uri
+                        + ", trying standalone compiler fallback");
+        ModuleNode fallback = getStandaloneAST(uri, content);
+        tokens = tryVisitModule(fallback, content, range, uri);
+        if (tokens != null && !tokens.isEmpty()) {
+            return new SemanticTokens(tokens);
         }
 
-        try {
-            SemanticTokensVisitor visitor = new SemanticTokensVisitor(content, range);
-            visitor.visitModule(moduleNode);
-
-            List<Integer> encodedTokens = visitor.getEncodedTokens();
-            SemanticTokens result = new SemanticTokens(encodedTokens);
-
-            // Cache successful non-empty full-document results
-            if (!encodedTokens.isEmpty() && range == null) {
-                lastGoodTokensCache.put(normalizedUri, result);
-            }
-
-            return result;
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("Semantic tokens computation failed for " + uri, e);
-            return returnCachedOrEmpty(normalizedUri);
-        }
+        GroovyLanguageServerPlugin.logInfo(
+                "[semantic] No usable AST for " + uri + ", returning empty tokens");
+        return new SemanticTokens(Collections.emptyList());
     }
 
     /**
-     * Returns the last known good cached tokens for the URI, or empty tokens
-     * if no cached result is available.
+     * Try to visit a module and return encoded tokens.
+     * Returns null or empty list if the module is unusable.
      */
-    private SemanticTokens returnCachedOrEmpty(String normalizedUri) {
-        SemanticTokens cached = lastGoodTokensCache.get(normalizedUri);
-        if (cached != null) {
-            GroovyLanguageServerPlugin.logInfo(
-                    "[semantic] Returning cached tokens for " + normalizedUri);
-            return cached;
+    private List<Integer> tryVisitModule(ModuleNode moduleNode, String content,
+                                          org.eclipse.lsp4j.Range range, String uri) {
+        if (moduleNode == null
+                || moduleNode.getClasses() == null
+                || moduleNode.getClasses().isEmpty()) {
+            return null;
         }
-        return new SemanticTokens(Collections.emptyList());
+        try {
+            SemanticTokensVisitor visitor = new SemanticTokensVisitor(content, range);
+            visitor.visitModule(moduleNode);
+            return visitor.getEncodedTokens();
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Semantic tokens visitor failed for " + uri, e);
+            return null;
+        }
     }
 
     /**
@@ -285,20 +237,26 @@ public class SemanticTokensProvider {
      * locations to blank out the offending lines and re-parse. This is a general
      * strategy that works for any kind of syntax error (trailing dots, incomplete
      * expressions, missing tokens, etc.) — not just specific patterns.
+     *
      */
     private ModuleNode getStandaloneAST(String uri, String content) {
         try {
             GroovyCompilerService compilerService = documentManager.getCompilerService();
 
             // First try: parse the content as-is
-            ModuleNode module = tryParseContent(compilerService, uri, content);
-            if (module != null) {
-                return module;
+            GroovyCompilerService.ParseResult firstResult = compilerService.parse(uri, content);
+            if (firstResult.hasAST()) {
+                ModuleNode module = firstResult.getModuleNode();
+                int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
+                GroovyLanguageServerPlugin.logInfo(
+                        "[semantic] Standalone compiler fallback for " + uri + " classes=" + classCount);
+                if (classCount > 0) {
+                    return module;
+                }
             }
 
             // Second try: blank out lines that have errors and re-parse
-            GroovyCompilerService.ParseResult result = compilerService.parse(uri, content);
-            return tryParsePatchedContent(compilerService, uri, content, result);
+            return tryParsePatchedContent(compilerService, uri, content, firstResult);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "[semantic] Standalone compiler fallback failed for " + uri, e);
@@ -306,81 +264,108 @@ public class SemanticTokensProvider {
         return null;
     }
 
-    private ModuleNode tryParseContent(GroovyCompilerService compilerService,
-                                        String uri, String content) {
-        GroovyCompilerService.ParseResult result = compilerService.parse(uri, content);
-        if (!result.hasAST()) {
-            return null;
-        }
-        ModuleNode module = result.getModuleNode();
-        int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
-        GroovyLanguageServerPlugin.logInfo(
-                "[semantic] Standalone compiler fallback for " + uri + " classes=" + classCount);
-        return classCount > 0 ? module : null;
-    }
-
     private ModuleNode tryParsePatchedContent(GroovyCompilerService compilerService,
                                                String uri, String content,
                                                GroovyCompilerService.ParseResult result) {
-        if (result.getErrors() == null || result.getErrors().isEmpty()) {
-            return null;
-        }
+        String[] lines = content.split("\n", -1);
+        Set<Integer> blankedLines = new HashSet<>();
+        GroovyCompilerService.ParseResult current = result;
 
-        String patched = blankErrorLines(content, result.getErrors());
-        if (patched == null) {
-            return null;
-        }
+        // Iteratively blank error lines (and their enclosing brace-blocks)
+        // then re-parse until we get a usable AST.
+        for (int attempt = 0; attempt < 5; attempt++) {
+            if (current.getErrors() == null || current.getErrors().isEmpty()) {
+                return null;
+            }
 
-        GroovyLanguageServerPlugin.logInfo(
-                "[semantic] Trying error-line-blanked content for " + uri);
-        GroovyCompilerService.ParseResult patchedResult =
-                compilerService.parse(uri + "#semantic-patched", patched);
-        if (!patchedResult.hasAST()) {
-            return null;
-        }
+            boolean blankedNew = false;
+            for (org.codehaus.groovy.syntax.SyntaxException error : current.getErrors()) {
+                int startLine = error.getStartLine() - 1;
+                int endLine = error.getEndLine() - 1;
+                if (endLine < startLine) {
+                    endLine = startLine;
+                }
+                int blockEnd = findClosingBrace(lines, startLine, endLine);
+                for (int i = Math.max(0, startLine); i <= Math.min(blockEnd, lines.length - 1); i++) {
+                    if (blankedLines.add(i) && !lines[i].isBlank()) {
+                        blankedNew = true;
+                    }
+                    lines[i] = "";
+                }
+            }
 
-        ModuleNode module = patchedResult.getModuleNode();
-        int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
-        GroovyLanguageServerPlugin.logInfo(
-                "[semantic] Error-line-blanked content for " + uri + " classes=" + classCount);
-        return classCount > 0 ? module : null;
+            if (!blankedNew) {
+                // Error lines were already empty — the parser is reporting the
+                // error at the end of a dangling construct (e.g. a stray
+                // annotation). Scan backward from the error to blank the
+                // nearest non-empty line that's likely the actual cause.
+                for (org.codehaus.groovy.syntax.SyntaxException error : current.getErrors()) {
+                    for (int s = error.getStartLine() - 2; s >= 0; s--) {
+                        if (!blankedLines.contains(s) && !lines[s].isBlank()) {
+                            blankedLines.add(s);
+                            lines[s] = "";
+                            blankedNew = true;
+                            break;
+                        }
+                    }
+                    if (blankedNew) break;
+                }
+                if (!blankedNew) {
+                    return null;
+                }
+            }
+
+            String patched = String.join("\n", lines);
+            GroovyLanguageServerPlugin.logInfo(
+                    "[semantic] Trying error-line-blanked content for " + uri
+                            + " (attempt " + (attempt + 1) + ", blanked " + blankedLines.size() + " lines)");
+            current = compilerService.parse(uri + "#semantic-patched-" + attempt, patched);
+
+            if (current.hasAST()) {
+                ModuleNode module = current.getModuleNode();
+                int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
+                GroovyLanguageServerPlugin.logInfo(
+                        "[semantic] Error-line-blanked content for " + uri + " classes=" + classCount);
+                if (classCount > 0) {
+                    return module;
+                }
+            }
+        }
+        return null;
     }
 
     /**
-     * Blank out lines that contain syntax errors, preserving line count so that
-     * the remaining AST nodes retain correct line numbers for token mapping.
-     *
-     * @param content the original source text
-     * @param errors  syntax errors with line information from a failed parse
-     * @return patched content with error lines blanked, or {@code null} if
-     *         nothing could be blanked
+     * If the error lines contain an unmatched opening brace, find the matching
+     * closing brace so the whole block can be blanked in one pass.
+     * Returns the 0-based line index of the closing brace, or {@code endLine}
+     * if no braces are involved.
      */
-    private String blankErrorLines(String content,
-            List<org.codehaus.groovy.syntax.SyntaxException> errors) {
-        String[] lines = content.split("\n", -1);
-        Set<Integer> errorLineIndices = new HashSet<>();
-
-        for (org.codehaus.groovy.syntax.SyntaxException error : errors) {
-            // SyntaxException lines are 1-based
-            int startLine = error.getStartLine() - 1;
-            int endLine = error.getEndLine() - 1;
-            if (endLine < startLine) {
-                endLine = startLine;
-            }
-            for (int i = Math.max(0, startLine); i <= Math.min(endLine, lines.length - 1); i++) {
-                errorLineIndices.add(i);
+    private int findClosingBrace(String[] lines, int startLine, int endLine) {
+        int depth = 0;
+        // Count braces on the error lines themselves
+        for (int i = Math.max(0, startLine); i <= Math.min(endLine, lines.length - 1); i++) {
+            for (char ch : lines[i].toCharArray()) {
+                if (ch == '{') depth++;
+                else if (ch == '}') depth--;
             }
         }
-
-        if (errorLineIndices.isEmpty()) {
-            return null;
+        if (depth <= 0) {
+            return endLine;
         }
-
-        // Blank error lines (replace with empty strings to preserve line numbering)
-        for (int idx : errorLineIndices) {
-            lines[idx] = "";
+        // Walk forward to find the matching closing braces
+        for (int i = Math.min(endLine, lines.length - 1) + 1; i < lines.length; i++) {
+            for (char ch : lines[i].toCharArray()) {
+                if (ch == '{') depth++;
+                else if (ch == '}') {
+                    depth--;
+                    if (depth == 0) {
+                        return i;
+                    }
+                }
+            }
         }
-
-        return String.join("\n", lines);
+        // Unmatched — blank to end of file
+        return lines.length - 1;
     }
+
 }

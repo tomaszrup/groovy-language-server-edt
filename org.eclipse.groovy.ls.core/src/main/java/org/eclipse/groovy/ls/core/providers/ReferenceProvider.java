@@ -96,16 +96,11 @@ public class ReferenceProvider {
 
             // Scope the search to source files in the current project only.
             // Library JARs don't need scanning — we want *usages*, not definitions.
+            // When the file is under src/test/, narrow scope to test sources.
             IJavaSearchScope scope;
             try {
                 org.eclipse.jdt.core.IJavaProject javaProject = workingCopy.getJavaProject();
-                if (javaProject != null) {
-                    scope = SearchEngine.createJavaSearchScope(
-                            new org.eclipse.jdt.core.IJavaElement[]{javaProject},
-                            IJavaSearchScope.SOURCES);
-                } else {
-                    scope = SearchEngine.createWorkspaceScope();
-                }
+                scope = SearchScopeHelper.createSourceScope(javaProject, uri);
             } catch (Exception scopeEx) {
                 scope = SearchEngine.createWorkspaceScope();
             }

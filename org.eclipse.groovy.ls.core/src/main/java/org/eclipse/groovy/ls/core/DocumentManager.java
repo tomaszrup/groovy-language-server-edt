@@ -145,6 +145,7 @@ public class DocumentManager {
                 return t;
             });
     private volatile java.util.concurrent.ScheduledFuture<?> pendingRefresh;
+    private volatile java.util.concurrent.ScheduledFuture<?> pendingCodeLensRefresh;
 
     // ---- Client connection ----
 
@@ -179,6 +180,32 @@ public class DocumentManager {
                 }
             }
         }, 300, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Schedule a debounced {@code workspace/codeLens/refresh} notification.
+     * Called after file changes that may affect reference counts shown in
+     * code lenses of <em>other</em> documents (e.g. editing file B changes
+     * counts displayed in file A).
+     */
+    public void scheduleCodeLensRefresh() {
+        java.util.concurrent.ScheduledFuture<?> existing = pendingCodeLensRefresh;
+        if (existing != null) {
+            existing.cancel(false);
+        }
+        pendingCodeLensRefresh = refreshScheduler.schedule(() -> {
+            LanguageClient client = languageClient;
+            if (client != null) {
+                try {
+                    client.refreshCodeLenses();
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[codeLens] Sent workspace/codeLens/refresh");
+                } catch (Exception e) {
+                    GroovyLanguageServerPlugin.logError(
+                            "[codeLens] Failed to send codeLens/refresh", e);
+                }
+            }
+        }, 500, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     // ---- URI normalization ----

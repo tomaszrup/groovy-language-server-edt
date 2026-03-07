@@ -297,8 +297,12 @@ public class GroovyTextDocumentService implements TextDocumentService {
         // Invalidate hover cache so stale results are not served
         hoverProvider.invalidateHoverCache(uri);
 
-        // Invalidate code lens resolve cache so stale reference counts are refreshed
-        codeLensProvider.invalidateCodeLensCache(uri);
+        // Invalidate ALL code lens resolve cache entries — editing file A
+        // may change reference counts displayed in file B's code lenses.
+        codeLensProvider.invalidateAllResolveCache();
+
+        // Ask the client to re-request code lenses (debounced 500ms)
+        documentManager.scheduleCodeLensRefresh();
 
         // Re-publish diagnostics after changes
         if (server.areDiagnosticsEnabled()) {
@@ -311,10 +315,6 @@ public class GroovyTextDocumentService implements TextDocumentService {
         String uri = params.getTextDocument().getUri();
         GroovyLanguageServerPlugin.logInfo("Document closed: " + uri);
         documentManager.didClose(uri);
-        // NOTE: we intentionally do NOT invalidate the semantic tokens cache here.
-        // Cached tokens must survive close/reopen cycles so that if a file is
-        // reopened while still broken, the last-known-good tokens are returned
-        // instead of an empty result that wipes all highlighting.
 
         // Clear diagnostics for closed document
         diagnosticsProvider.clearDiagnostics(uri);
@@ -336,12 +336,15 @@ public class GroovyTextDocumentService implements TextDocumentService {
         // should be reflected in subsequent type-name completions.
         completionProvider.invalidateTypeNameCache();
 
-        // Use debounced diagnostics (same as didChange) so that the save
-        // coalesces with any pending didChange debounce instead of running
-        // a redundant third reconcile.
-        if (server.areDiagnosticsEnabled()) {
-            diagnosticsProvider.publishDiagnosticsDebounced(uri);
-        }
+        // Republish diagnostics for ALL open documents — not just the saved
+        // file.  Changes in this file may affect unused-declaration fading in
+        // other open files (e.g. removing a call makes the callee unused).
+        publishDiagnosticsForOpenDocuments();
+
+        // Refresh code lenses — structural changes committed on save may
+        // affect reference counts across multiple files.
+        codeLensProvider.invalidateAllResolveCache();
+        documentManager.scheduleCodeLensRefresh();
     }
 
     // ---- Completion ----
@@ -1192,8 +1195,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<CodeLens> resolveCodeLens(CodeLens codeLens) {
         // resolveCodeLens uses SearchEngine which blocks on workspace lock
-        // during builds — return unresolved to avoid 60s thread blocking.
+        // during builds — return with a fallback command to avoid "no commands".
         if (server.isBuildInProgress()) {
+            ensureFallbackCommand(codeLens);
             return CompletableFuture.completedFuture(codeLens);
         }
 
@@ -1202,14 +1206,22 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 return codeLensProvider.resolveCodeLens(codeLens);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Code lens resolve failed", e);
+                ensureFallbackCommand(codeLens);
                 return codeLens;
             }
         }, lspBackgroundExecutor);
         return future.orTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                 .exceptionally(ex -> {
                     GroovyLanguageServerPlugin.logError("Code lens resolve timed out", ex);
+                    ensureFallbackCommand(codeLens);
                     return codeLens;
                 });
+    }
+
+    private static void ensureFallbackCommand(CodeLens codeLens) {
+        if (codeLens.getCommand() == null) {
+            codeLens.setCommand(new Command("0 references", "groovy.showReferences"));
+        }
     }
 
     /**
@@ -1229,6 +1241,17 @@ public class GroovyTextDocumentService implements TextDocumentService {
             GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsIfEnabled uri=" + clientUri);
             diagnosticsProvider.publishDiagnosticsDebounced(clientUri);
         }
+    }
+
+    /**
+     * Invalidate all cached code lens reference counts and ask the client
+     * to re-request code lenses.  Called from workspace-level handlers
+     * (watched file changes, post-build) where any open file's code lens
+     * may be stale.
+     */
+    void refreshCodeLenses() {
+        codeLensProvider.invalidateAllResolveCache();
+        documentManager.scheduleCodeLensRefresh();
     }
 
     void publishDiagnosticsForOpenDocuments() {

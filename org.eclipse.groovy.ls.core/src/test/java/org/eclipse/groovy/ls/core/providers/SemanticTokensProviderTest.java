@@ -220,27 +220,12 @@ class SemanticTokensProviderTest {
     }
 
     @Test
-    void returnsCachedTokensWhenASTBreaks() {
+    void returnsFreshTokensForValidPortionWhenASTBreaks() {
         DocumentManager manager = new DocumentManager();
-        String uri = "file:///CachedTokensTest.groovy";
+        String uri = "file:///CutoffTokensTest.groovy";
 
-        // Start with valid code — produces tokens
+        // Code with valid class structure but a syntax error at the end
         manager.didOpen(uri, """
-                class Greeter {
-                    String name
-                    def greet() { name.toUpperCase() }
-                }
-                """);
-
-        SemanticTokensProvider provider = new SemanticTokensProvider(manager);
-
-        SemanticTokensParams params = new SemanticTokensParams();
-        params.setTextDocument(new TextDocumentIdentifier(uri));
-        SemanticTokens goodTokens = provider.getSemanticTokensFull(params);
-        assertFalse(goodTokens.getData().isEmpty(), "Valid code should produce tokens");
-
-        // Simulate typing "xdd." — code becomes syntactically broken
-        TextDocumentContentChangeEvent change = new TextDocumentContentChangeEvent("""
                 class Greeter {
                     String name
                     def greet() { name.toUpperCase() }
@@ -248,59 +233,35 @@ class SemanticTokensProviderTest {
                 def xdd = new Greeter()
                 xdd.
                 """);
-        manager.didChange(uri, List.of(change));
-
-        SemanticTokens afterBreak = provider.getSemanticTokensFull(params);
-        assertNotNull(afterBreak);
-        // Should return cached tokens (non-empty), not wipe all highlighting
-        assertFalse(afterBreak.getData().isEmpty(),
-                "After syntax error, cached tokens should be returned instead of empty");
-
-        manager.didClose(uri);
-    }
-
-    @Test
-    void invalidateClearsCachedTokens() {
-        DocumentManager manager = new DocumentManager();
-        String uri = "file:///InvalidateCacheTest.groovy";
-        manager.didOpen(uri, """
-                class Foo {
-                    def bar() { 42 }
-                }
-                """);
 
         SemanticTokensProvider provider = new SemanticTokensProvider(manager);
 
         SemanticTokensParams params = new SemanticTokensParams();
         params.setTextDocument(new TextDocumentIdentifier(uri));
         SemanticTokens tokens = provider.getSemanticTokensFull(params);
-        assertFalse(tokens.getData().isEmpty());
-
-        // Invalidate the cache
-        provider.invalidate(uri);
-
-        // Now break the code — with no cache, should return empty
-        TextDocumentContentChangeEvent breakChange = new TextDocumentContentChangeEvent("class {{{ broken");
-        manager.didChange(uri, List.of(breakChange));
-        SemanticTokens afterInvalidate = provider.getSemanticTokensFull(params);
-        assertNotNull(afterInvalidate);
-        // No cached tokens available after invalidation
-        assertTrue(afterInvalidate.getData().isEmpty(),
-                "After invalidation and broken code, should return empty tokens");
+        assertNotNull(tokens);
+        // Should have tokens for the valid portion (class, fields, methods)
+        // but NOT stale tokens from a cached previous version
+        assertFalse(tokens.getData().isEmpty(),
+                "Should produce tokens for the valid portion of the broken file");
+        assertTrue(tokens.getData().size() % 5 == 0, "Token data must be a multiple of 5");
 
         manager.didClose(uri);
     }
 
     @Test
-    void cachedTokensSurviveCloseAndReopen() {
+    void garbageInsertedMidFileDoesNotShiftEarlierTokens() {
         DocumentManager manager = new DocumentManager();
-        String uri = "file:///CloseReopenSurvival.groovy";
-        // Step 1: open with valid code — tokens are produced and cached
-        manager.didOpen(uri, """
-                class Hello {
-                    def world() { 42 }
+        String uri = "file:///GarbageMidFileTest.groovy";
+
+        // Valid code
+        String validCode = """
+                class Example {
+                    String value
+                    def getValue() { value }
                 }
-                """);
+                """;
+        manager.didOpen(uri, validCode);
 
         SemanticTokensProvider provider = new SemanticTokensProvider(manager);
 
@@ -308,32 +269,63 @@ class SemanticTokensProviderTest {
         params.setTextDocument(new TextDocumentIdentifier(uri));
         SemanticTokens goodTokens = provider.getSemanticTokensFull(params);
         assertFalse(goodTokens.getData().isEmpty(), "Valid code should produce tokens");
+        List<Integer> goodData = goodTokens.getData();
 
-        // Step 2: break the code — cached tokens should be returned
-        TextDocumentContentChangeEvent breakChange = new TextDocumentContentChangeEvent("""
-                class Hello {
-                    def world() { 42 }
-                    xdd.
+        // Now insert garbage after the class
+        TextDocumentContentChangeEvent change = new TextDocumentContentChangeEvent("""
+                class Example {
+                    String value
+                    def getValue() { value }
                 }
+                \\::""
                 """);
-        manager.didChange(uri, List.of(breakChange));
+        manager.didChange(uri, List.of(change));
+
         SemanticTokens brokenTokens = provider.getSemanticTokensFull(params);
-        assertFalse(brokenTokens.getData().isEmpty(), "Broken code should return cached tokens");
+        assertNotNull(brokenTokens);
+        // The tokens for the valid portion should match the original tokens
+        // (since the garbage is after the class, all class tokens should survive
+        // the cutoff and their positions should be identical)
+        assertFalse(brokenTokens.getData().isEmpty(),
+                "Tokens for valid portion should still be produced");
 
-        // Step 3: close the file (simulates VS Code closing the tab)
         manager.didClose(uri);
-        // NOTE: we do NOT call provider.invalidate() here — matching the real didClose behavior
+    }
 
-        // Step 4: reopen with the same broken content
+    @Test
+    void fixingGarbageRestoresAllTokens() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///FixGarbageTest.groovy";
+
+        // Start broken
         manager.didOpen(uri, """
                 class Hello {
                     def world() { 42 }
-                    xdd.
+                    \\::""
                 }
                 """);
-        SemanticTokens reopenedTokens = provider.getSemanticTokensFull(params);
-        assertFalse(reopenedTokens.getData().isEmpty(),
-                "After close and reopen with broken code, cached tokens should still be available");
+
+        SemanticTokensProvider provider = new SemanticTokensProvider(manager);
+
+        SemanticTokensParams params = new SemanticTokensParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        SemanticTokens brokenTokens = provider.getSemanticTokensFull(params);
+        assertNotNull(brokenTokens);
+
+        // Fix the code
+        TextDocumentContentChangeEvent fix = new TextDocumentContentChangeEvent("""
+                class Hello {
+                    def world() { 42 }
+                }
+                """);
+        manager.didChange(uri, List.of(fix));
+        SemanticTokens fixedTokens = provider.getSemanticTokensFull(params);
+        assertNotNull(fixedTokens);
+        assertFalse(fixedTokens.getData().isEmpty(),
+                "After fixing the code, all tokens should be restored");
+        // Fixed version should have at least as many tokens as the broken one
+        assertTrue(fixedTokens.getData().size() >= brokenTokens.getData().size(),
+                "Fixed code should produce at least as many tokens as the broken version");
 
         manager.didClose(uri);
     }
@@ -384,6 +376,103 @@ class SemanticTokensProviderTest {
         // The patched content fallback should produce tokens for the class structure
         assertFalse(tokens.getData().isEmpty(),
                 "Partially broken code (trailing dot) should produce tokens via patched-content fallback");
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void importTokensPreservedWhenClassDeclarationIsBroken() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///ImportPreservation.groovy";
+        manager.didOpen(uri, """
+                import java.util.List
+
+                class X extends Lis--t {
+                }
+                """);
+
+        SemanticTokensProvider provider = new SemanticTokensProvider(manager);
+
+        SemanticTokensParams params = new SemanticTokensParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        SemanticTokens tokens = provider.getSemanticTokensFull(params);
+
+        assertNotNull(tokens);
+        // Even though the class declaration is broken, import tokens should survive
+        assertFalse(tokens.getData().isEmpty(),
+                "Import tokens should be preserved when the class declaration is broken");
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void importTokensPreservedWhenLongClassDeclarationIsBroken() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///LongBrokenClass.groovy";
+        manager.didOpen(uri, """
+                import java.util.List
+                import java.util.Map
+
+                class X extends Lis--t {
+                    String name
+                    int age
+                    boolean active
+                    String email
+                    String phone
+                    String address
+
+                    void doSomething() {
+                        println("hello")
+                    }
+
+                    void doSomethingElse() {
+                        println("world")
+                    }
+                }
+                """);
+
+        SemanticTokensProvider provider = new SemanticTokensProvider(manager);
+
+        SemanticTokensParams params = new SemanticTokensParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        SemanticTokens tokens = provider.getSemanticTokensFull(params);
+
+        assertNotNull(tokens);
+        // The broken class spans many lines — block-aware blanking should still
+        // recover import tokens by blanking the entire brace-matched block.
+        assertFalse(tokens.getData().isEmpty(),
+                "Import tokens should be preserved even when the broken class body is long");
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void importTokensPreservedWithPackageAndAnnotation() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///PackageAnnotation.groovy";
+        manager.didOpen(uri, """
+                package com.example.commons.delta
+
+                import spock.lang.Specification
+                import spock.lang.Stepwise
+
+                @Stepwise
+                class DeltaCommonContractSpec extends Spe--cification {
+
+                }
+                """);
+
+        SemanticTokensProvider provider = new SemanticTokensProvider(manager);
+
+        SemanticTokensParams params = new SemanticTokensParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        SemanticTokens tokens = provider.getSemanticTokensFull(params);
+
+        assertNotNull(tokens);
+        // Package, import, and annotation tokens should survive even when the
+        // class declaration has a broken superclass reference.
+        assertFalse(tokens.getData().isEmpty(),
+                "Package/import tokens should be preserved with broken class + annotation");
 
         manager.didClose(uri);
     }

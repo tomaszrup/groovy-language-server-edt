@@ -393,6 +393,13 @@ class UnusedDeclarationDetectorTest {
         return (Diagnostic) m.invoke(null, element, content);
     }
 
+    private static boolean invokeIsFrameworkManagedType(IType type) throws Exception {
+        Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
+                "isFrameworkManagedType", IType.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(null, type);
+    }
+
     // ----- Mock factories -----
 
     private static IType mockType(String superclassName, String path) throws Exception {
@@ -417,6 +424,7 @@ class UnusedDeclarationDetectorTest {
         when(method.getElementName()).thenReturn(name);
         when(method.getDeclaringType()).thenReturn(declaringType);
         when(method.getAnnotations()).thenReturn(annotations);
+        when(method.isConstructor()).thenReturn(false);
         return method;
     }
 
@@ -439,9 +447,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
         m.setAccessible(true);
-        m.invoke(null, type, "class Foo { void regularMethod() {} void anotherMethod() {} }", diagnostics);
+        m.invoke(null, type, "class Foo { void regularMethod() {} void anotherMethod() {} }", "file:///src/main/groovy/Foo.groovy", diagnostics);
 
         // Methods were iterated without exceptions
         assertNotNull(diagnostics);
@@ -463,9 +471,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
         m.setAccessible(true);
-        m.invoke(null, type, "class Foo { void testSomething() {} }", diagnostics);
+        m.invoke(null, type, "class Foo { void testSomething() {} }", "file:///src/main/groovy/Foo.groovy", diagnostics);
 
         // Test methods should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -486,9 +494,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
         m.setAccessible(true);
-        m.invoke(null, type, "class Foo { static void main(String[] args) {} }", diagnostics);
+        m.invoke(null, type, "class Foo { static void main(String[] args) {} }", "file:///src/main/groovy/Foo.groovy", diagnostics);
 
         // Main method should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -514,11 +522,157 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
         m.setAccessible(true);
-        m.invoke(null, outerType, "class Outer { class Inner {} }", diagnostics);
+        m.invoke(null, outerType, "class Outer { class Inner {} }", "file:///src/main/groovy/Outer.groovy", diagnostics);
 
         // Should complete without error (inner type was recursed)
+        assertNotNull(diagnostics);
+    }
+
+    // ================================================================
+    // isFrameworkManagedType tests
+    // ================================================================
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForComponent() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("Component");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForService() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("Service");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForRepository() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("Repository");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForController() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("Controller");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForRestController() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("RestController");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForConfiguration() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("Configuration");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForSpringBootApplication() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("SpringBootApplication");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsTrueForFqnPrefix() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("org.springframework.stereotype.Component");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertTrue(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsFalseForPlainClass() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        assertFalse(invokeIsFrameworkManagedType(type));
+    }
+
+    @Test
+    void isFrameworkManagedTypeReturnsFalseForNonFrameworkAnnotation() throws Exception {
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn("Override");
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
+        assertFalse(invokeIsFrameworkManagedType(type));
+    }
+
+    // ================================================================
+    // collectUnusedDeclarations — constructor skip in @Component types
+    // ================================================================
+
+    @Test
+    void collectUnusedDeclarationsSkipsConstructorInComponentType() throws Exception {
+        IAnnotation componentAnnotation = mock(IAnnotation.class);
+        when(componentAnnotation.getElementName()).thenReturn("Component");
+
+        IType type = mock(IType.class);
+        when(type.getSuperclassName()).thenReturn(null);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[] { componentAnnotation });
+        when(type.getResource()).thenReturn(null);
+
+        IMethod constructor = mockMethod("MyService", type, new IAnnotation[0]);
+        when(constructor.isConstructor()).thenReturn(true);
+        when(type.getMethods()).thenReturn(new IMethod[] { constructor });
+        when(type.getTypes()).thenReturn(new IType[0]);
+
+        java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
+
+        java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+        m.setAccessible(true);
+        m.invoke(null, type, "class MyService { MyService() {} }", "file:///src/main/groovy/MyService.groovy", diagnostics);
+
+        // Constructor in @Component type should be skipped
+        assertTrue(diagnostics.isEmpty());
+    }
+
+    @Test
+    void collectUnusedDeclarationsDoesNotSkipConstructorInPlainType() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getSuperclassName()).thenReturn(null);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(type.getResource()).thenReturn(null);
+
+        IMethod constructor = mockMethod("PlainClass", type, new IAnnotation[0]);
+        when(constructor.isConstructor()).thenReturn(true);
+        when(type.getMethods()).thenReturn(new IMethod[] { constructor });
+        when(type.getTypes()).thenReturn(new IType[0]);
+
+        java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
+
+        java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+        m.setAccessible(true);
+        m.invoke(null, type, "class PlainClass { PlainClass() {} }", "file:///src/main/groovy/PlainClass.groovy", diagnostics);
+
+        // Constructor in plain (non-framework) type should NOT be skipped —
+        // it will proceed to isUnreferenced() which returns false for mocks
         assertNotNull(diagnostics);
     }
 
@@ -532,9 +686,9 @@ class UnusedDeclarationDetectorTest {
         org.eclipse.jdt.core.IJavaElement element = mock(org.eclipse.jdt.core.IJavaElement.class);
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "isUnreferenced", org.eclipse.jdt.core.IJavaElement.class);
+                "isUnreferenced", org.eclipse.jdt.core.IJavaElement.class, String.class);
         m.setAccessible(true);
-        boolean result = (boolean) m.invoke(null, element);
+        boolean result = (boolean) m.invoke(null, element, "file:///src/main/groovy/Foo.groovy");
 
         // SearchPattern.createPattern returns null for mock -> isUnreferenced returns false
         assertFalse(result);

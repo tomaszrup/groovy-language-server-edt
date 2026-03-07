@@ -378,6 +378,14 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Post-build diagnostics failed", e);
             }
+
+            // Refresh code lenses — reference counts may have changed after
+            // the build updated the JDT index.
+            try {
+                textDocumentService.refreshCodeLenses();
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Post-build code lens refresh failed", e);
+            }
         });
     }
 

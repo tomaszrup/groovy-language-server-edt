@@ -70,7 +70,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     /** Spock framework block labels that should be highlighted as keywords. */
     private static final Set<String> SPOCK_LABELS = new HashSet<>(Arrays.asList(
-            "given", "when", "then", "expect", "where"));
+            "given", "when", "then", "expect", "where", "and"));
 
     /**
      * Raw token before delta encoding. Stores absolute position.

@@ -17,6 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Method;
 import java.nio.file.Path;
+import java.util.List;
 
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextEdit;
@@ -458,5 +459,274 @@ class GroovyWorkspaceServiceRenameHelpersTest {
         Method method = target.getClass().getDeclaredMethod(methodName, types);
         method.setAccessible(true);
         return method.invoke(target, args);
+    }
+
+    // ---- inferPackageFromPath ----
+
+    @Test
+    void inferPackageFromPathDetectsMainGroovySourceRoot() {
+        GroovyWorkspaceService service = createService();
+        String uri = "file:///project/src/main/groovy/com/example/demo/MyClass.groovy";
+
+        String result = service.inferPackageFromPath(uri, "fallback");
+        assertEquals("com.example.demo", result);
+    }
+
+    @Test
+    void inferPackageFromPathDetectsTestJavaSourceRoot() {
+        GroovyWorkspaceService service = createService();
+        String uri = "file:///project/src/test/java/org/foo/TestClass.groovy";
+
+        String result = service.inferPackageFromPath(uri, "fallback");
+        assertEquals("org.foo", result);
+    }
+
+    @Test
+    void inferPackageFromPathDefaultPackageAtSourceRoot() {
+        GroovyWorkspaceService service = createService();
+        String uri = "file:///project/src/main/groovy/MyClass.groovy";
+
+        String result = service.inferPackageFromPath(uri, "fallback");
+        assertEquals("", result);
+    }
+
+    @Test
+    void inferPackageFromPathFallsBackWhenNoSourceRoot() {
+        GroovyWorkspaceService service = createService();
+        String uri = "file:///random/path/MyClass.groovy";
+
+        String result = service.inferPackageFromPath(uri, "old.pkg");
+        assertEquals("old.pkg", result);
+    }
+
+    @Test
+    void inferPackageFromPathHandlesSrcShortRoot() {
+        GroovyWorkspaceService service = createService();
+        String uri = "file:///project/src/com/example/MyClass.groovy";
+
+        String result = service.inferPackageFromPath(uri, "fallback");
+        assertEquals("com.example", result);
+    }
+
+    // ---- hasStarImport ----
+
+    @Test
+    void hasStarImportReturnsTrueWhenPresent() {
+        GroovyWorkspaceService service = createService();
+        String content = "package test\n\nimport com.example.foo.*\n\nclass A {}\n";
+
+        assertTrue(service.hasStarImport(content, "com.example.foo"));
+    }
+
+    @Test
+    void hasStarImportReturnsFalseWhenAbsent() {
+        GroovyWorkspaceService service = createService();
+        String content = "package test\n\nimport com.example.foo.MyClass\n\nclass A {}\n";
+
+        assertFalse(service.hasStarImport(content, "com.example.foo"));
+    }
+
+    @Test
+    void hasStarImportReturnsFalseForDifferentPackage() {
+        GroovyWorkspaceService service = createService();
+        String content = "package test\n\nimport com.example.bar.*\n\nclass A {}\n";
+
+        assertFalse(service.hasStarImport(content, "com.example.foo"));
+    }
+
+    // ---- hasConflictingImport ----
+
+    @Test
+    void hasConflictingImportReturnsTrueForDifferentFqn() {
+        GroovyWorkspaceService service = createService();
+        String content = "import com.other.MyClass\n\nclass A {}\n";
+
+        assertTrue(service.hasConflictingImport(content, "MyClass", "com.example.MyClass"));
+    }
+
+    @Test
+    void hasConflictingImportReturnsFalseForSameFqn() {
+        GroovyWorkspaceService service = createService();
+        String content = "import com.example.MyClass\n\nclass A {}\n";
+
+        assertFalse(service.hasConflictingImport(content, "MyClass", "com.example.MyClass"));
+    }
+
+    @Test
+    void hasConflictingImportReturnsFalseWhenNoImport() {
+        GroovyWorkspaceService service = createService();
+        String content = "class A {}\n";
+
+        assertFalse(service.hasConflictingImport(content, "MyClass", "com.example.MyClass"));
+    }
+
+    // ---- isInsidePackageLine ----
+
+    @Test
+    void isInsidePackageLineReturnsTrueOnPackageLine() {
+        GroovyWorkspaceService service = createService();
+        String content = "package com.example.foo\n\nclass A {}\n";
+
+        assertTrue(service.isInsidePackageLine(content, 10));
+    }
+
+    @Test
+    void isInsidePackageLineReturnsFalseOnClassLine() {
+        GroovyWorkspaceService service = createService();
+        String content = "package com.example.foo\n\nclass A {}\n";
+
+        assertFalse(service.isInsidePackageLine(content, 30));
+    }
+
+    // ---- isInsideBuildOrOutputDir ----
+
+    @Test
+    void isInsideBuildOrOutputDirDetectsBuildDir() {
+        assertTrue(GroovyWorkspaceService.isInsideBuildOrOutputDir(
+                java.nio.file.Path.of("/project/build/classes/Main.groovy")));
+    }
+
+    @Test
+    void isInsideBuildOrOutputDirReturnsFalseForSourceDir() {
+        assertFalse(GroovyWorkspaceService.isInsideBuildOrOutputDir(
+                java.nio.file.Path.of("/project/src/main/groovy/Main.groovy")));
+    }
+
+    // ---- buildFallbackFileEdits ----
+
+    @Test
+    void buildFallbackFileEditsUpdatesImportWhenFqnChanges() {
+        GroovyWorkspaceService service = createService();
+        String content = "package other\n\nimport com.example.foo.MyClass\n\nclass A {\n  MyClass x\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyClass",
+                "com.example.foo", "com.example.bar",
+                "com.example.foo.MyClass", "com.example.bar.MyClass",
+                false, true);
+
+        // Should have import replacement
+        assertTrue(edits.stream().anyMatch(e -> e.getNewText().contains("com.example.bar.MyClass")),
+                "Should update import to new package");
+    }
+
+    @Test
+    void buildFallbackFileEditsAddsImportForPreviouslySamePackageFile() {
+        GroovyWorkspaceService service = createService();
+        // File in com.example.foo, referencing MyClass that was also in com.example.foo
+        String content = "package com.example.foo\n\nclass A {\n  MyClass x\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyClass",
+                "com.example.foo", "com.example.bar",
+                "com.example.foo.MyClass", "com.example.bar.MyClass",
+                false, true);
+
+        // Should add import since type moved to different package
+        assertTrue(edits.stream().anyMatch(e -> e.getNewText().contains("import com.example.bar.MyClass")),
+                "Should add import for type that moved out of same package");
+    }
+
+    @Test
+    void buildFallbackFileEditsRenamesSimpleNameReferences() {
+        GroovyWorkspaceService service = createService();
+        String content = "package com.example.foo\n\nclass A {\n  MyClass x\n  MyClass getIt() { return x }\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyNewClass",
+                "com.example.foo", "com.example.foo",
+                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                true, false);
+
+        long simpleNameEdits = edits.stream()
+                .filter(e -> "MyNewClass".equals(e.getNewText()))
+                .count();
+        assertEquals(2, simpleNameEdits, "Should rename both simple name occurrences");
+    }
+
+    @Test
+    void buildFallbackFileEditsUpdatesFqnReferences() {
+        GroovyWorkspaceService service = createService();
+        String content = "package other\n\nclass A {\n  com.example.foo.MyClass x\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyClass",
+                "com.example.foo", "com.example.bar",
+                "com.example.foo.MyClass", "com.example.bar.MyClass",
+                false, true);
+
+        assertTrue(edits.stream().anyMatch(e -> "com.example.bar.MyClass".equals(e.getNewText())),
+                "Should update fully-qualified reference");
+    }
+
+    @Test
+    void buildFallbackFileEditsSkipsFileWithNoReferences() {
+        GroovyWorkspaceService service = createService();
+        String content = "package unrelated\n\nclass B {\n  String x\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyNewClass",
+                "com.example.foo", "com.example.foo",
+                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                true, false);
+
+        assertTrue(edits.isEmpty(), "Should produce no edits for files without references");
+    }
+
+    @Test
+    void buildFallbackFileEditsRemovesImportWhenMovedToSamePackage() {
+        GroovyWorkspaceService service = createService();
+        String content = "package com.example.bar\n\nimport com.example.foo.MyClass\n\nclass A {\n  MyClass x\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyClass",
+                "com.example.foo", "com.example.bar",
+                "com.example.foo.MyClass", "com.example.bar.MyClass",
+                false, true);
+
+        assertTrue(edits.stream().anyMatch(e -> "".equals(e.getNewText())),
+                "Should remove import when type moves to same package as file");
+    }
+
+    @Test
+    void buildFallbackFileEditsSkipsConflictingImport() {
+        GroovyWorkspaceService service = createService();
+        // File imports a DIFFERENT MyClass — should not touch simple name references
+        String content = "package other\n\nimport com.different.MyClass\n\nclass A {\n  MyClass x\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyNewClass",
+                "com.example.foo", "com.example.foo",
+                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                true, false);
+
+        assertTrue(edits.isEmpty(),
+                "Should not rename simple names when conflicting import exists");
+    }
+
+    @Test
+    void buildFallbackFileEditsHandlesRenameWithImport() {
+        GroovyWorkspaceService service = createService();
+        String content = "package other\n\nimport com.example.foo.MyClass\n\nclass A {\n  MyClass x\n}\n";
+
+        List<TextEdit> edits = service.buildFallbackFileEdits(
+                content,
+                "MyClass", "MyNewClass",
+                "com.example.foo", "com.example.foo",
+                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                true, false);
+
+        // Should update import and rename simple name (not in import line)
+        assertTrue(edits.stream().anyMatch(e -> e.getNewText().contains("com.example.foo.MyNewClass")),
+                "Should update import FQN");
+        assertTrue(edits.stream().anyMatch(e -> "MyNewClass".equals(e.getNewText())),
+                "Should rename simple name reference");
     }
 }
