@@ -297,6 +297,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
         // Invalidate hover cache so stale results are not served
         hoverProvider.invalidateHoverCache(uri);
 
+        // Invalidate inlay hint hierarchy cache — types may have changed
+        inlayHintProvider.invalidateCache(uri);
+
         // Invalidate ALL code lens resolve cache entries — editing file A
         // may change reference counts displayed in file B's code lenses.
         codeLensProvider.invalidateAllResolveCache();
@@ -937,6 +940,23 @@ public class GroovyTextDocumentService implements TextDocumentService {
             future.whenComplete((r, t) -> pendingCodeActions.remove(normalizedUri, baseFuture));
         }
         return future;
+    }
+
+    @Override
+    public CompletableFuture<CodeAction> resolveCodeAction(CodeAction unresolved) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return codeActionProvider.resolveCodeAction(unresolved);
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError("Code action resolve failed", e);
+                return unresolved;
+            }
+        }, lspRequestExecutor)
+                .orTimeout(10, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    GroovyLanguageServerPlugin.logError("Code action resolve timed out", ex);
+                    return unresolved;
+                });
     }
 
     // ---- Formatting ----

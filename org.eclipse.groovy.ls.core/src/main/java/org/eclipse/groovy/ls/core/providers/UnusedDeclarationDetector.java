@@ -163,6 +163,9 @@ public class UnusedDeclarationDetector {
         "Factory",
     };
 
+    /** Maximum number of JDT search operations per detectUnusedDeclarations() call. */
+    private static final int MAX_SEARCHES_PER_FILE = 20;
+
     private UnusedDeclarationDetector() {
         // utility class
     }
@@ -188,11 +191,13 @@ public class UnusedDeclarationDetector {
         }
 
         List<Diagnostic> diagnostics = new ArrayList<>();
+        int[] searchBudget = {MAX_SEARCHES_PER_FILE};
 
         try {
             IType[] types = workingCopy.getTypes();
             for (IType type : types) {
-                collectUnusedDeclarations(type, content, uri, diagnostics);
+                if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
+                collectUnusedDeclarations(type, content, uri, diagnostics, searchBudget);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -203,20 +208,27 @@ public class UnusedDeclarationDetector {
     }
 
     private static void collectUnusedDeclarations(
-            IType type, String content, String uri, List<Diagnostic> diagnostics)
+            IType type, String content, String uri, List<Diagnostic> diagnostics,
+            int[] searchBudget)
             throws JavaModelException {
+
+        if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) return;
 
         // Check the type itself — but skip if it's in a test class context
         if (!isTestType(type) && isUnreferenced(type, uri)) {
+            searchBudget[0]--;
             Diagnostic diag = createUnusedDiagnostic(type, content);
             if (diag != null) {
                 diagnostics.add(diag);
             }
+        } else {
+            searchBudget[0]--;
         }
 
         // Check methods
         boolean frameworkType = isFrameworkManagedType(type);
         for (IMethod method : type.getMethods()) {
+            if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
             if (isTestMethod(method) || isMainMethod(method) || isFrameworkMethod(method)) {
                 continue;
             }
@@ -225,6 +237,7 @@ public class UnusedDeclarationDetector {
             if (frameworkType && method.isConstructor()) {
                 continue;
             }
+            searchBudget[0]--;
             if (isUnreferenced(method, uri)) {
                 Diagnostic diag = createUnusedDiagnostic(method, content);
                 if (diag != null) {
@@ -235,7 +248,8 @@ public class UnusedDeclarationDetector {
 
         // Recurse into inner types
         for (IType innerType : type.getTypes()) {
-            collectUnusedDeclarations(innerType, content, uri, diagnostics);
+            if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
+            collectUnusedDeclarations(innerType, content, uri, diagnostics, searchBudget);
         }
     }
 

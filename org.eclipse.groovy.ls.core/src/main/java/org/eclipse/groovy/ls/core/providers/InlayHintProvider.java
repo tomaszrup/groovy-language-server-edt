@@ -56,12 +56,42 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either;
  */
 public class InlayHintProvider {
 
+    private static final int HIERARCHY_CACHE_MAX = 100;
+
     private final DocumentManager documentManager;
     private final java.util.concurrent.atomic.AtomicReference<InlayHintSettings> currentSettings =
             new java.util.concurrent.atomic.AtomicReference<>(InlayHintSettings.defaults());
 
+    /**
+     * Instance-level LRU cache for JDT type hierarchies, shared across inlay
+     * hint requests.  Building a supertype hierarchy is expensive (especially
+     * with deep inheritance chains); caching them avoids redundant work when
+     * the user scrolls or edits within the same file.
+     * <p>
+     * Invalidated per-URI on {@code didChange} via {@link #invalidateCache}.
+     */
+    @SuppressWarnings("serial")
+    private final Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache =
+            Collections.synchronizedMap(new java.util.LinkedHashMap<String, org.eclipse.jdt.core.ITypeHierarchy>(
+                    HIERARCHY_CACHE_MAX + 1, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, org.eclipse.jdt.core.ITypeHierarchy> eldest) {
+                    return size() > HIERARCHY_CACHE_MAX;
+                }
+            });
+
     public InlayHintProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
+    }
+
+    /**
+     * Invalidate cached state for a URI (call on didChange / didClose).
+     */
+    public void invalidateCache(String uri) {
+        // The hierarchy cache is keyed by FQN, not URI, so a targeted
+        // per-URI eviction isn't practical.  A full clear is cheap and
+        // correct — hierarchies are rebuilt on the next request.
+        hierarchyCache.clear();
     }
 
     /**
@@ -99,7 +129,12 @@ public class InlayHintProvider {
             return Collections.emptyList();
         }
 
-        ModuleNode module = documentManager.getGroovyAST(uri);
+        // Use cached AST only — never trigger on-demand compilation.
+        // Inlay hints are decorative; returning empty when no AST is
+        // cached yet is acceptable and avoids burning the 15 s timeout
+        // budget on a full Groovy compilation that may never finish in
+        // large workspaces.
+        ModuleNode module = documentManager.getCachedGroovyAST(uri);
         if (module == null) {
             return Collections.emptyList();
         }
@@ -205,9 +240,9 @@ public class InlayHintProvider {
             IJavaProject project = workingCopy.getJavaProject();
             if (project == null || !project.exists()) return hints;
 
-            // Per-request cache: avoids recomputing the same supertype hierarchy
-            // when many variables share the same receiver type.
-            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache = new HashMap<>();
+            // Use the shared instance-level hierarchy cache (LRU, max 100
+            // entries) so that hierarchies computed for one request survive
+            // across subsequent inlay-hint refreshes.
 
             MethodCallDeclCollector collector = new MethodCallDeclCollector();
             for (ClassNode classNode : module.getClasses()) {
@@ -219,6 +254,7 @@ public class InlayHintProvider {
             }
 
             for (MethodCallDeclCollector.DeclInfo info : collector.getDeclarations()) {
+                if (Thread.currentThread().isInterrupted()) break;
                 if (requestedRange != null && !isInRange(info.line, requestedRange)) {
                     continue;
                 }
@@ -558,11 +594,12 @@ public class InlayHintProvider {
             this.sourceUnit = module.getContext();
 
             for (ClassNode classNode : module.getClasses()) {
+                if (Thread.currentThread().isInterrupted()) return;
                 visitModuleClass(classNode);
             }
 
             BlockStatement statementBlock = module.getStatementBlock();
-            if (statementBlock != null) {
+            if (statementBlock != null && !Thread.currentThread().isInterrupted()) {
                 statementBlock.visit(this);
             }
         }
@@ -600,12 +637,14 @@ public class InlayHintProvider {
 
         @Override
         public void visitMethodCallExpression(MethodCallExpression call) {
+            if (Thread.currentThread().isInterrupted()) return;
             addMethodCallHints(call);
             super.visitMethodCallExpression(call);
         }
 
         @Override
         public void visitConstructorCallExpression(ConstructorCallExpression call) {
+            if (Thread.currentThread().isInterrupted()) return;
             addConstructorCallHints(call);
             super.visitConstructorCallExpression(call);
         }

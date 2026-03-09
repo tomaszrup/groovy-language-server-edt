@@ -88,6 +88,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         indexDeclaredMethods(module);
 
         for (ClassNode classNode : module.getClasses()) {
+            if (Thread.currentThread().isInterrupted()) return;
             if (isTopLevelScriptClass(classNode)) {
                 visitTopLevelScriptClass(classNode);
             } else {
@@ -96,13 +97,14 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         }
 
         BlockStatement statementBlock = module.getStatementBlock();
-        if (statementBlock != null) {
+        if (statementBlock != null && !Thread.currentThread().isInterrupted()) {
             statementBlock.visit(this);
         }
     }
 
     @Override
     public void visitDeclarationExpression(DeclarationExpression expr) {
+        if (Thread.currentThread().isInterrupted()) return;
         if (settings.isVariableTypesEnabled()) {
             addVariableTypeHint(expr);
         }
@@ -111,6 +113,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitMethod(MethodNode node) {
+        if (Thread.currentThread().isInterrupted()) return;
         if (settings.isMethodReturnTypesEnabled()) {
             addMethodReturnTypeHint(node);
         }
@@ -119,6 +122,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitClosureExpression(ClosureExpression expr) {
+        if (Thread.currentThread().isInterrupted()) return;
         if (settings.isClosureParameterTypesEnabled()) {
             addClosureParameterHints(expr);
         }
@@ -127,6 +131,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitMethodCallExpression(MethodCallExpression call) {
+        if (Thread.currentThread().isInterrupted()) return;
         if (settings.isParameterNamesEnabled()) {
             addMethodCallParameterHints(call);
         }
@@ -135,6 +140,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitConstructorCallExpression(ConstructorCallExpression call) {
+        if (Thread.currentThread().isInterrupted()) return;
         if (settings.isParameterNamesEnabled()) {
             addConstructorParameterHints(call);
         }

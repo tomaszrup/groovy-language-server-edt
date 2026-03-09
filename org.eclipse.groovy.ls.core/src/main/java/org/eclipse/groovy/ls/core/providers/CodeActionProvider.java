@@ -14,6 +14,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.net.URI;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.lang.reflect.Modifier;
@@ -36,6 +37,7 @@ import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.TypeNameMatch;
 import org.eclipse.jdt.core.search.TypeNameMatchRequestor;
+import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 
@@ -66,9 +68,44 @@ public class CodeActionProvider {
     private static final String IMPORT_PREFIX = "import ";
     private static final String LINE_SEPARATOR = "\n";
     private static final String TYPE_MESSAGE_MARKER = "The type ";
+    /** Data key used to mark code actions that need lazy resolve. */
+    public static final String RESOLVE_KIND_ADD_IMPORT = "groovy.addImport";
 
     private final DocumentManager documentManager;
     private final DiagnosticsProvider diagnosticsProvider;
+
+    /**
+     * LRU cache for import search results, keyed by "simpleName#projectName".
+     * Avoids redundant JDT SearchEngine scans when the same type is searched
+     * in createAddImportActions and again in collectMissingImports.
+     * Entries expire after 60 s (checked on read).
+     */
+    private static final int IMPORT_CACHE_MAX = 200;
+    private static final long IMPORT_CACHE_TTL_MS = 60_000;
+
+    private static final class CachedSearchResult {
+        final List<String> results;
+        final long timestamp;
+        CachedSearchResult(List<String> results) {
+            this.results = results;
+            this.timestamp = System.currentTimeMillis();
+        }
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > IMPORT_CACHE_TTL_MS;
+        }
+    }
+
+    @SuppressWarnings("serial")
+    private final Map<String, CachedSearchResult> importSearchCache =
+            Collections.synchronizedMap(
+                    new java.util.LinkedHashMap<String, CachedSearchResult>(
+                            IMPORT_CACHE_MAX + 1, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(
+                                Map.Entry<String, CachedSearchResult> eldest) {
+                            return size() > IMPORT_CACHE_MAX;
+                        }
+                    });
 
     public CodeActionProvider(DocumentManager documentManager,
             DiagnosticsProvider diagnosticsProvider) {
@@ -119,7 +156,11 @@ public class CodeActionProvider {
         List<Diagnostic> requestDiagnostics = diagnostics != null ? diagnostics : new ArrayList<>();
         requestDiagnostics = ensureDiagnosticsForRequest(uri, requestDiagnostics, wantQuickfix, wantSource);
 
-        List<Diagnostic> allDiagnostics = getLatestOrCollectedDiagnostics(uri);
+        // Reuse the same diagnostics for allDiagnostics — avoids a second
+        // (potentially expensive) diagnostic collection call.
+        List<Diagnostic> allDiagnostics = requestDiagnostics.isEmpty()
+                ? getLatestDiagnosticsOnly(uri)
+                : requestDiagnostics;
         return new CodeActionRequest(uri, content, onlyKinds, requestDiagnostics,
                 allDiagnostics, wantQuickfix, wantSource);
     }
@@ -143,15 +184,18 @@ public class CodeActionProvider {
         if ((!wantQuickfix && !wantSource) || !diagnostics.isEmpty()) {
             return diagnostics;
         }
-        return getLatestOrCollectedDiagnostics(uri);
+        return getLatestDiagnosticsOnly(uri);
     }
 
-    private List<Diagnostic> getLatestOrCollectedDiagnostics(String uri) {
-        List<Diagnostic> latest = diagnosticsProvider.getLatestDiagnostics(uri);
-        if (!latest.isEmpty()) {
-            return latest;
-        }
-        return diagnosticsProvider.collectDiagnosticsForCodeActions(uri);
+    /**
+     * Return cached diagnostics only — never trigger a full JDT reconcile.
+     * Code actions should work with whatever diagnostics are already available
+     * (either cached from the last didChange cycle, or provided by the client
+     * in the request context). Triggering reconcile from here frequently
+     * caused 5–15 s hangs that exceeded the 15 s code-action timeout.
+     */
+    private List<Diagnostic> getLatestDiagnosticsOnly(String uri) {
+        return diagnosticsProvider.getLatestDiagnostics(uri);
     }
 
     private void addQuickFixActions(List<Either<Command, CodeAction>> actions, CodeActionRequest request) {
@@ -258,7 +302,6 @@ public class CodeActionProvider {
 
         try {
             // Extract the type name from the diagnostic message
-            // getMessage() may return String or Either<String,MarkupContent> depending on lsp4j version
             Object msgObj = diag.getMessage();
             String message = msgObj != null ? msgObj.toString() : null;
             String typeName = extractTypeNameFromMessage(message);
@@ -270,24 +313,21 @@ public class CodeActionProvider {
             // Also check imports already present to avoid duplicates
             Set<String> existingImports = getExistingImports(uri);
 
-            // Find the insert position — after the last import, or after the package declaration
-            int insertLine = findImportInsertLine(content);
-
             for (String fqn : candidates) {
                 if (existingImports.contains(fqn)) continue;
 
-                String importStatement = IMPORT_PREFIX + fqn + LINE_SEPARATOR;
-                TextEdit insertEdit = new TextEdit(
-                        new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
-                        importStatement);
-
+                // Return a lightweight code action with data — the actual
+                // WorkspaceEdit is computed lazily in resolveCodeAction()
+                // so that the code-action list appears instantly.
                 CodeAction action = new CodeAction("Import '" + fqn + "'");
                 action.setKind(CodeActionKind.QuickFix);
                 action.setDiagnostics(Collections.singletonList(diag));
 
-                WorkspaceEdit edit = new WorkspaceEdit();
-                edit.setChanges(Collections.singletonMap(uri, Collections.singletonList(insertEdit)));
-                action.setEdit(edit);
+                com.google.gson.JsonObject data = new com.google.gson.JsonObject();
+                data.addProperty("resolve", RESOLVE_KIND_ADD_IMPORT);
+                data.addProperty("uri", uri);
+                data.addProperty("fqn", fqn);
+                action.setData(data);
 
                 actions.add(action);
             }
@@ -296,6 +336,51 @@ public class CodeActionProvider {
         }
 
         return actions;
+    }
+
+    /**
+     * Resolve a deferred code action by computing its WorkspaceEdit.
+     * Called by the LSP {@code codeAction/resolve} handler.
+     */
+    public CodeAction resolveCodeAction(CodeAction codeAction) {
+        Object rawData = codeAction.getData();
+        if (rawData == null) return codeAction;
+
+        com.google.gson.JsonObject data;
+        if (rawData instanceof com.google.gson.JsonObject jo) {
+            data = jo;
+        } else {
+            // LSP4J may deserialise data as a generic JsonElement
+            try {
+                data = com.google.gson.JsonParser.parseString(rawData.toString()).getAsJsonObject();
+            } catch (Exception e) {
+                return codeAction;
+            }
+        }
+
+        String resolveKind = data.has("resolve") ? data.get("resolve").getAsString() : null;
+        if (!RESOLVE_KIND_ADD_IMPORT.equals(resolveKind)) {
+            return codeAction;
+        }
+
+        String uri = data.has("uri") ? data.get("uri").getAsString() : null;
+        String fqn = data.has("fqn") ? data.get("fqn").getAsString() : null;
+        if (uri == null || fqn == null) return codeAction;
+
+        String content = documentManager.getContent(uri);
+        if (content == null) return codeAction;
+
+        int insertLine = findImportInsertLine(content);
+        String importStatement = IMPORT_PREFIX + fqn + LINE_SEPARATOR;
+        TextEdit insertEdit = new TextEdit(
+                new Range(new Position(insertLine, 0), new Position(insertLine, 0)),
+                importStatement);
+
+        WorkspaceEdit edit = new WorkspaceEdit();
+        edit.setChanges(Collections.singletonMap(uri, Collections.singletonList(insertEdit)));
+        codeAction.setEdit(edit);
+
+        return codeAction;
     }
 
     private CodeAction createAddAllMissingImportsAction(String uri, String content,
@@ -340,15 +425,23 @@ public class CodeActionProvider {
     /**
      * Search the JDT classpath index for types matching the given simple name.
      * Returns a list of fully qualified type names found on the project's classpath.
+     * Results are cached (LRU, 60 s TTL) to avoid duplicate searches within
+     * the same code-action request cycle.
      */
     private List<String> searchClasspathForType(String simpleName, String uri) {
+        // Check the cache first
+        List<IJavaProject> javaProjects = getSearchProjectsForUri(uri);
+        String projectKey = javaProjects.isEmpty()
+                ? simpleName
+                : simpleName + "#" + javaProjects.get(0).getElementName();
+        CachedSearchResult cached = importSearchCache.get(projectKey);
+        if (cached != null && !cached.isExpired()) {
+            return new ArrayList<>(cached.results);
+        }
+
         List<String> results = new ArrayList<>();
 
         try {
-            // Prefer the Java project that owns this document to avoid
-            // cross-project classpath bleed in multi-project workspaces.
-            List<IJavaProject> javaProjects = getSearchProjectsForUri(uri);
-
             if (javaProjects.isEmpty()) {
                 GroovyLanguageServerPlugin.logInfo(
                         "[codeaction] No Java project found for import search");
@@ -373,6 +466,22 @@ public class CodeActionProvider {
                 }
             };
 
+            // Use a progress monitor that checks the thread interrupt flag
+            // so SearchEngine can be cancelled when the LSP request times out.
+            IProgressMonitor searchMonitor = new IProgressMonitor() {
+                private volatile boolean cancelled = false;
+                @Override public void beginTask(String name, int totalWork) {}
+                @Override public void done() {}
+                @Override public void internalWorked(double work) {}
+                @Override public boolean isCanceled() {
+                    return cancelled || Thread.currentThread().isInterrupted();
+                }
+                @Override public void setCanceled(boolean value) { cancelled = value; }
+                @Override public void setTaskName(String name) {}
+                @Override public void subTask(String name) {}
+                @Override public void worked(int work) {}
+            };
+
             searchEngine.searchAllTypeNames(
                     null,                                    // any package
                     SearchPattern.R_EXACT_MATCH,
@@ -382,7 +491,7 @@ public class CodeActionProvider {
                     scope,
                     requestor,
                     IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
-                    null);
+                    searchMonitor);
 
             // Convert matches to FQNs, filtering out internal/synthetic types
             for (TypeNameMatch match : matches) {
@@ -412,6 +521,7 @@ public class CodeActionProvider {
                     "[codeaction] JDT type search failed for '" + simpleName + "'", e);
         }
 
+        importSearchCache.put(projectKey, new CachedSearchResult(results));
         return results;
     }
 

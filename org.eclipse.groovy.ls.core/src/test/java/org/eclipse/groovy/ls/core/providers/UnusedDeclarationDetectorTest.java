@@ -447,9 +447,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class, int[].class);
         m.setAccessible(true);
-        m.invoke(null, type, "class Foo { void regularMethod() {} void anotherMethod() {} }", "file:///src/main/groovy/Foo.groovy", diagnostics);
+        m.invoke(null, type, "class Foo { void regularMethod() {} void anotherMethod() {} }", "file:///src/main/groovy/Foo.groovy", diagnostics, new int[]{20});
 
         // Methods were iterated without exceptions
         assertNotNull(diagnostics);
@@ -471,9 +471,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class, int[].class);
         m.setAccessible(true);
-        m.invoke(null, type, "class Foo { void testSomething() {} }", "file:///src/main/groovy/Foo.groovy", diagnostics);
+        m.invoke(null, type, "class Foo { void testSomething() {} }", "file:///src/main/groovy/Foo.groovy", diagnostics, new int[]{20});
 
         // Test methods should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -494,9 +494,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class, int[].class);
         m.setAccessible(true);
-        m.invoke(null, type, "class Foo { static void main(String[] args) {} }", "file:///src/main/groovy/Foo.groovy", diagnostics);
+        m.invoke(null, type, "class Foo { static void main(String[] args) {} }", "file:///src/main/groovy/Foo.groovy", diagnostics, new int[]{20});
 
         // Main method should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -522,9 +522,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class, int[].class);
         m.setAccessible(true);
-        m.invoke(null, outerType, "class Outer { class Inner {} }", "file:///src/main/groovy/Outer.groovy", diagnostics);
+        m.invoke(null, outerType, "class Outer { class Inner {} }", "file:///src/main/groovy/Outer.groovy", diagnostics, new int[]{20});
 
         // Should complete without error (inner type was recursed)
         assertNotNull(diagnostics);
@@ -644,9 +644,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class, int[].class);
         m.setAccessible(true);
-        m.invoke(null, type, "class MyService { MyService() {} }", "file:///src/main/groovy/MyService.groovy", diagnostics);
+        m.invoke(null, type, "class MyService { MyService() {} }", "file:///src/main/groovy/MyService.groovy", diagnostics, new int[]{20});
 
         // Constructor in @Component type should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -667,9 +667,9 @@ class UnusedDeclarationDetectorTest {
         java.util.List<org.eclipse.lsp4j.Diagnostic> diagnostics = new java.util.ArrayList<>();
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class);
+                "collectUnusedDeclarations", IType.class, String.class, String.class, java.util.List.class, int[].class);
         m.setAccessible(true);
-        m.invoke(null, type, "class PlainClass { PlainClass() {} }", "file:///src/main/groovy/PlainClass.groovy", diagnostics);
+        m.invoke(null, type, "class PlainClass { PlainClass() {} }", "file:///src/main/groovy/PlainClass.groovy", diagnostics, new int[]{20});
 
         // Constructor in plain (non-framework) type should NOT be skipped —
         // it will proceed to isUnreferenced() which returns false for mocks

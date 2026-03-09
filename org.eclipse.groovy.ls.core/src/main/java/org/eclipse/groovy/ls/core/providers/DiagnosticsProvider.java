@@ -167,7 +167,12 @@ public class DiagnosticsProvider {
     }
 
     /**
-     * Publish diagnostics for a document immediately.
+     * Publish diagnostics for a document in two phases:
+     * <ol>
+     *   <li><b>Fast pass</b> — JDT reconcile + unused imports (published immediately)</li>
+     *   <li><b>Deferred pass</b> — unused declaration detection via SearchEngine
+     *       (scheduled 1 s later to avoid blocking the fast diagnostics)</li>
+     * </ol>
      */
     public void publishDiagnostics(String uri) {
         String normalizedUri = DocumentManager.normalizeUri(uri);
@@ -183,11 +188,35 @@ public class DiagnosticsProvider {
             return;
         }
 
+        // Phase 1: fast diagnostics (JDT reconcile + unused imports)
         List<Diagnostic> diagnostics = collectDiagnostics(uri);
-        latestDiagnosticsByUri.put(normalizedUri, diagnostics);
+        latestDiagnosticsByUri.put(normalizedUri, new ArrayList<>(diagnostics));
         GroovyLanguageServerPlugin.logInfo(
-                "[diag-trace] publishDiagnostics uri=" + uri + " count=" + diagnostics.size());
-        client.publishDiagnostics(new PublishDiagnosticsParams(uri, diagnostics));
+                "[diag-trace] publishDiagnostics (fast) uri=" + uri + " count=" + diagnostics.size());
+        client.publishDiagnostics(new PublishDiagnosticsParams(uri, new ArrayList<>(diagnostics)));
+
+        // Phase 2: deferred unused-declaration detection — runs after a short
+        // delay so the user sees JDT errors immediately without waiting for
+        // the expensive SearchEngine scans.
+        scheduler.schedule(() -> {
+            try {
+                if (documentManager.getContent(uri) == null) return;
+                List<Diagnostic> unusedDeclarations =
+                        UnusedDeclarationDetector.detectUnusedDeclarations(uri, documentManager);
+                if (!unusedDeclarations.isEmpty()) {
+                    List<Diagnostic> merged = new ArrayList<>(diagnostics);
+                    merged.addAll(unusedDeclarations);
+                    latestDiagnosticsByUri.put(normalizedUri, merged);
+                    client.publishDiagnostics(new PublishDiagnosticsParams(uri, merged));
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[diag-trace] publishDiagnostics (deferred) uri=" + uri
+                            + " +unused=" + unusedDeclarations.size());
+                }
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                        "Deferred unused-declaration detection failed for " + uri, e);
+            }
+        }, 1000, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -442,14 +471,11 @@ public class DiagnosticsProvider {
             GroovyLanguageServerPlugin.logError("Unused import detection failed for " + uri, e);
         }
 
-        // Detect unused types and methods (faded text via DiagnosticTag.Unnecessary)
-        try {
-            List<Diagnostic> unusedDeclarations =
-                    UnusedDeclarationDetector.detectUnusedDeclarations(uri, documentManager);
-            diagnostics.addAll(unusedDeclarations);
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("Unused declaration detection failed for " + uri, e);
-        }
+        // NOTE: Unused declaration detection (UnusedDeclarationDetector) is
+        // intentionally NOT run here — it is deferred to a secondary pass in
+        // publishDiagnostics() so that JDT diagnostics + unused imports are
+        // published immediately without waiting for the expensive SearchEngine
+        // scans.  See publishDiagnostics() Phase 2.
 
         return diagnostics;
     }
@@ -486,6 +512,9 @@ public class DiagnosticsProvider {
     private void collectFromWorkingCopy(ICompilationUnit workingCopy, List<Diagnostic> diagnostics,
             String content, PositionUtils.LineIndex lineIndex) {
         try {
+            if (Thread.currentThread().isInterrupted()) {
+                return;
+            }
             // Reconcile to get fresh problems
             org.eclipse.jdt.core.dom.CompilationUnit ast = workingCopy.reconcile(
                     org.eclipse.jdt.core.dom.AST.getJLSLatest(),
@@ -494,6 +523,9 @@ public class DiagnosticsProvider {
                     documentManager.getWorkingCopyOwner(),
                     null);
 
+            if (Thread.currentThread().isInterrupted()) {
+                return;
+            }
             if (ast != null) {
                 // Check whether the Groovy AST has zero classes. When the code
                 // is mid-edit and syntactically broken, the parser can produce

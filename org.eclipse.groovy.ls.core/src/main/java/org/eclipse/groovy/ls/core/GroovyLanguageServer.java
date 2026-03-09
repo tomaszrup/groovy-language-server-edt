@@ -259,6 +259,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     CodeActionKind.SourceOrganizeImports,
                     org.eclipse.groovy.ls.core.providers.CodeActionProvider.SOURCE_KIND_ADD_MISSING_IMPORTS,
                     org.eclipse.groovy.ls.core.providers.CodeActionProvider.SOURCE_KIND_REMOVE_UNUSED_IMPORTS));
+            codeActionOptions.setResolveProvider(true);
             capabilities.setCodeActionProvider(codeActionOptions);
 
             // Signature help
