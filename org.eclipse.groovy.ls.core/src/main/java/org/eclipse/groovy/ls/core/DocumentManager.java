@@ -884,8 +884,12 @@ public class DocumentManager {
 
     /**
      * Import an external project directory as an Eclipse JDT project.
-     * Creates an Eclipse project linked to the external directory, adds the
-     * Java and Groovy natures, and configures source folders.
+     * <p>
+     * Uses <b>linked folders</b> instead of {@code setLocation()} so that
+     * Eclipse metadata ({@code .project}, {@code .classpath}) is written
+     * to the Eclipse workspace area ({@code -data} dir) rather than the
+     * user's source directory.  A linked folder ({@code "linked"}) points
+     * to the actual project directory on disk.
      */
     private void importExternalProject(java.io.File projectRoot) {
         try {
@@ -904,9 +908,8 @@ public class DocumentManager {
             IProject project = workspace.getRoot().getProject(projectName);
             IProjectDescription description = workspace.newProjectDescription(projectName);
 
-            // Point the project to the external directory
-            IPath locationPath = Path.fromOSString(projectRoot.getAbsolutePath());
-            description.setLocation(locationPath);
+            // Do NOT call description.setLocation() — that would place
+            // .project/.classpath in the user's source directory.
 
             // Add Java and Groovy natures
             description.setNatureIds(new String[]{
@@ -917,11 +920,19 @@ public class DocumentManager {
             project.create(description, new NullProgressMonitor());
             project.open(new NullProgressMonitor());
 
+            // Create a linked folder pointing to the actual project directory
+            IFolder linkedRoot = project.getFolder("linked");
+            linkedRoot.createLink(
+                    org.eclipse.core.runtime.Path.fromOSString(projectRoot.getAbsolutePath()),
+                    IResource.ALLOW_MISSING_LOCAL,
+                    new NullProgressMonitor());
+
             GroovyLanguageServerPlugin.logInfo(
-                    "Created Eclipse project '" + projectName + "' at " + projectRoot.getAbsolutePath());
+                    "Created Eclipse project '" + projectName
+                    + "' (linked folder) → " + projectRoot.getAbsolutePath());
 
             // Configure the classpath with detected source folders
-            configureExternalProjectClasspath(project);
+            configureExternalProjectClasspath(project, linkedRoot);
 
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -932,11 +943,14 @@ public class DocumentManager {
     /**
      * Configure the JDT classpath for an imported external project.
      * Detects standard source directories (Maven/Gradle conventions)
-     * and sets up the build path. Library dependencies are provided
-     * asynchronously by the Red Hat Java extension via the
-     * {@code groovy/classpathUpdate} notification.
+     * under the linked folder and sets up the build path.  Library
+     * dependencies are provided asynchronously by the Red Hat Java
+     * extension via the {@code groovy/classpathUpdate} notification.
+     *
+     * @param project    the Eclipse project (in the metadata area)
+     * @param linkedRoot the linked folder pointing to the real directory
      */
-    private void configureExternalProjectClasspath(IProject project) {
+    private void configureExternalProjectClasspath(IProject project, IFolder linkedRoot) {
         try {
             IJavaProject javaProject = JavaCore.create(project);
             if (javaProject == null) {
@@ -958,7 +972,7 @@ public class DocumentManager {
             Set<String> addedSrcDirs = new java.util.LinkedHashSet<>();
 
             for (String srcDir : candidateSrcDirs) {
-                IFolder folder = project.getFolder(srcDir);
+                IFolder folder = linkedRoot.getFolder(srcDir);
                 if (folder == null || !folder.exists() || hasNestedConflict(srcDir, addedSrcDirs)) {
                     if (folder != null && folder.exists()) {
                         GroovyLanguageServerPlugin.logInfo(
@@ -970,13 +984,13 @@ public class DocumentManager {
                 addedSrcDirs.add(srcDir);
                 foundAny = true;
                 GroovyLanguageServerPlugin.logInfo(
-                        "[ext] Added source folder: " + srcDir);
+                        "[ext] Added source folder: linked/" + srcDir);
             }
 
             if (!foundAny) {
-                entries.add(JavaCore.newSourceEntry(project.getFullPath()));
+                entries.add(JavaCore.newSourceEntry(linkedRoot.getFullPath()));
                 GroovyLanguageServerPlugin.logInfo(
-                        "[ext] No standard source folders found; using project root.");
+                        "[ext] No standard source folders found; using linked root.");
             }
 
             // Add JRE system library
