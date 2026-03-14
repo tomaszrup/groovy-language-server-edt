@@ -231,6 +231,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
             String projectName = server.getProjectNameForUri(uri);
             return projectName != null && server.hasClasspathForProject(projectName);
         });
+        this.diagnosticsProvider.setInitializationCompleteSupplier(server::isFirstBuildComplete);
         this.diagnosticsProvider.setBuildInProgressSupplier(server::isBuildInProgress);
         this.codeActionProvider = new CodeActionProvider(documentManager, diagnosticsProvider);
         this.inlayHintProvider = new InlayHintProvider(documentManager);

@@ -954,6 +954,16 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     /**
+     * Returns {@code true} once the first workspace build has completed
+     * (meaning all classpath updates have had a chance to arrive and JDT
+     * indexes are populated).  Before this point, missing-classpath
+     * diagnostics are expected and should not be shown to the user.
+     */
+    public boolean isFirstBuildComplete() {
+        return firstFullBuildComplete;
+    }
+
+    /**
      * Read optional tuning parameters from the client's
      * {@code initializationOptions} JSON and reconfigure the LSP request
      * executor if custom values are provided.
@@ -1027,6 +1037,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * documents that belong to the given Eclipse project name. This provides
      * near-instant feedback when a project's classpath becomes available,
      * without waiting for the full workspace build.
+     * <p>
+     * As a safety net, files whose project could not be resolved are also
+     * re-published — this covers edge cases where the URI→project mapping
+     * fails (e.g., special characters, external projects, or race conditions
+     * during initialization).
      */
     private void publishDiagnosticsForProjectFiles(String projectName) {
         initialBuildScheduler.submit(() -> {
@@ -1034,10 +1049,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 for (String uri : documentManager.getOpenDocumentUris()) {
                     String ownerProject = getProjectNameForUri(
                             documentManager.getClientUri(uri));
-                    if (projectName.equals(ownerProject)) {
+                    if (projectName.equals(ownerProject) || ownerProject == null) {
                         GroovyLanguageServerPlugin.logInfo(
                                 "[eager-diag] Publishing diagnostics for " + uri
-                                + " (project " + projectName + ")");
+                                + " (project " + projectName
+                                + ", resolved=" + ownerProject + ")");
                         textDocumentService.publishDiagnosticsIfEnabled(uri);
                     }
                 }

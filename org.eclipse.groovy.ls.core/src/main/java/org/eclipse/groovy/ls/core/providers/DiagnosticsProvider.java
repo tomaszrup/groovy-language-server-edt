@@ -100,7 +100,16 @@ public class DiagnosticsProvider {
             new java.util.concurrent.atomic.AtomicReference<>();
     private final java.util.concurrent.atomic.AtomicReference<java.util.function.BooleanSupplier> buildInProgressSupplier =
             new java.util.concurrent.atomic.AtomicReference<>(() -> false);
-        private final java.util.Map<String, List<Diagnostic>> latestDiagnosticsByUri =
+    /**
+     * Supplier that returns {@code true} once the very first workspace build
+     * has completed.  Before that point, missing-classpath is expected
+     * (classpaths arrive asynchronously) and the "no classpath" warning
+     * should be suppressed to avoid false alarms for files that were
+     * already open when the server started.
+     */
+    private final java.util.concurrent.atomic.AtomicReference<java.util.function.BooleanSupplier> initializationCompleteSupplier =
+            new java.util.concurrent.atomic.AtomicReference<>(() -> true);
+    private final java.util.Map<String, List<Diagnostic>> latestDiagnosticsByUri =
             new java.util.concurrent.ConcurrentHashMap<>();
 
     // Simple debounce: track last scheduled publish per URI
@@ -162,6 +171,16 @@ public class DiagnosticsProvider {
      * blocks on the workspace lock) and use the standalone Groovy compiler
      * for fast, non-blocking syntax diagnostics instead.
      */
+    /**
+     * Set a supplier that returns {@code true} once the first workspace build
+     * has completed.  Before that point, the "Classpath is not configured"
+     * warning is suppressed — classpath updates are still arriving and the
+     * missing classpath is transient.
+     */
+    public void setInitializationCompleteSupplier(java.util.function.BooleanSupplier supplier) {
+        this.initializationCompleteSupplier.set(supplier);
+    }
+
     public void setBuildInProgressSupplier(java.util.function.BooleanSupplier supplier) {
         this.buildInProgressSupplier.set(supplier);
     }
@@ -401,7 +420,20 @@ public class DiagnosticsProvider {
                 GroovyLanguageServerPlugin.logError(
                     "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
             }
-            diagnostics.add(createNoClasspathWarning(content));
+            // Only show the "Classpath is not configured" warning after the
+            // first workspace build has completed.  Before that point the
+            // missing classpath is expected — classpath updates arrive
+            // asynchronously during the initialization window and the
+            // warning would be a false alarm for files that were already
+            // open when the server started.  Once the build finishes and
+            // full diagnostics are published, the warning is legitimate.
+            boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+            if (initComplete) {
+                diagnostics.add(createNoClasspathWarning(content));
+            } else {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[classpath-check] Suppressed noClasspath warning (initialization in progress) for " + uri);
+            }
             return diagnostics;
         }
 
