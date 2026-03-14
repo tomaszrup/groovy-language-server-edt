@@ -519,7 +519,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     "[classpathUpdate] Updating Eclipse project '" + projName + "'");
 
             ClasspathComputation classpathComputation =
-                    buildUpdatedClasspath(javaProject.getRawClasspath(), request.entries);
+                    buildUpdatedClasspath(eclipseProject, javaProject.getRawClasspath(), request.entries);
             List<IClasspathEntry> newEntries = classpathComputation.entries;
 
             javaProject.setRawClasspath(
@@ -577,20 +577,52 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         return params.get(key).getAsString();
     }
 
-    private ClasspathComputation buildUpdatedClasspath(IClasspathEntry[] currentEntries, List<String> requestedEntries) {
+    private ClasspathComputation buildUpdatedClasspath(
+            IProject eclipseProject,
+            IClasspathEntry[] currentEntries,
+            List<String> requestedEntries) {
         List<IClasspathEntry> newEntries = new ArrayList<>();
-        addPreservedClasspathEntries(currentEntries, newEntries);
+        recalculatePreservedClasspathEntries(eclipseProject, currentEntries, newEntries);
 
         ClasspathComputation computation = new ClasspathComputation(newEntries);
         appendLibraryEntries(requestedEntries, newEntries, computation);
         return computation;
     }
 
-    private void addPreservedClasspathEntries(IClasspathEntry[] currentEntries, List<IClasspathEntry> target) {
+    /**
+     * Re-detect source entries from the linked folder instead of blindly
+     * preserving the ones computed during {@code initialize()}.  At
+     * initialization time the Eclipse resource model may not yet have
+     * indexed the linked folder's children, causing the fallback source
+     * entry (the entire linked root) to be used.  By the time a
+     * {@code classpathUpdate} arrives the folder is fully visible, so
+     * re-detecting here self-heals any wrong initial source entries.
+     * Container entries (JRE) are preserved as-is.
+     */
+    private void recalculatePreservedClasspathEntries(
+            IProject eclipseProject,
+            IClasspathEntry[] currentEntries,
+            List<IClasspathEntry> target) {
+        // Preserve container entries (JRE, etc.)
         for (IClasspathEntry entry : currentEntries) {
-            if (entry.getEntryKind() == IClasspathEntry.CPE_SOURCE
-                    || entry.getEntryKind() == IClasspathEntry.CPE_CONTAINER) {
+            if (entry.getEntryKind() == IClasspathEntry.CPE_CONTAINER) {
                 target.add(entry);
+            }
+        }
+
+        // Re-detect source entries from the linked folder
+        IFolder linkedRoot = eclipseProject.getFolder(LINKED_FOLDER_NAME);
+        if (linkedRoot != null && linkedRoot.exists()) {
+            List<IClasspathEntry> freshSourceEntries = createSourceEntries(
+                    linkedRoot, DEFAULT_SOURCE_DIR_SUFFIXES,
+                    "[classpathUpdate] Re-detected source folder: linked/");
+            target.addAll(freshSourceEntries);
+        } else {
+            // Linked root not available — fall back to preserving existing source entries
+            for (IClasspathEntry entry : currentEntries) {
+                if (entry.getEntryKind() == IClasspathEntry.CPE_SOURCE) {
+                    target.add(entry);
+                }
             }
         }
     }
@@ -1173,6 +1205,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         GroovyLanguageServerPlugin.logInfo(
                 "[" + projectName + "] Linked folder → " + subDir.getAbsolutePath());
 
+        // Ensure the resource model sees the linked folder's children
+        // before we probe for source directories.  The createFilter() call
+        // above uses BACKGROUND_REFRESH, so without this the nested folders
+        // may not be visible yet.
+        linkedRoot.refreshLocal(IResource.DEPTH_INFINITE, new NullProgressMonitor());
+
         // Configure source folders (relative to the linked root)
         IJavaProject javaProject = JavaCore.create(project);
         List<IClasspathEntry> entries = createSourceEntries(linkedRoot, srcDirSuffixes,
@@ -1209,6 +1247,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 GroovyLanguageServerPlugin.logError("[classpath] JavaCore.create returned null", null);
                 return;
             }
+
+            // Synchronise the resource model before probing source dirs
+            linkedRoot.refreshLocal(IResource.DEPTH_INFINITE, new NullProgressMonitor());
 
             List<IClasspathEntry> entries = createSourceEntries(
                     linkedRoot, srcDirSuffixes, "[classpath] Added source folder: linked/");
@@ -1297,7 +1338,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         boolean found = false;
         for (String srcDir : srcDirSuffixes) {
             IFolder folder = linkedRoot.getFolder(srcDir);
-            if (folder != null && folder.exists()) {
+            if (folder != null && existsOnFilesystem(folder)) {
                 entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
                 GroovyLanguageServerPlugin.logInfo(logPrefix + srcDir);
                 found = true;
@@ -1308,11 +1349,24 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     private void addFallbackSourceEntry(IFolder linkedRoot, List<IClasspathEntry> entries) {
         IFolder srcFolder = linkedRoot.getFolder("src");
-        if (srcFolder != null && srcFolder.exists()) {
+        if (srcFolder != null && existsOnFilesystem(srcFolder)) {
             entries.add(JavaCore.newSourceEntry(srcFolder.getFullPath()));
             return;
         }
         entries.add(JavaCore.newSourceEntry(linkedRoot.getFullPath()));
+    }
+
+    /**
+     * Check whether a folder exists on the real filesystem, bypassing the
+     * Eclipse resource model.  Shortly after a linked folder is created the
+     * resource model may not have discovered its children yet (especially
+     * with {@code BACKGROUND_REFRESH}), so {@code folder.exists()} can
+     * return {@code false} for directories that are actually present.
+     * Falling back to the filesystem avoids misconfiguring source entries.
+     */
+    private static boolean existsOnFilesystem(IFolder folder) {
+        org.eclipse.core.runtime.IPath location = folder.getLocation();
+        return location != null && location.toFile().isDirectory();
     }
 
     private void putSubprojectMapping(String filesystemPath, String projectName) {

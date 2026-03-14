@@ -973,8 +973,9 @@ public class DocumentManager {
 
             for (String srcDir : candidateSrcDirs) {
                 IFolder folder = linkedRoot.getFolder(srcDir);
-                if (folder == null || !folder.exists() || hasNestedConflict(srcDir, addedSrcDirs)) {
-                    if (folder != null && folder.exists()) {
+                boolean folderExists = existsOnFilesystem(folder);
+                if (folder == null || !folderExists || hasNestedConflict(srcDir, addedSrcDirs)) {
+                    if (folder != null && folderExists) {
                         GroovyLanguageServerPlugin.logInfo(
                                 "[ext] Skipping nested source folder: " + srcDir);
                     }
@@ -1014,6 +1015,17 @@ public class DocumentManager {
                     "Failed to configure classpath for external project "
                     + project.getName() + " (non-fatal): " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Check whether a folder exists on the real filesystem, bypassing the
+     * Eclipse resource model which may not have indexed the linked folder's
+     * children yet (due to {@code BACKGROUND_REFRESH}).
+     */
+    private static boolean existsOnFilesystem(IFolder folder) {
+        if (folder == null) return false;
+        org.eclipse.core.runtime.IPath location = folder.getLocation();
+        return location != null && location.toFile().isDirectory();
     }
 
     /**

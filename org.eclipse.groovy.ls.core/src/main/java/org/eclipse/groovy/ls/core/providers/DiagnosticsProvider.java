@@ -583,9 +583,13 @@ public class DiagnosticsProvider {
                 contextUnit = compilationUnit;
             }
             for (IMarker marker : markers) {
-                // Filter out the same Groovy-Eclipse false positive from markers
+                // Filter out the same Groovy-Eclipse false positive from markers.
+                // Extract the JDT problem ID when available so that ID-based
+                // filters (e.g. PACKAGE_IS_NOT_EXPECTED_PROBLEM_ID) also work
+                // for marker-sourced diagnostics.
                 String msg = marker.getAttribute(IMarker.MESSAGE, "");
-                if (shouldSkipDiagnostic(-1, msg, javaProject, contextUnit)) {
+                int markerId = marker.getAttribute("id", -1);
+                if (shouldSkipDiagnostic(markerId, msg, javaProject, contextUnit)) {
                     continue;
                 }
                 Diagnostic diagnostic = toDiagnostic(marker, lineIndex);
@@ -637,6 +641,18 @@ public class DiagnosticsProvider {
         // When the Groovy AST has zero classes (code is mid-edit/broken), JDT
         // sees no package declaration and reports a spurious package mismatch.
         if (astHasNoClasses && problemId == PACKAGE_IS_NOT_EXPECTED_PROBLEM_ID) {
+            return true;
+        }
+
+        // Suppress "The declared package X does not match the expected package
+        // ''" — an expected package of "" (empty) is always a symptom of a
+        // misconfigured source root (e.g. when the linked folder's children
+        // were not yet visible during project creation).  A real source file
+        // with a package declaration should never be expected to have no
+        // package, so this is always a false positive.
+        if (problemId == PACKAGE_IS_NOT_EXPECTED_PROBLEM_ID
+                && message != null
+                && message.endsWith(" \"\"")) {
             return true;
         }
 
