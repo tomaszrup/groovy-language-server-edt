@@ -27,6 +27,7 @@ import {
 let client: LanguageClient | undefined;
 let outputChannel: OutputChannel;
 let statusBarItem: StatusBarItem;
+let isRestarting = false;
 
 interface ClasspathNotificationPayload {
     projectUri: string;
@@ -447,6 +448,7 @@ export async function activate(context: ExtensionContext): Promise<void> {
         commands.registerCommand('groovy.restartServer', async () => {
             outputChannel.appendLine('Restarting Groovy Language Server...');
             updateStatusBar('Starting', 'Restarting...');
+            isRestarting = true;
             if (client) {
                 await client.stop();
             }
@@ -609,6 +611,7 @@ export async function deactivate(): Promise<void> {
 }
 
 async function startLanguageServer(context: ExtensionContext): Promise<void> {
+    isRestarting = false;
     // 1. Resolve JRE
     const javaHome = resolveJavaHome();
     if (!javaHome) {
@@ -834,6 +837,9 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     // Monitor client state for unexpected crashes
     client.onDidChangeState((e) => {
         if (e.newState === 1 /* Stopped */ && e.oldState === 2 /* Running */) {
+            if (isRestarting) {
+                return;
+            }
             outputChannel.appendLine('Groovy Language Server stopped unexpectedly.');
             updateStatusBar('Error', 'Server stopped unexpectedly');
             window.showErrorMessage(

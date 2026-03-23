@@ -136,6 +136,21 @@ class UnusedImportDetectorTest {
     }
 
     @Test
+    void detectUnusedImportsStaticMethodCallNotFlaggedAsUnused() {
+        String source = """
+                import static java.util.Collections.emptyList
+                class Example {
+                    def items() { emptyList() }
+                }
+                """;
+
+        List<Diagnostic> diagnostics = UnusedImportDetector.detectUnusedImports(parseModule(source), source);
+
+        assertTrue(diagnostics.isEmpty(),
+                "Static import of emptyList used as bare method call should not be flagged as unused");
+    }
+
+    @Test
     void detectUnusedImportsWithConstructorCallMarksAsUsed() {
         String source = """
                 import java.time.LocalDate

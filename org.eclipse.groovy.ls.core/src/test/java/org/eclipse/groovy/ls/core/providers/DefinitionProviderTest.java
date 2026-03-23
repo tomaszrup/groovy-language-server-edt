@@ -965,8 +965,22 @@ class DefinitionProviderTest {
     }
 
     @Test
-    void tryResolveImportLineReturnsNullForStaticImport() throws Exception {
-        assertNull(invokeTryResolveImportLine("import static java.lang.Math.PI", "PI"));
+    void tryResolveImportLineResolvesStaticImportMember() throws Exception {
+        // Static import: resolves the member name to the containing class FQN
+        assertEquals("java.lang.Math",
+                invokeTryResolveImportLine("import static java.lang.Math.PI", "PI"));
+    }
+
+    @Test
+    void tryResolveImportLineResolvesStaticImportClass() throws Exception {
+        // Static import: resolves the class name itself
+        assertEquals("java.lang.Math",
+                invokeTryResolveImportLine("import static java.lang.Math.PI", "Math"));
+    }
+
+    @Test
+    void tryResolveImportLineReturnsNullForStaticImportNoMatch() throws Exception {
+        assertNull(invokeTryResolveImportLine("import static java.lang.Math.PI", "E"));
     }
 
     @Test

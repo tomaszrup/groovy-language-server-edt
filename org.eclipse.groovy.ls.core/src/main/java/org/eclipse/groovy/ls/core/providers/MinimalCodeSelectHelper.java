@@ -34,6 +34,7 @@ import org.codehaus.groovy.control.SourceUnit;
 import org.codehaus.jdt.groovy.model.GroovyCompilationUnit;
 import org.codehaus.jdt.groovy.model.ICodeSelectHelper;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
+import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
@@ -114,6 +115,15 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             if (fqnFromImport != null) {
                 IType type = javaProject.findType(fqnFromImport);
                 if (type != null) {
+                    // If the word doesn't match the type name, it's a static import member
+                    if (!type.getElementName().equals(word)) {
+                        IJavaElement member = findStaticMemberInType(type, word);
+                        if (member != null) {
+                            results.add(member);
+                            GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved static import member: " + word + " in " + fqnFromImport);
+                            return results.toArray(new IJavaElement[0]);
+                        }
+                    }
                     results.add(type);
                     GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved via import: " + fqnFromImport);
                     return results.toArray(new IJavaElement[0]);
@@ -211,11 +221,46 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
         // Check static imports (e.g., import static org.junit.Assert.assertEquals)
         for (ImportNode imp : module.getStaticImports().values()) {
             ClassNode type = imp.getType();
+            if (type == null) continue;
+            // Match by class name (cursor on the class part of the import line)
+            if (type.getNameWithoutPackage().equals(word)) {
+                return type.getName();
+            }
+            // Match by member name (cursor on the member at a usage site)
+            String fieldName = imp.getFieldName();
+            if (fieldName != null && fieldName.equals(word)) {
+                return type.getName();
+            }
+        }
+
+        // Check static star imports (e.g., import static org.junit.Assert.*)
+        for (ImportNode imp : module.getStaticStarImports().values()) {
+            ClassNode type = imp.getType();
             if (type != null && type.getNameWithoutPackage().equals(word)) {
                 return type.getName();
             }
         }
 
+        return null;
+    }
+
+    /**
+     * Find a method or field by name in a type (for static import member resolution).
+     */
+    private IJavaElement findStaticMemberInType(IType type, String memberName) {
+        try {
+            for (IMethod method : type.getMethods()) {
+                if (method.getElementName().equals(memberName)) {
+                    return method;
+                }
+            }
+            IField field = type.getField(memberName);
+            if (field != null && field.exists()) {
+                return field;
+            }
+        } catch (JavaModelException e) {
+            // fall through
+        }
         return null;
     }
 

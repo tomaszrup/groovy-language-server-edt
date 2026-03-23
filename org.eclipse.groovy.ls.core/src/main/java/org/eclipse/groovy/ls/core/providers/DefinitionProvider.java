@@ -329,6 +329,17 @@ public class DefinitionProvider {
                     return loc;
                 }
             }
+            // Fallback: search the filesystem directly via project locations.
+            // This handles cases where Eclipse's resource model hasn't refreshed
+            // linked folders yet, or where sibling project source directories
+            // aren't visible through IProject.getFile().
+            for (IProject project : projects) {
+                if (!project.isOpen()) continue;
+                Location loc = searchProjectOnFilesystem(project, pathSuffix);
+                if (loc != null) {
+                    return loc;
+                }
+            }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[definition] Failed to search workspace for " + fqn, e);
         }
@@ -368,6 +379,51 @@ public class DefinitionProvider {
                 String targetUri = file.getLocationURI().toString();
                 return new Location(targetUri,
                         new Range(new Position(0, 0), new Position(0, 0)));
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Filesystem-based fallback for source lookup. Derives the real directory
+     * from the project's location (or its linked folders), then checks standard
+     * source directory layouts directly on disk.
+     */
+    private Location searchProjectOnFilesystem(IProject project, String pathSuffix) {
+        try {
+            // Try the project's direct location first
+            org.eclipse.core.runtime.IPath projectLocation = project.getLocation();
+            if (projectLocation != null) {
+                Location loc = findSourceOnDisk(projectLocation.toFile(), pathSuffix);
+                if (loc != null) return loc;
+            }
+            // Try linked folders (each may point to a different directory)
+            for (IResource member : project.members()) {
+                if (member instanceof org.eclipse.core.resources.IFolder folder) {
+                    org.eclipse.core.runtime.IPath folderLocation = folder.getLocation();
+                    if (folderLocation != null) {
+                        Location loc = findSourceOnDisk(folderLocation.toFile(), pathSuffix);
+                        if (loc != null) return loc;
+                    }
+                }
+            }
+        } catch (CoreException e) {
+            // ignore — best-effort fallback
+        }
+        return null;
+    }
+
+    private Location findSourceOnDisk(java.io.File projectDir, String pathSuffix) {
+        if (projectDir == null || !projectDir.isDirectory()) return null;
+        String[] extensions = {EXT_GROOVY, EXT_JAVA};
+        for (String ext : extensions) {
+            for (String srcPrefix : SRC_PREFIXES) {
+                java.io.File candidate = new java.io.File(projectDir, srcPrefix + pathSuffix + ext);
+                if (candidate.isFile()) {
+                    String targetUri = candidate.toURI().toString();
+                    return new Location(targetUri,
+                            new Range(new Position(0, 0), new Position(0, 0)));
+                }
             }
         }
         return null;
@@ -512,6 +568,23 @@ public class DefinitionProvider {
         }
         String importLine = trimmed.substring(7).replace(";", "").trim();
         if (importLine.startsWith(STATIC_PREFIX)) {
+            // Handle static imports: "import static org.junit.Assert.assertEquals"
+            String staticPart = importLine.substring(STATIC_PREFIX.length()).trim();
+            // Check if simpleName matches the member name (last segment)
+            if (staticPart.endsWith("." + simpleName)) {
+                int lastDot = staticPart.lastIndexOf('.');
+                if (lastDot > 0) {
+                    return staticPart.substring(0, lastDot);
+                }
+            }
+            // Check if simpleName matches the class name
+            int lastDot = staticPart.lastIndexOf('.');
+            if (lastDot > 0) {
+                String classPart = staticPart.substring(0, lastDot);
+                if (classPart.endsWith("." + simpleName) || classPart.equals(simpleName)) {
+                    return classPart;
+                }
+            }
             return null;
         }
         if (importLine.endsWith("." + simpleName)) {
@@ -783,6 +856,13 @@ public class DefinitionProvider {
         Location localVarResult = resolveLocalVariableDeclaration(ast, word, uri);
         if (localVarResult != null) {
             locations.add(localVarResult);
+            return locations;
+        }
+
+        // 5) Check static imports — resolve the member's containing class via JDT
+        Location staticImportResult = resolveStaticImportMember(ast, word);
+        if (staticImportResult != null) {
+            locations.add(staticImportResult);
             return locations;
         }
 
@@ -1349,6 +1429,34 @@ public class DefinitionProvider {
 
             if (varExpr.getLineNumber() >= 1) {
                 return astNodeToLocation(uri, varExpr);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve a word via static imports (e.g., {@code assertEquals} from
+     * {@code import static org.junit.Assert.assertEquals}).
+     * Looks up the containing class via JDT and navigates to the member.
+     */
+    private Location resolveStaticImportMember(ModuleNode ast, String word) {
+        // Check named static imports
+        for (ImportNode imp : ast.getStaticImports().values()) {
+            String fieldName = imp.getFieldName();
+            if (fieldName != null && fieldName.equals(word)) {
+                ClassNode type = imp.getType();
+                if (type != null) {
+                    Location loc = navigateToFqn(type.getName(), type.getNameWithoutPackage());
+                    if (loc != null) return loc;
+                }
+            }
+        }
+        // Check static star imports
+        for (ImportNode imp : ast.getStaticStarImports().values()) {
+            ClassNode type = imp.getType();
+            if (type != null) {
+                Location loc = navigateToFqn(type.getName(), type.getNameWithoutPackage());
+                if (loc != null) return loc;
             }
         }
         return null;

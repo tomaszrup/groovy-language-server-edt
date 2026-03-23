@@ -246,9 +246,9 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     }
 
     private void collectImportTokens(ModuleNode module) {
-        // Star imports
+        // Star imports (e.g., import java.util.*)
         for (ImportNode imp : module.getStarImports()) {
-            visitSingleImport(imp);
+            visitStarImport(imp);
         }
         // Regular imports
         for (ImportNode imp : module.getImports()) {
@@ -258,9 +258,82 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         for (ImportNode imp : module.getStaticImports().values()) {
             visitSingleImport(imp);
         }
-        // Static star imports
+        // Static star imports (e.g., import static org.junit.Assert.*)
         for (ImportNode imp : module.getStaticStarImports().values()) {
-            visitSingleImport(imp);
+            visitStaticStarImport(imp);
+        }
+    }
+
+    /**
+     * Emit tokens for a wildcard import like {@code import java.util.*}.
+     * The ImportNode's getType() returns a synthetic node with invalid line numbers,
+     * so we use getPackageName() and the ImportNode's own line number instead.
+     */
+    private void visitStarImport(ImportNode imp) {
+        if (imp.getLineNumber() < 1) return;
+        String packageName = imp.getPackageName();
+        if (packageName == null || packageName.isEmpty()) return;
+        // Remove trailing dot if present (Groovy's getPackageName() returns "java.util.")
+        if (packageName.endsWith(".")) {
+            packageName = packageName.substring(0, packageName.length() - 1);
+        }
+        int line = imp.getLineNumber() - 1;
+        emitAllSegmentsAsNamespace(packageName, line);
+    }
+
+    /**
+     * Emit tokens for a static wildcard import like {@code import static org.junit.Assert.*}.
+     * Emits package segments as namespace and the class name as type.
+     */
+    private void visitStaticStarImport(ImportNode imp) {
+        if (imp.getLineNumber() < 1) return;
+        ClassNode importedType = imp.getType();
+        // Try the normal path first (works when the type has valid positions)
+        if (importedType != null && importedType.getLineNumber() > 0) {
+            String className = importedType.getNameWithoutPackage();
+            int tLine = importedType.getLineNumber() - 1;
+            int tCol = importedType.getColumnNumber() - 1;
+            if (tCol >= 0 && !className.isEmpty()) {
+                emitImportPackageTokens(importedType.getName(), tLine, tCol);
+                emitImportTypeToken(className, tLine, tCol);
+                return;
+            }
+        }
+        // Fallback: use the ImportNode's own line and the type's FQN
+        if (importedType == null) return;
+        String fqn = importedType.getName();
+        if (fqn == null || fqn.isEmpty()) return;
+        int line = imp.getLineNumber() - 1;
+        String className = importedType.getNameWithoutPackage();
+        String packageName = fqn.contains(".")
+                ? fqn.substring(0, fqn.lastIndexOf('.'))
+                : null;
+        if (packageName != null && !packageName.isEmpty()) {
+            emitAllSegmentsAsNamespace(packageName, line);
+        }
+        if (className != null && !className.isEmpty()) {
+            int nameOffset = findNameInLine(line, 0, className);
+            if (nameOffset >= 0) {
+                addToken(line, nameOffset, className.length(),
+                        SemanticTokensProvider.TYPE_TYPE, 0);
+            }
+        }
+    }
+
+    /**
+     * Emit namespace tokens for every segment of a dotted name on a given line.
+     */
+    private void emitAllSegmentsAsNamespace(String dottedName, int line) {
+        String[] segments = dottedName.split("\\.");
+        int cursor = 0;
+        for (String segment : segments) {
+            if (segment == null || segment.isEmpty()) continue;
+            int segOffset = findNameInLine(line, cursor, segment);
+            if (segOffset >= 0) {
+                addToken(line, segOffset, segment.length(),
+                        SemanticTokensProvider.TYPE_NAMESPACE, 0);
+                cursor = segOffset + segment.length() + 1;
+            }
         }
     }
 

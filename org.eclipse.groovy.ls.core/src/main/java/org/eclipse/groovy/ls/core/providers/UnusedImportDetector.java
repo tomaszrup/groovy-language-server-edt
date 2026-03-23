@@ -109,7 +109,13 @@ public class UnusedImportDetector {
             this.column = node.getColumnNumber() - 1;
             this.used = false;
 
-            if (node.getType() != null) {
+            if (node.isStatic() && node.getFieldName() != null) {
+                // Static import: track by member name (e.g., "assertEquals")
+                this.simpleName = node.getFieldName();
+                ClassNode type = node.getType();
+                this.fullName = (type != null ? type.getName() : node.getClassName())
+                        + "." + node.getFieldName();
+            } else if (node.getType() != null) {
                 this.simpleName = node.getType().getNameWithoutPackage();
                 this.fullName = node.getType().getName();
             } else {
@@ -465,6 +471,13 @@ public class UnusedImportDetector {
                         && Character.isUpperCase(name.charAt(0))) {
                     simpleNames.add(name);
                 }
+            }
+            // Capture the method name — needed for bare calls of statically
+            // imported methods (e.g., assertEquals(...) from
+            // import static org.junit.Assert.assertEquals).
+            String methodName = expr.getMethodAsString();
+            if (methodName != null && !methodName.isEmpty()) {
+                simpleNames.add(methodName);
             }
             super.visitMethodCallExpression(expr);
         }
