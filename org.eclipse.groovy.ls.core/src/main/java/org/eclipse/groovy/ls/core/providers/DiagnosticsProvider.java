@@ -412,29 +412,26 @@ public class DiagnosticsProvider {
                 + " hasClasspath=" + hasClasspath);
 
         if (!hasClasspath) {
-            GroovyLanguageServerPlugin.logInfo(
-                    "[classpath-check] No classpath for " + uri + " → syntax-only mode");
-            try {
-                collectFromGroovyCompiler(uri, diagnostics);
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError(
-                    "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
-            }
-            // Only show the "Classpath is not configured" warning after the
-            // first workspace build has completed.  Before that point the
-            // missing classpath is expected — classpath updates arrive
-            // asynchronously during the initialization window and the
-            // warning would be a false alarm for files that were already
-            // open when the server started.  Once the build finishes and
-            // full diagnostics are published, the warning is legitimate.
+            // After the first workspace build, the JDT model is fully indexed
+            // even if the per-project classpath mapping didn't cover this file.
+            // Skip the no-classpath warning and fall through to JDT diagnostics.
             boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
             if (initComplete) {
-                diagnostics.add(createNoClasspathWarning(content));
+                GroovyLanguageServerPlugin.logInfo(
+                        "[classpath-check] No mapped classpath for " + uri
+                        + " but init complete — proceeding with JDT diagnostics");
+                // Fall through to JDT-based diagnostics below
             } else {
                 GroovyLanguageServerPlugin.logInfo(
-                        "[classpath-check] Suppressed noClasspath warning (initialization in progress) for " + uri);
+                        "[classpath-check] No classpath for " + uri + " → syntax-only mode");
+                try {
+                    collectFromGroovyCompiler(uri, diagnostics);
+                } catch (Exception e) {
+                    GroovyLanguageServerPlugin.logError(
+                        "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
+                }
+                return diagnostics;
             }
-            return diagnostics;
         }
 
         // When a build is in progress, the workspace lock is held and any

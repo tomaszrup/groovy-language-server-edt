@@ -724,13 +724,9 @@ public class DefinitionProvider {
     }
 
     private boolean canResolveSourceUncached(String fqn) {
-        // Quick check: JDK types
-        String jdkSource = SourceJarHelper.readSourceFromJdkSrcZip(fqn);
-        if (jdkSource != null) return true;
-
-        // Check workspace
-        Location wsLoc = findSourceInWorkspace(fqn);
-        if (wsLoc != null) return true;
+        // Use JDT's indexed type search — covers JDK, workspace source, and
+        // binary types on the classpath.  Much faster than manual filesystem
+        // scanning or opening src.zip.
 
         // Try the project that last resolved successfully first
         IProject remembered = currentDefinitionProject;
