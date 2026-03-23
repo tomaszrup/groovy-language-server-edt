@@ -38,6 +38,7 @@ import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.IClassFile;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
@@ -231,6 +232,16 @@ public class DefinitionProvider {
             return workspaceLoc;
         }
 
+        // Try to derive source from the binary type's classpath entry path.
+        // For types from sibling project build outputs (build/classes/ or
+        // build/libs/), walk up to the project root and check source dirs.
+        Location binaryDerivedLoc = findSourceFromBinaryRoot(type, fqn);
+        if (binaryDerivedLoc != null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[definition] Found source via binary root: " + binaryDerivedLoc.getUri());
+            return binaryDerivedLoc;
+        }
+
         Location jarLoc = toLocationFromSourcesJar(type, fqn);
         if (jarLoc != null) {
             return jarLoc;
@@ -318,6 +329,67 @@ public class DefinitionProvider {
      * Search the workspace for a source file that defines the given fully-qualified type.
      * Converts FQN to a path pattern and searches for matching .groovy or .java files.
      */
+    /**
+     * Derive the source file location from the binary type's package fragment root.
+     * When a type comes from a sibling project's build output (e.g.
+     * {@code build/classes/java/main} or {@code build/libs/foo.jar}), we walk up
+     * from the binary path to find the project root, then check standard source dirs.
+     * This works even for deeply nested Gradle subprojects that may not have their
+     * own Eclipse IProject.
+     */
+    private Location findSourceFromBinaryRoot(IType type, String fqn) {
+        try {
+            IPackageFragmentRoot pfr =
+                    (IPackageFragmentRoot) type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT);
+            if (pfr == null) return null;
+
+            // Resolve the filesystem path for this classpath entry
+            org.eclipse.core.runtime.IPath pfrPath = pfr.getPath();
+            if (pfrPath == null) return null;
+
+            // pfrPath might be workspace-relative (e.g., /ExtGroovy_foo/linked/build/...)
+            // or absolute filesystem. Get the real filesystem location.
+            java.io.File binaryDir;
+            if (pfr.getResource() != null && pfr.getResource().getLocation() != null) {
+                binaryDir = pfr.getResource().getLocation().toFile();
+            } else {
+                // External or absolute path — use as-is
+                binaryDir = pfrPath.toFile();
+            }
+
+            if (binaryDir == null) return null;
+
+            // Walk up from the binary path to find the project root.
+            // We look for a parent whose child is "build" (handles both
+            // build/classes/java/main and build/libs/*.jar cases).
+            java.io.File projectRoot = deriveProjectRoot(binaryDir);
+            if (projectRoot == null) return null;
+
+            String pathSuffix = fqn.replace('.', '/');
+            return findSourceOnDisk(projectRoot, pathSuffix);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "[definition] Error in findSourceFromBinaryRoot for " + fqn, e);
+            return null;
+        }
+    }
+
+    /**
+     * Walk up from a binary output directory or JAR to find the project root.
+     * Stops when we find a directory whose child is named "build".
+     */
+    private java.io.File deriveProjectRoot(java.io.File path) {
+        java.io.File current = path;
+        // Walk up at most 10 levels to avoid infinite loop
+        for (int i = 0; i < 10 && current != null; i++) {
+            if ("build".equals(current.getName())) {
+                return current.getParentFile();
+            }
+            current = current.getParentFile();
+        }
+        return null;
+    }
+
     private Location findSourceInWorkspace(String fqn) {
         try {
             String pathSuffix = fqn.replace('.', '/');
