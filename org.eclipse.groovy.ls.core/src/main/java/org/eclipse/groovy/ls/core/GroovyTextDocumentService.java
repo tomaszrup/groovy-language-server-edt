@@ -228,6 +228,11 @@ public class GroovyTextDocumentService implements TextDocumentService {
         this.formattingProvider = new FormattingProvider(documentManager);
         this.diagnosticsProvider = new DiagnosticsProvider(documentManager);
         this.diagnosticsProvider.setClasspathChecker(uri -> {
+            // After the first full build, all classpaths have been received
+            // and applied.  The per-project mapping may not cover every file
+            // (e.g. deeply nested subprojects), so treat all files as having
+            // a classpath once the build is done.
+            if (server.isFirstBuildComplete()) return true;
             String projectName = server.getProjectNameForUri(uri);
             return projectName != null && server.hasClasspathForProject(projectName);
         });

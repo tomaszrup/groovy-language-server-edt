@@ -364,7 +364,6 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
                 firstFullBuildComplete = true;
                 GroovyLanguageServerPlugin.logInfo("Build completed (kind=" + buildKind + ").");
-                sendStatus(STATUS_READY, null);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Build failed (kind=" + buildKind + ")", e);
                 sendStatus("Error", "Build failed: " + e.getMessage());
@@ -373,7 +372,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             }
 
             // Now that the workspace lock is released, publish full JDT-based
-            // diagnostics for every open file.
+            // diagnostics for every open file.  Keep the status as Compiling
+            // until diagnostics have been dispatched — the reconcile work
+            // itself runs asynchronously on the diagnostics thread pool.
             try {
                 textDocumentService.publishDiagnosticsForOpenDocuments();
             } catch (Exception e) {
@@ -387,6 +388,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Post-build code lens refresh failed", e);
             }
+
+            // Mark as ready only after diagnostics have been scheduled
+            // for all open files, so the user doesn't see "Ready" while
+            // imports are still being resolved.
+            sendStatus(STATUS_READY, null);
         });
     }
 

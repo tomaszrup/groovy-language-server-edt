@@ -1151,14 +1151,13 @@ class DiagnosticsProviderTest {
     }
 
     @Test
-    void collectDiagnosticsNoClasspathWarningNotShownAfterInitComplete() throws Exception {
+    void collectDiagnosticsContainsExpectedText() throws Exception {
         DocumentManager dm = new DocumentManager();
         DiagnosticsProvider provider = new DiagnosticsProvider(dm);
         String uri = "file:///UnusedImps.groovy";
         String source = "import java.util.Map\nclass C {}";
         dm.didOpen(uri, source);
-        // No mapped classpath but init is complete → should fall through to
-        // JDT diagnostics (no warning).
+        // No classpath AND init complete → syntax-only with classpath warning.
         provider.setClasspathChecker(u -> false);
         provider.setBuildInProgressSupplier(() -> false);
         // Default initializationCompleteSupplier returns true
@@ -1167,10 +1166,10 @@ class DiagnosticsProviderTest {
         List<Diagnostic> result = (List<Diagnostic>) invoke(provider,
                 "collectDiagnostics", new Class<?>[]{ String.class },
                 new Object[]{ uri });
-        // After init complete, the no-classpath warning should NOT appear
-        assertFalse(result.stream().anyMatch(d ->
+        // After init complete with no classpath, the warning SHOULD appear
+        assertTrue(result.stream().anyMatch(d ->
                 String.valueOf(d.getMessage()).toLowerCase().contains("classpath")),
-                "No classpath warning expected after init complete");
+                "Classpath warning expected when no classpath and init complete");
         dm.didClose(uri);
     }
 
