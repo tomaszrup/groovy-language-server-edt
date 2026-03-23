@@ -176,6 +176,7 @@ public class DefinitionProvider {
 
     /**
      * Try to resolve a location from the element's workspace resource (source file in the project).
+     * Only returns locations for actual source files (.java, .groovy), never for .class files.
      */
     private Location toLocationFromResource(IJavaElement element) throws JavaModelException {
         IResource resource = element.getResource();
@@ -187,6 +188,11 @@ public class DefinitionProvider {
         }
 
         if (resource != null && resource.getLocationURI() != null) {
+            String name = resource.getName();
+            // Skip binary .class files — we want source files only
+            if (name != null && name.endsWith(".class")) {
+                return null;
+            }
             String targetUri = resource.getLocationURI().toString();
             Range range = new Range(new Position(0, 0), new Position(0, 0));
             if (element instanceof ISourceReference sourceRef) {
@@ -223,23 +229,24 @@ public class DefinitionProvider {
     private Location resolveLocationForType(IType type) {
         String fqn = type.getFullyQualifiedName();
         GroovyLanguageServerPlugin.logInfo("[definition] Binary type: " + fqn
-                + " — searching workspace for source");
+                + " — searching for source");
 
-        Location workspaceLoc = findSourceInWorkspace(fqn);
-        if (workspaceLoc != null) {
-            GroovyLanguageServerPlugin.logInfo("[definition] Found source in workspace: "
-                    + workspaceLoc.getUri());
-            return workspaceLoc;
-        }
-
-        // Try to derive source from the binary type's classpath entry path.
-        // For types from sibling project build outputs (build/classes/ or
-        // build/libs/), walk up to the project root and check source dirs.
+        // 1) Fast, targeted: derive source from the binary type's classpath entry.
+        //    Works for sibling project build outputs (build/classes/, build/libs/)
+        //    and project output folders (bin/).
         Location binaryDerivedLoc = findSourceFromBinaryRoot(type, fqn);
         if (binaryDerivedLoc != null) {
             GroovyLanguageServerPlugin.logInfo(
                     "[definition] Found source via binary root: " + binaryDerivedLoc.getUri());
             return binaryDerivedLoc;
+        }
+
+        // 2) Broader: search all workspace projects via Eclipse resource model.
+        Location workspaceLoc = findSourceInWorkspace(fqn);
+        if (workspaceLoc != null) {
+            GroovyLanguageServerPlugin.logInfo("[definition] Found source in workspace: "
+                    + workspaceLoc.getUri());
+            return workspaceLoc;
         }
 
         Location jarLoc = toLocationFromSourcesJar(type, fqn);
@@ -326,16 +333,14 @@ public class DefinitionProvider {
     }
 
     /**
-     * Search the workspace for a source file that defines the given fully-qualified type.
-     * Converts FQN to a path pattern and searches for matching .groovy or .java files.
-     */
-    /**
      * Derive the source file location from the binary type's package fragment root.
-     * When a type comes from a sibling project's build output (e.g.
-     * {@code build/classes/java/main} or {@code build/libs/foo.jar}), we walk up
-     * from the binary path to find the project root, then check standard source dirs.
-     * This works even for deeply nested Gradle subprojects that may not have their
-     * own Eclipse IProject.
+     * <p>
+     * Strategy 1: For external roots (library entries pointing to build/classes/ or
+     * build/libs/), resolve the absolute filesystem path, walk up past "build" to
+     * find the project root, and check standard source dirs on disk.
+     * <p>
+     * Strategy 2: For workspace-internal roots (e.g., a project's /bin output),
+     * find the owning IProject's linked folder and check source dirs on disk.
      */
     private Location findSourceFromBinaryRoot(IType type, String fqn) {
         try {
@@ -343,30 +348,36 @@ public class DefinitionProvider {
                     (IPackageFragmentRoot) type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT);
             if (pfr == null) return null;
 
-            // Resolve the filesystem path for this classpath entry
             org.eclipse.core.runtime.IPath pfrPath = pfr.getPath();
             if (pfrPath == null) return null;
 
-            // pfrPath might be workspace-relative (e.g., /ExtGroovy_foo/linked/build/...)
-            // or absolute filesystem. Get the real filesystem location.
-            java.io.File binaryDir;
-            if (pfr.getResource() != null && pfr.getResource().getLocation() != null) {
-                binaryDir = pfr.getResource().getLocation().toFile();
-            } else {
-                // External or absolute path — use as-is
-                binaryDir = pfrPath.toFile();
+            String pathSuffix = fqn.replace('.', '/');
+
+            // Strategy 1: External library entry (absolute filesystem path).
+            // Covers build/classes/java/main and build/libs/*.jar from sibling projects.
+            java.io.File binaryFile = resolveExternalPath(pfr);
+            if (binaryFile != null) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[definition] Binary root path: " + binaryFile.getAbsolutePath());
+                java.io.File projectRoot = deriveProjectRoot(binaryFile);
+                if (projectRoot != null) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[definition] Derived project root: " + projectRoot.getAbsolutePath());
+                    Location loc = findSourceOnDisk(projectRoot, pathSuffix);
+                    if (loc != null) return loc;
+                }
             }
 
-            if (binaryDir == null) return null;
+            // Strategy 2: Workspace-internal root (e.g., project /bin output).
+            // Use the owning project's linked folder to find source on disk.
+            IProject owningProject = pfr.getJavaProject() != null
+                    ? pfr.getJavaProject().getProject() : null;
+            if (owningProject != null && owningProject.isOpen()) {
+                Location loc = searchLinkedFoldersOnDisk(owningProject, pathSuffix);
+                if (loc != null) return loc;
+            }
 
-            // Walk up from the binary path to find the project root.
-            // We look for a parent whose child is "build" (handles both
-            // build/classes/java/main and build/libs/*.jar cases).
-            java.io.File projectRoot = deriveProjectRoot(binaryDir);
-            if (projectRoot == null) return null;
-
-            String pathSuffix = fqn.replace('.', '/');
-            return findSourceOnDisk(projectRoot, pathSuffix);
+            return null;
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "[definition] Error in findSourceFromBinaryRoot for " + fqn, e);
@@ -375,14 +386,52 @@ public class DefinitionProvider {
     }
 
     /**
+     * Resolve the absolute filesystem path for a package fragment root.
+     * Returns null if the root is workspace-internal (no external path).
+     */
+    private java.io.File resolveExternalPath(IPackageFragmentRoot pfr) {
+        // For external roots, getPath() is already an absolute filesystem path
+        if (pfr.isExternal()) {
+            return pfr.getPath().toFile();
+        }
+        // For workspace-internal roots, try to get the real filesystem location
+        // via the resource model
+        if (pfr.getResource() != null && pfr.getResource().getLocation() != null) {
+            return pfr.getResource().getLocation().toFile();
+        }
+        return null;
+    }
+
+    /**
+     * Search a project's linked folders for source files on disk.
+     * Each linked folder may point to a different filesystem directory.
+     */
+    private Location searchLinkedFoldersOnDisk(IProject project, String pathSuffix) {
+        try {
+            for (IResource member : project.members()) {
+                if (member instanceof org.eclipse.core.resources.IFolder folder) {
+                    org.eclipse.core.runtime.IPath loc = folder.getLocation();
+                    if (loc != null) {
+                        Location result = findSourceOnDisk(loc.toFile(), pathSuffix);
+                        if (result != null) return result;
+                    }
+                }
+            }
+        } catch (CoreException e) {
+            // ignore — best effort
+        }
+        return null;
+    }
+
+    /**
      * Walk up from a binary output directory or JAR to find the project root.
-     * Stops when we find a directory whose child is named "build".
+     * Recognizes both Gradle output ("build") and Eclipse output ("bin").
      */
     private java.io.File deriveProjectRoot(java.io.File path) {
         java.io.File current = path;
-        // Walk up at most 10 levels to avoid infinite loop
         for (int i = 0; i < 10 && current != null; i++) {
-            if ("build".equals(current.getName())) {
+            String name = current.getName();
+            if ("build".equals(name) || "bin".equals(name)) {
                 return current.getParentFile();
             }
             current = current.getParentFile();
@@ -397,17 +446,6 @@ public class DefinitionProvider {
             for (IProject project : projects) {
                 if (!project.isOpen()) continue;
                 Location loc = searchProjectForSource(project, pathSuffix);
-                if (loc != null) {
-                    return loc;
-                }
-            }
-            // Fallback: search the filesystem directly via project locations.
-            // This handles cases where Eclipse's resource model hasn't refreshed
-            // linked folders yet, or where sibling project source directories
-            // aren't visible through IProject.getFile().
-            for (IProject project : projects) {
-                if (!project.isOpen()) continue;
-                Location loc = searchProjectOnFilesystem(project, pathSuffix);
                 if (loc != null) {
                     return loc;
                 }
@@ -452,35 +490,6 @@ public class DefinitionProvider {
                 return new Location(targetUri,
                         new Range(new Position(0, 0), new Position(0, 0)));
             }
-        }
-        return null;
-    }
-
-    /**
-     * Filesystem-based fallback for source lookup. Derives the real directory
-     * from the project's location (or its linked folders), then checks standard
-     * source directory layouts directly on disk.
-     */
-    private Location searchProjectOnFilesystem(IProject project, String pathSuffix) {
-        try {
-            // Try the project's direct location first
-            org.eclipse.core.runtime.IPath projectLocation = project.getLocation();
-            if (projectLocation != null) {
-                Location loc = findSourceOnDisk(projectLocation.toFile(), pathSuffix);
-                if (loc != null) return loc;
-            }
-            // Try linked folders (each may point to a different directory)
-            for (IResource member : project.members()) {
-                if (member instanceof org.eclipse.core.resources.IFolder folder) {
-                    org.eclipse.core.runtime.IPath folderLocation = folder.getLocation();
-                    if (folderLocation != null) {
-                        Location loc = findSourceOnDisk(folderLocation.toFile(), pathSuffix);
-                        if (loc != null) return loc;
-                    }
-                }
-            }
-        } catch (CoreException e) {
-            // ignore — best-effort fallback
         }
         return null;
     }
