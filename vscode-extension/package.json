@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.0.31",
+    "version": "1.2.1",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -93,7 +93,7 @@
                 "groovy.java.home": {
                     "type": "string",
                     "default": null,
-                    "description": "Path to the JDK installation used to run the Groovy language server. Requires JDK 17 or later. If not set, uses the JAVA_HOME environment variable.",
+                    "description": "Path to the JDK installation used to run the Groovy language server. Requires JDK 21 or later. If not set, uses the JAVA_HOME environment variable.",
                     "scope": "machine-overridable"
                 },
                 "groovy.ls.vmargs": {
@@ -192,12 +192,23 @@
         },
         "commands": [
             {
+                "command": "groovy.triggerSuggestAndSignatureHelp",
+                "title": "Groovy: Trigger Completion And Signature Help"
+            },
+            {
                 "command": "groovy.restartServer",
                 "title": "Groovy: Restart Language Server"
             },
             {
                 "command": "groovy.showOutputChannel",
                 "title": "Groovy: Show Output Channel"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "groovy.triggerSuggestAndSignatureHelp",
+                "key": "ctrl+space",
+                "when": "editorTextFocus && editorLangId == groovy"
             }
         ]
     },

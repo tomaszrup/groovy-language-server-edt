@@ -23,12 +23,6 @@ import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
-import org.eclipse.jdt.core.search.IJavaSearchConstants;
-import org.eclipse.jdt.core.search.IJavaSearchScope;
-import org.eclipse.jdt.core.search.SearchEngine;import org.eclipse.jdt.core.search.IJavaSearchScope;import org.eclipse.jdt.core.search.SearchMatch;
-import org.eclipse.jdt.core.search.SearchParticipant;
-import org.eclipse.jdt.core.search.SearchPattern;
-import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticSeverity;
 import org.eclipse.lsp4j.DiagnosticTag;
@@ -262,52 +256,7 @@ public class UnusedDeclarationDetector {
      * The search is cancelled as soon as the first match is found.
      */
     private static boolean isUnreferenced(IJavaElement element, String uri) {
-        try {
-            SearchPattern pattern = SearchPattern.createPattern(
-                    element, IJavaSearchConstants.REFERENCES);
-            if (pattern == null) {
-                return false;
-            }
-
-            // Scope to the enclosing project's sources only – we only care
-            // whether the declaration is referenced in source code, not in JARs.
-            // When the file is under src/test/, narrow scope to test sources.
-            org.eclipse.jdt.core.IJavaProject javaProject =
-                    element.getJavaProject();
-            IJavaSearchScope scope = SearchScopeHelper.createSourceScope(javaProject, uri);
-
-            boolean[] found = {false};
-            SearchEngine engine = new SearchEngine();
-
-            // Use a progress monitor that cancels after the first match
-            // to avoid scanning the entire index needlessly.
-            org.eclipse.core.runtime.IProgressMonitor cancelOnFound =
-                    new org.eclipse.core.runtime.NullProgressMonitor() {
-                        @Override
-                        public boolean isCanceled() {
-                            return found[0];
-                        }
-                    };
-
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                    scope,
-                    new SearchRequestor() {
-                        @Override
-                        public void acceptSearchMatch(SearchMatch match) {
-                            found[0] = true;
-                        }
-                    },
-                    cancelOnFound);
-
-            return !found[0];
-        } catch (org.eclipse.core.runtime.OperationCanceledException ignored) {
-            // Cancelled because we found a reference — not unused.
-            return false;
-        } catch (Exception e) {
-            // If search fails, don't flag as unused
-            return false;
-        }
+        return !ReferenceSearchHelper.hasReferences(element, uri);
     }
 
     /**

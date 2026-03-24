@@ -58,6 +58,9 @@ public class InlayHintProvider {
 
     private static final int HIERARCHY_CACHE_MAX = 100;
 
+    private record ReturnTypeInfo(String displayName, IType resolvedType) {
+    }
+
     private final DocumentManager documentManager;
     private final java.util.concurrent.atomic.AtomicReference<InlayHintSettings> currentSettings =
             new java.util.concurrent.atomic.AtomicReference<>(InlayHintSettings.defaults());
@@ -258,9 +261,9 @@ public class InlayHintProvider {
                 if (requestedRange != null && !isInRange(info.line, requestedRange)) {
                     continue;
                 }
-                IType returnType = resolveMethodCallChainType(info.methodCall, module, project, hierarchyCache);
-                if (returnType != null) {
-                    String typeName = returnType.getElementName();
+                ReturnTypeInfo returnType = resolveMethodCallChainInfo(info.methodCall, module, project, hierarchyCache);
+                if (returnType != null && returnType.displayName() != null && !returnType.displayName().isBlank()) {
+                    String typeName = returnType.displayName();
                     Position hintPos = new Position(info.line, info.column + info.varName.length());
                     InlayHint hint = new InlayHint(hintPos, Either.forLeft(": " + typeName));
                     hint.setKind(InlayHintKind.Type);
@@ -286,6 +289,13 @@ public class InlayHintProvider {
     private IType resolveMethodCallChainType(MethodCallExpression methodCall,
                                               ModuleNode module, IJavaProject project,
                                               Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) {
+        ReturnTypeInfo returnType = resolveMethodCallChainInfo(methodCall, module, project, hierarchyCache);
+        return returnType != null ? returnType.resolvedType() : null;
+    }
+
+    private ReturnTypeInfo resolveMethodCallChainInfo(MethodCallExpression methodCall,
+            ModuleNode module, IJavaProject project,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) {
         try {
             Expression objectExpr = methodCall.getObjectExpression();
             String methodName = methodCall.getMethodAsString();
@@ -297,7 +307,8 @@ public class InlayHintProvider {
                 ClassNode ctorType = ctorCall.getType();
                 receiverType = resolveClassNodeToType(ctorType, module, project);
             } else if (objectExpr instanceof MethodCallExpression nestedCall) {
-                receiverType = resolveMethodCallChainType(nestedCall, module, project, hierarchyCache);
+                ReturnTypeInfo nestedReturnType = resolveMethodCallChainInfo(nestedCall, module, project, hierarchyCache);
+                receiverType = nestedReturnType != null ? nestedReturnType.resolvedType() : null;
             } else if (objectExpr instanceof VariableExpression varExpr) {
                 String receiverVarName = varExpr.getName();
                 if (!"this".equals(receiverVarName)) {
@@ -312,7 +323,7 @@ public class InlayHintProvider {
             if (receiverType == null) return null;
 
             // Find the method return type via JDT, with per-request hierarchy cache
-            return findMethodReturnType(receiverType, methodName, project, hierarchyCache);
+            return findMethodReturnInfo(receiverType, methodName, project, hierarchyCache);
         } catch (Exception e) {
             return null;
         }
@@ -320,7 +331,8 @@ public class InlayHintProvider {
 
     private IType findMethodReturnType(IType receiverType, String methodName, IJavaProject project)
             throws JavaModelException {
-        return findMethodReturnType(receiverType, methodName, project, null);
+        ReturnTypeInfo returnType = findMethodReturnInfo(receiverType, methodName, project, null);
+        return returnType != null ? returnType.resolvedType() : null;
     }
 
     /**
@@ -333,56 +345,119 @@ public class InlayHintProvider {
             IJavaProject project,
             Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache)
             throws JavaModelException {
+        ReturnTypeInfo returnType = findMethodReturnInfo(receiverType, methodName, project, hierarchyCache);
+        return returnType != null ? returnType.resolvedType() : null;
+    }
+
+    private ReturnTypeInfo findMethodReturnInfo(IType receiverType, String methodName,
+            IJavaProject project,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache)
+            throws JavaModelException {
+        IType memberSource = JavaBinaryMemberResolver.resolveMemberSource(receiverType);
+        if (memberSource == null) {
+            return null;
+        }
+
         // Search in the type itself first
-        IMethod[] methods = receiverType.getMethods();
-        for (IMethod method : methods) {
-            if (methodName.equals(method.getElementName())) {
-                String returnSig = method.getReturnType();
-                if (returnSig != null) {
-                    String returnTypeName = org.eclipse.jdt.core.Signature.toString(returnSig);
-                    IType returnType = resolveTypeByName(returnTypeName, receiverType, project);
-                    if (returnType != null) return returnType;
-                }
-            }
+        ReturnTypeInfo returnType = findMethodReturnInfo(memberSource.getMethods(), methodName, memberSource, project);
+        if (returnType != null) {
+            return returnType;
         }
 
         // Check supertypes — cache the hierarchy per receiver FQN
-        String cacheKey = receiverType.getFullyQualifiedName();
+        String cacheKey = memberSource.getFullyQualifiedName();
         org.eclipse.jdt.core.ITypeHierarchy hierarchy = null;
         if (hierarchyCache != null) {
             hierarchy = hierarchyCache.get(cacheKey);
         }
         if (hierarchy == null) {
-            hierarchy = receiverType.newSupertypeHierarchy(null);
+            hierarchy = memberSource.newSupertypeHierarchy(null);
             if (hierarchyCache != null && hierarchy != null) {
                 hierarchyCache.put(cacheKey, hierarchy);
             }
         }
 
         if (hierarchy != null) {
-            for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
-                for (IMethod method : superType.getMethods()) {
-                    if (methodName.equals(method.getElementName())) {
-                        String returnSig = method.getReturnType();
-                        if (returnSig != null) {
-                            String returnTypeName = org.eclipse.jdt.core.Signature.toString(returnSig);
-                            IType returnType = resolveTypeByName(returnTypeName, superType, project);
-                            if (returnType != null) return returnType;
-                        }
-                    }
+            for (IType superType : hierarchy.getAllSupertypes(memberSource)) {
+                returnType = findMethodReturnInfo(superType.getMethods(), methodName, superType, project);
+                if (returnType != null) {
+                    return returnType;
+                }
+            }
+        }
+
+        return findRecordComponentReturnInfo(receiverType, methodName, project);
+    }
+
+    private ReturnTypeInfo findMethodReturnInfo(IMethod[] methods, String methodName,
+            IType context, IJavaProject project) throws JavaModelException {
+        for (IMethod method : methods) {
+            if (methodName.equals(method.getElementName())) {
+                ReturnTypeInfo returnType = createReturnTypeInfoFromSignature(method.getReturnType(), context, project);
+                if (returnType != null) {
+                    return returnType;
                 }
             }
         }
         return null;
     }
 
+    private ReturnTypeInfo findRecordComponentReturnInfo(IType receiverType, String methodName,
+            IJavaProject project) throws JavaModelException {
+        for (JavaRecordSourceSupport.RecordComponentInfo component : JavaRecordSourceSupport.getRecordComponents(receiverType)) {
+            if (methodName.equals(component.name())) {
+                return createReturnTypeInfo(component.type(), receiverType, project);
+            }
+        }
+        return null;
+    }
+
+    private ReturnTypeInfo createReturnTypeInfoFromSignature(String returnSig, IType context,
+            IJavaProject project) throws JavaModelException {
+        if (returnSig == null || returnSig.isBlank()) {
+            return null;
+        }
+        return createReturnTypeInfo(org.eclipse.jdt.core.Signature.toString(returnSig), context, project);
+    }
+
+    private ReturnTypeInfo createReturnTypeInfo(String displayName, IType context,
+            IJavaProject project) throws JavaModelException {
+        String normalizedDisplayName = normalizeDisplayTypeName(displayName);
+        if (normalizedDisplayName == null) {
+            return null;
+        }
+        IType resolvedType = resolveTypeByName(normalizedDisplayName, context, project);
+        return new ReturnTypeInfo(normalizedDisplayName, resolvedType);
+    }
+
+    private String normalizeDisplayTypeName(String typeName) {
+        if (typeName == null) {
+            return null;
+        }
+        String normalized = typeName.trim();
+        return normalized.isEmpty() ? null : normalized;
+    }
+
     private IType resolveTypeByName(String typeName, IType context, IJavaProject project)
             throws JavaModelException {
+        String lookupTypeName = normalizeLookupTypeName(typeName);
+        if (lookupTypeName == null) {
+            return null;
+        }
+
         IType type = project.findType(typeName);
         if (type != null) return type;
 
+        if (!lookupTypeName.equals(typeName)) {
+            type = project.findType(lookupTypeName);
+            if (type != null) return type;
+        }
+
         if (context != null) {
             String[][] resolved = context.resolveType(typeName);
+            if ((resolved == null || resolved.length == 0) && !lookupTypeName.equals(typeName)) {
+                resolved = context.resolveType(lookupTypeName);
+            }
             if (resolved != null && resolved.length > 0) {
                 String fqn = resolved[0][0].isEmpty()
                         ? resolved[0][1]
@@ -393,8 +468,38 @@ public class InlayHintProvider {
         }
 
         // Try java.lang
-        type = project.findType("java.lang." + typeName);
+        type = project.findType("java.lang." + lookupTypeName);
         return type;
+    }
+
+    private String normalizeLookupTypeName(String typeName) {
+        if (typeName == null) {
+            return null;
+        }
+
+        String normalized = typeName.trim();
+        if (normalized.isEmpty() || "?".equals(normalized)) {
+            return null;
+        }
+
+        if (normalized.startsWith("? extends ")) {
+            normalized = normalized.substring("? extends ".length()).trim();
+        } else if (normalized.startsWith("? super ")) {
+            normalized = normalized.substring("? super ".length()).trim();
+        }
+
+        int angleBracket = normalized.indexOf('<');
+        if (angleBracket >= 0) {
+            normalized = normalized.substring(0, angleBracket);
+        }
+
+        int bracket = normalized.indexOf('[');
+        if (bracket >= 0) {
+            normalized = normalized.substring(0, bracket);
+        }
+
+        normalized = normalized.trim();
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private IType resolveClassNodeToType(ClassNode typeNode, ModuleNode module, IJavaProject project)

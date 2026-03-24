@@ -4,8 +4,8 @@ plugins {
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 // Read versions from gradle.properties
@@ -29,6 +29,14 @@ def eclipseSearchVersion = project.property('eclipseSearchVersion')
 def lsp4jVersion = project.property('lsp4jVersion')
 def groovyVersion = project.property('groovyVersion')
 def gsonVersion = project.property('gsonVersion')
+def groovyEclipseIntegrationVersion = project.property('groovyEclipseIntegrationVersion')
+def groovyEclipseTrain = project.property('groovyEclipseTrain')
+def groovyEclipseBuildQualifier = project.property('groovyEclipseBuildQualifier')
+
+def groovyEclipseP2Base = "https://groovy.jfrog.io/artifactory/plugins-release-local/org/codehaus/groovy/groovy-eclipse-integration/${groovyEclipseIntegrationVersion}/${groovyEclipseTrain}/plugins"
+def groovyEclipseGroovyCoreJarName = "org.eclipse.jdt.groovy.core_${groovyEclipseIntegrationVersion}.${groovyEclipseBuildQualifier}.jar"
+def groovyEclipseLibDir = layout.buildDirectory.dir('groovy-eclipse-libs')
+def groovyEclipseGroovyCoreJar = groovyEclipseLibDir.map { it.file(groovyEclipseGroovyCoreJarName) }
 
 // Configure source directories to match the Eclipse plugin layout
 sourceSets {
@@ -39,6 +47,27 @@ sourceSets {
         resources {
             srcDirs = ['src/main/java']
             include '**/*.properties', '**/*.xml'
+        }
+    }
+}
+
+tasks.register('downloadGroovyEclipseCompileOnlyJar') {
+    description = 'Download the groovy-eclipse helper bundle used only for compile/test wiring'
+    group = 'build'
+
+    outputs.file(groovyEclipseGroovyCoreJar)
+
+    doLast {
+        def targetFile = groovyEclipseGroovyCoreJar.get().asFile
+        if (!targetFile.exists()) {
+            targetFile.parentFile.mkdirs()
+            def url = "${groovyEclipseP2Base}/${groovyEclipseGroovyCoreJarName}"
+            logger.lifecycle("Downloading groovy-eclipse helper bundle: ${groovyEclipseGroovyCoreJarName}")
+            new URL(url).withInputStream { input ->
+                targetFile.withOutputStream { output ->
+                    output << input
+                }
+            }
         }
     }
 }
@@ -92,7 +121,7 @@ dependencies {
     // ---- groovy-eclipse JDT Groovy Core (compile-only) ----
     // Needed to compile MinimalCodeSelectHelper against ICodeSelectHelper / GroovyCompilationUnit.
     // At runtime the real OSGi bundle is loaded from the plugins/ directory.
-    compileOnly files('libs/org.eclipse.jdt.groovy.core_6.0.0.v202512311626-e2503.jar')
+    compileOnly files(groovyEclipseGroovyCoreJar)
 
     // ---- Test ----
     testImplementation platform('org.junit:junit-bom:5.11.0')
@@ -100,7 +129,15 @@ dependencies {
     testImplementation 'org.mockito:mockito-core:5.12.0'
     testImplementation "org.apache.groovy:groovy:${groovyVersion}"
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-    testRuntimeOnly files('libs/org.eclipse.jdt.groovy.core_6.0.0.v202512311626-e2503.jar')
+    testRuntimeOnly files(groovyEclipseGroovyCoreJar)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    dependsOn 'downloadGroovyEclipseCompileOnlyJar'
+}
+
+tasks.withType(Test).configureEach {
+    dependsOn 'downloadGroovyEclipseCompileOnlyJar'
 }
 
 test {

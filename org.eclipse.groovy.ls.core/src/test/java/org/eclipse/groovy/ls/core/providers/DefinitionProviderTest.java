@@ -30,7 +30,9 @@ import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.Flags;
 import org.eclipse.jdt.core.IField;
+import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IOrdinaryClassFile;
 import org.eclipse.jdt.core.IPackageFragment;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.lsp4j.DefinitionParams;
@@ -368,6 +370,47 @@ class DefinitionProviderTest {
     }
 
     @Test
+    void resolveLocationForTypeUsesJdtAttachedSource() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getFullyQualifiedName()).thenReturn("test.binary.AttachedDemo");
+        when(type.getElementName()).thenReturn("AttachedDemo");
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(null);
+
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        when(type.getClassFile()).thenReturn(classFile);
+        String source = """
+                package test.binary;
+                public class AttachedDemo {
+                    public String marker() {
+                        return \"attached\";
+                    }
+                }
+                """;
+        when(classFile.getSource()).thenReturn(source);
+
+        Location loc = invokeResolveLocationForType(type);
+
+        assertNotNull(loc);
+        assertEquals("groovy-source:///test/binary/AttachedDemo.java", loc.getUri());
+        assertEquals(source, SourceJarHelper.resolveSourceContent(loc.getUri()));
+    }
+
+    @Test
+    void resolveLocationForTypeReturnsNullWhenBinaryTypeHasNoSource() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getFullyQualifiedName()).thenReturn("test.binary.NoSource");
+        when(type.getElementName()).thenReturn("NoSource");
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(null);
+
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        when(type.getClassFile()).thenReturn(classFile);
+        when(classFile.getSource()).thenReturn(null);
+
+        assertNull(invokeResolveLocationForType(type));
+        assertNull(SourceJarHelper.getCachedContent("test.binary.NoSource"));
+    }
+
+    @Test
     void getDefinitionFromGroovyASTWithMultipleClasses() throws Exception {
         String uri = "file:///DefASTMulti.groovy";
         String content = """
@@ -686,6 +729,12 @@ class DefinitionProviderTest {
         Method m = DefinitionProvider.class.getDeclaredMethod("generateClassStub", IType.class);
         m.setAccessible(true);
         return (String) m.invoke(provider, type);
+    }
+
+    private Location invokeResolveLocationForType(IType type) throws Exception {
+        Method m = DefinitionProvider.class.getDeclaredMethod("resolveLocationForType", IType.class);
+        m.setAccessible(true);
+        return (Location) m.invoke(provider, type);
     }
 
     // ================================================================

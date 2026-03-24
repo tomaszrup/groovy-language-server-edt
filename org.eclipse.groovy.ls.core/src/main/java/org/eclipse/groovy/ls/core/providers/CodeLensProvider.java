@@ -54,6 +54,8 @@ public class CodeLensProvider {
     private static final String HANDLE_ID_KEY = "handleId";
     private static final String URI_KEY = "uri";
     private static final String SHOW_REFERENCES_COMMAND = "groovy.showReferences";
+    private static final String SHOW_OUTPUT_COMMAND = "groovy.showOutputChannel";
+    private static final String REFERENCES_UNAVAILABLE_TITLE = "References unavailable";
     private static final int RESOLVE_CACHE_SIZE = 300;
 
     private final DocumentManager documentManager;
@@ -82,11 +84,10 @@ public class CodeLensProvider {
      */
     public void invalidateCodeLensCache(String uri) {
         if (uri == null) return;
-        resolveCache.entrySet().removeIf(entry -> {
-            // Handle IDs produced by JDT contain the project-relative path;
-            // a simple URI suffix check covers the common case.
-            return entry.getKey().contains(uri) || uri.contains(entry.getKey());
-        });
+        // Handle IDs produced by JDT contain the project-relative path;
+        // a simple URI suffix check covers the common case.
+        resolveCache.entrySet().removeIf(
+                entry -> entry.getKey().contains(uri) || uri.contains(entry.getKey()));
     }
 
     /**
@@ -124,7 +125,7 @@ public class CodeLensProvider {
         try {
             IType[] types = workingCopy.getTypes();
             for (IType type : types) {
-                addCodeLensesForType(type, content, lenses);
+                addCodeLensesForType(type, content, uri, lenses);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("CodeLens generation failed for " + uri, e);
@@ -202,22 +203,22 @@ public class CodeLensProvider {
     }
 
     private static Command fallbackCommand() {
-        return new Command("0 references", SHOW_REFERENCES_COMMAND);
+        return new Command(REFERENCES_UNAVAILABLE_TITLE, SHOW_OUTPUT_COMMAND);
     }
 
     // ---- Helpers ----
 
-    private void addCodeLensesForType(IType type, String content, List<CodeLens> lenses)
+    private void addCodeLensesForType(IType type, String content, String uri, List<CodeLens> lenses)
             throws JavaModelException {
         // Code lens for the type itself
-        CodeLens typeLens = createUnresolvedCodeLens(type, content);
+        CodeLens typeLens = createCodeLensIfReferenced(type, content, uri);
         if (typeLens != null) {
             lenses.add(typeLens);
         }
 
         // Code lens for each method
         for (IMethod method : type.getMethods()) {
-            CodeLens methodLens = createUnresolvedCodeLens(method, content);
+            CodeLens methodLens = createCodeLensIfReferenced(method, content, uri);
             if (methodLens != null) {
                 lenses.add(methodLens);
             }
@@ -225,8 +226,19 @@ public class CodeLensProvider {
 
         // Recurse into inner types
         for (IType innerType : type.getTypes()) {
-            addCodeLensesForType(innerType, content, lenses);
+            addCodeLensesForType(innerType, content, uri, lenses);
         }
+    }
+
+    CodeLens createCodeLensIfReferenced(IJavaElement element, String content, String uri) {
+        if (!hasReferences(element, uri)) {
+            return null;
+        }
+        return createUnresolvedCodeLens(element, content);
+    }
+
+    boolean hasReferences(IJavaElement element, String uri) {
+        return ReferenceSearchHelper.hasReferences(element, uri);
     }
 
     /**
@@ -235,7 +247,7 @@ public class CodeLensProvider {
      * is performed here — resolution is deferred to
      * {@link #resolveCodeLens(CodeLens)}.
      */
-    private CodeLens createUnresolvedCodeLens(IJavaElement element, String content) {
+    CodeLens createUnresolvedCodeLens(IJavaElement element, String content) {
         try {
             if (!(element instanceof ISourceReference sourceRef)) {
                 return null;

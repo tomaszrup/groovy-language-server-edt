@@ -4,28 +4,37 @@ plugins {
 
 def eclipseEquinoxLauncherVersion = project.property('eclipseEquinoxLauncherVersion')
 def groovyVersion = project.property('groovyVersion')
+def groovyEclipseIntegrationVersion = project.property('groovyEclipseIntegrationVersion')
+def groovyEclipseTrain = project.property('groovyEclipseTrain')
+def groovyEclipseBuildQualifier = project.property('groovyEclipseBuildQualifier')
+def groovyEclipseJdtCoreVersion = project.property('groovyEclipseJdtCoreVersion')
 
 // ---- Groovy-Eclipse integration settings ----
 // The patched JDT core from groovy-eclipse replaces the standard JDT at runtime
 // to provide native Groovy compilation support inside Eclipse/JDT.
-def groovyEclipseIntegrationVersion = '6.0.0'
-def groovyEclipseBuildQualifier = 'v202512311626-e2503'
-def groovyEclipseP2Base = "https://groovy.jfrog.io/artifactory/plugins-release-local/org/codehaus/groovy/groovy-eclipse-integration/${groovyEclipseIntegrationVersion}/e4.35/plugins"
+def groovyEclipseP2Base = "https://groovy.jfrog.io/artifactory/plugins-release-local/org/codehaus/groovy/groovy-eclipse-integration/${groovyEclipseIntegrationVersion}/${groovyEclipseTrain}/plugins"
 
 // Groovy-Eclipse OSGi bundles to download from the p2 update site.
 // Only the essential bundles for JDT-Groovy integration are included.
 // The .eclipse.core/.codeassist/.refactoring bundles require full Eclipse IDE
 // (UI, codebrowsing, compilerResolver) and are not needed for a headless LS.
 def groovyEclipseBundles = [
-    "org.eclipse.jdt.core_3.41.0.${groovyEclipseBuildQualifier}.jar",
-    "org.eclipse.jdt.core.compiler.batch_3.41.0.${groovyEclipseBuildQualifier}.jar",
+    "org.eclipse.jdt.core_${groovyEclipseJdtCoreVersion}.${groovyEclipseBuildQualifier}.jar",
+    "org.eclipse.jdt.core.compiler.batch_${groovyEclipseJdtCoreVersion}.${groovyEclipseBuildQualifier}.jar",
     "org.eclipse.jdt.groovy.core_${groovyEclipseIntegrationVersion}.${groovyEclipseBuildQualifier}.jar",
-    "org.codehaus.groovy_5.0.3.${groovyEclipseBuildQualifier}.jar",
+    "org.codehaus.groovy_${groovyVersion}.${groovyEclipseBuildQualifier}.jar",
 ]
 
 // The product output directory
 def productDir = layout.buildDirectory.dir('product')
 def pluginsDir = layout.buildDirectory.dir('product/plugins')
+
+tasks.register('cleanProductDir', Delete) {
+    description = 'Delete the assembled product directory before repopulating it'
+    group = 'build'
+
+    delete productDir
+}
 
 // ============================================================================
 // Task: Collect all runtime JARs (our plugin + all transitive Eclipse deps)
@@ -34,6 +43,7 @@ tasks.register('collectPlugins', Copy) {
     description = 'Collect all runtime JARs into the product plugins/ directory'
     group = 'build'
 
+    dependsOn 'cleanProductDir'
     dependsOn ':org.eclipse.groovy.ls.core:jar'
 
     // Our language server JAR
@@ -74,6 +84,7 @@ tasks.register('downloadEquinoxLauncher') {
     description = 'Download the Equinox launcher JAR from Maven Central'
     group = 'build'
 
+    dependsOn 'cleanProductDir'
     def launcherJar = pluginsDir.map { it.file("org.eclipse.equinox.launcher_${eclipseEquinoxLauncherVersion}.jar") }
     outputs.file launcherJar
 
@@ -103,6 +114,7 @@ tasks.register('downloadGroovyEclipsePlugins') {
     description = 'Download groovy-eclipse patched JDT and integration bundles from JFrog p2 site'
     group = 'build'
 
+    dependsOn 'cleanProductDir'
     def outputFiles = groovyEclipseBundles.collect { name ->
         pluginsDir.map { it.file(name) }
     }
@@ -149,6 +161,7 @@ tasks.register('copyConfigs', Copy) {
     description = 'Copy platform config.ini files to the product directory'
     group = 'build'
 
+    dependsOn 'cleanProductDir'
     from('config_win') { into 'config_win' }
     from('config_linux') { into 'config_linux' }
     from('config_mac') { into 'config_mac' }

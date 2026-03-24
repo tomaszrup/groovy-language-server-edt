@@ -181,6 +181,24 @@ public class GroovyCompilerService {
     }
 
     /**
+     * Remove the primary cached parse result for a document together with any
+     * derived semantic-token recovery entries for the same source.
+     */
+    public void invalidateDocumentFamily(String uri) {
+        String normalized = DocumentManager.normalizeUri(uri);
+        String rawPatchedPrefix = normalized + "#semantic-patched";
+        String encodedPatchedPrefix = normalized + "%23semantic-patched";
+
+        synchronized (cache) {
+            cache.remove(normalized);
+            cache.entrySet().removeIf(entry -> {
+                String key = entry.getKey();
+                return key.startsWith(rawPatchedPrefix) || key.startsWith(encodedPatchedPrefix);
+            });
+        }
+    }
+
+    /**
      * Collect syntax errors from the Groovy error collector.
      */
     private void collectErrors(ErrorCollector collector, List<SyntaxException> errors) {

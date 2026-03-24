@@ -19,6 +19,8 @@ import static org.mockito.Mockito.when;
 import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IOrdinaryClassFile;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
@@ -344,6 +346,50 @@ class TypeDefinitionProviderTest {
         assertEquals("file:///cu/Baz.java", loc.getUri());
     }
 
+    @Test
+    void toLocationUsesAttachedBinarySource() throws Exception {
+        org.eclipse.jdt.core.IType type = mock(org.eclipse.jdt.core.IType.class);
+        when(type.getResource()).thenReturn(null);
+        when(type.getCompilationUnit()).thenReturn(null);
+        when(type.getFullyQualifiedName()).thenReturn("type.definition.AttachedType");
+        when(type.getElementName()).thenReturn("AttachedType");
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(null);
+
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        when(type.getClassFile()).thenReturn(classFile);
+        String source = """
+                package type.definition;
+                public class AttachedType {
+                    public int size() {
+                        return 7;
+                    }
+                }
+                """;
+        when(classFile.getSource()).thenReturn(source);
+
+        Location loc = invokeToLocation(type);
+
+        assertNotNull(loc);
+        assertEquals("groovy-source:///type/definition/AttachedType.java", loc.getUri());
+        assertEquals(source, SourceJarHelper.resolveSourceContent(loc.getUri()));
+    }
+
+    @Test
+    void toLocationReturnsNullWhenBinaryTypeHasNoSource() throws Exception {
+        org.eclipse.jdt.core.IType type = mock(org.eclipse.jdt.core.IType.class);
+        when(type.getResource()).thenReturn(null);
+        when(type.getCompilationUnit()).thenReturn(null);
+        when(type.getFullyQualifiedName()).thenReturn("type.definition.NoSource");
+        when(type.getElementName()).thenReturn("NoSource");
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(null);
+
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        when(type.getClassFile()).thenReturn(classFile);
+        when(classFile.getSource()).thenReturn(null);
+
+        assertNull(invokeToLocation(type));
+    }
+
     // ================================================================
     // resolveType tests
     // ================================================================
@@ -488,5 +534,12 @@ class TypeDefinitionProviderTest {
                 "stripArrayAndGenerics", String.class);
         m.setAccessible(true);
         assertEquals("Integer", (String) m.invoke(provider, "Integer"));
+    }
+
+    private Location invokeToLocation(org.eclipse.jdt.core.IType type) throws Exception {
+        java.lang.reflect.Method m = TypeDefinitionProvider.class.getDeclaredMethod("toLocation",
+                org.eclipse.jdt.core.IType.class);
+        m.setAccessible(true);
+        return (Location) m.invoke(provider, type);
     }
 }

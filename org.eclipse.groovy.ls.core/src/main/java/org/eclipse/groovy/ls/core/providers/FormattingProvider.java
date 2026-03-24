@@ -65,6 +65,7 @@ public class FormattingProvider {
 
     private static final String BUNDLED_DEFAULT_PROFILE_RESOURCE =
             "/org/eclipse/groovy/ls/core/providers/intellij-formatter.xml";
+    private static final String FORMATTER_JAVA_LEVEL = "21";
 
     private final DocumentManager documentManager;
 
@@ -544,10 +545,11 @@ public class FormattingProvider {
             }
         }
 
-        // Ensure the source compatibility is set high enough for Groovy features
-        options.put(JavaCore.COMPILER_SOURCE, "17");
-        options.put(JavaCore.COMPILER_COMPLIANCE, "17");
-        options.put(JavaCore.COMPILER_CODEGEN_TARGET_PLATFORM, "17");
+        // Keep the formatter aligned with the server's Java 21 runtime floor so
+        // newer syntax is not rejected by JDT's parser during formatting.
+        options.put(JavaCore.COMPILER_SOURCE, FORMATTER_JAVA_LEVEL);
+        options.put(JavaCore.COMPILER_COMPLIANCE, FORMATTER_JAVA_LEVEL);
+        options.put(JavaCore.COMPILER_CODEGEN_TARGET_PLATFORM, FORMATTER_JAVA_LEVEL);
 
         // Spock blocks (e.g. expect:, when:, then:) are parsed similarly to labels by
         // the JDT formatter; forcing newline-after-label prevents block flattening.

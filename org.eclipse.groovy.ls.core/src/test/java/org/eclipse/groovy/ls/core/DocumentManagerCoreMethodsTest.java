@@ -13,13 +13,20 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 import org.codehaus.groovy.ast.ModuleNode;
+import org.eclipse.jdt.core.IBuffer;
+import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -394,6 +401,57 @@ class DocumentManagerCoreMethodsTest {
         assertFalse(manager.hasJdtWorkingCopy(uri));
     }
 
+    @Test
+    void replayOpenDocumentsReconcilesExistingWorkingCopyAndRefreshesSemantics() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/Replay.groovy";
+        manager.didOpen(uri, "class Replay {}\n");
+        GroovyCompilerService.ParseResult cachedBeforeReplay = manager.getCompilerService().getCachedResult(uri);
+        assertNotNull(cachedBeforeReplay);
+
+        LanguageClient client = mock(LanguageClient.class);
+        manager.setLanguageClient(client);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IBuffer buffer = mock(IBuffer.class);
+        org.mockito.Mockito.when(workingCopy.getBuffer()).thenReturn(buffer);
+        getWorkingCopies(manager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        manager.replayOpenDocuments(java.util.List.of(uri));
+
+        verify(buffer, timeout(1500)).setContents("class Replay {}\n");
+        verify(workingCopy, timeout(1500)).reconcile(
+                ICompilationUnit.NO_AST, true, true, manager.getWorkingCopyOwner(), null);
+        verify(client, timeout(2000).atLeastOnce()).refreshSemanticTokens();
+        assertSame(cachedBeforeReplay, manager.getCompilerService().getCachedResult(uri));
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void didChangeInvalidatesStandaloneCacheWhenWorkingCopyExists() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/Replay.groovy";
+        manager.didOpen(uri, "class Replay {}\n");
+        assertNotNull(manager.getCompilerService().getCachedResult(uri));
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IBuffer buffer = mock(IBuffer.class);
+        org.mockito.Mockito.when(workingCopy.getBuffer()).thenReturn(buffer);
+        getWorkingCopies(manager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setText("class Replay { String name }\n");
+
+        manager.didChange(uri, java.util.List.of(change));
+
+        verify(buffer).setContents("class Replay { String name }\n");
+        assertNull(manager.getCompilerService().getCachedResult(uri));
+
+        manager.didClose(uri);
+    }
+
     // ================================================================
     // getGroovyAST expansion
     // ================================================================
@@ -498,6 +556,13 @@ class DocumentManagerCoreMethodsTest {
         Method method = DocumentManager.class.getDeclaredMethod("detectProjectRoot", java.io.File.class);
         method.setAccessible(true);
         return (java.io.File) method.invoke(manager, file);
+    }
+
+    @SuppressWarnings("unchecked")
+    private java.util.Map<String, ICompilationUnit> getWorkingCopies(DocumentManager manager) throws Exception {
+        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("workingCopies");
+        field.setAccessible(true);
+        return (java.util.Map<String, ICompilationUnit>) field.get(manager);
     }
 
     // ================================================================

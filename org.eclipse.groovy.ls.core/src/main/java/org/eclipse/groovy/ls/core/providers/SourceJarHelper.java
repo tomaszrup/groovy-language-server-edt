@@ -170,6 +170,11 @@ public class SourceJarHelper {
             if (!(root instanceof IPackageFragmentRoot)) return null;
             IPackageFragmentRoot pfr = (IPackageFragmentRoot) root;
 
+            File attachedSourcesJar = findAttachedSourcesJar(pfr);
+            if (attachedSourcesJar != null) {
+                return attachedSourcesJar;
+            }
+
             org.eclipse.core.runtime.IPath jarPath = pfr.getPath();
             if (jarPath == null) return null;
 
@@ -184,6 +189,10 @@ public class SourceJarHelper {
             if (!jarFile.exists()) {
                 IClasspathEntry cpEntry = pfr.getRawClasspathEntry();
                 if (cpEntry != null) {
+                    File cpAttachedSourcesJar = toExistingFile(cpEntry.getSourceAttachmentPath());
+                    if (cpAttachedSourcesJar != null) {
+                        return cpAttachedSourcesJar;
+                    }
                     org.eclipse.core.runtime.IPath cpPath = cpEntry.getPath();
                     if (cpPath != null) {
                         jarFile = cpPath.toFile();
@@ -203,6 +212,55 @@ public class SourceJarHelper {
             GroovyLanguageServerPlugin.logError("[source] Failed to find source JAR", e);
             return null;
         }
+    }
+
+    private static File findAttachedSourcesJar(IPackageFragmentRoot pfr) {
+        try {
+            File sourceAttachment = toExistingFile(pfr.getSourceAttachmentPath());
+            if (sourceAttachment != null) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[source] Using attached source JAR: " + sourceAttachment.getAbsolutePath());
+                return sourceAttachment;
+            }
+        } catch (Exception e) {
+            // Fall through to other lookup strategies.
+        }
+
+        try {
+            IClasspathEntry cpEntry = pfr.getRawClasspathEntry();
+            if (cpEntry != null) {
+                File sourceAttachment = toExistingFile(cpEntry.getSourceAttachmentPath());
+                if (sourceAttachment != null) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[source] Using classpath source attachment: "
+                            + sourceAttachment.getAbsolutePath());
+                    return sourceAttachment;
+                }
+            }
+        } catch (Exception e) {
+            // Fall through to other lookup strategies.
+        }
+
+        return null;
+    }
+
+    private static File toExistingFile(org.eclipse.core.runtime.IPath path) {
+        if (path == null) {
+            return null;
+        }
+
+        File file = path.toFile();
+        if (file.exists()) {
+            return file;
+        }
+
+        String osPath = path.toOSString();
+        if (osPath == null || osPath.isBlank()) {
+            return null;
+        }
+
+        file = new File(osPath);
+        return file.exists() ? file : null;
     }
 
     /**

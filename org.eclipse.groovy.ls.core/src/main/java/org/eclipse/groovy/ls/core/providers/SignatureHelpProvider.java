@@ -124,12 +124,48 @@ public class SignatureHelpProvider {
         }
 
         if (element instanceof IType typeElement) {
-            for (IMethod constructor : typeElement.getMethods()) {
+            IType memberSource = JavaBinaryMemberResolver.resolveMemberSource(typeElement);
+            boolean foundConstructor = false;
+            for (IMethod constructor : memberSource.getMethods()) {
                 if (constructor.isConstructor()) {
+                    foundConstructor = true;
                     addJdtSignature(signatures, constructor);
                 }
             }
+
+            if (!foundConstructor) {
+                addRecordConstructorSignature(signatures, typeElement);
+            }
         }
+    }
+
+    private void addRecordConstructorSignature(List<SignatureInformation> signatures, IType typeElement) {
+        List<JavaRecordSourceSupport.RecordComponentInfo> components = JavaRecordSourceSupport.getRecordComponents(typeElement);
+        if (components.isEmpty()) {
+            return;
+        }
+
+        SignatureInformation signature = new SignatureInformation();
+        List<ParameterInformation> parameters = new ArrayList<>();
+        StringBuilder label = new StringBuilder(typeElement.getElementName()).append('(');
+
+        for (int index = 0; index < components.size(); index++) {
+            JavaRecordSourceSupport.RecordComponentInfo component = components.get(index);
+            String parameterLabel = component.type() + " " + component.name();
+            if (index > 0) {
+                label.append(", ");
+            }
+            label.append(parameterLabel);
+
+            ParameterInformation parameter = new ParameterInformation();
+            parameter.setLabel(parameterLabel);
+            parameters.add(parameter);
+        }
+
+        label.append(')');
+        signature.setLabel(label.toString());
+        signature.setParameters(parameters);
+        signatures.add(signature);
     }
 
     private void addJdtSignature(List<SignatureInformation> signatures, IMethod method) {

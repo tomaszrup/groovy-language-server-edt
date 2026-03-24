@@ -18,9 +18,17 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IOrdinaryClassFile;
+import org.eclipse.jdt.core.IPackageFragment;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
+import org.eclipse.jdt.core.IType;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.SignatureHelp;
 import org.eclipse.lsp4j.SignatureHelpParams;
@@ -464,10 +472,73 @@ class SignatureHelpProviderTest {
         assertNull(sig);
     }
 
+    @Test
+    void addJdtSignaturesForElementUsesBinaryConstructorsForSourceRecordType() throws Exception {
+        SignatureHelpProvider provider = new SignatureHelpProvider(new DocumentManager());
+        IType sourceType = mock(IType.class);
+        ICompilationUnit compilationUnit = mock(ICompilationUnit.class);
+        IJavaProject project = mock(IJavaProject.class);
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        IPackageFragment fragment = mock(IPackageFragment.class);
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        IType binaryType = mock(IType.class);
+
+        when(sourceType.getCompilationUnit()).thenReturn(compilationUnit);
+        when(sourceType.getJavaProject()).thenReturn(project);
+        when(sourceType.getFullyQualifiedName()).thenReturn("demo.RecordData");
+
+        when(project.getPackageFragmentRoots()).thenReturn(new IPackageFragmentRoot[] {root});
+        when(root.getKind()).thenReturn(IPackageFragmentRoot.K_BINARY);
+        when(root.getPackageFragment("demo")).thenReturn(fragment);
+        when(fragment.getOrdinaryClassFile("RecordData.class")).thenReturn(classFile);
+        when(classFile.exists()).thenReturn(true);
+        when(classFile.getType()).thenReturn(binaryType);
+        when(binaryType.exists()).thenReturn(true);
+
+        IMethod constructor = mock(IMethod.class);
+        when(constructor.getElementName()).thenReturn("RecordData");
+        when(constructor.getParameterTypes()).thenReturn(new String[] {"QString;", "I"});
+        when(constructor.getParameterNames()).thenReturn(new String[] {"name", "age"});
+        when(constructor.isConstructor()).thenReturn(true);
+        when(binaryType.getMethods()).thenReturn(new IMethod[] {constructor});
+
+        List<SignatureInformation> signatures = new ArrayList<>();
+        invokeAddJdtSignaturesForElement(provider, signatures, sourceType);
+
+        assertEquals(1, signatures.size());
+        assertTrue(signatures.get(0).getLabel().contains("RecordData(String name, int age)"));
+    }
+
+    @Test
+    void addJdtSignaturesForElementSynthesizesCanonicalConstructorForSourceRecord() throws Exception {
+        SignatureHelpProvider provider = new SignatureHelpProvider(new DocumentManager());
+        IType sourceType = mock(IType.class);
+
+        when(sourceType.getElementName()).thenReturn("RecordData");
+        when(sourceType.getSource()).thenReturn("public record RecordData(String name, int age) {}\n");
+        when(sourceType.getMethods()).thenReturn(new IMethod[0]);
+
+        List<SignatureInformation> signatures = new ArrayList<>();
+        invokeAddJdtSignaturesForElement(provider, signatures, sourceType);
+
+        assertEquals(1, signatures.size());
+        assertEquals("RecordData(String name, int age)", signatures.get(0).getLabel());
+        assertEquals(2, signatures.get(0).getParameters().size());
+    }
+
     private SignatureInformation invokeToSignatureInformation(SignatureHelpProvider provider, IMethod method) throws Exception {
         Method m = SignatureHelpProvider.class.getDeclaredMethod("toSignatureInformation", IMethod.class);
         m.setAccessible(true);
         return (SignatureInformation) m.invoke(provider, method);
+    }
+
+    private void invokeAddJdtSignaturesForElement(SignatureHelpProvider provider,
+                                                  List<SignatureInformation> signatures,
+                                                  IType type) throws Exception {
+        Method method = SignatureHelpProvider.class.getDeclaredMethod(
+                "addJdtSignaturesForElement", List.class, org.eclipse.jdt.core.IJavaElement.class);
+        method.setAccessible(true);
+        method.invoke(provider, signatures, type);
     }
 
 }

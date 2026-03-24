@@ -61,7 +61,7 @@ The extension ships a `language-configuration.json` that enables rich editing su
 
 | Option | Type | Description |
 |---|---|---|
-| `groovy.java.home` | `string` | Path to a JDK installation (requires JDK 17+). Falls back to `JAVA_HOME` if not set |
+| `groovy.java.home` | `string` | Path to a JDK installation (requires JDK 21+). Falls back to `JAVA_HOME` if not set |
 | `groovy.ls.vmargs` | `string` | Extra JVM arguments for the language server (default: `"-Xmx1G"`) |
 | `groovy.trace.server` | `string` | Traces communication between VS Code and the server. Values: `off` (default), `messages`, `verbose` |
 | `groovy.format.enabled` | `boolean` | Enable or disable document formatting (default: `true`) |
@@ -85,7 +85,7 @@ This is the same XML format exported by Eclipse IDE's **Java > Code Style > Form
 
 ## Prerequisites
 
-- **JDK 17** or later
+- **JDK 21** or later
 - [Language Support for Java™ by Red Hat](https://marketplace.visualstudio.com/items?itemName=redhat.java) VS Code extension — required for classpath resolution
 
 ## Architecture
@@ -100,7 +100,7 @@ Key components:
 
 ## Build
 
-Requires JDK 17+.
+Requires JDK 21+.
 
 ```sh
 ./gradlew build

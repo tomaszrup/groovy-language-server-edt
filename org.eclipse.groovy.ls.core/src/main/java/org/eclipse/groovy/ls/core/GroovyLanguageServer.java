@@ -376,6 +376,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             // until diagnostics have been dispatched — the reconcile work
             // itself runs asynchronously on the diagnostics thread pool.
             try {
+                textDocumentService.refreshOpenDocumentsSemanticState();
                 textDocumentService.publishDiagnosticsForOpenDocuments();
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Post-build diagnostics failed", e);
@@ -551,6 +552,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             // files the user is looking at, rather than waiting for all 50
             // projects' classpaths to arrive + a full workspace build.
             publishDiagnosticsForProjectFiles(projName);
+
+            // Retry or re-reconcile working copies for open files in the
+            // project whose classpath just became available so semantic tokens
+            // can upgrade without waiting for an edit.
+            textDocumentService.refreshOpenDocumentsSemanticState(projName);
 
             triggerBuildAfterClasspathUpdate();
 

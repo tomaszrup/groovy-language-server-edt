@@ -33,6 +33,9 @@ import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IOrdinaryClassFile;
+import org.eclipse.jdt.core.IPackageFragment;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.lsp4j.InlayHint;
 import org.eclipse.lsp4j.InlayHintKind;
 import org.eclipse.lsp4j.InlayHintLabelPart;
@@ -1083,6 +1086,68 @@ class InlayHintProviderTest {
         assertEquals(returnType, result);
     }
 
+    @Test
+    void findMethodReturnTypeFallsBackToSourceRecordComponent() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType receiverType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType returnType = mock(org.eclipse.jdt.core.IType.class);
+
+        when(receiverType.getMethods()).thenReturn(new IMethod[0]);
+        when(receiverType.getFullyQualifiedName()).thenReturn("com.example.Recc");
+        when(receiverType.getElementName()).thenReturn("Recc");
+        when(receiverType.getSource()).thenReturn("public record Recc(String something) {}\n");
+
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = mock(org.eclipse.jdt.core.ITypeHierarchy.class);
+        when(hierarchy.getAllSupertypes(receiverType)).thenReturn(new org.eclipse.jdt.core.IType[0]);
+        when(receiverType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+
+        when(project.findType("String")).thenReturn(returnType);
+
+        org.eclipse.jdt.core.IType result = invokeFindMethodReturnType(receiverType, "something", project);
+        assertEquals(returnType, result);
+    }
+
+    @Test
+    void findMethodReturnTypeUsesBinaryMemberMetadataForGeneratedGetter() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType sourceType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType binaryType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType returnType = mock(org.eclipse.jdt.core.IType.class);
+        ICompilationUnit compilationUnit = mock(ICompilationUnit.class);
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        IPackageFragment fragment = mock(IPackageFragment.class);
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+
+        when(sourceType.getCompilationUnit()).thenReturn(compilationUnit);
+        when(sourceType.getJavaProject()).thenReturn(project);
+        when(sourceType.getFullyQualifiedName()).thenReturn("com.example.Helper");
+        when(sourceType.getMethods()).thenReturn(new IMethod[0]);
+
+        when(project.getPackageFragmentRoots()).thenReturn(new IPackageFragmentRoot[] {root});
+        when(root.getKind()).thenReturn(IPackageFragmentRoot.K_BINARY);
+        when(root.getPackageFragment("com.example")).thenReturn(fragment);
+        when(fragment.getOrdinaryClassFile("Helper.class")).thenReturn(classFile);
+        when(classFile.exists()).thenReturn(true);
+        when(classFile.getType()).thenReturn(binaryType);
+        when(binaryType.exists()).thenReturn(true);
+        when(binaryType.getFullyQualifiedName()).thenReturn("com.example.Helper");
+
+        IMethod getter = mock(IMethod.class);
+        when(getter.getElementName()).thenReturn("getSomeList");
+        when(getter.getReturnType()).thenReturn("QList<QString;>;");
+        when(binaryType.getMethods()).thenReturn(new IMethod[] {getter});
+
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = mock(org.eclipse.jdt.core.ITypeHierarchy.class);
+        when(hierarchy.getAllSupertypes(binaryType)).thenReturn(new org.eclipse.jdt.core.IType[0]);
+        when(binaryType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+
+        when(project.findType("List<String>")).thenReturn(null);
+        when(project.findType("List")).thenReturn(returnType);
+
+        org.eclipse.jdt.core.IType result = invokeFindMethodReturnType(sourceType, "getSomeList", project);
+        assertEquals(returnType, result);
+    }
+
     // ================================================================
     // resolveTypeByName tests (part of findMethodReturnType path)
     // ================================================================
@@ -1121,6 +1186,18 @@ class InlayHintProviderTest {
         when(project.findType("java.lang.Integer")).thenReturn(foundType);
 
         org.eclipse.jdt.core.IType result = invokeResolveTypeByName("Integer", null, project);
+        assertEquals(foundType, result);
+    }
+
+    @Test
+    void resolveTypeByNameStripsGenericsBeforeLookup() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        org.eclipse.jdt.core.IType foundType = mock(org.eclipse.jdt.core.IType.class);
+
+        when(project.findType("List<String>")).thenReturn(null);
+        when(project.findType("List")).thenReturn(foundType);
+
+        org.eclipse.jdt.core.IType result = invokeResolveTypeByName("List<String>", null, project);
         assertEquals(foundType, result);
     }
 
@@ -1208,6 +1285,100 @@ class InlayHintProviderTest {
         if (!hints.isEmpty()) {
             assertTrue(hints.stream().anyMatch(h -> labelText(h).contains("int")));
         }
+    }
+
+    @Test
+    void computeJdtVariableTypeHintsUsesSourceRecordAccessorFallback() throws Exception {
+        String source = """
+                import com.example.Recc
+                def xdf = new Recc()
+                def a = xdf.something()
+                """;
+        ModuleNode module = parseModule(source);
+
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        when(project.exists()).thenReturn(true);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+
+        org.eclipse.jdt.core.IType recordType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType stringType = mock(org.eclipse.jdt.core.IType.class);
+        when(stringType.getElementName()).thenReturn("String");
+
+        when(project.findType("com.example.Recc")).thenReturn(recordType);
+        when(project.findType("String")).thenReturn(stringType);
+        when(recordType.getFullyQualifiedName()).thenReturn("com.example.Recc");
+        when(recordType.getElementName()).thenReturn("Recc");
+        when(recordType.getMethods()).thenReturn(new IMethod[0]);
+        when(recordType.getSource()).thenReturn("public record Recc(String something) {}\n");
+
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = mock(org.eclipse.jdt.core.ITypeHierarchy.class);
+        when(hierarchy.getAllSupertypes(recordType)).thenReturn(new org.eclipse.jdt.core.IType[0]);
+        when(recordType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+
+        Range range = new Range(new Position(0, 0), new Position(5, 0));
+        List<InlayHint> hints = invokeComputeJdtVariableTypeHints(module, source, range, workingCopy);
+
+        assertFalse(hints.isEmpty());
+        assertTrue(hints.stream().anyMatch(h -> ": String".equals(labelText(h))));
+    }
+
+    @Test
+    void computeJdtVariableTypeHintsUsesBinaryMemberMetadataForGetter() throws Exception {
+        String source = """
+                import com.example.Helper
+                def x = new Helper()
+                def n = x.getSomeList()
+                """;
+        ModuleNode module = parseModule(source);
+
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        when(project.exists()).thenReturn(true);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+
+        org.eclipse.jdt.core.IType sourceType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType binaryType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType listType = mock(org.eclipse.jdt.core.IType.class);
+        ICompilationUnit helperCompilationUnit = mock(ICompilationUnit.class);
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        IPackageFragment fragment = mock(IPackageFragment.class);
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+
+        when(project.findType("com.example.Helper")).thenReturn(sourceType);
+        when(project.findType("List<String>")).thenReturn(null);
+        when(project.findType("List")).thenReturn(listType);
+
+        when(sourceType.getCompilationUnit()).thenReturn(helperCompilationUnit);
+        when(sourceType.getJavaProject()).thenReturn(project);
+        when(sourceType.getFullyQualifiedName()).thenReturn("com.example.Helper");
+        when(sourceType.getMethods()).thenReturn(new IMethod[0]);
+
+        when(project.getPackageFragmentRoots()).thenReturn(new IPackageFragmentRoot[] {root});
+        when(root.getKind()).thenReturn(IPackageFragmentRoot.K_BINARY);
+        when(root.getPackageFragment("com.example")).thenReturn(fragment);
+        when(fragment.getOrdinaryClassFile("Helper.class")).thenReturn(classFile);
+        when(classFile.exists()).thenReturn(true);
+        when(classFile.getType()).thenReturn(binaryType);
+        when(binaryType.exists()).thenReturn(true);
+        when(binaryType.getFullyQualifiedName()).thenReturn("com.example.Helper");
+
+        IMethod getter = mock(IMethod.class);
+        when(getter.getElementName()).thenReturn("getSomeList");
+        when(getter.getReturnType()).thenReturn("QList<QString;>;");
+        when(binaryType.getMethods()).thenReturn(new IMethod[] {getter});
+
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = mock(org.eclipse.jdt.core.ITypeHierarchy.class);
+        when(hierarchy.getAllSupertypes(binaryType)).thenReturn(new org.eclipse.jdt.core.IType[0]);
+        when(binaryType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+
+        Range range = new Range(new Position(0, 0), new Position(5, 0));
+        List<InlayHint> hints = invokeComputeJdtVariableTypeHints(module, source, range, workingCopy);
+
+        assertFalse(hints.isEmpty());
+        assertTrue(hints.stream().anyMatch(h -> ": List<String>".equals(labelText(h))));
     }
 
     @Test

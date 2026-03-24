@@ -82,6 +82,24 @@ class GroovyCompilerServiceTest {
         assertNull(service.getCachedResult(canonical));
     }
 
+    @Test
+    void invalidateDocumentFamilyRemovesSemanticPatchedEntries() throws IOException {
+        GroovyCompilerService service = new GroovyCompilerService();
+        String uri = createSourceUri("SemanticPatched.groovy");
+        String patchedUri = uri + "#semantic-patched-0";
+
+        service.parse(uri, "class Sample {}\n");
+        service.parse(patchedUri, "class Sample {}\n");
+
+        assertNotNull(service.getCachedResult(uri));
+        assertNotNull(service.getCachedResult(patchedUri));
+
+        service.invalidateDocumentFamily(uri);
+
+        assertNull(service.getCachedResult(uri));
+        assertNull(service.getCachedResult(patchedUri));
+    }
+
     private String createSourceUri(String fileName) throws IOException {
         return createSourceFile(fileName).toUri().toString();
     }

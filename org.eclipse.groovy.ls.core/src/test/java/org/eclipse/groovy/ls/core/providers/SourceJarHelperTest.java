@@ -14,6 +14,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.io.File;
 import java.io.IOException;
@@ -22,6 +24,9 @@ import java.nio.file.Path;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
+import org.eclipse.jdt.core.IType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -72,6 +77,26 @@ class SourceJarHelperTest {
         Files.writeString(notAJar.toPath(), "x");
 
         assertNull(SourceJarHelper.findSourcesJarForBinaryJar(notAJar));
+    }
+
+    @Test
+    void findSourcesJarUsesExplicitSourceAttachmentPath() throws Exception {
+        Files.createDirectories(tempDir.resolve("attached"));
+        File sourcesJar = createJar(
+                tempDir.resolve("attached/demo-1.0-sources.jar"),
+                "com/example/Demo.java",
+                "class Demo {}\n");
+
+        IType type = mock(IType.class);
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(root);
+        when(root.getSourceAttachmentPath()).thenReturn(
+                org.eclipse.core.runtime.Path.fromOSString(sourcesJar.getAbsolutePath()));
+
+        File found = SourceJarHelper.findSourcesJar(type);
+
+        assertNotNull(found);
+        assertEquals(sourcesJar.getAbsolutePath(), found.getAbsolutePath());
     }
 
     @Test

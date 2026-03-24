@@ -35,7 +35,6 @@ import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
-import org.eclipse.jdt.core.IClassFile;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
@@ -223,8 +222,7 @@ public class DefinitionProvider {
     }
 
     /**
-     * Try all strategies to resolve a location for a binary type:
-     * workspace source, sources JAR, JDT attachment, and generated stub.
+     * Try all strategies to resolve a location for a binary type using real source only.
      */
     private Location resolveLocationForType(IType type) {
         String fqn = type.getFullyQualifiedName();
@@ -249,19 +247,10 @@ public class DefinitionProvider {
             return workspaceLoc;
         }
 
-        Location jarLoc = toLocationFromSourcesJar(type, fqn);
-        if (jarLoc != null) {
-            return jarLoc;
-        }
-
-        Location jdtLoc = toLocationFromJdtAttachment(type, fqn);
-        if (jdtLoc != null) {
-            return jdtLoc;
-        }
-
-        Location stubLoc = toLocationFromStub(type, fqn);
-        if (stubLoc != null) {
-            return stubLoc;
+        Location binarySourceLoc = BinaryTypeLocationResolver.resolveLocation(
+                type, fqn, type.getElementName());
+        if (binarySourceLoc != null) {
+            return binarySourceLoc;
         }
 
         GroovyLanguageServerPlugin.logInfo(
@@ -273,47 +262,14 @@ public class DefinitionProvider {
      * Try to find a sources JAR and read the source directly from it.
      */
     private Location toLocationFromSourcesJar(IType type, String fqn) {
-        java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
-        if (sourcesJar != null) {
-            String source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-            if (source != null && !source.isEmpty()) {
-                GroovyLanguageServerPlugin.logInfo(
-                        "[definition] Read source from JAR for " + fqn
-                        + " (" + source.length() + " chars)");
-
-                String ext = determineSourceExtension(sourcesJar, fqn);
-
-                String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                        fqn, ext, sourcesJar.getAbsolutePath(), false, source);
-                Range range = findClassDeclarationRange(source, type.getElementName());
-                return new Location(virtualUri, range);
-            }
-        }
-        return null;
+        return BinaryTypeLocationResolver.toLocationFromSourcesJar(type, fqn, type.getElementName());
     }
 
     /**
      * Try to get source via JDT source attachment (might already be set on the class file).
      */
     private Location toLocationFromJdtAttachment(IType type, String fqn) {
-        IClassFile classFile = type.getClassFile();
-        if (classFile != null) {
-            String source = null;
-            try {
-                source = classFile.getSource();
-            } catch (Exception e) {
-                // no source available
-            }
-            if (source != null && !source.isEmpty()) {
-                GroovyLanguageServerPlugin.logInfo(
-                        "[definition] Found source via JDT attachment for " + fqn);
-                String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                        fqn, EXT_JAVA, null, false, source);
-                Range range = findClassDeclarationRange(source, type.getElementName());
-                return new Location(virtualUri, range);
-            }
-        }
-        return null;
+        return BinaryTypeLocationResolver.toLocationFromJdtAttachment(type, fqn, type.getElementName());
     }
 
     /**
@@ -810,28 +766,11 @@ public class DefinitionProvider {
             return null;
         }
 
-        Location sourceLoc = navigateTypeFromSourcesJar(type, fqn, simpleName);
-        if (sourceLoc != null) {
-            return sourceLoc;
-        }
-
-        return toLocationFromStub(type, fqn);
+        return BinaryTypeLocationResolver.resolveLocation(type, fqn, simpleName);
     }
 
     private Location navigateTypeFromSourcesJar(IType type, String fqn, String simpleName) {
-        java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
-        if (sourcesJar == null) {
-            return null;
-        }
-        String source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-        if (source == null || source.isEmpty()) {
-            return null;
-        }
-        String ext = determineSourceExtension(sourcesJar, fqn);
-        String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                fqn, ext, sourcesJar.getAbsolutePath(), false, source);
-        Range range = findClassDeclarationRange(source, simpleName);
-        return new Location(virtualUri, range);
+        return BinaryTypeLocationResolver.toLocationFromSourcesJar(type, fqn, simpleName);
     }
 
     private Location navigateViaJdkSource(String fqn, String simpleName) {
@@ -841,7 +780,7 @@ public class DefinitionProvider {
         }
         String virtualUri = SourceJarHelper.buildGroovySourceUri(
                 fqn, EXT_JAVA, null, true, jdkSource);
-        Range range = findClassDeclarationRange(jdkSource, simpleName);
+        Range range = BinaryTypeLocationResolver.findClassDeclarationRange(jdkSource, simpleName);
         return new Location(virtualUri, range);
     }
 
@@ -849,31 +788,14 @@ public class DefinitionProvider {
      * Determine whether a source entry in the JAR is Groovy or Java.
      */
     private String determineSourceExtension(java.io.File sourcesJar, String fqn) {
-        String entryPath = fqn.replace('.', '/') + EXT_GROOVY;
-        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(sourcesJar)) {
-            if (zf.getEntry(entryPath) != null) {
-                return EXT_GROOVY;
-            }
-        } catch (Exception e) {
-            // Intentionally ignored — default to .java
-        }
-        return EXT_JAVA;
+        return BinaryTypeLocationResolver.determineSourceExtension(sourcesJar, fqn);
     }
 
     /**
      * Find the range of the class declaration in source code.
      */
     private Range findClassDeclarationRange(String source, String simpleName) {
-        int classIdx = source.indexOf("class " + simpleName);
-        if (classIdx < 0) classIdx = source.indexOf("interface " + simpleName);
-        if (classIdx < 0) classIdx = source.indexOf("enum " + simpleName);
-        if (classIdx < 0) classIdx = source.indexOf("trait " + simpleName);
-        if (classIdx >= 0) {
-            Position start = offsetToPosition(source, classIdx);
-            Position end = offsetToPosition(source, classIdx + simpleName.length() + 6);
-            return new Range(start, end);
-        }
-        return new Range(new Position(0, 0), new Position(0, 0));
+        return BinaryTypeLocationResolver.findClassDeclarationRange(source, simpleName);
     }
 
     // ---- Groovy AST fallback definition ----

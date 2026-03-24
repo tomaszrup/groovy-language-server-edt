@@ -329,68 +329,114 @@ public class DocumentManager {
         // so that semantic tokens / hover / etc. work even before JDT is ready.
         compilerService.parse(uri, text);
 
-        // Create the JDT working copy on a background thread.  findCompilationUnit()
-        // and reconcile() both touch the Eclipse workspace model, which can block
-        // for the duration of a full build.  Doing this on the LSP dispatch thread
-        // would freeze ALL message processing (didOpen, didChange, completion,
-        // semantic tokens) for every other file.
-        final String bgUri = uri;
+        scheduleWorkingCopyRefresh(uri, text, "didOpen");
+    }
+
+    /**
+     * Revisit open documents after workspace readiness changes (e.g. classpath
+     * arrival or build completion). This retries missing JDT working copies and
+     * re-reconciles existing ones so semantic tokens can upgrade without a user edit.
+     */
+    public void replayOpenDocuments(java.lang.Iterable<String> uris) {
+        for (String uri : uris) {
+            String normalizedUri = normalizeUri(uri);
+            String content = getContent(normalizedUri);
+            if (content == null) {
+                continue;
+            }
+
+            if (compilerService.getCachedResult(normalizedUri) == null) {
+                compilerService.parse(normalizedUri, content);
+            }
+            scheduleWorkingCopyRefresh(normalizedUri, content, "replay");
+        }
+    }
+
+    private void scheduleWorkingCopyRefresh(String normalizedUri, String text, String trigger) {
+        final String bgUri = normalizedUri;
         final String bgText = text;
 
-        // Cancel any previous in-flight task for this URI (e.g., rapid re-open)
         java.util.concurrent.Future<?> prev = pendingOpenFutures.remove(bgUri);
         if (prev != null) {
             prev.cancel(true);
         }
 
+        final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.Future<?>> futureRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.Future<?> future = didOpenExecutor.submit(() -> {
-            // Check if the document was already closed before we even start
-            if (!openDocuments.containsKey(bgUri)) {
+            try {
+                refreshWorkingCopy(bgUri, bgText, trigger);
+            } finally {
+                pendingOpenFutures.remove(bgUri, futureRef.get());
+            }
+        });
+        futureRef.set(future);
+        pendingOpenFutures.put(bgUri, future);
+    }
+
+    private void refreshWorkingCopy(String uri, String text, String trigger) {
+        if (!openDocuments.containsKey(uri)) {
+            GroovyLanguageServerPlugin.logInfo(
+                    trigger + " background task skipped (already closed): " + uri);
+            return;
+        }
+
+        ICompilationUnit workingCopy = workingCopies.get(uri);
+        boolean createdWorkingCopy = false;
+        if (workingCopy == null) {
+            ICompilationUnit cu = findCompilationUnit(uri);
+            if (cu == null) {
                 GroovyLanguageServerPlugin.logInfo(
-                        "didOpen background task skipped (already closed): " + bgUri);
+                        "No JDT compilation unit for " + uri
+                        + "; using Groovy compiler fallback (trigger=" + trigger + ").");
                 return;
             }
 
-            ICompilationUnit cu = findCompilationUnit(bgUri);
-            if (cu != null) {
-                try {
-                    // Check again after the potentially-slow findCompilationUnit
-                    if (!openDocuments.containsKey(bgUri)) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "didOpen background task aborted after findCU (closed): " + bgUri);
-                        return;
-                    }
-
-                    ICompilationUnit workingCopy = cu.getWorkingCopy(workingCopyOwner, null);
-                    workingCopy.getBuffer().setContents(bgText);
-                    workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
-
-                    // After reconcile completes, verify the document is still open.
-                    // If didClose ran while we were reconciling, discard immediately
-                    // to prevent a leaked working copy.
-                    if (openDocuments.containsKey(bgUri)) {
-                        workingCopies.put(bgUri, workingCopy);
-                        GroovyLanguageServerPlugin.logInfo("JDT working copy created for " + bgUri
-                                + " (type: " + workingCopy.getClass().getName() + ")");
-                        // Notify the client to re-request semantic tokens now that
-                        // the fully type-resolved JDT AST is available.
-                        scheduleSemanticTokensRefresh();
-                    } else {
-                        workingCopy.discardWorkingCopy();
-                        GroovyLanguageServerPlugin.logInfo(
-                                "didOpen background task discarded working copy (closed): " + bgUri);
-                    }
-                } catch (JavaModelException e) {
-                    GroovyLanguageServerPlugin.logError("Failed to create working copy for " + bgUri, e);
+            try {
+                if (!openDocuments.containsKey(uri)) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            trigger + " background task aborted after findCU (closed): " + uri);
+                    return;
                 }
-            } else {
-                GroovyLanguageServerPlugin.logInfo(
-                        "No JDT compilation unit for " + bgUri + "; using Groovy compiler fallback.");
-            }
 
-            pendingOpenFutures.remove(bgUri);
-        });
-        pendingOpenFutures.put(bgUri, future);
+                workingCopy = cu.getWorkingCopy(workingCopyOwner, null);
+                createdWorkingCopy = true;
+            } catch (JavaModelException e) {
+                GroovyLanguageServerPlugin.logError(
+                        "Failed to create working copy for " + uri + " (trigger=" + trigger + ")", e);
+                return;
+            }
+        }
+
+        try {
+            workingCopy.getBuffer().setContents(text);
+            workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
+
+            if (openDocuments.containsKey(uri)) {
+                workingCopies.put(uri, workingCopy);
+                GroovyLanguageServerPlugin.logInfo(
+                        "JDT working copy refreshed for " + uri
+                        + " (trigger=" + trigger + ", type: "
+                        + workingCopy.getClass().getName() + ")");
+                scheduleSemanticTokensRefresh();
+            } else if (createdWorkingCopy) {
+                workingCopy.discardWorkingCopy();
+                GroovyLanguageServerPlugin.logInfo(
+                        trigger + " background task discarded working copy (closed): " + uri);
+            }
+        } catch (JavaModelException e) {
+            if (createdWorkingCopy) {
+                try {
+                    workingCopy.discardWorkingCopy();
+                } catch (JavaModelException discardError) {
+                    GroovyLanguageServerPlugin.logError(
+                            "Failed to discard working copy after reconcile failure for " + uri,
+                            discardError);
+                }
+            }
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to reconcile working copy for " + uri + " (trigger=" + trigger + ")", e);
+        }
     }
 
     /**
@@ -406,6 +452,7 @@ public class DocumentManager {
         // Invalidate cached codeSelect results — the file content changed,
         // so previously resolved elements at any offset may be stale.
         invalidateCodeSelectCache(uri);
+        compilerService.invalidateDocumentFamily(uri);
 
         StringBuilder content = openDocuments.get(uri);
         if (content == null) {
@@ -457,8 +504,7 @@ public class DocumentManager {
         openDocuments.remove(uri);
         clientUris.remove(uri);
         invalidateCodeSelectCache(uri);
-        compilerService.invalidate(uri);
-        compilerService.invalidate(uri + "#semantic-patched");
+        compilerService.invalidateDocumentFamily(uri);
 
         // Cancel any in-flight didOpen background task for this URI.
         // This prevents the background task from creating a working copy

@@ -18,16 +18,19 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
+import java.net.URI;
 
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.Flags;
 import org.eclipse.jdt.core.IAnnotation;
+import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.ILocalVariable;
@@ -398,6 +401,50 @@ class HoverProviderTest {
         dm.didClose(uri);
     }
 
+        @Test
+        void getHoverFromGroovyASTIncludesClassGroovydoc() throws Exception {
+                String uri = "file:///HoverASTClassDoc.groovy";
+                String content = """
+                                /**
+                                 * Service level docs.
+                                 */
+                                class DocumentedService {
+                                    String run() { '' }
+                                }
+                                """;
+                DocumentManager dm = new DocumentManager();
+                dm.didOpen(uri, content);
+                HoverProvider hp = new HoverProvider(dm);
+
+                Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(3, 10));
+                assertNotNull(hover);
+                assertTrue(hover.getContents().getRight().getValue().contains("Service level docs."));
+
+                dm.didClose(uri);
+        }
+
+        @Test
+        void getHoverFromGroovyASTIncludesMemberGroovydoc() throws Exception {
+                String uri = "file:///HoverASTMemberDoc.groovy";
+                String content = """
+                                class DocumentedService {
+                                    /**
+                                     * Greets callers.
+                                     */
+                                    String greet(String name) { '' }
+                                }
+                                """;
+                DocumentManager dm = new DocumentManager();
+                dm.didOpen(uri, content);
+                HoverProvider hp = new HoverProvider(dm);
+
+                Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(4, 12));
+                assertNotNull(hover);
+                assertTrue(hover.getContents().getRight().getValue().contains("Greets callers."));
+
+                dm.didClose(uri);
+        }
+
     @Test
     void getHoverFromGroovyASTReturnsNullForBlankArea() throws Exception {
         String uri = "file:///HoverASTBlank.groovy";
@@ -562,6 +609,85 @@ class HoverProviderTest {
         assertNotNull(hover);
         assertTrue(hover.contains("throws"));
         assertTrue(hover.contains("IOException"));
+    }
+
+    @Test
+    void buildHoverContentUsesOpenWorkspaceSourceForTypeJavadoc() throws Exception {
+        String uri = "file:///workspace/LiveDemo.groovy";
+        String liveContent = """
+                /**
+                 * Live docs from the open buffer.
+                 */
+                class LiveDemo {
+                }
+                """;
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, liveContent);
+        HoverProvider hp = new HoverProvider(dm);
+
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        IResource resource = mock(IResource.class);
+        when(resource.getLocationURI()).thenReturn(URI.create(uri));
+        when(cu.getResource()).thenReturn(resource);
+        when(cu.getSource()).thenReturn("/** Stale docs. */ class LiveDemo {}");
+
+        IType type = mock(IType.class);
+        when(type.getElementType()).thenReturn(IJavaElement.TYPE);
+        when(type.getElementName()).thenReturn("LiveDemo");
+        when(type.getFlags()).thenReturn(Flags.AccPublic);
+        when(type.isInterface()).thenReturn(false);
+        when(type.isEnum()).thenReturn(false);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(type.getSuperclassName()).thenReturn(null);
+        when(type.getSuperInterfaceNames()).thenReturn(new String[0]);
+        when(type.getFullyQualifiedName()).thenReturn("com.example.LiveDemo");
+        when(type.getClassFile()).thenReturn(null);
+        when(type.getCompilationUnit()).thenReturn(cu);
+        when(type.getResource()).thenReturn(null);
+
+        String hover = invokeBuildHoverContent(hp, type);
+        assertNotNull(hover);
+        assertTrue(hover.contains("Live docs from the open buffer."));
+        assertFalse(hover.contains("Stale docs."));
+
+        dm.didClose(uri);
+    }
+
+    @Test
+    void buildHoverContentUsesWorkspaceSourceForMemberJavadoc() throws Exception {
+        String source = """
+                class Demo {
+                    /**
+                     * Greets from workspace source.
+                     */
+                    String greet(String name) { '' }
+                }
+                """;
+
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        when(cu.getSource()).thenReturn(source);
+
+        IType type = mock(IType.class);
+        when(type.getCompilationUnit()).thenReturn(cu);
+        when(type.getResource()).thenReturn(null);
+        when(type.getFullyQualifiedName()).thenReturn("com.example.Demo");
+        when(type.getClassFile()).thenReturn(null);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementType()).thenReturn(IJavaElement.METHOD);
+        when(method.getElementName()).thenReturn("greet");
+        when(method.getFlags()).thenReturn(Flags.AccPublic);
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getReturnType()).thenReturn("QString;");
+        when(method.getParameterTypes()).thenReturn(new String[]{"QString;"});
+        when(method.getParameterNames()).thenReturn(new String[]{"name"});
+        when(method.getExceptionTypes()).thenReturn(new String[0]);
+        when(method.getDeclaringType()).thenReturn(type);
+        when(method.getAncestor(IJavaElement.TYPE)).thenReturn(type);
+
+        String hover = invokeBuildHoverContent(method);
+        assertNotNull(hover);
+        assertTrue(hover.contains("Greets from workspace source."));
     }
 
     @Test
@@ -735,9 +861,13 @@ class HoverProviderTest {
     // ================================================================
 
     private String invokeBuildHoverContent(IJavaElement element) throws Exception {
+        return invokeBuildHoverContent(provider, element);
+    }
+
+    private String invokeBuildHoverContent(HoverProvider hoverProvider, IJavaElement element) throws Exception {
         Method m = HoverProvider.class.getDeclaredMethod("buildHoverContent", IJavaElement.class);
         m.setAccessible(true);
-        return (String) m.invoke(provider, element);
+        return (String) m.invoke(hoverProvider, element);
     }
 
     private boolean invokeIsTrait(IType type) throws Exception {
@@ -796,9 +926,9 @@ class HoverProviderTest {
     }
 
     private Hover invokeBuildASTHover(String text) throws Exception {
-        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class);
+        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class, String.class);
         m.setAccessible(true);
-        return (Hover) m.invoke(provider, text);
+        return (Hover) m.invoke(provider, text, null);
     }
 
     private Hover invokeGetHoverFromGroovyAST(HoverProvider hp, String uri, Position position) throws Exception {
@@ -854,10 +984,12 @@ class HoverProviderTest {
 
     @Test
     void resolveTraitMemberHoverForTraitField() throws Exception {
-        String source = "trait HasCount {\n"
-                + "    int counter = 0\n"
-                + "}\n"
-                + "class Impl implements HasCount {}\n";
+        String source = """
+                trait HasCount {
+                    int counter = 0
+                }
+                class Impl implements HasCount {}
+                """;
         String uri = "file:///TraitFieldHover.groovy";
         DocumentManager dm = new DocumentManager();
         dm.didOpen(uri, source);
@@ -868,9 +1000,9 @@ class HoverProviderTest {
         ClassNode impl = findClass(ast, "Impl");
 
         Method m = HoverProvider.class.getDeclaredMethod(
-                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, String.class, int.class);
         m.setAccessible(true);
-        Hover hover = (Hover) m.invoke(hp, impl, ast, "counter", 4);
+        Hover hover = (Hover) m.invoke(hp, impl, ast, source, "counter", 4);
 
         assertNotNull(hover);
         assertTrue(hover.getContents().getRight().getValue().contains("counter"));
@@ -879,10 +1011,12 @@ class HoverProviderTest {
 
     @Test
     void resolveTraitMemberHoverForTraitProperty() throws Exception {
-        String source = "trait Named {\n"
-                + "    String name\n"
-                + "}\n"
-                + "class Person implements Named {}\n";
+        String source = """
+                trait Named {
+                    String name
+                }
+                class Person implements Named {}
+                """;
         String uri = "file:///TraitPropHover.groovy";
         DocumentManager dm = new DocumentManager();
         dm.didOpen(uri, source);
@@ -893,9 +1027,9 @@ class HoverProviderTest {
         ClassNode person = findClass(ast, "Person");
 
         Method m = HoverProvider.class.getDeclaredMethod(
-                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, String.class, int.class);
         m.setAccessible(true);
-        Hover hover = (Hover) m.invoke(hp, person, ast, "name", 4);
+        Hover hover = (Hover) m.invoke(hp, person, ast, source, "name", 4);
 
         assertNotNull(hover);
         assertTrue(hover.getContents().getRight().getValue().contains("name"));
@@ -915,10 +1049,9 @@ class HoverProviderTest {
         ClassNode c = findClass(ast, "C");
 
         Method m = HoverProvider.class.getDeclaredMethod(
-                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, String.class, int.class);
         m.setAccessible(true);
-        // Target line 100 is way beyond the class
-        Hover hover = (Hover) m.invoke(hp, c, ast, "foo", 100);
+        Hover hover = (Hover) m.invoke(hp, c, ast, source, "foo", 100);
 
         assertNull(hover);
         dm.didClose(uri);
@@ -937,9 +1070,9 @@ class HoverProviderTest {
         ClassNode c = findClass(ast, "C");
 
         Method m = HoverProvider.class.getDeclaredMethod(
-                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, int.class);
+                "resolveTraitMemberHover", ClassNode.class, ModuleNode.class, String.class, String.class, int.class);
         m.setAccessible(true);
-        Hover hover = (Hover) m.invoke(hp, c, ast, "nonexistent", 2);
+        Hover hover = (Hover) m.invoke(hp, c, ast, source, "nonexistent", 2);
 
         assertNull(hover);
         dm.didClose(uri);
@@ -951,23 +1084,23 @@ class HoverProviderTest {
 
     @Test
     void buildASTHoverReturnsNullForEmptyText() throws Exception {
-        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class);
+        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class, String.class);
         m.setAccessible(true);
-        assertNull(m.invoke(provider, ""));
+        assertNull(m.invoke(provider, "", null));
     }
 
     @Test
     void buildASTHoverReturnsNullForNullText() throws Exception {
-        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class);
+        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class, String.class);
         m.setAccessible(true);
-        assertNull(m.invoke(provider, (Object) null));
+        assertNull(m.invoke(provider, null, null));
     }
 
     @Test
     void buildASTHoverReturnsMarkdown() throws Exception {
-        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class);
+        Method m = HoverProvider.class.getDeclaredMethod("buildASTHover", String.class, String.class);
         m.setAccessible(true);
-        Hover hover = (Hover) m.invoke(provider, "some hover text");
+        Hover hover = (Hover) m.invoke(provider, "some hover text", null);
         assertNotNull(hover);
         assertEquals("some hover text", hover.getContents().getRight().getValue());
     }

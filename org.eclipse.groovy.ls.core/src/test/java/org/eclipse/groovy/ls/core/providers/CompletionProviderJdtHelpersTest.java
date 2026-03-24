@@ -21,10 +21,14 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IOrdinaryClassFile;
+import org.eclipse.jdt.core.IPackageFragment;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.lsp4j.CompletionItem;
@@ -106,6 +110,162 @@ class CompletionProviderJdtHelpersTest {
         assertTrue(items.stream().anyMatch(i -> "count".equals(i.getLabel())));
         assertEquals(1, items.stream().filter(i -> i.getLabel().startsWith("work(")).count());
         assertTrue(items.stream().anyMatch(i -> i.getLabel().startsWith("assist(")));
+    }
+
+    @Test
+    void addMembersOfTypeIncludesJavaGetterExposedByJdt() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IType javaType = mock(IType.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+
+        when(javaType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(javaType)).thenReturn(new IType[0]);
+        when(javaType.getElementName()).thenReturn("SomeClass");
+
+        IMethod getter = method("getSomeMember", "QString;", new String[0], new String[0], false);
+        when(javaType.getMethods()).thenReturn(new IMethod[] {getter});
+        when(javaType.getFields()).thenReturn(new IField[0]);
+
+        List<CompletionItem> items = new ArrayList<>();
+        invokeAddMembersOfType(provider, javaType, "getSome", false, items);
+
+        CompletionItem getterItem = items.stream()
+                .filter(item -> "getSomeMember()".equals(item.getLabel()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(getterItem);
+        assertEquals(CompletionItemKind.Method, getterItem.getKind());
+        assertEquals("getSomeMember()", getterItem.getInsertText());
+        assertTrue(getterItem.getDetail().contains("SomeClass"));
+    }
+
+    @Test
+    void addMembersOfTypeUsesBinaryMetadataForGeneratedJavaGetter() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IType sourceType = mock(IType.class);
+        IJavaProject project = mock(IJavaProject.class);
+        ICompilationUnit compilationUnit = mock(ICompilationUnit.class);
+        IType binaryType = mock(IType.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        IPackageFragment fragment = mock(IPackageFragment.class);
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+
+        when(sourceType.getCompilationUnit()).thenReturn(compilationUnit);
+        when(sourceType.getJavaProject()).thenReturn(project);
+        when(sourceType.getFullyQualifiedName()).thenReturn("demo.SomeClass");
+
+        when(project.getPackageFragmentRoots()).thenReturn(new IPackageFragmentRoot[] {root});
+        when(root.getKind()).thenReturn(IPackageFragmentRoot.K_BINARY);
+        when(root.getPackageFragment("demo")).thenReturn(fragment);
+        when(fragment.getOrdinaryClassFile("SomeClass.class")).thenReturn(classFile);
+        when(classFile.exists()).thenReturn(true);
+        when(classFile.getType()).thenReturn(binaryType);
+        when(binaryType.exists()).thenReturn(true);
+        when(binaryType.getElementName()).thenReturn("SomeClass");
+        when(binaryType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(binaryType)).thenReturn(new IType[0]);
+
+        IMethod getter = method("getSomeMember", "QString;", new String[0], new String[0], false);
+        when(binaryType.getMethods()).thenReturn(new IMethod[] {getter});
+        when(binaryType.getFields()).thenReturn(new IField[0]);
+
+        List<CompletionItem> items = new ArrayList<>();
+        invokeAddMembersOfType(provider, sourceType, "getSome", false, items);
+
+        CompletionItem getterItem = items.stream()
+                .filter(item -> "getSomeMember()".equals(item.getLabel()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(getterItem);
+        assertEquals(CompletionItemKind.Method, getterItem.getKind());
+        assertTrue(getterItem.getDetail().contains("SomeClass"));
+    }
+
+    @Test
+    void addMembersOfTypeFiltersExplicitConstructors() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IType type = mock(IType.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+
+        when(type.getElementName()).thenReturn("SomeClass");
+        when(type.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(type)).thenReturn(new IType[0]);
+
+        IMethod constructor = method("SomeClass", "V", new String[] {"QString;"}, new String[] {"name"}, true);
+        IMethod regularMethod = method("work", "V", new String[0], new String[0], false);
+        when(type.getMethods()).thenReturn(new IMethod[] {constructor, regularMethod});
+        when(type.getFields()).thenReturn(new IField[0]);
+
+        List<CompletionItem> items = new ArrayList<>();
+        invokeAddMembersOfType(provider, type, "", false, items);
+
+        assertTrue(items.stream().anyMatch(item -> "work()".equals(item.getLabel())));
+        assertTrue(items.stream().noneMatch(item -> item.getKind() == CompletionItemKind.Constructor));
+        assertTrue(items.stream().noneMatch(item -> item.getLabel() != null && item.getLabel().startsWith("SomeClass(")));
+    }
+
+    @Test
+    void addMembersOfTypeIncludesRecordStyleAccessorProperty() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IType recordType = mock(IType.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+
+        when(recordType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(recordType)).thenReturn(new IType[0]);
+        when(recordType.getElementName()).thenReturn("SomeRecord");
+
+        IMethod accessor = method("someMember", "QString;", new String[0], new String[0], false);
+        when(recordType.getMethods()).thenReturn(new IMethod[] {accessor});
+        IField componentField = field("someMember", "QString;", false);
+        when(recordType.getFields()).thenReturn(new IField[] {componentField});
+
+        List<CompletionItem> items = new ArrayList<>();
+        invokeAddMembersOfType(provider, recordType, "some", false, items);
+
+        CompletionItem methodItem = items.stream()
+                .filter(item -> "someMember()".equals(item.getLabel()))
+                .findFirst()
+                .orElse(null);
+        CompletionItem propertyItem = items.stream()
+                .filter(item -> "someMember".equals(item.getLabel()))
+                .filter(item -> item.getKind() == CompletionItemKind.Property)
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(methodItem);
+        assertNotNull(propertyItem);
+        assertEquals("someMember", propertyItem.getInsertText());
+        assertTrue(propertyItem.getDetail().contains("record-style property"));
+    }
+
+    @Test
+    void addMembersOfTypeSynthesizesSourceRecordAccessors() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IType recordType = mock(IType.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+
+        when(recordType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(recordType)).thenReturn(new IType[0]);
+        when(recordType.getElementName()).thenReturn("SomeRecord");
+        when(recordType.getSource()).thenReturn("public record SomeRecord(String someMember, int age) {}\n");
+        when(recordType.getMethods()).thenReturn(new IMethod[0]);
+        when(recordType.getFields()).thenReturn(new IField[0]);
+
+        List<CompletionItem> items = new ArrayList<>();
+        invokeAddMembersOfType(provider, recordType, "some", false, items);
+
+        CompletionItem accessorItem = items.stream()
+                .filter(item -> "someMember()".equals(item.getLabel()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(accessorItem);
+        assertEquals(CompletionItemKind.Method, accessorItem.getKind());
+        assertEquals("someMember()", accessorItem.getInsertText());
+        assertTrue(accessorItem.getDetail().contains("record component"));
     }
 
     private CompletionItem invokeMethodToCompletionItem(

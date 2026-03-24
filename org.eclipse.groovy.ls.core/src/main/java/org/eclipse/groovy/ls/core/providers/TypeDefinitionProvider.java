@@ -201,18 +201,7 @@ public class TypeDefinitionProvider {
                 return new Location(targetUri, range);
             }
 
-            // Binary type: use SourceJarHelper
-            java.io.File sourcesJar = SourceJarHelper.findSourcesJar(type);
-            if (sourcesJar != null) {
-                String fqn = type.getFullyQualifiedName();
-                String source = SourceJarHelper.readSourceFromJar(sourcesJar, fqn);
-                if (source != null && !source.isEmpty()) {
-                    String virtualUri = SourceJarHelper.buildGroovySourceUri(
-                            fqn, ".java", sourcesJar.getAbsolutePath(), false, source);
-                    return new Location(virtualUri,
-                            new Range(new Position(0, 0), new Position(0, 0)));
-                }
-            }
+            return BinaryTypeLocationResolver.resolveLocation(type);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to resolve type location for " + type.getElementName(), e);

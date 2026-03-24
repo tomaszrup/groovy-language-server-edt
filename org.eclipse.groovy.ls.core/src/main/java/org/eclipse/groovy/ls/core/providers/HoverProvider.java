@@ -15,6 +15,7 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -80,51 +81,67 @@ public class HoverProvider {
         String uri = params.getTextDocument().getUri();
         Position position = params.getPosition();
 
-        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-        if (workingCopy != null) {
-            try {
-                String content = documentManager.getContent(uri);
-                if (content != null) {
-                    int offset = positionToOffset(content, position);
-
-                    // Check cache first — avoids a full codeSelect() round-trip
-                    String cacheKey = uri + "#" + offset;
-                    Hover cached = hoverCache.get(cacheKey);
-                    if (cached != null) {
-                        return cached == NO_HOVER ? null : cached;
-                    }
-
-                    // Bail out early if the future was cancelled / timed out
-                    if (Thread.currentThread().isInterrupted()) {
-                        return null;
-                    }
-
-                    // codeSelect resolves the element at the given offset
-                    IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
-                    if (elements != null && elements.length > 0) {
-                        IJavaElement element = elements[0];
-                        String hoverContent = buildHoverContent(element);
-
-                        if (hoverContent != null && !hoverContent.isEmpty()) {
-                            MarkupContent markup = new MarkupContent();
-                            markup.setKind(MarkupKind.MARKDOWN);
-                            markup.setValue(hoverContent);
-                            Hover result = new Hover(markup);
-                            hoverCache.put(cacheKey, result);
-                            return result;
-                        }
-                    }
-
-                    // Cache the "no JDT hover" sentinel so we don't retry
-                    hoverCache.put(cacheKey, NO_HOVER);
-                }
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError("Hover JDT failed for " + uri + ", falling back to AST", e);
-            }
+        Hover jdtHover = getHoverFromJdt(uri, position);
+        if (jdtHover != null) {
+            return jdtHover;
         }
 
         // Fallback: try hover from Groovy AST
         return getHoverFromGroovyAST(uri, position);
+    }
+
+    private Hover getHoverFromJdt(String uri, Position position) {
+        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        if (workingCopy == null) {
+            return null;
+        }
+
+        try {
+            String content = documentManager.getContent(uri);
+            if (content == null) {
+                return null;
+            }
+
+            int offset = positionToOffset(content, position);
+            String cacheKey = uri + "#" + offset;
+            Hover cached = hoverCache.get(cacheKey);
+            if (cached != null) {
+                return cached == NO_HOVER ? null : cached;
+            }
+
+            if (Thread.currentThread().isInterrupted()) {
+                return null;
+            }
+
+            Hover hover = computeHoverForOffset(workingCopy, offset);
+            if (hover != null) {
+                hoverCache.put(cacheKey, hover);
+                return hover;
+            }
+
+            hoverCache.put(cacheKey, NO_HOVER);
+            return null;
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Hover JDT failed for " + uri + ", falling back to AST", e);
+            return null;
+        }
+    }
+
+    private Hover computeHoverForOffset(ICompilationUnit workingCopy, int offset) throws JavaModelException {
+        IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
+        if (elements == null || elements.length == 0) {
+            return null;
+        }
+
+        String hoverContent = buildHoverContent(elements[0]);
+        if (hoverContent == null || hoverContent.isEmpty()) {
+            return null;
+        }
+
+        MarkupContent markup = new MarkupContent();
+        markup.setKind(MarkupKind.MARKDOWN);
+        markup.setValue(hoverContent);
+        return new Hover(markup);
     }
 
     /**
@@ -358,11 +375,60 @@ public class HoverProvider {
     }
 
     private String loadSourceForJavadoc(IType type) {
+        String workspaceSource = loadWorkspaceSourceForJavadoc(type);
+        if (workspaceSource != null && !workspaceSource.isEmpty()) {
+            return workspaceSource;
+        }
+
         String fqn = type.getFullyQualifiedName();
         if (type.getClassFile() == null) {
             return SourceJarHelper.readSourceFromJdkSrcZip(fqn);
         }
         return loadSourceFromJarOrJdk(type, fqn);
+    }
+
+    private String loadWorkspaceSourceForJavadoc(IType type) {
+        ICompilationUnit compilationUnit = resolveCompilationUnit(type);
+
+        String openDocumentSource = loadOpenDocumentSource(type, compilationUnit);
+        if (openDocumentSource != null && !openDocumentSource.isEmpty()) {
+            return openDocumentSource;
+        }
+
+        if (compilationUnit == null) {
+            return null;
+        }
+
+        try {
+            return compilationUnit.getSource();
+        } catch (JavaModelException e) {
+            GroovyLanguageServerPlugin.logError("[hover] Failed to read workspace source for "
+                    + type.getFullyQualifiedName(), e);
+            return null;
+        }
+    }
+
+    private ICompilationUnit resolveCompilationUnit(IType type) {
+        ICompilationUnit compilationUnit = type.getCompilationUnit();
+        if (compilationUnit != null) {
+            return compilationUnit;
+        }
+
+        IJavaElement ancestor = type.getAncestor(IJavaElement.COMPILATION_UNIT);
+        return ancestor instanceof ICompilationUnit cu ? cu : null;
+    }
+
+    private String loadOpenDocumentSource(IType type, ICompilationUnit compilationUnit) {
+        IResource resource = type.getResource();
+        if (resource == null && compilationUnit != null) {
+            resource = compilationUnit.getResource();
+        }
+        if (resource == null || resource.getLocationURI() == null) {
+            return null;
+        }
+
+        String normalizedUri = DocumentManager.normalizeUri(resource.getLocationURI().toString());
+        return documentManager.getContent(normalizedUri);
     }
 
     private String loadSourceFromJarOrJdk(IType type, String fqn) {
@@ -436,7 +502,7 @@ public class HoverProvider {
         }
 
         for (ClassNode classNode : ast.getClasses()) {
-            Hover hover = findHoverInClass(classNode, ast, word, targetLine);
+            Hover hover = findHoverInClass(classNode, ast, content, word, targetLine);
             if (hover != null) {
                 return hover;
             }
@@ -448,40 +514,46 @@ public class HoverProvider {
     /**
      * Search a single AST class for hover information matching the given word at the target line.
      */
-    private Hover findHoverInClass(ClassNode classNode, ModuleNode ast, String word, int targetLine) {
+    private Hover findHoverInClass(ClassNode classNode, ModuleNode ast,
+                                   String content, String word, int targetLine) {
         // Check class name
         if (classNode.getNameWithoutPackage().equals(word) && isInRange(classNode, targetLine)) {
-            return buildASTHover(buildClassHover(classNode));
+            return buildASTHover(buildClassHover(classNode),
+                    extractClassDocumentation(content, classNode));
         }
 
-        Hover memberHover = findMemberHoverInClass(classNode, word, targetLine);
+        Hover memberHover = findMemberHoverInClass(classNode, content, word, targetLine);
         if (memberHover != null) {
             return memberHover;
         }
 
         // Check members inherited from traits/interfaces
-        return resolveTraitMemberHover(classNode, ast, word, targetLine);
+        return resolveTraitMemberHover(classNode, ast, content, word, targetLine);
     }
 
     /**
      * Search direct members (methods, fields, properties) of a class for hover information.
      */
-    private Hover findMemberHoverInClass(ClassNode classNode, String word, int targetLine) {
+    private Hover findMemberHoverInClass(ClassNode classNode, String content,
+                                         String word, int targetLine) {
         for (MethodNode method : classNode.getMethods()) {
             if (method.getName().equals(word) && isInRange(method, targetLine)) {
-                return buildASTHover(buildMethodHover(method));
+                return buildASTHover(buildMethodHover(method),
+                        extractMemberDocumentation(content, classNode, method.getName()));
             }
         }
 
         for (FieldNode field : classNode.getFields()) {
             if (field.getName().equals(word) && isInRange(field, targetLine)) {
-                return buildASTHover(buildFieldHover(field));
+                return buildASTHover(buildFieldHover(field),
+                        extractMemberDocumentation(content, classNode, field.getName()));
             }
         }
 
         for (PropertyNode prop : classNode.getProperties()) {
             if (isPropertyMatch(prop, word, targetLine)) {
-                return buildASTHover(buildPropertyHover(prop));
+                return buildASTHover(buildPropertyHover(prop),
+                        extractMemberDocumentation(content, classNode, prop.getName()));
             }
         }
 
@@ -505,7 +577,7 @@ public class HoverProvider {
      * Look up a member in the traits/interfaces implemented by the given class.
      */
     private Hover resolveTraitMemberHover(ClassNode classNode, ModuleNode ast,
-                                           String word, int targetLine) {
+                                           String content, String word, int targetLine) {
         // Only check if the cursor is inside this class
         if (classNode.getLineNumber() > 0 && classNode.getLastLineNumber() > 0
                 && (targetLine < classNode.getLineNumber() || targetLine > classNode.getLastLineNumber())) {
@@ -514,34 +586,102 @@ public class HoverProvider {
 
         for (MethodNode method : TraitMemberResolver.collectTraitMethods(classNode, ast, documentManager)) {
             if (method.getName().equals(word)) {
-                return buildASTHover(buildMethodHover(method));
+                return buildASTHover(buildMethodHover(method),
+                        extractTraitMemberDocumentation(content, method.getDeclaringClass(), method.getName()));
             }
         }
 
         for (FieldNode field : TraitMemberResolver.collectTraitFields(classNode, ast, documentManager)) {
             if (field.getName().equals(word)
                     || TraitMemberResolver.isTraitFieldMatch(field.getName(), word)) {
-                return buildASTHover(buildFieldHover(field));
+                return buildASTHover(buildFieldHover(field),
+                        extractTraitMemberDocumentation(content, field.getDeclaringClass(), field.getName()));
             }
         }
 
         for (PropertyNode prop : TraitMemberResolver.collectTraitProperties(classNode, ast, documentManager)) {
             if (prop.getName().equals(word)) {
-                return buildASTHover(buildPropertyHover(prop));
+                return buildASTHover(buildPropertyHover(prop),
+                        extractTraitMemberDocumentation(content, prop.getDeclaringClass(), prop.getName()));
             }
         }
 
         return null;
     }
 
-    private Hover buildASTHover(String hoverText) {
-        if (hoverText == null || hoverText.isEmpty()) {
+    private Hover buildASTHover(String hoverText, String documentation) {
+        String combined = appendDocumentation(hoverText, documentation);
+        if (combined == null || combined.isEmpty()) {
             return null;
         }
         MarkupContent markup = new MarkupContent();
         markup.setKind(MarkupKind.MARKDOWN);
-        markup.setValue(hoverText);
+        markup.setValue(combined);
         return new Hover(markup);
+    }
+
+    private String appendDocumentation(String hoverText, String documentation) {
+        if (hoverText == null || hoverText.isEmpty()) {
+            return null;
+        }
+        if (documentation == null || documentation.isEmpty()) {
+            return hoverText;
+        }
+        return hoverText + "\n---\n" + documentation;
+    }
+
+    private String extractClassDocumentation(String source, ClassNode classNode) {
+        return SourceJarHelper.extractJavadoc(source, classNode.getNameWithoutPackage());
+    }
+
+    private String extractMemberDocumentation(String source, ClassNode owner, String memberName) {
+        if (source == null || owner == null || memberName == null) {
+            return null;
+        }
+
+        String classScopedSource = extractClassScopedSource(source, owner);
+        if (classScopedSource == null || classScopedSource.isEmpty()) {
+            return null;
+        }
+        return SourceJarHelper.extractMemberJavadoc(classScopedSource, memberName);
+    }
+
+    private String extractTraitMemberDocumentation(String source, ClassNode declaringClass, String memberName) {
+        if (declaringClass == null) {
+            return null;
+        }
+        return extractMemberDocumentation(source, declaringClass, memberName);
+    }
+
+    private String extractClassScopedSource(String source, ClassNode owner) {
+        if (source == null || owner == null || owner.getLineNumber() <= 0 || owner.getLastLineNumber() <= 0) {
+            return source;
+        }
+
+        int startOffset = lineToOffset(source, owner.getLineNumber());
+        int endOffset = lineToOffset(source, owner.getLastLineNumber() + 1);
+        if (startOffset < 0 || endOffset < startOffset) {
+            return source;
+        }
+
+        return source.substring(startOffset, Math.min(endOffset, source.length()));
+    }
+
+    private int lineToOffset(String source, int oneBasedLine) {
+        if (source == null || oneBasedLine <= 1) {
+            return 0;
+        }
+
+        int line = 1;
+        for (int i = 0; i < source.length(); i++) {
+            if (line == oneBasedLine) {
+                return i;
+            }
+            if (source.charAt(i) == '\n') {
+                line++;
+            }
+        }
+        return source.length();
     }
 
     private String buildClassHover(ClassNode classNode) {

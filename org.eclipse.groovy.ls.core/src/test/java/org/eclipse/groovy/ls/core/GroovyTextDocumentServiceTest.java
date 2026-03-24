@@ -10,6 +10,7 @@
 package org.eclipse.groovy.ls.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -250,9 +251,8 @@ class GroovyTextDocumentServiceTest {
     }
 
     @Test
-    void didOpenDelegatesToDocumentManagerAndPublishesDiagnostics() throws Exception {
+    void didOpenDelegatesToDocumentManagerAndPublishesDiagnosticsImmediately() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
-        setField(server, "diagnosticsEnabled", true);
         DocumentManager documentManager = new DocumentManager();
         GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
 
@@ -270,6 +270,44 @@ class GroovyTextDocumentServiceTest {
 
         // Document should be stored
         assertNotNull(documentManager.getContent("file:///test/Open.groovy"));
+        verify(diagnostics).publishDiagnosticsImmediate("file:///test/Open.groovy");
+    }
+
+    @Test
+    void refreshOpenDocumentsSemanticStateFiltersByProject() {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public String getProjectNameForUri(String uri) {
+                if (uri.contains("A.groovy")) {
+                    return "projA";
+                }
+                if (uri.contains("Unknown.groovy")) {
+                    return null;
+                }
+                return "projB";
+            }
+        };
+        DocumentManager documentManager = mock(DocumentManager.class);
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        when(documentManager.getOpenDocumentUris()).thenReturn(Set.of(
+                "file:///test/A.groovy",
+                "file:///test/B.groovy",
+                "file:///test/Unknown.groovy"));
+        when(documentManager.getClientUri("file:///test/A.groovy")).thenReturn("file:///test/A.groovy");
+        when(documentManager.getClientUri("file:///test/B.groovy")).thenReturn("file:///test/B.groovy");
+        when(documentManager.getClientUri("file:///test/Unknown.groovy")).thenReturn("file:///test/Unknown.groovy");
+
+        service.refreshOpenDocumentsSemanticState("projA");
+
+        @SuppressWarnings("unchecked")
+        Class<Iterable<String>> iterableClass = (Class<Iterable<String>>) (Class<?>) Iterable.class;
+        ArgumentCaptor<Iterable<String>> captor = ArgumentCaptor.forClass(iterableClass);
+        verify(documentManager).replayOpenDocuments(captor.capture());
+
+        java.util.List<String> replayed = new java.util.ArrayList<>();
+        captor.getValue().forEach(replayed::add);
+        assertEquals(Set.of("file:///test/A.groovy", "file:///test/Unknown.groovy"), Set.copyOf(replayed));
     }
 
     @Test
@@ -439,14 +477,16 @@ class GroovyTextDocumentServiceTest {
         setField(service, "codeLensProvider", provider);
         CodeLens lens = new CodeLens();
         when(provider.resolveCodeLens(any())).thenThrow(new RuntimeException("boom"));
-        assertSame(lens, service.resolveCodeLens(lens).join());
+        CodeLens result = service.resolveCodeLens(lens).join();
+        assertSame(lens, result);
+        assertNotNull(result.getCommand());
+        assertEquals("References unavailable", result.getCommand().getTitle());
     }
 
     @Test
     void shutdownPoolsAndClearsPendingTokens() {
         GroovyTextDocumentService service = createService();
-        // Should not throw
-        service.shutdown();
+        assertDoesNotThrow(service::shutdown);
     }
 
     // ================================================================

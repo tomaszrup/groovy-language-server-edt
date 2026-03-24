@@ -12,17 +12,22 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.codehaus.groovy.ast.ASTNode;
+import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.ConstructorNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.codehaus.groovy.ast.expr.ClosureExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
 import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.codehaus.groovy.ast.expr.Expression;
@@ -30,6 +35,7 @@ import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.ExpressionStatement;
 import org.codehaus.groovy.ast.stmt.Statement;
+import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.core.resources.IProject;
@@ -90,6 +96,136 @@ public class CompletionProvider {
             this.currentPackage = currentPackage;
             this.existingImports = existingImports;
             this.importInsertLine = importInsertLine;
+        }
+    }
+
+    private record ScopedVariable(String name, ClassNode type) {
+    }
+
+    private static final class ScopedVariableCollector extends ClassCodeVisitorSupport {
+        private final int targetLine;
+        private final int targetColumn;
+        private final LinkedHashMap<String, ClassNode> variables = new LinkedHashMap<>();
+
+        ScopedVariableCollector(Position position) {
+            this.targetLine = position.getLine() + 1;
+            this.targetColumn = position.getCharacter() + 1;
+        }
+
+        List<ScopedVariable> getVariables() {
+            List<ScopedVariable> result = new ArrayList<>();
+            for (Map.Entry<String, ClassNode> entry : variables.entrySet()) {
+                result.add(new ScopedVariable(entry.getKey(), entry.getValue()));
+            }
+            return result;
+        }
+
+        void addParameters(Parameter[] parameters) {
+            if (parameters == null) {
+                return;
+            }
+            for (Parameter parameter : parameters) {
+                if (parameter == null || parameter.getName() == null || parameter.getName().isEmpty()) {
+                    continue;
+                }
+                variables.put(parameter.getName(), normalizeType(parameter.getType()));
+            }
+        }
+
+        @Override
+        protected SourceUnit getSourceUnit() {
+            return null;
+        }
+
+        @Override
+        public void visitDeclarationExpression(DeclarationExpression expr) {
+            if (expr == null || expr.getLineNumber() < 1) {
+                return;
+            }
+            if (containsPosition(expr)) {
+                Expression right = expr.getRightExpression();
+                if (right != null) {
+                    right.visit(this);
+                }
+                return;
+            }
+            if (startsBeforeCursor(expr)) {
+                Expression left = expr.getLeftExpression();
+                if (left instanceof VariableExpression varExpr) {
+                    String name = varExpr.getName();
+                    if (name != null && !name.isEmpty()) {
+                        variables.put(name, resolveVariableType(varExpr, expr.getRightExpression()));
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void visitClosureExpression(ClosureExpression expr) {
+            if (expr == null || !containsPosition(expr)) {
+                return;
+            }
+            addParameters(expr.getParameters());
+            if (expr.getCode() != null) {
+                expr.getCode().visit(this);
+            }
+        }
+
+        private ClassNode resolveVariableType(VariableExpression variable, Expression initializer) {
+            if (variable == null) {
+                return null;
+            }
+            ClassNode originType = normalizeType(variable.getOriginType());
+            if (originType != null) {
+                return originType;
+            }
+            if (initializer instanceof ConstructorCallExpression ctorCall) {
+                return normalizeType(ctorCall.getType());
+            }
+            return initializer != null ? normalizeType(initializer.getType()) : null;
+        }
+
+        private ClassNode normalizeType(ClassNode type) {
+            if (type == null) {
+                return null;
+            }
+            String name = type.getName();
+            if (name == null || name.isEmpty() || "void".equals(name) || "java.lang.Object".equals(name)) {
+                return null;
+            }
+            return type;
+        }
+
+        private boolean startsBeforeCursor(ASTNode node) {
+            if (node == null || node.getLineNumber() < 1) {
+                return false;
+            }
+            if (node.getLineNumber() < targetLine) {
+                return true;
+            }
+            if (node.getLineNumber() > targetLine) {
+                return false;
+            }
+            int startColumn = node.getColumnNumber() > 0 ? node.getColumnNumber() : 1;
+            return startColumn <= targetColumn;
+        }
+
+        private boolean containsPosition(ASTNode node) {
+            if (node == null || node.getLineNumber() < 1) {
+                return false;
+            }
+            int endLine = node.getLastLineNumber() > 0 ? node.getLastLineNumber() : node.getLineNumber();
+            int endColumn = node.getLastColumnNumber() > 0 ? node.getLastColumnNumber() : Integer.MAX_VALUE;
+            if (targetLine < node.getLineNumber() || targetLine > endLine) {
+                return false;
+            }
+            if (targetLine == node.getLineNumber()) {
+                int startColumn = node.getColumnNumber() > 0 ? node.getColumnNumber() : 1;
+                if (targetColumn < startColumn) {
+                    return false;
+                }
+            }
+            return targetLine != endLine || targetColumn <= endColumn;
         }
     }
 
@@ -332,18 +468,18 @@ public class CompletionProvider {
         try {
             if (isDotCompletion) {
                 int dotPos = prefixStart - 1; // position of the '.'
-                items.addAll(getDotCompletions(workingCopy, uri, content, dotPos, prefix));
+                items.addAll(getDotCompletions(workingCopy, uri, content, position, dotPos, prefix));
                 // Never add keywords/types after a dot — only member completions
             } else if (isAnnotationCompletion) {
                 // After '@', only annotation types are valid.
                 items.addAll(getTypeCompletions(workingCopy, uri, content, prefix, true));
             } else {
                 // Non-dot context: identifiers + types + keywords
-                items.addAll(getIdentifierCompletions(workingCopy, uri, prefix));
+                items.addAll(getIdentifierCompletions(workingCopy, uri, position, prefix));
                 if (!prefix.isEmpty()) {
                     items.addAll(getTypeCompletions(workingCopy, uri, content, prefix, false));
+                    items.addAll(getKeywordCompletions(prefix));
                 }
-                items.addAll(getKeywordCompletions(prefix));
             }
 
             GroovyLanguageServerPlugin.logInfo("[completion] Returning " + items.size() + " items");
@@ -374,7 +510,8 @@ public class CompletionProvider {
      */
     private List<CompletionItem> getDotCompletions(ICompilationUnit workingCopy,
                                                     String lspUri, String content,
-                                                    int dotPos, String prefix) {
+                                                    Position position, int dotPos,
+                                                    String prefix) {
         List<CompletionItem> items = new ArrayList<>();
 
         // When the prefix is empty (cursor right after the dot), the source
@@ -446,7 +583,7 @@ public class CompletionProvider {
 
             // AST-based dot completion fallback: resolve the expression type via the AST
             if (items.isEmpty()) {
-                addAstDotCompletions(workingCopy, lspUri, exprName, prefix, items);
+                addAstDotCompletions(workingCopy, lspUri, position, exprName, prefix, items);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[completion] Dot completion failed", e);
@@ -574,17 +711,19 @@ public class CompletionProvider {
     private void addMembersOfType(IType type, String prefix, boolean staticOnly,
                                    List<CompletionItem> items) throws JavaModelException {
         Set<String> seen = new HashSet<>();
+        IType memberSource = JavaBinaryMemberResolver.resolveMemberSource(type);
 
-        List<IType> chain = buildTypeHierarchyChain(type, hierarchyCache);
+        List<IType> chain = buildTypeHierarchyChain(memberSource, hierarchyCache);
         for (int typeIndex = 0; typeIndex < chain.size() && items.size() < MAX_MEMBER_RESULTS; typeIndex++) {
             IType currentType = chain.get(typeIndex);
             String sortPrefix = (typeIndex == 0) ? "0" : "1";
             addMethodMembers(currentType, prefix, staticOnly, sortPrefix, seen, items);
+            addFieldBackedAccessorPropertyMembers(currentType, prefix, staticOnly, sortPrefix, seen, items);
             addFieldMembers(currentType, prefix, staticOnly, sortPrefix, seen, items);
         }
 
         GroovyLanguageServerPlugin.logInfo("[completion] Added " + items.size()
-                + " members from " + type.getElementName()
+        + " members from " + memberSource.getElementName()
                 + " hierarchy (" + chain.size() + " types)");
     }
 
@@ -617,13 +756,38 @@ public class CompletionProvider {
                 items.add(methodToCompletionItem(method, name, ownerType, sortPrefix));
             }
         }
+
+        addRecordComponentAccessorMembers(ownerType, prefix, staticOnly, sortPrefix, seen, items);
+    }
+
+    private void addRecordComponentAccessorMembers(IType ownerType, String prefix, boolean staticOnly,
+                                                   String sortPrefix, Set<String> seen,
+                                                   List<CompletionItem> items) {
+        if (staticOnly) {
+            return;
+        }
+
+        for (JavaRecordSourceSupport.RecordComponentInfo component : JavaRecordSourceSupport.getRecordComponents(ownerType)) {
+            if (items.size() >= MAX_MEMBER_RESULTS) {
+                return;
+            }
+
+            String name = component.name();
+            String key = name + "/0";
+            boolean includeComponent = matchesPrefix(name, prefix) && !seen.contains(key);
+            if (includeComponent) {
+                seen.add(key);
+                items.add(recordComponentToCompletionItem(component, ownerType, sortPrefix));
+            }
+        }
     }
 
     private boolean shouldIncludeMethod(IMethod method, String prefix,
                                         boolean staticOnly, Set<String> seen)
             throws JavaModelException {
         String name = method.getElementName();
-        if (name.startsWith("<") || !matchesPrefix(name, prefix)) {
+        if (method.isConstructor() || name.startsWith("<") || name.contains("$")
+                || name.startsWith("__") || !matchesPrefix(name, prefix)) {
             return false;
         }
         if (staticOnly && !Flags.isStatic(method.getFlags())) {
@@ -645,6 +809,62 @@ public class CompletionProvider {
                 seen.add("f:" + name);
                 items.add(buildFieldCompletionItem(field, name, ownerType, sortPrefix));
             }
+        }
+    }
+
+    private void addFieldBackedAccessorPropertyMembers(IType ownerType, String prefix,
+                                                       boolean staticOnly, String sortPrefix,
+                                                       Set<String> seen, List<CompletionItem> items)
+            throws JavaModelException {
+        if (staticOnly) {
+            return;
+        }
+
+        Map<String, IField> candidateFields = new LinkedHashMap<>();
+        for (IField field : ownerType.getFields()) {
+            String name = field.getElementName();
+            if (!name.startsWith("$") && !name.startsWith("__")) {
+                candidateFields.put(name, field);
+            }
+        }
+
+        for (IMethod method : ownerType.getMethods()) {
+            if (items.size() >= MAX_MEMBER_RESULTS) {
+                break;
+            }
+
+            String name = method.getElementName();
+            if (!isFieldBackedAccessorPropertyCandidate(method, candidateFields.get(name), prefix)
+                    || !seen.add("p:" + name)) {
+                continue;
+            }
+
+            CompletionItem item = new CompletionItem(name);
+            item.setKind(CompletionItemKind.Property);
+            item.setDetail(resolveFieldBackedAccessorDetail(method, ownerType));
+            item.setInsertText(name);
+            item.setFilterText(name);
+            item.setSortText(sortPrefix + "_" + name);
+            items.add(item);
+        }
+    }
+
+    private boolean isFieldBackedAccessorPropertyCandidate(IMethod method, IField field, String prefix)
+            throws JavaModelException {
+        if (field == null) {
+            return false;
+        }
+
+        String name = method.getElementName();
+        if (name.startsWith("<") || name.contains("$") || name.startsWith("__")
+                || !matchesPrefix(name, prefix) || method.getParameterTypes().length != 0) {
+            return false;
+        }
+
+        try {
+            return field.getTypeSignature().equals(method.getReturnType());
+        } catch (JavaModelException e) {
+            return false;
         }
     }
 
@@ -678,6 +898,27 @@ public class CompletionProvider {
             return Signature.toString(field.getTypeSignature()) + " — " + ownerType.getElementName();
         } catch (Exception e) {
             return ownerType.getElementName();
+        }
+    }
+
+    private CompletionItem recordComponentToCompletionItem(JavaRecordSourceSupport.RecordComponentInfo component,
+                                                           IType ownerType, String sortPrefix) {
+        CompletionItem item = new CompletionItem();
+        item.setLabel(component.name() + "()");
+        item.setKind(CompletionItemKind.Method);
+        item.setDetail(component.type() + " — " + ownerType.getElementName() + " (record component)");
+        item.setInsertText(component.name() + "()");
+        item.setFilterText(component.name());
+        item.setSortText(sortPrefix + "_" + component.name());
+        return item;
+    }
+
+    private String resolveFieldBackedAccessorDetail(IMethod method, IType ownerType) {
+        try {
+            return Signature.toString(method.getReturnType())
+                    + " — " + ownerType.getElementName() + " (record-style property)";
+        } catch (Exception e) {
+            return ownerType.getElementName() + " (record-style property)";
         }
     }
 
@@ -1045,7 +1286,8 @@ public class CompletionProvider {
      * declarations when typing without a dot.
      */
     private List<CompletionItem> getIdentifierCompletions(ICompilationUnit workingCopy,
-                                                          String lspUri, String prefix) {
+                                                          String lspUri, Position position,
+                                                          String prefix) {
         List<CompletionItem> items = new ArrayList<>();
         if (prefix.isEmpty()) return items;
 
@@ -1054,6 +1296,8 @@ public class CompletionProvider {
 
             // Also add members inherited from traits/interfaces
             addTraitIdentifierCompletions(workingCopy, lspUri, prefix, items);
+
+            addScopedAstIdentifierCompletions(workingCopy, lspUri, position, prefix, items);
 
             // AST-based fallback: add own-class fields/properties/methods from Groovy AST
             // when JDT model returns empty (e.g., getModuleNode() returns null)
@@ -1116,11 +1360,18 @@ public class CompletionProvider {
             throws JavaModelException {
         for (IMethod method : type.getMethods()) {
             String name = method.getElementName();
-            if (!name.startsWith("<") && matchesPrefix(name, prefix)) {
+            if (isTypeMethodIdentifierCandidate(name, prefix)) {
                 CompletionItem mi = methodToCompletionItem(method, name, type, "2");
                 items.add(mi);
             }
         }
+    }
+
+    private boolean isTypeMethodIdentifierCandidate(String name, String prefix) {
+        return !name.startsWith("<")
+                && !name.contains("$")
+                && !name.startsWith("__")
+                && matchesPrefix(name, prefix);
     }
 
     /**
@@ -1150,6 +1401,33 @@ public class CompletionProvider {
             seen.add(existing.getFilterText() != null ? existing.getFilterText() : existing.getLabel());
         }
         return seen;
+    }
+
+    private void addScopedAstIdentifierCompletions(ICompilationUnit workingCopy,
+                                                   String lspUri,
+                                                   Position position,
+                                                   String prefix,
+                                                   List<CompletionItem> items) {
+        ModuleNode ast = resolveAst(workingCopy, lspUri);
+        if (ast == null) {
+            return;
+        }
+
+        Set<String> seen = collectSeenCompletionNames(items);
+        for (ScopedVariable variable : findScopedVisibleVariables(ast, position)) {
+            String name = variable.name();
+            if (!matchesPrefix(name, prefix) || !seen.add(name)) {
+                continue;
+            }
+            CompletionItem item = new CompletionItem(name);
+            item.setKind(CompletionItemKind.Variable);
+            item.setDetail(variable.type() != null
+                    ? variable.type().getNameWithoutPackage() : OBJECT_TYPE_NAME);
+            item.setInsertText(name);
+            item.setFilterText(name);
+            item.setSortText("0_" + name);
+            items.add(item);
+        }
     }
 
     private void addTraitCompletionsForClass(ClassNode classNode, ModuleNode ast,
@@ -1515,7 +1793,7 @@ public class CompletionProvider {
      * own class when JDT codeSelect and direct model lookup both fail.
      */
     private void addAstDotCompletions(ICompilationUnit workingCopy, String lspUri,
-                                       String exprName, String prefix,
+                                       Position position, String exprName, String prefix,
                                        List<CompletionItem> items) {
         ModuleNode ast = resolveAst(workingCopy, lspUri);
         if (ast == null) return;
@@ -1524,7 +1802,7 @@ public class CompletionProvider {
 
         for (ClassNode classNode : ast.getClasses()) {
             if (classNode.getLineNumber() >= 0) {
-                ClassNode exprType = resolveAstExpressionType(classNode, ast, exprName);
+                ClassNode exprType = resolveAstExpressionType(classNode, ast, position, exprName);
                 addAstResolvedTypeMembers(exprType, project, prefix, items);
                 if (!items.isEmpty()) return;
             }
@@ -1536,15 +1814,83 @@ public class CompletionProvider {
         addAstResolvedTypeMembers(scriptType, project, prefix, items);
     }
 
-    private ClassNode resolveAstExpressionType(ClassNode classNode, ModuleNode ast, String exprName) {
+    private ClassNode resolveAstExpressionType(ClassNode classNode, ModuleNode ast,
+                                               Position position, String exprName) {
         ClassNode exprType = resolveClassMemberExpressionType(classNode, exprName);
         if (exprType != null) return exprType;
 
         exprType = resolveTraitMemberExpressionType(classNode, ast, exprName);
         if (exprType != null) return exprType;
 
+        exprType = resolveScopedVariableType(ast, position, exprName);
+        if (exprType != null) return exprType;
+
         // Check local variables inside method bodies
         return resolveLocalVariableTypeInClass(classNode, exprName);
+    }
+
+    private ClassNode resolveScopedVariableType(ModuleNode ast, Position position, String varName) {
+        for (ScopedVariable variable : findScopedVisibleVariables(ast, position)) {
+            if (varName.equals(variable.name())) {
+                return variable.type();
+            }
+        }
+        return null;
+    }
+
+    private List<ScopedVariable> findScopedVisibleVariables(ModuleNode ast, Position position) {
+        if (ast == null || position == null) {
+            return List.of();
+        }
+
+        for (ClassNode classNode : ast.getClasses()) {
+            List<ScopedVariable> variables = findScopedVisibleVariables(classNode, position);
+            if (!variables.isEmpty()) {
+                return variables;
+            }
+        }
+
+        BlockStatement statementBlock = ast.getStatementBlock();
+        if (containsPosition(statementBlock, position)) {
+            ScopedVariableCollector collector = new ScopedVariableCollector(position);
+            statementBlock.visit(collector);
+            return collector.getVariables();
+        }
+        return List.of();
+    }
+
+    private List<ScopedVariable> findScopedVisibleVariables(ClassNode classNode, Position position) {
+        if (classNode == null || position == null) {
+            return List.of();
+        }
+
+        for (MethodNode method : classNode.getMethods()) {
+            List<ScopedVariable> variables = collectScopedVariablesFromCode(method, methodBodyBlock(method), position);
+            if (!variables.isEmpty()) {
+                return variables;
+            }
+        }
+        for (ConstructorNode ctor : classNode.getDeclaredConstructors()) {
+            List<ScopedVariable> variables = collectScopedVariablesFromCode(ctor, methodBodyBlock(ctor), position);
+            if (!variables.isEmpty()) {
+                return variables;
+            }
+        }
+        return List.of();
+    }
+
+    private List<ScopedVariable> collectScopedVariablesFromCode(MethodNode method,
+                                                                BlockStatement block,
+                                                                Position position) {
+        if (!containsPosition(method, position) && !containsPosition(block, position)) {
+            return List.of();
+        }
+        ScopedVariableCollector collector = new ScopedVariableCollector(position);
+        collector.addParameters(method.getParameters());
+        if (block != null) {
+            block.visit(collector);
+        }
+        return collector.getVariables();
     }
 
     /**
@@ -1573,6 +1919,32 @@ public class CompletionProvider {
     private BlockStatement methodBodyBlock(MethodNode method) {
         Statement code = method.getCode();
         return (code instanceof BlockStatement block) ? block : null;
+    }
+
+    private boolean containsPosition(ASTNode node, Position position) {
+        if (node == null || position == null || node.getLineNumber() < 1) {
+            return false;
+        }
+        int line = position.getLine() + 1;
+        int column = position.getCharacter() + 1;
+        int startLine = node.getLineNumber();
+        int endLine = node.getLastLineNumber() > 0 ? node.getLastLineNumber() : startLine;
+        if (line < startLine || line > endLine) {
+            return false;
+        }
+        if (line == startLine) {
+            int startColumn = node.getColumnNumber() > 0 ? node.getColumnNumber() : 1;
+            if (column < startColumn) {
+                return false;
+            }
+        }
+        if (line == endLine) {
+            int endColumn = node.getLastColumnNumber() > 0 ? node.getLastColumnNumber() : Integer.MAX_VALUE;
+            if (column > endColumn) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1897,39 +2269,10 @@ public class CompletionProvider {
             }
 
             SearchEngine engine = new SearchEngine();
-            IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
-                    new IJavaElement[]{project},
-                    IJavaSearchScope.SOURCES
-                        | IJavaSearchScope.APPLICATION_LIBRARIES);
-
-            engine.searchAllTypeNames(
-                    null, // any package
-                    SearchPattern.R_PATTERN_MATCH,
-                    (prefix.isEmpty() ? "*" : prefix).toCharArray(),
-                    prefix.isEmpty() ? SearchPattern.R_PATTERN_MATCH : SearchPattern.R_PREFIX_MATCH,
-                    IJavaSearchConstants.TYPE,
-                    scope,
-                    new TypeNameRequestor() {
-                        @Override
-                        public void acceptType(int modifiers, char[] packageName,
-                                              char[] simpleTypeName,
-                                              char[][] enclosingTypeNames, String path) {
-                            if (items.size() >= MAX_TYPE_RESULTS) return;
-
-                            String simpleName = new String(simpleTypeName);
-                            String pkg = new String(packageName);
-                            String fqn = pkg.isEmpty() ? simpleName : pkg + "." + simpleName;
-
-                            if (isSearchResultEligible(simpleName, fqn, modifiers, annotationOnly,
-                                    project, seenSimpleNames)) {
-                                CompletionItem item = buildTypeSearchItem(simpleName, pkg, modifiers,
-                                    fqn, searchContext);
-                                items.add(item);
-                            }
-                        }
-                    },
-                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
-                    null);
+            searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
+                    searchContext, items, engine, IJavaSearchScope.SOURCES, "5_");
+            searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
+                    searchContext, items, engine, IJavaSearchScope.APPLICATION_LIBRARIES, "6_");
 
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"
                     + prefix + "': " + items.size() + " results");
@@ -1959,9 +2302,58 @@ public class CompletionProvider {
         return true;
     }
 
+    private void searchTypeNames(IJavaProject project, String prefix, boolean annotationOnly,
+                                 Set<String> seenSimpleNames, TypeSearchContext searchContext,
+                                 List<CompletionItem> items, SearchEngine engine,
+                                 int scopeMask, String sortPrefix) throws JavaModelException {
+        if (items.size() >= MAX_TYPE_RESULTS) {
+            return;
+        }
+
+        IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
+                new IJavaElement[]{project}, scopeMask);
+        engine.searchAllTypeNames(
+                null,
+                SearchPattern.R_PATTERN_MATCH,
+                (prefix.isEmpty() ? "*" : prefix).toCharArray(),
+                prefix.isEmpty() ? SearchPattern.R_PATTERN_MATCH : SearchPattern.R_PREFIX_MATCH,
+                IJavaSearchConstants.TYPE,
+                scope,
+                new TypeNameRequestor() {
+                    @Override
+                    public void acceptType(int modifiers, char[] packageName,
+                                           char[] simpleTypeName,
+                                           char[][] enclosingTypeNames, String path) {
+                        if (items.size() >= MAX_TYPE_RESULTS) {
+                            return;
+                        }
+
+                        String simpleName = new String(simpleTypeName);
+                        String pkg = new String(packageName);
+                        String fqn = pkg.isEmpty() ? simpleName : pkg + "." + simpleName;
+
+                        if (isSearchResultEligible(simpleName, fqn, modifiers, annotationOnly,
+                                project, seenSimpleNames)) {
+                            items.add(buildTypeSearchItem(simpleName, pkg, modifiers,
+                                    fqn, searchContext, sortPrefix));
+                        }
+                    }
+                },
+                IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
+                null);
+    }
+
     private CompletionItem buildTypeSearchItem(String simpleName, String pkg, int modifiers,
                                                String fqn,
                                                TypeSearchContext searchContext) {
+        return buildTypeSearchItem(simpleName, pkg, modifiers, fqn, searchContext,
+                (searchContext.annotationOnly ? "4_" : "5_"));
+    }
+
+    private CompletionItem buildTypeSearchItem(String simpleName, String pkg, int modifiers,
+                                               String fqn,
+                                               TypeSearchContext searchContext,
+                                               String sortPrefix) {
         CompletionItem item = new CompletionItem(simpleName);
         item.setKind(resolveTypeKind(modifiers));
         item.setDetail(pkg.isEmpty() ? simpleName : pkg + "." + simpleName);
@@ -1972,7 +2364,7 @@ public class CompletionProvider {
             item.setAdditionalTextEdits(
                     java.util.Collections.singletonList(createImportEdit(searchContext.importInsertLine, fqn)));
         }
-        item.setSortText((searchContext.annotationOnly ? "4_" : "5_") + simpleName);
+        item.setSortText(sortPrefix + simpleName);
         return item;
     }
 
@@ -2106,11 +2498,27 @@ public class CompletionProvider {
         }
 
         // Keywords
-        items.addAll(getKeywordCompletions(prefix));
+        if (!prefix.isEmpty()) {
+            items.addAll(getKeywordCompletions(prefix));
+        }
 
         // Identifiers from the Groovy AST
         ModuleNode ast = documentManager.getGroovyAST(uri);
         if (ast != null) {
+            for (ScopedVariable variable : findScopedVisibleVariables(ast, position)) {
+                String name = variable.name();
+                if (!matchesPrefix(name, prefix)) {
+                    continue;
+                }
+                CompletionItem item = new CompletionItem(name);
+                item.setKind(CompletionItemKind.Variable);
+                item.setDetail(variable.type() != null
+                        ? variable.type().getNameWithoutPackage() : OBJECT_TYPE_NAME);
+                item.setInsertText(name);
+                item.setFilterText(name);
+                item.setSortText("0_" + name);
+                items.add(item);
+            }
             for (ClassNode classNode : ast.getClasses()) {
                 addClassCompletions(classNode, prefix, items);
             }
@@ -2148,6 +2556,7 @@ public class CompletionProvider {
         for (MethodNode method : classNode.getMethods()) {
             String name = method.getName();
             if (name != null && !name.startsWith("<")
+                    && !name.contains("$") && !name.startsWith("__")
                     && (prefix.isEmpty() || name.startsWith(prefix))) {
                 CompletionItem item = new CompletionItem(name);
                 item.setKind(CompletionItemKind.Method);

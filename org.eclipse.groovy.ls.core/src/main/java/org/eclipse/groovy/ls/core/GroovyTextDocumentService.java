@@ -54,6 +54,9 @@ import org.eclipse.lsp4j.services.TextDocumentService;
  */
 public class GroovyTextDocumentService implements TextDocumentService {
 
+    private static final String CODE_LENS_FALLBACK_COMMAND = "groovy.showOutputChannel";
+    private static final String CODE_LENS_FALLBACK_TITLE = "References unavailable";
+
     private final GroovyLanguageServer server;
     private final DocumentManager documentManager;
     private LanguageClient client;
@@ -269,9 +272,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
         // is already available and there are no rapid-fire edits to coalesce.
         // The task still runs asynchronously so the LSP dispatch thread is
         // never stalled by workspace-lock contention during a build.
-        if (server.areDiagnosticsEnabled()) {
-            diagnosticsProvider.publishDiagnosticsImmediate(uri);
-        }
+        diagnosticsProvider.publishDiagnosticsImmediate(uri);
 
         // Lazily warm the JDT type search index for this file's project.
         // Runs on the background pool so it never blocks interactive requests.
@@ -1246,7 +1247,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
     private static void ensureFallbackCommand(CodeLens codeLens) {
         if (codeLens.getCommand() == null) {
-            codeLens.setCommand(new Command("0 references", "groovy.showReferences"));
+            codeLens.setCommand(new Command(CODE_LENS_FALLBACK_TITLE, CODE_LENS_FALLBACK_COMMAND));
         }
     }
 
@@ -1278,6 +1279,25 @@ public class GroovyTextDocumentService implements TextDocumentService {
     void refreshCodeLenses() {
         codeLensProvider.invalidateAllResolveCache();
         documentManager.scheduleCodeLensRefresh();
+    }
+
+    void refreshOpenDocumentsSemanticState() {
+        documentManager.replayOpenDocuments(documentManager.getOpenDocumentUris());
+    }
+
+    void refreshOpenDocumentsSemanticState(String projectName) {
+        if (projectName == null) {
+            return;
+        }
+
+        java.util.List<String> urisToReplay = new java.util.ArrayList<>();
+        for (String uri : documentManager.getOpenDocumentUris()) {
+            String ownerProject = server.getProjectNameForUri(documentManager.getClientUri(uri));
+            if (projectName.equals(ownerProject) || ownerProject == null) {
+                urisToReplay.add(uri);
+            }
+        }
+        documentManager.replayOpenDocuments(urisToReplay);
     }
 
     void publishDiagnosticsForOpenDocuments() {

@@ -50,6 +50,7 @@ let cachedJavaApi: any = null;
 /** Scheme for virtual source documents from JARs/JDK. */
 const GROOVY_SOURCE_SCHEME = 'groovy-source';
 const GRADLE_CLASSPATH_LINE_PREFIX = 'GROOVY_LS_CP::';
+const MINIMUM_JAVA_MAJOR = 21;
 
 /**
  * Cached project root map to avoid repeatedly scanning the workspace for
@@ -325,7 +326,7 @@ async function resolveGradleClasspath(projectPath: string): Promise<string[]> {
             execFile(wrapper, gradleArgs, opts, (error, stdout, stderr) => {
                 if (error) {
                     (error as any).stderr = stderr;
-                    reject(error);
+                    reject(toError(error));
                 } else {
                     resolve(stdout);
                 }
@@ -428,6 +429,10 @@ export async function activate(context: ExtensionContext): Promise<void> {
     context.subscriptions.push(
         outputChannel,
         statusBarItem,
+        commands.registerCommand('groovy.triggerSuggestAndSignatureHelp', async () => {
+            await vscode.commands.executeCommand('editor.action.triggerSuggest');
+            await vscode.commands.executeCommand('editor.action.triggerParameterHints');
+        }),
         commands.registerCommand('groovy.showOutputChannel', () => {
             outputChannel.show(true);
         }),
@@ -542,6 +547,7 @@ async function waitForJavaExtension(): Promise<boolean> {
 async function preFetchClasspaths(javaApi: any): Promise<void> {
     updateStatusBar('WaitingForJava', 'Waiting for Java: fetching classpath...');
     outputChannel.appendLine('[java-ext] Pre-fetching classpath entries...');
+    preFetchedClasspathData = [];
 
     const javaHomePath = resolveJavaHome() ?? '';
     const javaHomeNorm = javaHomePath.replaceAll('\\', '/').toLowerCase();
@@ -553,40 +559,54 @@ async function preFetchClasspaths(javaApi: any): Promise<void> {
 
         outputChannel.appendLine(`[java-ext] Pre-fetch: java.project.getAll returned ${projectUris.length} project(s)`);
 
-        for (const projectUri of projectUris) {
+        const fetchProjectClasspath = async (projectUri: string): Promise<ClasspathNotificationPayload | undefined> => {
             if (isJdtWorkspaceUri(projectUri)) {
                 outputChannel.appendLine(`[java-ext] Pre-fetch: skipping jdt_ws project ${projectUri}`);
-                continue;
+                return undefined;
             }
+
             try {
                 let result: { classpaths: string[]; modulepaths: string[] } | null = null;
                 if (typeof javaApi.getClasspaths === 'function') {
                     result = await javaApi.getClasspaths(projectUri, { scope: 'test' });
                 }
 
-                let rawEntries: string[] = [];
-                if (result) {
-                    rawEntries = [...(result.classpaths ?? []), ...(result.modulepaths ?? [])];
+                const rawEntries = result
+                    ? [...(result.classpaths ?? []), ...(result.modulepaths ?? [])]
+                    : [];
+                const filteredEntries = rawEntries.filter(entry => !isJdkEntry(entry, javaHomeNorm));
+
+                if (filteredEntries.length === 0) {
+                    return undefined;
                 }
 
-                const filteredEntries = rawEntries.filter(e => !isJdkEntry(e, javaHomeNorm));
+                const projectPath = resolveProjectPathFromUri(projectUri, projectRootMap)
+                    ?? inferProjectPathFromEntries(filteredEntries, projectRootMap);
 
-                if (filteredEntries.length > 0) {
-                    const projectPath = resolveProjectPathFromUri(projectUri, projectRootMap)
-                        ?? inferProjectPathFromEntries(filteredEntries, projectRootMap);
+                outputChannel.appendLine(
+                    `[java-ext] Pre-fetched ${filteredEntries.length} entries for ${projectUri}`
+                    + (projectPath ? ` (projectPath=${projectPath})` : '')
+                );
 
-                    preFetchedClasspathData.push({
-                        projectUri,
-                        projectPath,
-                        entries: filteredEntries,
-                    });
-                    outputChannel.appendLine(
-                        `[java-ext] Pre-fetched ${filteredEntries.length} entries for ${projectUri}`
-                        + (projectPath ? ` (projectPath=${projectPath})` : '')
-                    );
-                }
+                return {
+                    projectUri,
+                    projectPath,
+                    entries: filteredEntries,
+                };
             } catch (e) {
                 outputChannel.appendLine(`[java-ext] Pre-fetch failed for ${projectUri}: ${e}`);
+                return undefined;
+            }
+        };
+
+        const BATCH_SIZE = 20;
+        for (let i = 0; i < projectUris.length; i += BATCH_SIZE) {
+            const batch = projectUris.slice(i, i + BATCH_SIZE);
+            const results = await Promise.allSettled(batch.map(fetchProjectClasspath));
+            for (const result of results) {
+                if (result.status === 'fulfilled' && result.value) {
+                    preFetchedClasspathData.push(result.value);
+                }
             }
         }
 
@@ -612,24 +632,8 @@ export async function deactivate(): Promise<void> {
 
 async function startLanguageServer(context: ExtensionContext): Promise<void> {
     isRestarting = false;
-    // 1. Resolve JRE
-    const javaHome = resolveJavaHome();
-    if (!javaHome) {
-        updateStatusBar('Error', 'JDK not found');
-        window.showErrorMessage(
-            'Groovy Language Server requires JDK 17+. ' +
-            'Set "groovy.java.home" in settings or the JAVA_HOME environment variable.'
-        );
-        return;
-    }
-
-    const javaExecutable = getJavaExecutable(javaHome);
-    if (!fs.existsSync(javaExecutable)) {
-        updateStatusBar('Error', 'Java executable not found');
-        window.showErrorMessage(
-            `Java executable not found at: ${javaExecutable}. ` +
-            'Please verify your "groovy.java.home" setting or JAVA_HOME.'
-        );
+    const javaExecutable = await resolveJavaExecutableOrShowError();
+    if (!javaExecutable) {
         return;
     }
 
@@ -664,31 +668,8 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     // A corrupt JAR (e.g. truncated during download from JFrog) causes Equinox
     // to fail with a ZipException and exit code 13 — a confusing error with no
     // actionable message.  Check the most critical JARs upfront.
-    const pluginsDir = path.join(serverDir, 'plugins');
-    const criticalJars = fs.readdirSync(pluginsDir).filter(
-        name => name.endsWith('.jar') && (
-            name.startsWith('org.eclipse.jdt.core_') ||
-            name.startsWith('org.eclipse.jdt.groovy.core_') ||
-            name.startsWith('org.eclipse.groovy.ls.core_') ||
-            name.startsWith('org.codehaus.groovy_')
-        )
-    );
-    const MIN_JAR_SIZE = 50_000; // 50 KB — legitimate JARs are much larger
-    for (const jar of criticalJars) {
-        const jarPath = path.join(pluginsDir, jar);
-        try {
-            const stat = fs.statSync(jarPath);
-            if (stat.size < MIN_JAR_SIZE) {
-                const sizeMB = (stat.size / 1024).toFixed(1);
-                outputChannel.appendLine(`WARNING: ${jar} appears corrupt (${sizeMB} KB — expected several MB)`);
-                updateStatusBar('Error', `Corrupt JAR: ${jar}`);
-                window.showErrorMessage(
-                    `Groovy Language Server: ${jar} appears corrupt (only ${sizeMB} KB). ` +
-                    'Please rebuild the server with: ./gradlew :org.eclipse.groovy.ls.product:assembleProduct'
-                );
-                return;
-            }
-        } catch { /* best effort — let Equinox report the error */ }
+    if (!validateCriticalPluginJars(serverDir)) {
+        return;
     }
 
     // 4. Determine platform-specific config directory
@@ -719,7 +700,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     const vmargs = workspace.getConfiguration('groovy').get<string>('ls.vmargs', '-Xmx2G');
     const args: string[] = [];
 
-    // JVM module access flags (required for JDK 17+)
+    // JVM module access flags (required for modern JDKs, including JDK 21)
     args.push(
         '--add-modules=ALL-SYSTEM',
         '--add-opens', 'java.base/java.util=ALL-UNNAMED',
@@ -761,24 +742,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     context.subscriptions.push(groovyWatcher, javaWatcher, gradleWatcher, pomWatcher);
 
     // Build initializationOptions from user settings
-    const config = workspace.getConfiguration('groovy');
-    const initOptions: Record<string, unknown> = {};
-    const requestPoolSize = config.get<number>('ls.requestPoolSize', 0);
-    const requestQueueSize = config.get<number>('ls.requestQueueSize', 64);
-    const backgroundPoolSize = config.get<number>('ls.backgroundPoolSize', 0);
-    const backgroundQueueSize = config.get<number>('ls.backgroundQueueSize', 128);
-    if (requestPoolSize > 0) {
-        initOptions.lspRequestPoolSize = requestPoolSize;
-    }
-    if (requestQueueSize !== 64) {
-        initOptions.lspRequestQueueSize = requestQueueSize;
-    }
-    if (backgroundPoolSize > 0) {
-        initOptions.lspBackgroundPoolSize = backgroundPoolSize;
-    }
-    if (backgroundQueueSize !== 128) {
-        initOptions.lspBackgroundQueueSize = backgroundQueueSize;
-    }
+    const initOptions = buildInitializationOptions();
 
     const clientOptions: LanguageClientOptions = {
         documentSelector: [
@@ -787,7 +751,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
             { scheme: GROOVY_SOURCE_SCHEME, language: 'groovy' },
             { scheme: GROOVY_SOURCE_SCHEME, language: 'java' },
         ],
-        initializationOptions: Object.keys(initOptions).length > 0 ? initOptions : undefined,
+        initializationOptions: initOptions,
         synchronize: {
             fileEvents: [groovyWatcher, javaWatcher, gradleWatcher, pomWatcher],
         },
@@ -869,26 +833,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
 
     // Send pre-fetched classpath immediately — before the server's deferred
     // initial build timer fires. This ensures the first build has full classpath.
-    if (preFetchedClasspathData.length > 0) {
-        outputChannel.appendLine(`[java-ext] Sending ${preFetchedClasspathData.length} pre-fetched classpath(s) to server...`);
-        for (const cp of preFetchedClasspathData) {
-            client.sendNotification('groovy/classpathUpdate', {
-                projectUri: cp.projectUri,
-                projectPath: cp.projectPath,
-                entries: cp.entries,
-            });
-            outputChannel.appendLine(
-                `[java-ext]   Sent ${cp.entries.length} entries for ${cp.projectUri}`
-                + (cp.projectPath ? ` (projectPath=${cp.projectPath})` : '')
-            );
-        }
-        preFetchedClasspathData = []; // clear after sending
-
-        // Tell the server all initial classpaths are delivered so it can
-        // build immediately instead of waiting for the debounce timer.
-        client.sendNotification('groovy/classpathBatchComplete', {});
-        outputChannel.appendLine('[java-ext] Sent groovy/classpathBatchComplete to server.');
-    }
+    sendPrefetchedClasspaths(client);
 
     // Push initial configuration (formatter + inlay hints) to the server
     const sendGroovyConfiguration = () => {
@@ -1376,6 +1321,40 @@ function resolveJavaHome(): string | undefined {
     return undefined;
 }
 
+async function resolveJavaExecutableOrShowError(): Promise<string | undefined> {
+    const javaHome = resolveJavaHome();
+    if (!javaHome) {
+        updateStatusBar('Error', 'JDK not found');
+        window.showErrorMessage(
+            `Groovy Language Server requires JDK ${MINIMUM_JAVA_MAJOR}+. ` +
+            'Set "groovy.java.home" in settings or the JAVA_HOME environment variable.'
+        );
+        return undefined;
+    }
+
+    const javaExecutable = getJavaExecutable(javaHome);
+    if (!fs.existsSync(javaExecutable)) {
+        updateStatusBar('Error', 'Java executable not found');
+        window.showErrorMessage(
+            `Java executable not found at: ${javaExecutable}. ` +
+            'Please verify your "groovy.java.home" setting or JAVA_HOME.'
+        );
+        return undefined;
+    }
+
+    const javaMajorVersion = await getJavaMajorVersion(javaExecutable);
+    if (javaMajorVersion !== undefined && javaMajorVersion < MINIMUM_JAVA_MAJOR) {
+        updateStatusBar('Error', `JDK ${MINIMUM_JAVA_MAJOR}+ required`);
+        window.showErrorMessage(
+            `Groovy Language Server requires JDK ${MINIMUM_JAVA_MAJOR}+ and found JDK ${javaMajorVersion}. ` +
+            'Update "groovy.java.home" or JAVA_HOME to a Java 21 installation.'
+        );
+        return undefined;
+    }
+
+    return javaExecutable;
+}
+
 /**
  * Get the full path to the java executable.
  */
@@ -1387,6 +1366,137 @@ function getJavaExecutable(javaHome: string): string {
     }
     // Maybe javaHome IS the bin directory
     return path.join(javaHome, exe);
+}
+
+function validateCriticalPluginJars(serverDir: string): boolean {
+    const pluginsDir = path.join(serverDir, 'plugins');
+    const criticalJars = fs.readdirSync(pluginsDir).filter(
+        name => name.endsWith('.jar') && (
+            name.startsWith('org.eclipse.jdt.core_') ||
+            name.startsWith('org.eclipse.jdt.groovy.core_') ||
+            name.startsWith('org.eclipse.groovy.ls.core_') ||
+            name.startsWith('org.codehaus.groovy_')
+        )
+    );
+    const minJarSize = 50_000;
+
+    for (const jar of criticalJars) {
+        const jarPath = path.join(pluginsDir, jar);
+        try {
+            const stat = fs.statSync(jarPath);
+            if (stat.size >= minJarSize) {
+                continue;
+            }
+
+            const sizeKB = (stat.size / 1024).toFixed(1);
+            outputChannel.appendLine(`WARNING: ${jar} appears corrupt (${sizeKB} KB — expected several MB)`);
+            updateStatusBar('Error', `Corrupt JAR: ${jar}`);
+            window.showErrorMessage(
+                `Groovy Language Server: ${jar} appears corrupt (only ${sizeKB} KB). ` +
+                'Please rebuild the server with: ./gradlew :org.eclipse.groovy.ls.product:assembleProduct'
+            );
+            return false;
+        } catch {
+            // Best effort only — let Equinox report any deeper JAR issue.
+        }
+    }
+
+    return true;
+}
+
+function buildInitializationOptions(): Record<string, unknown> | undefined {
+    const config = workspace.getConfiguration('groovy');
+    const initOptions: Record<string, unknown> = {};
+    const requestPoolSize = config.get<number>('ls.requestPoolSize', 0);
+    const requestQueueSize = config.get<number>('ls.requestQueueSize', 64);
+    const backgroundPoolSize = config.get<number>('ls.backgroundPoolSize', 0);
+    const backgroundQueueSize = config.get<number>('ls.backgroundQueueSize', 128);
+
+    if (requestPoolSize > 0) {
+        initOptions.lspRequestPoolSize = requestPoolSize;
+    }
+    if (requestQueueSize !== 64) {
+        initOptions.lspRequestQueueSize = requestQueueSize;
+    }
+    if (backgroundPoolSize > 0) {
+        initOptions.lspBackgroundPoolSize = backgroundPoolSize;
+    }
+    if (backgroundQueueSize !== 128) {
+        initOptions.lspBackgroundQueueSize = backgroundQueueSize;
+    }
+
+    return Object.keys(initOptions).length > 0 ? initOptions : undefined;
+}
+
+function sendPrefetchedClasspaths(languageClient: LanguageClient): void {
+    if (preFetchedClasspathData.length === 0) {
+        return;
+    }
+
+    outputChannel.appendLine(`[java-ext] Sending ${preFetchedClasspathData.length} pre-fetched classpath(s) to server...`);
+    for (const cp of preFetchedClasspathData) {
+        languageClient.sendNotification('groovy/classpathUpdate', {
+            projectUri: cp.projectUri,
+            projectPath: cp.projectPath,
+            entries: cp.entries,
+        });
+        outputChannel.appendLine(
+            `[java-ext]   Sent ${cp.entries.length} entries for ${cp.projectUri}`
+            + (cp.projectPath ? ` (projectPath=${cp.projectPath})` : '')
+        );
+    }
+
+    preFetchedClasspathData = [];
+    languageClient.sendNotification('groovy/classpathBatchComplete', {});
+    outputChannel.appendLine('[java-ext] Sent groovy/classpathBatchComplete to server.');
+}
+
+function toError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+}
+
+async function getJavaMajorVersion(javaExecutable: string): Promise<number | undefined> {
+    const execOptions: ExecFileSyncOptionsWithStringEncoding = {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 10000,
+        maxBuffer: 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    };
+
+    try {
+        const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+            execFile(javaExecutable, ['-version'], execOptions, (error, stdout, stderr) => {
+                if (error) {
+                    reject(toError(error));
+                } else {
+                    resolve({ stdout, stderr });
+                }
+            });
+        });
+
+        const versionText = `${stdout}\n${stderr}`;
+        const match = /version\s+"([^"]+)"/i.exec(versionText);
+        if (!match) {
+            outputChannel.appendLine('[java] Unable to parse java -version output; continuing without a strict version gate.');
+            return undefined;
+        }
+
+        const rawVersion = match[1];
+        const majorToken = rawVersion.startsWith('1.')
+            ? rawVersion.split('.')[1]
+            : rawVersion.split(/[.+-]/)[0];
+        const majorVersion = Number.parseInt(majorToken, 10);
+        if (Number.isNaN(majorVersion)) {
+            outputChannel.appendLine(`[java] Unable to parse Java major version from: ${rawVersion}`);
+            return undefined;
+        }
+
+        return majorVersion;
+    } catch (e) {
+        outputChannel.appendLine(`[java] Failed to inspect Java version for ${javaExecutable}: ${e}`);
+        return undefined;
+    }
 }
 
 /**

@@ -138,7 +138,7 @@ class CompletionProviderTest {
     }
 
     @Test
-    void getCompletionsFallsBackToAstAndKeywordsWithoutWorkingCopy() {
+    void getCompletionsFallsBackToAstWithoutWorkingCopy() {
         String uri = "file:///CompletionProviderFallbackCompletions.groovy";
         DocumentManager manager = new DocumentManager();
         manager.didOpen(uri, """
@@ -325,7 +325,7 @@ class CompletionProviderTest {
     // ---- getFallbackCompletions: comprehensive integration tests ----
 
     @Test
-    void getFallbackCompletionsIncludesKeywordsAndClassMembers() throws Exception {
+    void getFallbackCompletionsSuppressesEmptyPrefixKeywordsAndIncludesClassMembers() throws Exception {
         String uri = "file:///FallbackIntegration.groovy";
         DocumentManager manager = new DocumentManager();
         manager.didOpen(uri, """
@@ -339,9 +339,7 @@ class CompletionProviderTest {
         CompletionProvider provider = new CompletionProvider(manager);
         List<CompletionItem> items = invokeGetFallbackCompletions(provider, uri, new Position(4, 0));
 
-        // Should include keywords
-        assertTrue(items.stream().anyMatch(i -> "def".equals(i.getLabel())));
-        assertTrue(items.stream().anyMatch(i -> "class".equals(i.getLabel())));
+        assertFalse(items.stream().anyMatch(i -> i.getKind() == CompletionItemKind.Keyword));
         // Should include class name
         assertTrue(items.stream().anyMatch(i -> "MyService".equals(i.getLabel())));
         // Should include method
@@ -372,6 +370,52 @@ class CompletionProviderTest {
         assertTrue(items.stream().anyMatch(i -> "handleResponse".equals(i.getLabel())));
         // "process" should not be included because the prefix "ha" doesn't match
         assertFalse(items.stream().anyMatch(i -> "process".equals(i.getLabel())));
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void getCompletionsSuppressesKeywordsForEmptyLineCompletion() {
+        String uri = "file:///CompletionProviderEmptyLineCompletion.groovy";
+        DocumentManager manager = new DocumentManager();
+        manager.didOpen(uri, """
+                class Helper {}
+
+                """);
+
+        CompletionProvider provider = new CompletionProvider(manager);
+        CompletionParams params = new CompletionParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(1, 0));
+
+        List<CompletionItem> items = provider.getCompletions(params);
+
+        assertFalse(items.stream().anyMatch(i -> i.getKind() == CompletionItemKind.Keyword));
+        assertTrue(items.stream().anyMatch(i -> "Helper".equals(i.getLabel())));
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void getCompletionsSuppressesKeywordsInsideConstructorArgumentsWhenPrefixIsEmpty() {
+        String uri = "file:///CompletionProviderConstructorArguments.groovy";
+        DocumentManager manager = new DocumentManager();
+        manager.didOpen(uri, """
+                class Helper {
+                    Helper(String value) {}
+                }
+                String seed = "demo"
+                new Helper(
+                """);
+
+        CompletionProvider provider = new CompletionProvider(manager);
+        CompletionParams params = new CompletionParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(4, 11));
+
+        List<CompletionItem> items = provider.getCompletions(params);
+
+        assertFalse(items.stream().anyMatch(i -> i.getKind() == CompletionItemKind.Keyword));
 
         manager.didClose(uri);
     }
@@ -1556,13 +1600,18 @@ class CompletionProviderTest {
         when(hidden.getFlags()).thenReturn(Flags.AccPublic);
         when(hidden.getParameterTypes()).thenReturn(new String[0]);
 
+        IMethod dgm = mock(IMethod.class);
+        when(dgm.getElementName()).thenReturn("dgm$1008");
+        when(dgm.getFlags()).thenReturn(Flags.AccPublic);
+        when(dgm.getParameterTypes()).thenReturn(new String[0]);
+
         IField dollarField = mock(IField.class);
         when(dollarField.getElementName()).thenReturn("$internal");
 
         IField doubleUnder = mock(IField.class);
         when(doubleUnder.getElementName()).thenReturn("__meta");
 
-        when(type.getMethods()).thenReturn(new IMethod[]{ hidden });
+        when(type.getMethods()).thenReturn(new IMethod[]{ hidden, dgm });
         when(type.getFields()).thenReturn(new IField[]{ dollarField, doubleUnder });
 
         ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
@@ -1573,6 +1622,33 @@ class CompletionProviderTest {
         invokeAddMembersOfType(provider, type, "", false, items);
 
         assertEquals(0, items.size(), "$, __ and <> members should be filtered out");
+    }
+
+    @Test
+    void getCompletionsFallbackIncludesScopedLocalVariable() {
+        String uri = "file:///ScopedLocalCompletion.groovy";
+        String source = """
+                class Demo {
+                    void run() {
+                        def deltaCommon = new StringBuilder()
+                        d
+                    }
+                }
+                """;
+        DocumentManager manager = new DocumentManager();
+        manager.didOpen(uri, source);
+
+        CompletionProvider provider = new CompletionProvider(manager);
+        CompletionParams params = new CompletionParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(3, 9));
+
+        List<CompletionItem> items = provider.getCompletions(params);
+
+        assertTrue(items.stream().anyMatch(i -> "deltaCommon".equals(i.getLabel())
+                && i.getKind() == CompletionItemKind.Variable));
+
+        manager.didClose(uri);
     }
 
     @Test
@@ -1835,9 +1911,9 @@ class CompletionProviderTest {
     private List<CompletionItem> invokeGetIdentifierCompletions(CompletionProvider provider,
             ICompilationUnit workingCopy, String uri, String prefix) throws Exception {
         Method m = CompletionProvider.class.getDeclaredMethod(
-                "getIdentifierCompletions", ICompilationUnit.class, String.class, String.class);
+            "getIdentifierCompletions", ICompilationUnit.class, String.class, Position.class, String.class);
         m.setAccessible(true);
-        return (List<CompletionItem>) m.invoke(provider, workingCopy, uri, prefix);
+        return (List<CompletionItem>) m.invoke(provider, workingCopy, uri, new Position(0, prefix.length()), prefix);
     }
 
     private IType invokeFindFieldTypeDirectly(CompletionProvider provider,
@@ -2286,7 +2362,10 @@ class CompletionProviderTest {
     void shouldIncludeMethodConstructorExcluded() throws Exception {
         CompletionProvider provider = new CompletionProvider(new DocumentManager());
         IMethod method = mock(IMethod.class);
-        when(method.getElementName()).thenReturn("<init>");
+        when(method.getElementName()).thenReturn("Widget");
+        when(method.isConstructor()).thenReturn(true);
+        when(method.getFlags()).thenReturn(0);
+        when(method.getParameterTypes()).thenReturn(new String[0]);
         assertFalse((boolean) invokeShouldIncludeMethod(provider, method, "", false, new HashSet<>()));
     }
 
@@ -2959,8 +3038,59 @@ class CompletionProviderTest {
         var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse("file:///exprType.groovy", source);
         org.codehaus.groovy.ast.ModuleNode module = compileResult.getModuleNode();
         org.codehaus.groovy.ast.ClassNode cls = module.getClasses().get(0);
-        Object result = invokeResolveAstExpressionType(cls, module, "name");
-        // May return ClassNode or null depending on AST structure
+        Object result = invokeResolveAstExpressionType(cls, module, new Position(0, 20), "name");
+        assertNotNull(result);
+    }
+
+    @Test
+    void resolveAstExpressionTypeForScopedLocalVariable() throws Exception {
+        String source = """
+                class DeltaCommon {
+                    String value
+                }
+                class Demo {
+                    void run() {
+                        def deltaCommon = new DeltaCommon()
+                        deltaCommon.value
+                    }
+                }
+                """;
+        var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse("file:///exprTypeLocal.groovy", source);
+        org.codehaus.groovy.ast.ModuleNode module = compileResult.getModuleNode();
+        org.codehaus.groovy.ast.ClassNode cls = module.getClasses().stream()
+                .filter(candidate -> "Demo".equals(candidate.getNameWithoutPackage()))
+                .findFirst().orElseThrow();
+
+        Object result = invokeResolveAstExpressionType(cls, module,
+                positionOf(source, "deltaCommon.value"), "deltaCommon");
+
+        assertNotNull(result);
+        assertEquals("DeltaCommon", ((ClassNode) result).getNameWithoutPackage());
+    }
+
+    @Test
+    void resolveAstExpressionTypeForTypedClosureParameter() throws Exception {
+        String source = """
+                class Helper {
+                    String value
+                }
+                class Demo {
+                    void run() {
+                        [new Helper()].each { Helper it -> it.value }
+                    }
+                }
+                """;
+        var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse("file:///exprTypeClosure.groovy", source);
+        org.codehaus.groovy.ast.ModuleNode module = compileResult.getModuleNode();
+        org.codehaus.groovy.ast.ClassNode cls = module.getClasses().stream()
+                .filter(candidate -> "Demo".equals(candidate.getNameWithoutPackage()))
+                .findFirst().orElseThrow();
+
+        Object result = invokeResolveAstExpressionType(cls, module,
+                positionOf(source, "it.value"), "it");
+
+        assertNotNull(result);
+        assertEquals("Helper", ((ClassNode) result).getNameWithoutPackage());
     }
 
     // ================================================================
@@ -3119,12 +3249,33 @@ class CompletionProviderTest {
         m.invoke(cp, cls, prefix, seen, items);
     }
 
-    private Object invokeResolveAstExpressionType(org.codehaus.groovy.ast.ClassNode cls, org.codehaus.groovy.ast.ModuleNode module, String name) throws Exception {
+    private Object invokeResolveAstExpressionType(org.codehaus.groovy.ast.ClassNode cls,
+                                                  org.codehaus.groovy.ast.ModuleNode module,
+                                                  Position position,
+                                                  String name) throws Exception {
         java.lang.reflect.Method m = CompletionProvider.class.getDeclaredMethod("resolveAstExpressionType",
-                org.codehaus.groovy.ast.ClassNode.class, org.codehaus.groovy.ast.ModuleNode.class, String.class);
+                org.codehaus.groovy.ast.ClassNode.class, org.codehaus.groovy.ast.ModuleNode.class,
+                Position.class, String.class);
         m.setAccessible(true);
         CompletionProvider cp = new CompletionProvider(new DocumentManager());
-        return m.invoke(cp, cls, module, name);
+        return m.invoke(cp, cls, module, position, name);
+    }
+
+    private Position positionOf(String source, String marker) {
+        int index = source.indexOf(marker);
+        assertTrue(index >= 0, "Marker not found: " + marker);
+
+        int line = 0;
+        int column = 0;
+        for (int i = 0; i < index; i++) {
+            if (source.charAt(i) == '\n') {
+                line++;
+                column = 0;
+            } else {
+                column++;
+            }
+        }
+        return new Position(line, column);
     }
 
     private Object invokeResolveClassMemberExpressionType(org.codehaus.groovy.ast.ClassNode cls, String name) throws Exception {
@@ -4035,11 +4186,11 @@ class CompletionProviderTest {
 
         Method m = CompletionProvider.class.getDeclaredMethod("resolveAstExpressionType",
                 org.codehaus.groovy.ast.ClassNode.class,
-                org.codehaus.groovy.ast.ModuleNode.class, String.class);
+            org.codehaus.groovy.ast.ModuleNode.class, Position.class, String.class);
         m.setAccessible(true);
 
         org.codehaus.groovy.ast.ClassNode result =
-                (org.codehaus.groovy.ast.ClassNode) m.invoke(cp, demo, ast, "title");
+            (org.codehaus.groovy.ast.ClassNode) m.invoke(cp, demo, ast, new Position(3, 16), "title");
         assertNotNull(result, "Should resolve expression type for 'title'");
     }
 }
