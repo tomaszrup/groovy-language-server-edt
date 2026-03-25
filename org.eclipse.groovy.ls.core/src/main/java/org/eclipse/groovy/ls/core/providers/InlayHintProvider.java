@@ -422,12 +422,12 @@ public class InlayHintProvider {
 
     private ReturnTypeInfo createReturnTypeInfo(String displayName, IType context,
             IJavaProject project) throws JavaModelException {
-        String normalizedDisplayName = normalizeDisplayTypeName(displayName);
-        if (normalizedDisplayName == null) {
+        String resolvedTypeName = normalizeDisplayTypeName(displayName);
+        if (resolvedTypeName == null) {
             return null;
         }
-        IType resolvedType = resolveTypeByName(normalizedDisplayName, context, project);
-        return new ReturnTypeInfo(normalizedDisplayName, resolvedType);
+        IType resolvedType = resolveTypeByName(resolvedTypeName, context, project);
+        return new ReturnTypeInfo(simplifyDisplayTypeName(resolvedTypeName), resolvedType);
     }
 
     private String normalizeDisplayTypeName(String typeName) {
@@ -436,6 +436,37 @@ public class InlayHintProvider {
         }
         String normalized = typeName.trim();
         return normalized.isEmpty() ? null : normalized;
+    }
+
+    private String simplifyDisplayTypeName(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return typeName;
+        }
+
+        StringBuilder simplified = new StringBuilder(typeName.length());
+        StringBuilder token = new StringBuilder();
+        for (int index = 0; index < typeName.length(); index++) {
+            char current = typeName.charAt(index);
+            if (Character.isJavaIdentifierPart(current) || current == '.' || current == '$') {
+                token.append(current);
+            } else {
+                appendSimplifiedTypeToken(simplified, token);
+                simplified.append(current);
+            }
+        }
+        appendSimplifiedTypeToken(simplified, token);
+        return simplified.toString();
+    }
+
+    private void appendSimplifiedTypeToken(StringBuilder target, StringBuilder token) {
+        if (token.isEmpty()) {
+            return;
+        }
+
+        String tokenText = token.toString();
+        int splitIndex = Math.max(tokenText.lastIndexOf('.'), tokenText.lastIndexOf('$'));
+        target.append(splitIndex >= 0 ? tokenText.substring(splitIndex + 1) : tokenText);
+        token.setLength(0);
     }
 
     private IType resolveTypeByName(String typeName, IType context, IJavaProject project)

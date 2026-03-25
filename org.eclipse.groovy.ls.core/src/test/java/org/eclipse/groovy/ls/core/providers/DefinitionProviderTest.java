@@ -26,15 +26,20 @@ import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
+import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.Flags;
+import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IOrdinaryClassFile;
 import org.eclipse.jdt.core.IPackageFragment;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
+import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.lsp4j.DefinitionParams;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
@@ -3077,5 +3082,83 @@ class DefinitionProviderTest {
         org.codehaus.groovy.ast.ClassNode result =
                 (org.codehaus.groovy.ast.ClassNode) m.invoke(dp, block, "msg");
         assertNotNull(result, "Should resolve type of local variable 'msg'");
+    }
+
+    @Test
+    void resolveGeneratedAccessorLocationUsesBinaryMemberMetadataForGetter() throws Exception {
+        DefinitionProvider dp = new DefinitionProvider(new DocumentManager());
+
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        IType sourceType = mock(IType.class);
+        IType binaryType = mock(IType.class);
+        IType sourceDeclaringType = mock(IType.class);
+        ICompilationUnit compilationUnit = mock(ICompilationUnit.class);
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        IPackageFragment fragment = mock(IPackageFragment.class);
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+        IMethod getter = mock(IMethod.class);
+        IResource resource = mock(IResource.class);
+        ISourceRange nameRange = mock(ISourceRange.class);
+
+        when(sourceType.getCompilationUnit()).thenReturn(compilationUnit);
+        when(sourceType.getJavaProject()).thenReturn(project);
+        when(sourceType.getFullyQualifiedName()).thenReturn("com.example.Helper");
+        when(sourceType.getMethods()).thenReturn(new IMethod[0]);
+
+        when(project.getPackageFragmentRoots()).thenReturn(new IPackageFragmentRoot[] {root});
+        when(root.getKind()).thenReturn(IPackageFragmentRoot.K_BINARY);
+        when(root.getPackageFragment("com.example")).thenReturn(fragment);
+        when(fragment.getOrdinaryClassFile("Helper.class")).thenReturn(classFile);
+        when(classFile.exists()).thenReturn(true);
+        when(classFile.getType()).thenReturn(binaryType);
+        when(binaryType.exists()).thenReturn(true);
+        when(binaryType.getFullyQualifiedName()).thenReturn("com.example.Helper");
+        when(binaryType.getMethods()).thenReturn(new IMethod[] {getter});
+        when(binaryType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(binaryType)).thenReturn(new IType[0]);
+
+        when(getter.getElementName()).thenReturn("getSomeList");
+        when(getter.getDeclaringType()).thenReturn(sourceDeclaringType);
+
+        when(sourceDeclaringType.getResource()).thenReturn(resource);
+        when(sourceDeclaringType.getNameRange()).thenReturn(nameRange);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///workspace/Helper.java"));
+        when(resource.getName()).thenReturn("Helper.java");
+        when(nameRange.getOffset()).thenReturn(0);
+        when(nameRange.getLength()).thenReturn(6);
+
+        Method m = DefinitionProvider.class.getDeclaredMethod(
+                "resolveGeneratedAccessorLocation", IType.class, String.class);
+        m.setAccessible(true);
+        Location loc = (Location) m.invoke(dp, sourceType, "getSomeList");
+
+        assertNotNull(loc);
+        assertEquals("file:///workspace/Helper.java", loc.getUri());
+    }
+
+    @Test
+    void resolveGeneratedAccessorLocationFallsBackToRecordOwnerType() throws Exception {
+        DefinitionProvider dp = new DefinitionProvider(new DocumentManager());
+        IType recordType = mock(IType.class);
+        IResource resource = mock(IResource.class);
+        ISourceRange nameRange = mock(ISourceRange.class);
+
+        when(recordType.getElementName()).thenReturn("Recc");
+        when(recordType.getSource()).thenReturn("public record Recc(String something) {}\n");
+        when(recordType.getResource()).thenReturn(resource);
+        when(recordType.getNameRange()).thenReturn(nameRange);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create("file:///workspace/Recc.java"));
+        when(resource.getName()).thenReturn("Recc.java");
+        when(nameRange.getOffset()).thenReturn(0);
+        when(nameRange.getLength()).thenReturn(4);
+
+        Method m = DefinitionProvider.class.getDeclaredMethod(
+                "resolveGeneratedAccessorLocation", IType.class, String.class);
+        m.setAccessible(true);
+        Location loc = (Location) m.invoke(dp, recordType, "something");
+
+        assertNotNull(loc);
+        assertEquals("file:///workspace/Recc.java", loc.getUri());
     }
 }

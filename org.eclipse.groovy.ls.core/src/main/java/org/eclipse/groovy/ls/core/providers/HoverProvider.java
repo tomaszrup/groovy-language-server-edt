@@ -10,11 +10,21 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.FieldNode;
+import org.codehaus.groovy.ast.ImportNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
+import org.codehaus.groovy.ast.expr.Expression;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
+import org.codehaus.groovy.ast.expr.VariableExpression;
+import org.codehaus.groovy.ast.stmt.BlockStatement;
+import org.codehaus.groovy.ast.stmt.ExpressionStatement;
+import org.codehaus.groovy.ast.stmt.Statement;
+import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
@@ -22,6 +32,7 @@ import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IAnnotation;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IField;
+import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.ILocalVariable;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
@@ -114,6 +125,9 @@ public class HoverProvider {
             }
 
             Hover hover = computeHoverForOffset(workingCopy, offset);
+            if (hover == null) {
+                hover = computeGeneratedAccessorHover(uri, content, workingCopy, offset);
+            }
             if (hover != null) {
                 hoverCache.put(cacheKey, hover);
                 return hover;
@@ -142,6 +156,62 @@ public class HoverProvider {
         markup.setKind(MarkupKind.MARKDOWN);
         markup.setValue(hoverContent);
         return new Hover(markup);
+    }
+
+    private Hover computeGeneratedAccessorHover(String uri, String content,
+            ICompilationUnit workingCopy, int offset) throws JavaModelException {
+        String word = extractWordAt(content, offset);
+        if (word == null || word.isBlank() || !isMemberReferenceAfterDot(content, offset)) {
+            return null;
+        }
+
+        ModuleNode ast = documentManager.getGroovyAST(uri);
+        if (ast == null) {
+            return null;
+        }
+
+        IJavaProject project = workingCopy.getJavaProject();
+        if (project == null || !project.exists()) {
+            return null;
+        }
+
+        IType receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content);
+        if (receiverType == null) {
+            return null;
+        }
+
+        return buildGeneratedAccessorHover(receiverType, word);
+    }
+
+    private Hover buildGeneratedAccessorHover(IType receiverType, String methodName) throws JavaModelException {
+        IMethod generatedMethod = GeneratedAccessorResolver.findMethod(receiverType, methodName);
+        if (generatedMethod != null) {
+            String hoverContent = buildHoverContent(generatedMethod);
+            return buildASTHover(hoverContent, null);
+        }
+
+        JavaRecordSourceSupport.RecordComponentInfo component =
+                GeneratedAccessorResolver.findRecordComponent(receiverType, methodName);
+        if (component != null) {
+            return buildASTHover(buildRecordAccessorHover(receiverType, component), null);
+        }
+
+        return null;
+    }
+
+    private String buildRecordAccessorHover(IType receiverType,
+            JavaRecordSourceSupport.RecordComponentInfo component) throws JavaModelException {
+        StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
+        sb.append(simplifyTypeName(component.type())).append(' ');
+        sb.append(component.name()).append("()");
+        sb.append(FENCE_CLOSE);
+
+        String declaringType = receiverType.getFullyQualifiedName();
+        if (declaringType != null && !declaringType.isBlank()) {
+            sb.append("\n*Declared in* `").append(declaringType).append("`\n");
+        }
+
+        return sb.toString();
     }
 
     /**
@@ -474,6 +544,37 @@ public class HoverProvider {
         return dot >= 0 ? fqn.substring(dot + 1) : fqn;
     }
 
+    private String simplifyTypeName(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return typeName;
+        }
+
+        StringBuilder simplified = new StringBuilder(typeName.length());
+        StringBuilder token = new StringBuilder();
+        for (int index = 0; index < typeName.length(); index++) {
+            char current = typeName.charAt(index);
+            if (Character.isJavaIdentifierPart(current) || current == '.' || current == '$') {
+                token.append(current);
+            } else {
+                appendSimplifiedTypeToken(simplified, token);
+                simplified.append(current);
+            }
+        }
+        appendSimplifiedTypeToken(simplified, token);
+        return simplified.toString();
+    }
+
+    private void appendSimplifiedTypeToken(StringBuilder target, StringBuilder token) {
+        if (token.isEmpty()) {
+            return;
+        }
+
+        String tokenText = token.toString();
+        int splitIndex = Math.max(tokenText.lastIndexOf('.'), tokenText.lastIndexOf('$'));
+        target.append(splitIndex >= 0 ? tokenText.substring(splitIndex + 1) : tokenText);
+        token.setLength(0);
+    }
+
     // ---- Groovy AST fallback hover ----
 
     /**
@@ -772,5 +873,285 @@ public class HoverProvider {
         }
         if (start == end) return null;
         return content.substring(start, end);
+    }
+
+    private boolean isMemberReferenceAfterDot(String content, int offset) {
+        int wordStart = offset;
+        while (wordStart > 0 && Character.isJavaIdentifierPart(content.charAt(wordStart - 1))) {
+            wordStart--;
+        }
+        return wordStart > 0 && content.charAt(wordStart - 1) == '.';
+    }
+
+    private IType resolveReceiverTypeFromAst(ModuleNode ast, IJavaProject project,
+            int offset, String methodName, String content) {
+        MethodCallExpression found = findMethodCallAtOffset(ast, offset, methodName, content);
+        if (found == null) {
+            return null;
+        }
+
+        Expression objectExpr = found.getObjectExpression();
+        ClassNode receiverClassNode = resolveObjectExpressionType(objectExpr, ast);
+        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+            return null;
+        }
+
+        return resolveClassNodeToIType(receiverClassNode, ast, project);
+    }
+
+    private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
+            String methodName, String content) {
+        Position pos = offsetToPosition(content, offset);
+        int targetLine = pos.getLine() + 1;
+        int targetCol = pos.getCharacter() + 1;
+
+        final MethodCallExpression[] result = new MethodCallExpression[1];
+
+        ClassCodeVisitorSupport visitor = new ClassCodeVisitorSupport() {
+            @Override
+            protected SourceUnit getSourceUnit() {
+                return module.getContext();
+            }
+
+            @Override
+            public void visitMethodCallExpression(MethodCallExpression call) {
+                if (result[0] != null) {
+                    return;
+                }
+                String name = call.getMethodAsString();
+                if (methodName.equals(name)) {
+                    Expression methodExpr = call.getMethod();
+                    int mLine = methodExpr.getLineNumber();
+                    int mCol = methodExpr.getColumnNumber();
+                    int mLastCol = methodExpr.getLastColumnNumber();
+                    if (mLine == targetLine && targetCol >= mCol && targetCol <= mLastCol) {
+                        result[0] = call;
+                        return;
+                    }
+                }
+                super.visitMethodCallExpression(call);
+            }
+        };
+
+        for (ClassNode classNode : module.getClasses()) {
+            if (result[0] != null) {
+                break;
+            }
+            visitor.visitClass(classNode);
+        }
+
+        if (result[0] == null) {
+            BlockStatement stmtBlock = module.getStatementBlock();
+            if (stmtBlock != null) {
+                for (Statement stmt : stmtBlock.getStatements()) {
+                    if (result[0] != null) {
+                        break;
+                    }
+                    stmt.visit(visitor);
+                }
+            }
+        }
+
+        return result[0];
+    }
+
+    private ClassNode resolveObjectExpressionType(Expression objectExpr, ModuleNode ast) {
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+        if (objectExpr instanceof VariableExpression varExpr) {
+            String varName = varExpr.getName();
+            if ("this".equals(varName)) {
+                return null;
+            }
+            for (ClassNode classNode : ast.getClasses()) {
+                if (classNode.getLineNumber() < 0) {
+                    continue;
+                }
+                for (MethodNode method : classNode.getMethods()) {
+                    ClassNode type = resolveLocalVarTypeInBlock(getBlock(method), varName, ast);
+                    if (type != null) {
+                        return type;
+                    }
+                }
+            }
+            BlockStatement stmtBlock = ast.getStatementBlock();
+            if (stmtBlock != null) {
+                ClassNode type = resolveLocalVarTypeInBlock(stmtBlock, varName, ast);
+                if (type != null) {
+                    return type;
+                }
+            }
+            ClassNode exprType = varExpr.getType();
+            if (exprType != null && !"java.lang.Object".equals(exprType.getName())) {
+                return exprType;
+            }
+        }
+        if (objectExpr instanceof MethodCallExpression nestedCall) {
+            return resolveMethodCallReturnType(nestedCall, ast);
+        }
+        return null;
+    }
+
+    private ClassNode resolveMethodCallReturnType(MethodCallExpression methodCall, ModuleNode module) {
+        Expression objectExpr = methodCall.getObjectExpression();
+        String methodName = methodCall.getMethodAsString();
+        if (methodName == null) {
+            return null;
+        }
+
+        ClassNode receiverClassNode = null;
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            receiverClassNode = ctorCall.getType();
+        } else if (objectExpr instanceof MethodCallExpression nestedCall) {
+            receiverClassNode = resolveMethodCallReturnType(nestedCall, module);
+        } else if (objectExpr instanceof VariableExpression varExpr) {
+            String receiverVarName = varExpr.getName();
+            if (!"this".equals(receiverVarName)) {
+                receiverClassNode = resolveLocalVarTypeInBlock(module.getStatementBlock(), receiverVarName, module);
+                if (receiverClassNode == null) {
+                    receiverClassNode = varExpr.getType();
+                }
+            }
+        }
+
+        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+            return null;
+        }
+
+        for (MethodNode method : receiverClassNode.getMethods()) {
+            if (methodName.equals(method.getName())) {
+                ClassNode returnType = method.getReturnType();
+                if (returnType != null && !"java.lang.Object".equals(returnType.getName())) {
+                    return returnType;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private BlockStatement getBlock(MethodNode method) {
+        Statement code = method.getCode();
+        return code instanceof BlockStatement block ? block : null;
+    }
+
+    private ClassNode resolveLocalVarTypeInBlock(BlockStatement block, String varName, ModuleNode module) {
+        if (block == null) {
+            return null;
+        }
+        for (Statement stmt : block.getStatements()) {
+            if (!(stmt instanceof ExpressionStatement exprStmt)) {
+                continue;
+            }
+            if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) {
+                continue;
+            }
+            Expression left = decl.getLeftExpression();
+            if (!(left instanceof VariableExpression varExpr) || !varName.equals(varExpr.getName())) {
+                continue;
+            }
+
+            Expression init = decl.getRightExpression();
+            if (init instanceof ConstructorCallExpression ctorCall) {
+                return ctorCall.getType();
+            }
+            if (init instanceof MethodCallExpression methodCall) {
+                return resolveMethodCallReturnType(methodCall, module);
+            }
+
+            ClassNode originType = varExpr.getOriginType();
+            if (originType != null && !"java.lang.Object".equals(originType.getName())) {
+                return originType;
+            }
+
+            ClassNode initType = init.getType();
+            if (initType != null && !"java.lang.Object".equals(initType.getName())) {
+                return initType;
+            }
+        }
+        return null;
+    }
+
+    private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module, IJavaProject project) {
+        if (typeNode == null || project == null) {
+            return null;
+        }
+        try {
+            String typeName = typeNode.getName();
+            if (typeName == null || typeName.isEmpty()) {
+                return null;
+            }
+
+            if (typeName.contains(".")) {
+                IType type = project.findType(typeName);
+                if (type != null) {
+                    return type;
+                }
+                if (typeName.contains("$")) {
+                    type = project.findType(typeName.replace('$', '.'));
+                    if (type != null) {
+                        return type;
+                    }
+                }
+            }
+
+            for (ImportNode imp : module.getImports()) {
+                ClassNode impType = imp.getType();
+                if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
+                    IType type = project.findType(impType.getName());
+                    if (type != null) {
+                        return type;
+                    }
+                }
+            }
+
+            for (ImportNode starImport : module.getStarImports()) {
+                String pkgName = starImport.getPackageName();
+                if (pkgName != null) {
+                    IType type = project.findType(pkgName + typeName);
+                    if (type != null) {
+                        return type;
+                    }
+                }
+            }
+
+            String pkg = module.getPackageName();
+            if (pkg != null && !pkg.isEmpty()) {
+                if (pkg.endsWith(".")) {
+                    pkg = pkg.substring(0, pkg.length() - 1);
+                }
+                IType type = project.findType(pkg + "." + typeName);
+                if (type != null) {
+                    return type;
+                }
+            }
+
+            String[] autoPackages = {"java.lang.", "java.util.", "java.io.",
+                    "groovy.lang.", "groovy.util.", "java.math."};
+            for (String autoPkg : autoPackages) {
+                IType type = project.findType(autoPkg + typeName);
+                if (type != null) {
+                    return type;
+                }
+            }
+        } catch (JavaModelException e) {
+            return null;
+        }
+        return null;
+    }
+
+    private Position offsetToPosition(String content, int offset) {
+        int line = 0;
+        int character = 0;
+        for (int index = 0; index < Math.min(offset, content.length()); index++) {
+            if (content.charAt(index) == '\n') {
+                line++;
+                character = 0;
+            } else {
+                character++;
+            }
+        }
+        return new Position(line, character);
     }
 }

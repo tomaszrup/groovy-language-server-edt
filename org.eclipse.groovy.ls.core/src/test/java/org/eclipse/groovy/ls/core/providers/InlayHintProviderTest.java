@@ -1382,6 +1382,12 @@ class InlayHintProviderTest {
     }
 
     @Test
+    void simplifyDisplayTypeNameStripsQualifiedNamesInsideGenerics() throws Exception {
+        String simplified = invokeSimplifyDisplayTypeName("java.util.List<java.lang.String>");
+        assertEquals("List<String>", simplified);
+    }
+
+    @Test
     void computeJdtVariableTypeHintsReturnsEmptyForNullProject() throws Exception {
         String source = "def x = someCall()";
         ModuleNode module = parseModule(source);
@@ -1528,6 +1534,12 @@ class InlayHintProviderTest {
                 String.class, org.eclipse.jdt.core.IType.class, org.eclipse.jdt.core.IJavaProject.class);
         m.setAccessible(true);
         return (org.eclipse.jdt.core.IType) m.invoke(provider, typeName, context, project);
+    }
+
+    private String invokeSimplifyDisplayTypeName(String typeName) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("simplifyDisplayTypeName", String.class);
+        m.setAccessible(true);
+        return (String) m.invoke(provider, typeName);
     }
 
     @SuppressWarnings("unchecked")

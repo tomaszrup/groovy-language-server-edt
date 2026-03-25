@@ -1144,9 +1144,33 @@ public class DefinitionProvider {
                     }
                 }
             }
+
+            Location generatedAccessorLoc = resolveGeneratedAccessorLocation(receiverType, word);
+            if (generatedAccessorLoc != null) {
+                return generatedAccessorLoc;
+            }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[definition-ast] resolveAstDotMethodCall failed", e);
         }
+        return null;
+    }
+
+    private Location resolveGeneratedAccessorLocation(IType receiverType, String memberName)
+            throws JavaModelException {
+        org.eclipse.jdt.core.IMethod generatedMethod = GeneratedAccessorResolver.findMethod(receiverType, memberName);
+        if (generatedMethod != null) {
+            IType declaringType = generatedMethod.getDeclaringType();
+            if (declaringType != null) {
+                return toLocation(declaringType);
+            }
+        }
+
+        JavaRecordSourceSupport.RecordComponentInfo component =
+                GeneratedAccessorResolver.findRecordComponent(receiverType, memberName);
+        if (component != null) {
+            return toLocation(receiverType);
+        }
+
         return null;
     }
 
