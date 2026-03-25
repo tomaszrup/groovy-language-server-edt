@@ -191,7 +191,7 @@ public class UnusedDeclarationDetector {
             IType[] types = workingCopy.getTypes();
             for (IType type : types) {
                 if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-                collectUnusedDeclarations(type, content, uri, diagnostics, searchBudget);
+                collectUnusedDeclarations(type, content, uri, documentManager, diagnostics, searchBudget);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -202,14 +202,15 @@ public class UnusedDeclarationDetector {
     }
 
     private static void collectUnusedDeclarations(
-            IType type, String content, String uri, List<Diagnostic> diagnostics,
+            IType type, String content, String uri, DocumentManager documentManager,
+            List<Diagnostic> diagnostics,
             int[] searchBudget)
             throws JavaModelException {
 
         if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) return;
 
         // Check the type itself — but skip if it's in a test class context
-        if (!isTestType(type) && isUnreferenced(type, uri)) {
+        if (!isTestType(type) && isUnreferenced(type, uri, documentManager)) {
             searchBudget[0]--;
             Diagnostic diag = createUnusedDiagnostic(type, content);
             if (diag != null) {
@@ -232,7 +233,7 @@ public class UnusedDeclarationDetector {
                 continue;
             }
             searchBudget[0]--;
-            if (isUnreferenced(method, uri)) {
+            if (isUnreferenced(method, uri, documentManager)) {
                 Diagnostic diag = createUnusedDiagnostic(method, content);
                 if (diag != null) {
                     diagnostics.add(diag);
@@ -243,7 +244,7 @@ public class UnusedDeclarationDetector {
         // Recurse into inner types
         for (IType innerType : type.getTypes()) {
             if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-            collectUnusedDeclarations(innerType, content, uri, diagnostics, searchBudget);
+            collectUnusedDeclarations(innerType, content, uri, documentManager, diagnostics, searchBudget);
         }
     }
 
@@ -255,8 +256,9 @@ public class UnusedDeclarationDetector {
      * can only be referenced within its own project anyway.
      * The search is cancelled as soon as the first match is found.
      */
-    private static boolean isUnreferenced(IJavaElement element, String uri) {
-        return !ReferenceSearchHelper.hasReferences(element, uri);
+    private static boolean isUnreferenced(
+            IJavaElement element, String uri, DocumentManager documentManager) {
+        return !ReferenceSearchHelper.hasReferences(element, uri, documentManager);
     }
 
     /**

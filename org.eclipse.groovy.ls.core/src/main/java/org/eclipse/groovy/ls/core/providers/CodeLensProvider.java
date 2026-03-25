@@ -27,13 +27,6 @@ import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
-import org.eclipse.jdt.core.search.IJavaSearchConstants;
-import org.eclipse.jdt.core.search.IJavaSearchScope;
-import org.eclipse.jdt.core.search.SearchEngine;
-import org.eclipse.jdt.core.search.SearchMatch;
-import org.eclipse.jdt.core.search.SearchParticipant;
-import org.eclipse.jdt.core.search.SearchPattern;
-import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.CodeLens;
 import org.eclipse.lsp4j.CodeLensParams;
 import org.eclipse.lsp4j.Command;
@@ -238,7 +231,7 @@ public class CodeLensProvider {
     }
 
     boolean hasReferences(IJavaElement element, String uri) {
-        return ReferenceSearchHelper.hasReferences(element, uri);
+        return ReferenceSearchHelper.hasReferences(element, uri, documentManager);
     }
 
     /**
@@ -288,85 +281,7 @@ public class CodeLensProvider {
      *                test-scope narrowing)
      */
     private List<Location> findReferenceLocations(IJavaElement element, String uri) {
-        List<Location> locations = new ArrayList<>();
-        try {
-            SearchPattern pattern = SearchPattern.createPattern(
-                    element, IJavaSearchConstants.REFERENCES);
-            if (pattern == null) {
-                return locations;
-            }
-
-            org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
-            IJavaSearchScope scope = SearchScopeHelper.createSourceScope(javaProject, uri);
-            SearchEngine engine = new SearchEngine();
-
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                    scope,
-                    new SearchRequestor() {
-                        @Override
-                        public void acceptSearchMatch(SearchMatch match) {
-                            Location location = toLocation(match);
-                            if (location != null) {
-                                locations.add(location);
-                            }
-                        }
-                    },
-                    null);
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError(
-                    "Failed to find reference locations for " + element.getElementName(), e);
-        }
-        return locations;
-    }
-
-    /**
-     * Convert a JDT {@link SearchMatch} to an LSP {@link Location}.
-     */
-    private Location toLocation(SearchMatch match) {
-        try {
-            org.eclipse.core.resources.IResource resource = match.getResource();
-            if (resource == null || resource.getLocationURI() == null) {
-                return null;
-            }
-
-            String targetUri = resource.getLocationURI().toString();
-            String content = readContent(targetUri, resource);
-
-            int startOffset = match.getOffset();
-            int endOffset = startOffset + match.getLength();
-
-            Range range;
-            if (content != null) {
-                Position start = offsetToPosition(content, startOffset);
-                Position end = offsetToPosition(content, endOffset);
-                range = new Range(start, end);
-            } else {
-                range = new Range(new Position(0, 0), new Position(0, 0));
-            }
-
-            return new Location(targetUri, range);
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("Failed to convert search match to location", e);
-            return null;
-        }
-    }
-
-    private String readContent(String targetUri, org.eclipse.core.resources.IResource resource) {
-        String content = documentManager.getContent(targetUri);
-        if (content != null) {
-            return content;
-        }
-
-        if (resource instanceof org.eclipse.core.resources.IFile file) {
-            try (java.io.InputStream is = file.getContents()) {
-                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            } catch (Exception e) {
-                return null;
-            }
-        }
-
-        return null;
+        return ReferenceSearchHelper.findReferenceLocations(element, uri, documentManager);
     }
 
     Position offsetToPosition(String content, int offset) {

@@ -48,11 +48,11 @@ public final class SearchScopeHelper {
             return SearchEngine.createWorkspaceScope();
         }
 
-        if (uri != null && isTestFileUri(uri)) {
-            IJavaSearchScope testScope = createTestSourceScope(javaProject);
-            if (testScope != null) {
-                return testScope;
-            }
+        List<IPackageFragmentRoot> roots = getSourceRoots(javaProject, uri);
+        if (!roots.isEmpty()) {
+            return SearchEngine.createJavaSearchScope(
+                    roots.toArray(new IJavaElement[0]),
+                    IJavaSearchScope.SOURCES);
         }
 
         return SearchEngine.createJavaSearchScope(
@@ -71,6 +71,26 @@ public final class SearchScopeHelper {
         return normalised.contains("/src/test/");
     }
 
+    static List<IPackageFragmentRoot> getSourceRoots(IJavaProject javaProject, String uri) {
+        if (javaProject == null) {
+            return List.of();
+        }
+
+        List<IPackageFragmentRoot> sourceRoots = collectSourceRoots(javaProject);
+        if (sourceRoots.isEmpty()) {
+            return List.of();
+        }
+
+        if (uri != null && isTestFileUri(uri)) {
+            List<IPackageFragmentRoot> testRoots = filterTestSourceRoots(sourceRoots);
+            if (!testRoots.isEmpty()) {
+                return testRoots;
+            }
+        }
+
+        return sourceRoots;
+    }
+
     /**
      * Build a scope that covers only the test source roots of a project.
      *
@@ -78,17 +98,7 @@ public final class SearchScopeHelper {
      */
     private static IJavaSearchScope createTestSourceScope(IJavaProject javaProject) {
         try {
-            IPackageFragmentRoot[] roots = javaProject.getPackageFragmentRoots();
-            List<IJavaElement> testRoots = new ArrayList<>();
-            for (IPackageFragmentRoot root : roots) {
-                if (root.getKind() != IPackageFragmentRoot.K_SOURCE) {
-                    continue;
-                }
-                String path = root.getPath().toString().replace('\\', '/');
-                if (path.contains("/src/test/")) {
-                    testRoots.add(root);
-                }
-            }
+            List<IPackageFragmentRoot> testRoots = filterTestSourceRoots(collectSourceRoots(javaProject));
             if (testRoots.isEmpty()) {
                 return null;
             }
@@ -100,5 +110,33 @@ public final class SearchScopeHelper {
                     "Failed to create test source scope for " + javaProject.getElementName(), e);
             return null;
         }
+    }
+
+    private static List<IPackageFragmentRoot> collectSourceRoots(IJavaProject javaProject) {
+        try {
+            IPackageFragmentRoot[] roots = javaProject.getPackageFragmentRoots();
+            List<IPackageFragmentRoot> sourceRoots = new ArrayList<>();
+            for (IPackageFragmentRoot root : roots) {
+                if (root.getKind() == IPackageFragmentRoot.K_SOURCE) {
+                    sourceRoots.add(root);
+                }
+            }
+            return sourceRoots;
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to collect source roots for " + javaProject.getElementName(), e);
+            return List.of();
+        }
+    }
+
+    private static List<IPackageFragmentRoot> filterTestSourceRoots(List<IPackageFragmentRoot> roots) {
+        List<IPackageFragmentRoot> testRoots = new ArrayList<>();
+        for (IPackageFragmentRoot root : roots) {
+            String path = root.getPath().toString().replace('\\', '/');
+            if (path.contains("/src/test/")) {
+                testRoots.add(root);
+            }
+        }
+        return testRoots;
     }
 }
