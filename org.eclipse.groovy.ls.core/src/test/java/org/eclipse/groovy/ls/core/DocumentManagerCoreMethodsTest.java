@@ -22,6 +22,8 @@ import static org.mockito.Mockito.verify;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.codehaus.groovy.ast.ModuleNode;
 import org.eclipse.jdt.core.IBuffer;
@@ -424,6 +426,42 @@ class DocumentManagerCoreMethodsTest {
                 ICompilationUnit.NO_AST, true, true, manager.getWorkingCopyOwner(), null);
         verify(client, timeout(2000).atLeastOnce()).refreshSemanticTokens();
         assertSame(cachedBeforeReplay, manager.getCompilerService().getCachedResult(uri));
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void replayOpenDocumentsNotifiesWorkingCopyReadyListener() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/Ready.groovy";
+        manager.didOpen(uri, "class Ready {}\n");
+
+        List<String> notifiedUris = new ArrayList<>();
+        manager.setWorkingCopyReadyListener(notifiedUris::add);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IBuffer buffer = mock(IBuffer.class);
+        org.mockito.Mockito.when(workingCopy.getBuffer()).thenReturn(buffer);
+        getWorkingCopies(manager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        manager.replayOpenDocuments(java.util.List.of(uri));
+
+        verify(buffer, timeout(1500)).setContents("class Ready {}\n");
+        verify(workingCopy, timeout(1500)).reconcile(
+                ICompilationUnit.NO_AST, true, true, manager.getWorkingCopyOwner(), null);
+        assertTrue(notifiedUris.contains(DocumentManager.normalizeUri(uri)));
+
+        manager.didClose(uri);
+    }
+
+    @Test
+    void isReadyForDiagnosticsReturnsFalseWhileDidOpenRefreshIsPending() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/Pending.groovy";
+
+        manager.didOpen(uri, "class Pending {}\n");
+
+        assertFalse(manager.isReadyForDiagnostics(uri));
 
         manager.didClose(uri);
     }

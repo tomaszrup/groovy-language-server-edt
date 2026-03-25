@@ -22,6 +22,7 @@ import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.groovy.ls.core.providers.CallHierarchyProvider;
@@ -253,7 +254,12 @@ class GroovyTextDocumentServiceTest {
     @Test
     void didOpenDelegatesToDocumentManagerAndPublishesDiagnosticsImmediately() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
-        DocumentManager documentManager = new DocumentManager();
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public boolean isReadyForDiagnostics(String uri) {
+                return true;
+            }
+        };
         GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
 
         DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
@@ -271,6 +277,56 @@ class GroovyTextDocumentServiceTest {
         // Document should be stored
         assertNotNull(documentManager.getContent("file:///test/Open.groovy"));
         verify(diagnostics).publishDiagnosticsImmediate("file:///test/Open.groovy");
+    }
+
+    @Test
+    void didOpenPublishesSyntaxDiagnosticsWhileWorkingCopyIsPending() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public boolean isReadyForDiagnostics(String uri) {
+                return false;
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        org.eclipse.lsp4j.DidOpenTextDocumentParams params = new org.eclipse.lsp4j.DidOpenTextDocumentParams();
+        org.eclipse.lsp4j.TextDocumentItem item = new org.eclipse.lsp4j.TextDocumentItem();
+        item.setUri("file:///test/OpenPending.groovy");
+        item.setText("class OpenPending {}");
+        params.setTextDocument(item);
+
+        service.didOpen(params);
+
+        verify(diagnostics).publishSyntaxDiagnosticsImmediate("file:///test/OpenPending.groovy");
+    }
+
+    @Test
+    void readyWorkingCopyCallbackPublishesDebouncedDiagnostics() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        DocumentManager documentManager = new DocumentManager();
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+
+        String uri = "file:///test/ListenerReady.groovy";
+        documentManager.didOpen(uri, "class ListenerReady {}\n");
+
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IBuffer buffer = mock(org.eclipse.jdt.core.IBuffer.class);
+        when(workingCopy.getBuffer()).thenReturn(buffer);
+        getWorkingCopies(documentManager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        documentManager.replayOpenDocuments(List.of(uri));
+
+        verify(diagnostics, org.mockito.Mockito.timeout(2000))
+                .publishDiagnosticsDebounced(uri);
     }
 
     @Test
@@ -692,6 +748,14 @@ class GroovyTextDocumentServiceTest {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
         field.set(target, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, org.eclipse.jdt.core.ICompilationUnit> getWorkingCopies(DocumentManager manager)
+            throws Exception {
+        Field field = DocumentManager.class.getDeclaredField("workingCopies");
+        field.setAccessible(true);
+        return (Map<String, org.eclipse.jdt.core.ICompilationUnit>) field.get(manager);
     }
 }
 

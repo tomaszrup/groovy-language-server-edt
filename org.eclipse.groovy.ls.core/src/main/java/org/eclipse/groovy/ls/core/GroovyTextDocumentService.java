@@ -219,6 +219,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
     public GroovyTextDocumentService(GroovyLanguageServer server, DocumentManager documentManager) {
         this.server = server;
         this.documentManager = documentManager;
+        this.documentManager.setWorkingCopyReadyListener(this::publishDiagnosticsIfEnabled);
 
         this.completionProvider = new CompletionProvider(documentManager);
         this.hoverProvider = new HoverProvider(documentManager);
@@ -268,11 +269,14 @@ public class GroovyTextDocumentService implements TextDocumentService {
         GroovyLanguageServerPlugin.logInfo("Document opened: " + uri);
         documentManager.didOpen(uri, text);
 
-        // Publish diagnostics immediately — on didOpen the full file content
-        // is already available and there are no rapid-fire edits to coalesce.
-        // The task still runs asynchronously so the LSP dispatch thread is
-        // never stalled by workspace-lock contention during a build.
-        diagnosticsProvider.publishDiagnosticsImmediate(uri);
+        // A newly opened document may still be waiting for its background JDT
+        // working-copy refresh. Publish syntax-only diagnostics during that
+        // gap, then let the readiness callback trigger the full pass.
+        if (documentManager.isReadyForDiagnostics(uri)) {
+            diagnosticsProvider.publishDiagnosticsImmediate(uri);
+        } else {
+            diagnosticsProvider.publishSyntaxDiagnosticsImmediate(uri);
+        }
 
         // Lazily warm the JDT type search index for this file's project.
         // Runs on the background pool so it never blocks interactive requests.

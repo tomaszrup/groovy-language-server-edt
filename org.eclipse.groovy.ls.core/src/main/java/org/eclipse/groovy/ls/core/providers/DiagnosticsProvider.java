@@ -321,6 +321,43 @@ public class DiagnosticsProvider {
     }
 
     /**
+     * Publish syntax-only diagnostics immediately. Used during didOpen while a
+     * background JDT working-copy refresh is still in flight.
+     */
+    public void publishSyntaxDiagnosticsImmediate(String uri) {
+        GroovyLanguageServerPlugin.logInfo("[diag-trace] publishSyntaxDiagnosticsImmediate uri=" + uri);
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+
+        java.util.concurrent.atomic.AtomicLong version =
+                diagnosticVersions.computeIfAbsent(normalizedUri,
+                        k -> new java.util.concurrent.atomic.AtomicLong(0));
+        long myVersion = version.incrementAndGet();
+
+        java.util.concurrent.ScheduledFuture<?> existing = pendingPublish.remove(normalizedUri);
+        if (existing != null) {
+            existing.cancel(false);
+        }
+
+        java.util.concurrent.ScheduledFuture<?> future = scheduler.schedule(() -> {
+            if (version.get() != myVersion) {
+                return;
+            }
+            if (!diagnosticsInFlight.add(normalizedUri)) {
+                return;
+            }
+            try {
+                publishSyntaxDiagnostics(uri);
+            } finally {
+                diagnosticsInFlight.remove(normalizedUri);
+                if (version.get() != myVersion && documentManager.getContent(uri) != null) {
+                    publishDiagnosticsDebounced(uri);
+                }
+            }
+        }, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
+        pendingPublish.put(normalizedUri, future);
+    }
+
+    /**
      * Publish diagnostics after a short delay (debounced).
      * <p>
      * Subsequent calls for the same URI cancel the previous scheduled publish
@@ -380,6 +417,27 @@ public class DiagnosticsProvider {
             }
         }, 200, java.util.concurrent.TimeUnit.MILLISECONDS);
         pendingPublish.put(normalizedUri, future);
+    }
+
+    private void publishSyntaxDiagnostics(String uri) {
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+        if (client == null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] publishSyntaxDiagnostics skipped (no client) uri=" + uri);
+            return;
+        }
+
+        if (documentManager.getContent(uri) == null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] publishSyntaxDiagnostics skipped (document closed) uri=" + uri);
+            return;
+        }
+
+        List<Diagnostic> diagnostics = collectSyntaxDiagnostics(uri);
+        latestDiagnosticsByUri.put(normalizedUri, new ArrayList<>(diagnostics));
+        client.publishDiagnostics(new PublishDiagnosticsParams(uri, new ArrayList<>(diagnostics)));
+        GroovyLanguageServerPlugin.logInfo(
+                "[diag-trace] publishSyntaxDiagnostics uri=" + uri + " count=" + diagnostics.size());
     }
 
     /**
@@ -503,6 +561,30 @@ public class DiagnosticsProvider {
         // publishDiagnostics() so that JDT diagnostics + unused imports are
         // published immediately without waiting for the expensive SearchEngine
         // scans.  See publishDiagnostics() Phase 2.
+
+        return diagnostics;
+    }
+
+    private List<Diagnostic> collectSyntaxDiagnostics(String uri) {
+        List<Diagnostic> diagnostics = new ArrayList<>();
+        String content = documentManager.getContent(uri);
+        if (content == null) {
+            return diagnostics;
+        }
+
+        try {
+            collectFromGroovyCompiler(uri, diagnostics);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to collect syntax-only diagnostics for " + uri, e);
+        }
+
+        java.util.function.Predicate<String> checker = classpathAvailableForUri.get();
+        boolean hasClasspath = checker == null || checker.test(uri);
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        if (!hasClasspath && initComplete) {
+            diagnostics.add(createNoClasspathWarning(content));
+        }
 
         return diagnostics;
     }

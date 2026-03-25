@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 import org.eclipse.jdt.core.IJavaElement;
 
@@ -132,6 +133,12 @@ public class DocumentManager {
     private volatile LanguageClient languageClient;
 
     /**
+     * Listener invoked after a document has a reconciled JDT working copy and
+     * can be upgraded from syntax-only to full diagnostics.
+     */
+    private volatile Consumer<String> workingCopyReadyListener;
+
+    /**
      * Debounce guard for workspace/semanticTokens/refresh notifications.
      * When multiple files are opened in rapid succession (e.g., on startup),
      * we coalesce into a single refresh notification. A scheduled future
@@ -155,6 +162,14 @@ public class DocumentManager {
      */
     public void setLanguageClient(LanguageClient client) {
         this.languageClient = client;
+    }
+
+    /**
+     * Set a listener to be notified when a document's working copy is ready
+     * for full diagnostics.
+     */
+    public void setWorkingCopyReadyListener(Consumer<String> listener) {
+        this.workingCopyReadyListener = listener;
     }
 
     /**
@@ -418,6 +433,7 @@ public class DocumentManager {
                         "JDT working copy refreshed for " + uri
                         + " (trigger=" + trigger + ", type: "
                         + workingCopy.getClass().getName() + ")");
+                notifyWorkingCopyReady(uri);
                 scheduleSemanticTokensRefresh();
             } else if (createdWorkingCopy) {
                 workingCopy.discardWorkingCopy();
@@ -747,6 +763,28 @@ public class DocumentManager {
      */
     public boolean hasJdtWorkingCopy(String uri) {
         return workingCopies.containsKey(normalizeUri(uri));
+    }
+
+    /**
+     * Returns {@code true} once the didOpen background refresh for a document
+     * has finished and diagnostics can move beyond syntax-only fallback mode.
+     */
+    public boolean isReadyForDiagnostics(String uri) {
+        String normalizedUri = normalizeUri(uri);
+        return hasJdtWorkingCopy(normalizedUri) || !pendingOpenFutures.containsKey(normalizedUri);
+    }
+
+    private void notifyWorkingCopyReady(String uri) {
+        Consumer<String> listener = workingCopyReadyListener;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.accept(uri);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to notify diagnostics readiness for " + uri, e);
+        }
     }
 
     // ---- Private helpers ----

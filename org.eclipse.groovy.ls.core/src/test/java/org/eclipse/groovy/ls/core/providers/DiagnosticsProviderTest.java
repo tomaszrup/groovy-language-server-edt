@@ -162,6 +162,24 @@ class DiagnosticsProviderTest {
     }
 
     @Test
+    void shouldSkipDiagnosticFiltersPackageMismatchWhenExpectedPackageIsEmpty() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+
+        boolean skipped = (boolean) invoke(
+                provider,
+                "shouldSkipDiagnostic",
+                new Class<?>[] { int.class, String.class, IJavaProject.class, ICompilationUnit.class },
+                new Object[] {
+                    536871240,
+                    "The declared package \"com.example\" does not match the expected package \"\"",
+                    null,
+                    null
+                });
+
+        assertTrue(skipped);
+    }
+
+    @Test
     void typeExistsInProjectContextUsesJavaLangFallbackForSimpleName() throws Exception {
         DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
 
