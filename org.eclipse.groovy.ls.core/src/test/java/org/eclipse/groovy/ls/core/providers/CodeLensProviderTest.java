@@ -254,9 +254,6 @@ class CodeLensProviderTest {
         when(mockType.getMethods()).thenReturn(new org.eclipse.jdt.core.IMethod[]{mockMethod});
         when(mockType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[0]);
 
-        localProvider.referencedElements.add(mockType);
-        localProvider.referencedElements.add(mockMethod);
-
         java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
         java.lang.reflect.Method m = CodeLensProvider.class.getDeclaredMethod(
             "addCodeLensesForType", org.eclipse.jdt.core.IType.class, String.class, String.class, java.util.List.class);
@@ -291,9 +288,6 @@ class CodeLensProviderTest {
 
         when(outerType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[]{innerType});
 
-        localProvider.referencedElements.add(outerType);
-        localProvider.referencedElements.add(innerType);
-
         java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
         String content = "class Outer {\n    class Inner {}\n}";
         java.lang.reflect.Method m = CodeLensProvider.class.getDeclaredMethod(
@@ -306,7 +300,7 @@ class CodeLensProviderTest {
     }
 
     @Test
-    void addCodeLensesForTypeSkipsUnreferencedDeclarations() throws Exception {
+    void addCodeLensesForTypeIncludesDeclarationsWithoutInitialReferenceCheck() throws Exception {
         RecordingCodeLensProvider localProvider = new RecordingCodeLensProvider(documentManager);
         org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
         org.eclipse.jdt.core.ISourceRange typeNameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
@@ -332,17 +326,19 @@ class CodeLensProviderTest {
         when(mockType.getMethods()).thenReturn(new org.eclipse.jdt.core.IMethod[]{referencedMethod, unusedMethod});
         when(mockType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[0]);
 
-        localProvider.referencedElements.add(referencedMethod);
-
         java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
         java.lang.reflect.Method m = CodeLensProvider.class.getDeclaredMethod(
                 "addCodeLensesForType", org.eclipse.jdt.core.IType.class, String.class, String.class, java.util.List.class);
         m.setAccessible(true);
         m.invoke(localProvider, mockType, "class Foo {\n    void bar() {}\n    void baz() {}\n}", "file:///Foo.groovy", lenses);
 
-        assertEquals(1, lenses.size());
-        JsonObject data = (JsonObject) lenses.get(0).getData();
-        assertEquals("=Proj/src<pkg{File.groovy[Foo~bar", data.get("handleId").getAsString());
+    assertEquals(3, lenses.size());
+    JsonObject typeData = (JsonObject) lenses.get(0).getData();
+    JsonObject firstMethodData = (JsonObject) lenses.get(1).getData();
+    JsonObject secondMethodData = (JsonObject) lenses.get(2).getData();
+    assertEquals("=Proj/src<pkg{File.groovy[Foo", typeData.get("handleId").getAsString());
+    assertEquals("=Proj/src<pkg{File.groovy[Foo~bar", firstMethodData.get("handleId").getAsString());
+    assertEquals("=Proj/src<pkg{File.groovy[Foo~baz", secondMethodData.get("handleId").getAsString());
     }
 
     @Test

@@ -203,15 +203,17 @@ public class CodeLensProvider {
 
     private void addCodeLensesForType(IType type, String content, String uri, List<CodeLens> lenses)
             throws JavaModelException {
-        // Code lens for the type itself
-        CodeLens typeLens = createCodeLensIfReferenced(type, content, uri);
+        // Initial code lens creation must stay cheap because it shares the
+        // background executor with folding, inlay hints, and document symbols.
+        // Actual reference counting is deferred to resolveCodeLens.
+        CodeLens typeLens = createUnresolvedCodeLens(type, content);
         if (typeLens != null) {
             lenses.add(typeLens);
         }
 
         // Code lens for each method
         for (IMethod method : type.getMethods()) {
-            CodeLens methodLens = createCodeLensIfReferenced(method, content, uri);
+            CodeLens methodLens = createUnresolvedCodeLens(method, content);
             if (methodLens != null) {
                 lenses.add(methodLens);
             }
