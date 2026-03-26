@@ -59,6 +59,33 @@ class CompletionProviderJdtHelpersTest {
     }
 
     @Test
+    void methodToCompletionItemRecoversSyntheticConstructorParameterNames() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IMethod constructor = mock(IMethod.class);
+        IType owner = mock(IType.class);
+        IType declaringType = mock(IType.class);
+        IField nameField = field("name", "QString;", false);
+        IField ageField = field("age", "QInteger;", false);
+
+        when(constructor.getParameterTypes()).thenReturn(new String[] {"QString;", "QInteger;"});
+        when(constructor.getParameterNames()).thenReturn(new String[] {"p50", "p51"});
+        when(constructor.getReturnType()).thenReturn("V");
+        when(constructor.isConstructor()).thenReturn(true);
+        when(constructor.getDeclaringType()).thenReturn(declaringType);
+        when(declaringType.getFields()).thenReturn(new IField[] {nameField, ageField});
+        when(owner.getElementName()).thenReturn("Person");
+
+        CompletionItem item = invokeMethodToCompletionItem(provider, constructor, "Person", owner, "0");
+
+        assertNotNull(item);
+        assertTrue(item.getLabel().contains("String name"));
+        assertTrue(item.getLabel().contains("Integer age"));
+        assertTrue(item.getInsertText().contains("${1:name}"));
+        assertTrue(item.getInsertText().contains("${2:age}"));
+        assertEquals(CompletionItemKind.Constructor, item.getKind());
+    }
+
+    @Test
     void resolveElementTypeSupportsTypeFieldAndMethodElements() throws Exception {
         CompletionProvider provider = new CompletionProvider(new DocumentManager());
         IJavaProject project = mock(IJavaProject.class);

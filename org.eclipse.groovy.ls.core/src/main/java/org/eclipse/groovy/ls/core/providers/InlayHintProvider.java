@@ -992,24 +992,7 @@ public class InlayHintProvider {
         }
 
         private String[] readParameterNames(IMethod method) {
-            try {
-                String[] names = method.getParameterNames();
-                if (names != null && names.length > 0) {
-                    return names;
-                }
-            } catch (Exception ignored) {
-                // Parameter names may be absent when debug metadata is unavailable.
-            }
-
-            int count = getParameterCount(method);
-            if (count < 0 || count > 1000) {
-                return new String[0];
-            }
-            String[] fallback = new String[count];
-            for (int i = 0; i < count; i++) {
-                fallback[i] = "arg" + i;
-            }
-            return fallback;
+            return JdtParameterNameResolver.resolve(method);
         }
 
         private int resolveMethodNameOffset(MethodCallExpression call, String methodName) {

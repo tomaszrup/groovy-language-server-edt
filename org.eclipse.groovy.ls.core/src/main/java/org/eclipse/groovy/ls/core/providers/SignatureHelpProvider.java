@@ -93,12 +93,17 @@ public class SignatureHelpProvider {
         }
 
         int offset = positionToOffset(content, position);
+        int openingParenOffset = findInvocationStart(content, offset);
+        if (openingParenOffset < 0) {
+            return null;
+        }
+
         int methodNameEnd = findMethodNameEnd(content, offset);
         if (methodNameEnd < 0) {
             return null;
         }
 
-        int activeParameter = countCommas(content, methodNameEnd + 1, offset);
+        int activeParameter = countCommas(content, openingParenOffset + 1, offset);
         return new SignatureContext(methodNameEnd, activeParameter);
     }
 
@@ -184,7 +189,7 @@ public class SignatureHelpProvider {
             label.append(method.getElementName()).append('(');
 
             String[] paramTypes = method.getParameterTypes();
-            String[] paramNames = method.getParameterNames();
+            String[] paramNames = JdtParameterNameResolver.resolve(method);
             List<ParameterInformation> parameters = new ArrayList<>();
 
             for (int i = 0; i < paramTypes.length; i++) {
@@ -242,6 +247,23 @@ public class SignatureHelpProvider {
                         nameEnd--;
                     }
                     return nameEnd;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private int findInvocationStart(String content, int offset) {
+        int depth = 0;
+        for (int i = offset - 1; i >= 0; i--) {
+            char c = content.charAt(i);
+            if (c == ')' || c == ']') {
+                depth++;
+            } else if (c == '(' || c == '[') {
+                if (depth > 0) {
+                    depth--;
+                } else if (c == '(') {
+                    return i;
                 }
             }
         }

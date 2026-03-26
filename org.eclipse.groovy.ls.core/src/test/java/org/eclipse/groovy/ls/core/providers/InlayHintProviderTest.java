@@ -31,11 +31,13 @@ import org.codehaus.groovy.ast.expr.NamedArgumentListExpression;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IOrdinaryClassFile;
 import org.eclipse.jdt.core.IPackageFragment;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
+import org.eclipse.jdt.core.IType;
 import org.eclipse.lsp4j.InlayHint;
 import org.eclipse.lsp4j.InlayHintKind;
 import org.eclipse.lsp4j.InlayHintLabelPart;
@@ -205,6 +207,35 @@ class InlayHintProviderTest {
                 new Class<?>[] {IMethod.class}, new Object[] {method});
         assertEquals("arg0", names[0]);
         assertEquals("arg1", names[1]);
+    }
+
+    @Test
+    void parameterCollectorReadParameterNamesRecoversSyntheticConstructorFieldNames() throws Exception {
+        Object collector = createCollector("new Person('Ada', 37)\n", null);
+
+        IMethod constructor = mock(IMethod.class);
+        IType declaringType = mock(IType.class);
+        IField nameField = mock(IField.class);
+        IField ageField = mock(IField.class);
+
+        when(constructor.isConstructor()).thenReturn(true);
+        when(constructor.getParameterNames()).thenReturn(new String[] {"p50", "p51"});
+        when(constructor.getParameterTypes()).thenReturn(new String[] {"QString;", "I"});
+        when(constructor.getDeclaringType()).thenReturn(declaringType);
+
+        when(nameField.getElementName()).thenReturn("name");
+        when(nameField.getTypeSignature()).thenReturn("QString;");
+        when(nameField.getFlags()).thenReturn(0);
+        when(ageField.getElementName()).thenReturn("age");
+        when(ageField.getTypeSignature()).thenReturn("I");
+        when(ageField.getFlags()).thenReturn(0);
+        when(declaringType.getFields()).thenReturn(new IField[] {nameField, ageField});
+
+        String[] names = (String[]) invokeCollector(collector, "readParameterNames",
+                new Class<?>[] {IMethod.class}, new Object[] {constructor});
+
+        assertEquals("name", names[0]);
+        assertEquals("age", names[1]);
     }
 
     @Test

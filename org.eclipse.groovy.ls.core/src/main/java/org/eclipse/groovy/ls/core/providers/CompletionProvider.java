@@ -931,7 +931,7 @@ public class CompletionProvider {
         try {
             // Label: name(ParamType1 p1, ParamType2 p2)
             String[] paramTypes = method.getParameterTypes();
-            String[] paramNames = method.getParameterNames();
+            String[] paramNames = JdtParameterNameResolver.resolve(method);
             StringBuilder label = new StringBuilder(name).append('(');
             for (int i = 0; i < paramTypes.length; i++) {
                 if (i > 0) label.append(", ");

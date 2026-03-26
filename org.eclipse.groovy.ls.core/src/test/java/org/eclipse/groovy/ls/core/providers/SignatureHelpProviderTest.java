@@ -23,6 +23,7 @@ import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IOrdinaryClassFile;
@@ -61,7 +62,7 @@ class SignatureHelpProviderTest {
         assertNotNull(help.getSignatures());
         assertFalse(help.getSignatures().isEmpty());
         assertTrue(help.getSignatures().get(0).getLabel().contains("add("));
-        assertEquals(0, help.getActiveParameter());
+        assertEquals(1, help.getActiveParameter());
 
         manager.didClose(uri);
     }
@@ -87,7 +88,7 @@ class SignatureHelpProviderTest {
         assertNotNull(help);
         assertFalse(help.getSignatures().isEmpty());
         assertTrue(help.getSignatures().stream().anyMatch(sig -> sig.getLabel().contains("name")));
-        assertEquals(0, help.getActiveParameter());
+        assertEquals(1, help.getActiveParameter());
 
         manager.didClose(uri);
     }
@@ -111,8 +112,8 @@ class SignatureHelpProviderTest {
         int methodNameEnd = invokeFindMethodNameEnd(provider, content, offset);
         assertEquals(content.indexOf("fn") + 1, methodNameEnd);
 
-        int commas = invokeCountCommas(provider, content, methodNameEnd + 1, offset);
-        assertEquals(0, commas);
+        int commas = invokeCountCommas(provider, content, content.indexOf('(') + 1, offset);
+        assertEquals(2, commas);
 
         assertEquals("fn", invokeExtractWordAt(provider, content, content.indexOf("fn")));
         assertEquals(6, invokePositionToOffset(provider, "hello\nworld", new Position(1, 0)));
@@ -340,7 +341,7 @@ class SignatureHelpProviderTest {
         SignatureHelpProvider provider = new SignatureHelpProvider(manager);
         SignatureHelpParams params = new SignatureHelpParams();
         params.setTextDocument(new TextDocumentIdentifier(uri));
-        params.setPosition(new Position(6, 20));
+        params.setPosition(new Position(6, 23));
 
         SignatureHelp help = provider.getSignatureHelp(params);
 
@@ -350,6 +351,7 @@ class SignatureHelpProviderTest {
         assertTrue(sig.getLabel().contains("String"));
         assertTrue(sig.getLabel().contains("boolean"));
         assertEquals(3, sig.getParameters().size());
+        assertEquals(2, help.getActiveParameter());
 
         manager.didClose(uri);
     }
@@ -458,6 +460,40 @@ class SignatureHelpProviderTest {
         SignatureInformation sig = invokeToSignatureInformation(provider, method);
         assertNotNull(sig);
         assertTrue(sig.getLabel().contains("arg0"));
+    }
+
+    @Test
+    void toSignatureInformationRecoversSyntheticConstructorParameterNames() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+
+        IMethod method = mock(IMethod.class);
+        IType declaringType = mock(IType.class);
+        IField nameField = mock(IField.class);
+        IField ageField = mock(IField.class);
+
+        when(method.getElementName()).thenReturn("Person");
+        when(method.getParameterTypes()).thenReturn(new String[] {"QString;", "I"});
+        when(method.getParameterNames()).thenReturn(new String[] {"p50", "p51"});
+        when(method.isConstructor()).thenReturn(true);
+        when(method.getReturnType()).thenReturn("V");
+        when(method.getDeclaringType()).thenReturn(declaringType);
+
+        when(nameField.getElementName()).thenReturn("name");
+        when(nameField.getTypeSignature()).thenReturn("QString;");
+        when(nameField.getFlags()).thenReturn(0);
+        when(ageField.getElementName()).thenReturn("age");
+        when(ageField.getTypeSignature()).thenReturn("I");
+        when(ageField.getFlags()).thenReturn(0);
+        when(declaringType.getFields()).thenReturn(new IField[] {nameField, ageField});
+
+        SignatureInformation sig = invokeToSignatureInformation(provider, method);
+
+        assertNotNull(sig);
+        assertTrue(sig.getLabel().contains("String name"));
+        assertTrue(sig.getLabel().contains("int age"));
+        assertFalse(sig.getLabel().contains("p50"));
+        assertFalse(sig.getLabel().contains("p51"));
     }
 
     @Test
