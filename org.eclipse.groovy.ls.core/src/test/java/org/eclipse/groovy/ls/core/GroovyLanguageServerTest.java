@@ -16,11 +16,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -288,7 +289,6 @@ class GroovyLanguageServerTest {
         return result.getCapabilities();
     }
 
-    @SuppressWarnings("rawtypes")
     private boolean booleanCapability(Object either) {
         if (either instanceof Boolean b) {
             return b;
@@ -317,6 +317,12 @@ class GroovyLanguageServerTest {
         Method m = GroovyLanguageServer.class.getDeclaredMethod(methodName, types);
         m.setAccessible(true);
         return m.invoke(server, args);
+    }
+
+    private Object getField(GroovyLanguageServer server, String fieldName) throws Exception {
+        Field field = GroovyLanguageServer.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(server);
     }
 
     // ================================================================
@@ -791,6 +797,38 @@ class GroovyLanguageServerTest {
         server.classpathBatchComplete(new com.google.gson.JsonObject());
     }
 
+    @Test
+    void classpathUpdateQueuesWhileWorkspaceProjectsAreInitializing() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        ((AtomicBoolean) getField(server, "workspaceProjectsReady")).set(false);
+
+        JsonObject params = new JsonObject();
+        params.addProperty("projectUri", "file:///workspace/app");
+        params.addProperty("projectPath", "/workspace/app");
+        JsonArray entries = new JsonArray();
+        entries.add("/tmp/example.jar");
+        params.add("entries", entries);
+
+        server.classpathUpdate(params);
+
+        @SuppressWarnings("unchecked")
+        ConcurrentLinkedQueue<Object> queue =
+                (ConcurrentLinkedQueue<Object>) getField(server, "pendingClasspathUpdates");
+        assertEquals(1, queue.size());
+        assertFalse(server.areDiagnosticsEnabled());
+    }
+
+    @Test
+    void classpathBatchCompleteQueuesWhileWorkspaceProjectsAreInitializing() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        ((AtomicBoolean) getField(server, "workspaceProjectsReady")).set(false);
+
+        server.classpathBatchComplete(new JsonObject());
+
+        AtomicBoolean pending = (AtomicBoolean) getField(server, "pendingClasspathBatchComplete");
+        assertTrue(pending.get());
+    }
+
     // ================================================================
     // getProjectNameForUri tests
     // ================================================================
@@ -816,7 +854,6 @@ class GroovyLanguageServerTest {
         putMapping.invoke(server, "/workspace/projA", "ProjA");
         // Try to look up a URI under that subproject
         String result = server.getProjectNameForUri("file:///workspace/projA/src/Foo.groovy");
-        // The method normalizes the URI, so it should find the mapping or return null
-        // depending on prefix matching implementation
+        assertTrue(result == null || result.equals("ProjA"));
     }
 }

@@ -236,7 +236,7 @@
         "types": {
             "patterns": [
                 {
-                    "name": "storage.type.groovy",
+                    "name": "storage.modifier.groovy",
                     "match": "\\b(class|interface|enum|extends|implements|trait)\\b"
                 },
                 {

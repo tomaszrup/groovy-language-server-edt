@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.2.7",
+    "version": "1.2.8",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -67,7 +67,7 @@
         "semanticTokenTypes": [
             {
                 "id": "typeKeyword",
-                "description": "Type declaration keywords like class, interface, enum, and trait."
+                "description": "Declaration and inheritance keywords like class, interface, enum, trait, extends, and implements."
             }
         ],
         "semanticTokenScopes": [
@@ -81,8 +81,8 @@
                         "keyword.control.groovy"
                     ],
                     "typeKeyword": [
-                        "storage.type",
-                        "storage.type.groovy"
+                        "storage.modifier",
+                        "storage.modifier.groovy"
                     ]
                 }
             }

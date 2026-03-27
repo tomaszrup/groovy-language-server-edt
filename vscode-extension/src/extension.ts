@@ -42,15 +42,49 @@ interface JavaClasspathTarget {
     source: string;
 }
 
-/** Pre-fetched classpath data from the Java extension (filled before LS starts). */
-let preFetchedClasspathData: ClasspathNotificationPayload[] = [];
 /** Cached Java extension API (obtained during wait phase). */
 let cachedJavaApi: any = null;
+const sentClasspathFingerprints = new Map<string, string>();
+let initialClasspathBatchCompleteSent = false;
+
+class StartupTrace {
+    private readonly startedAt = Date.now();
+    private lastMarkAt = this.startedAt;
+
+    mark(phase: string, details?: string): void {
+        const now = Date.now();
+        const sinceLast = now - this.lastMarkAt;
+        const total = now - this.startedAt;
+        outputChannel.appendLine(
+            `[startup] ${phase} (+${sinceLast} ms, ${total} ms total)`
+            + (details ? ` - ${details}` : '')
+        );
+        this.lastMarkAt = now;
+    }
+
+    duration(phase: string, phaseStartAt: number, details?: string): void {
+        const now = Date.now();
+        const total = now - this.startedAt;
+        outputChannel.appendLine(
+            `[startup] ${phase} completed in ${now - phaseStartAt} ms (${total} ms total)`
+            + (details ? ` - ${details}` : '')
+        );
+    }
+}
+
+interface WorkspaceDataPreparation {
+    dataDir: string;
+    resetWorkspace: boolean;
+}
+
+let startupTrace: StartupTrace | undefined;
 
 /** Scheme for virtual source documents from JARs/JDK. */
 const GROOVY_SOURCE_SCHEME = 'groovy-source';
 const GRADLE_CLASSPATH_LINE_PREFIX = 'GROOVY_LS_CP::';
 const MINIMUM_JAVA_MAJOR = 21;
+const WORKSPACE_DATA_VERSION = 2;
+const WORKSPACE_DATA_STATE_FILE = 'groovy_ws_state.json';
 
 /**
  * Cached project root map to avoid repeatedly scanning the workspace for
@@ -95,6 +129,19 @@ type ServerState = 'WaitingForJava' | 'Starting' | 'Importing' | 'Compiling' | '
 interface StatusNotification {
     state: ServerState;
     message?: string;
+}
+
+function beginStartupTrace(): void {
+    startupTrace = new StartupTrace();
+    startupTrace.mark('startup.begin');
+}
+
+function markStartupPhase(phase: string, details?: string): void {
+    startupTrace?.mark(phase, details);
+}
+
+function logStartupDuration(phase: string, phaseStartAt: number, details?: string): void {
+    startupTrace?.duration(phase, phaseStartAt, details);
 }
 
 function toFileSystemPath(uriValue: string): string | undefined {
@@ -422,6 +469,7 @@ function updateStatusBar(state: ServerState, message?: string): void {
 export async function activate(context: ExtensionContext): Promise<void> {
     outputChannel = window.createOutputChannel('Groovy Language Server');
     outputChannel.appendLine('Activating Groovy Language Server extension...');
+    beginStartupTrace();
 
     // Create status bar item (right-aligned, high priority to appear near the left of right section)
     statusBarItem = window.createStatusBarItem(StatusBarAlignment.Left, 0);
@@ -452,6 +500,7 @@ export async function activate(context: ExtensionContext): Promise<void> {
         }),
         commands.registerCommand('groovy.restartServer', async () => {
             outputChannel.appendLine('Restarting Groovy Language Server...');
+            beginStartupTrace();
             updateStatusBar('Starting', 'Restarting...');
             isRestarting = true;
             if (client) {
@@ -460,162 +509,63 @@ export async function activate(context: ExtensionContext): Promise<void> {
             await startLanguageServer(context);
         })
     );
+    markStartupPhase('activate.commands-registered');
 
-    // Wait for the Red Hat Java extension to be fully ready before starting.
-    // This prevents the Groovy LS from processing files before classpath is resolved,
-    // which would show spurious errors for unresolved types/imports.
-    updateStatusBar('WaitingForJava');
-    const javaReady = await waitForJavaExtension();
+    // Activate the Java extension up front so classpath delegation can start
+    // in the background, but do not block Groovy LS startup on project import.
+    updateStatusBar('WaitingForJava', 'Activating Java support...');
+    const javaReady = await activateJavaExtension();
+    markStartupPhase(
+        'activate.java-extension',
+        javaReady ? 'classpath delegation enabled' : 'starting without delegated classpath'
+    );
     if (!javaReady) {
         outputChannel.appendLine('Java extension not available — starting Groovy LS without classpath delegation.');
     }
 
     await startLanguageServer(context);
+    markStartupPhase('activate.complete');
 }
 
 /**
- * Wait for the Red Hat Java extension to activate and finish importing projects.
- * Returns true if the Java extension is ready, false if it's unavailable or timed out.
+ * Activate the Red Hat Java extension so classpath delegation can be used.
+ * Returns true if the Java extension API is available.
  */
-async function waitForJavaExtension(): Promise<boolean> {
+async function activateJavaExtension(): Promise<boolean> {
+    const waitStart = Date.now();
+    markStartupPhase('java.activate.begin');
     const javaExtension = vscode.extensions.getExtension('redhat.java');
     if (!javaExtension) {
         outputChannel.appendLine('[java-ext] Red Hat Java extension not installed.');
+        logStartupDuration('java.activate', waitStart, 'extension unavailable');
         return false;
     }
 
-    outputChannel.appendLine('[java-ext] Waiting for Red Hat Java extension to be ready...');
+    outputChannel.appendLine('[java-ext] Activating Red Hat Java extension...');
 
     // Activate the Java extension if needed
     let javaApi: any;
     try {
         javaApi = javaExtension.isActive ? javaExtension.exports : await javaExtension.activate();
+        markStartupPhase('java.extension-activated', `mode=${javaApi?.serverMode ?? 'unknown'}`);
     } catch (e) {
         outputChannel.appendLine(`[java-ext] Failed to activate: ${e}`);
+        logStartupDuration('java.activate', waitStart, 'activation failed');
         return false;
     }
 
     if (!javaApi) {
         outputChannel.appendLine('[java-ext] Java extension API is null.');
+        logStartupDuration('java.activate', waitStart, 'api unavailable');
         return false;
     }
 
     outputChannel.appendLine('[java-ext] Activated. API version: ' + (javaApi.apiVersion ?? 'unknown'));
     outputChannel.appendLine('[java-ext] Server mode: ' + (javaApi.serverMode ?? 'unknown'));
-
-    // Wait for Standard mode to be ready (projects imported, indices built).
-    // If the Java server is already in Standard mode when we activate, the
-    // serverReady() promise may never resolve (it was meant to be awaited
-    // *before* the server finishes).  Use a short timeout in that case.
-    if (typeof javaApi.serverReady === 'function') {
-        const alreadyStandard = javaApi.serverMode === 'Standard';
-        const timeoutMs = alreadyStandard ? 5_000 : 120_000;
-        outputChannel.appendLine(
-            `[java-ext] Waiting for serverReady() (mode=${javaApi.serverMode ?? 'unknown'}, timeout=${timeoutMs}ms)...`);
-        updateStatusBar('WaitingForJava', 'Waiting for Java: importing projects...');
-        const ready = await Promise.race([
-            javaApi.serverReady().then(() => 'ready' as const),
-            new Promise<'timeout'>(resolve =>
-                setTimeout(() => resolve('timeout'), timeoutMs)),
-        ]);
-        if (ready === 'ready') {
-            outputChannel.appendLine('[java-ext] Server is ready (Standard mode, imports done).');
-        } else {
-            outputChannel.appendLine(
-                `[java-ext] serverReady() timed out (alreadyStandard=${alreadyStandard}) — proceeding.`);
-        }
-    } else {
-        outputChannel.appendLine('[java-ext] serverReady() not available — waiting 10s as fallback.');
-        await new Promise(resolve => setTimeout(resolve, 10000));
-    }
-
-    outputChannel.appendLine('[java-ext] Java extension is ready.');
-
-    // Pre-fetch classpath entries now while LS hasn't started yet.
-    // This way we can send them immediately after client.start() completes,
-    // before the server triggers its initial build.
     cachedJavaApi = javaApi;
-    await preFetchClasspaths(javaApi);
+    logStartupDuration('java.activate', waitStart, 'java extension activated');
 
     return true;
-}
-
-/**
- * Pre-fetch classpath entries from the Java extension before the Groovy LS starts.
- * Stores results in preFetchedClasspathData for immediate sending after client.start().
- */
-async function preFetchClasspaths(javaApi: any): Promise<void> {
-    updateStatusBar('WaitingForJava', 'Waiting for Java: fetching classpath...');
-    outputChannel.appendLine('[java-ext] Pre-fetching classpath entries...');
-    preFetchedClasspathData = [];
-
-    const javaHomePath = resolveJavaHome() ?? '';
-    const javaHomeNorm = javaHomePath.replaceAll('\\', '/').toLowerCase();
-
-    try {
-        const projectRootMap = await collectProjectRootMap();
-        const projectUris: string[] =
-            (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
-
-        outputChannel.appendLine(`[java-ext] Pre-fetch: java.project.getAll returned ${projectUris.length} project(s)`);
-
-        const fetchProjectClasspath = async (projectUri: string): Promise<ClasspathNotificationPayload | undefined> => {
-            if (isJdtWorkspaceUri(projectUri)) {
-                outputChannel.appendLine(`[java-ext] Pre-fetch: skipping jdt_ws project ${projectUri}`);
-                return undefined;
-            }
-
-            try {
-                let result: { classpaths: string[]; modulepaths: string[] } | null = null;
-                if (typeof javaApi.getClasspaths === 'function') {
-                    result = await javaApi.getClasspaths(projectUri, { scope: 'test' });
-                }
-
-                const rawEntries = result
-                    ? [...(result.classpaths ?? []), ...(result.modulepaths ?? [])]
-                    : [];
-                const filteredEntries = rawEntries.filter(entry => !isJdkEntry(entry, javaHomeNorm));
-
-                if (filteredEntries.length === 0) {
-                    return undefined;
-                }
-
-                const projectPath = resolveProjectPathFromUri(projectUri, projectRootMap)
-                    ?? inferProjectPathFromEntries(filteredEntries, projectRootMap);
-
-                outputChannel.appendLine(
-                    `[java-ext] Pre-fetched ${filteredEntries.length} entries for ${projectUri}`
-                    + (projectPath ? ` (projectPath=${projectPath})` : '')
-                );
-
-                return {
-                    projectUri,
-                    projectPath,
-                    entries: filteredEntries,
-                };
-            } catch (e) {
-                outputChannel.appendLine(`[java-ext] Pre-fetch failed for ${projectUri}: ${e}`);
-                return undefined;
-            }
-        };
-
-        const BATCH_SIZE = 20;
-        for (let i = 0; i < projectUris.length; i += BATCH_SIZE) {
-            const batch = projectUris.slice(i, i + BATCH_SIZE);
-            const results = await Promise.allSettled(batch.map(fetchProjectClasspath));
-            for (const result of results) {
-                if (result.status === 'fulfilled' && result.value) {
-                    preFetchedClasspathData.push(result.value);
-                }
-            }
-        }
-
-        outputChannel.appendLine(
-            `[java-ext] Pre-fetch complete: ${preFetchedClasspathData.length} project(s) with classpath data`
-        );
-    } catch (e) {
-        outputChannel.appendLine(`[java-ext] Pre-fetch failed: ${e}`);
-    }
 }
 
 export async function deactivate(): Promise<void> {
@@ -631,11 +581,15 @@ export async function deactivate(): Promise<void> {
 }
 
 async function startLanguageServer(context: ExtensionContext): Promise<void> {
+    const startPhase = Date.now();
+    markStartupPhase('server.launch.begin');
     isRestarting = false;
+    sentClasspathFingerprints.clear();
     const javaExecutable = await resolveJavaExecutableOrShowError();
     if (!javaExecutable) {
         return;
     }
+    markStartupPhase('server.java-resolved', javaExecutable);
 
     outputChannel.appendLine(`Using Java: ${javaExecutable}`);
 
@@ -677,24 +631,11 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     outputChannel.appendLine(`Config directory: ${configDir}`);
 
     // 5. Build the workspace data directory.
-    // Wipe the previous Eclipse workspace data on every start so that stale
-    // metadata (linked-folder resource trees, build state, etc.) never
-    // accumulates.  All state is derived at runtime (project structure,
-    // classpath from Java extension) so nothing precious is lost.
-    // This also fixes existing installs where linked folders were created
-    // without resource filters, which caused runaway I/O that could break
-    // other extensions' persisted state (e.g. VS Code Copilot chat history).
-    const workspaceStoragePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
-    const dataDir = path.join(workspaceStoragePath, 'groovy_ws');
-    try {
-        if (fs.existsSync(dataDir)) {
-            fs.rmSync(dataDir, { recursive: true, force: true });
-            outputChannel.appendLine(`Cleaned stale workspace data: ${dataDir}`);
-        }
-    } catch (e) {
-        outputChannel.appendLine(`Warning: failed to clean workspace data: ${e}`);
-    }
-    fs.mkdirSync(dataDir, { recursive: true });
+    // Preserve the Eclipse workspace across healthy restarts so JDT and OSGi
+    // caches can be reused. Invalidate only when the persisted workspace
+    // schema changes or the marker is missing/corrupt.
+    const workspaceData = prepareWorkspaceDataDir(context);
+    const dataDir = workspaceData.dataDir;
 
     // 6. Build JVM arguments
     const vmargs = workspace.getConfiguration('groovy').get<string>('ls.vmargs', '-Xmx2G');
@@ -713,12 +654,17 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     }
 
     // Eclipse / Equinox system properties, launcher JAR, and Equinox configuration
+    if (workspaceData.resetWorkspace) {
+        args.push('-Dosgi.clean=true');
+        markStartupPhase('server.workspace-reset', dataDir);
+    } else {
+        markStartupPhase('server.workspace-reused', dataDir);
+    }
     args.push(
         '-Declipse.application=org.eclipse.groovy.ls.core.id1',
         '-Declipse.product=org.eclipse.groovy.ls.core.product',
         '-Dosgi.bundles.defaultStartLevel=4',
         '-Dosgi.checkConfiguration=true',
-        '-Dosgi.clean=true',
         '-Dfile.encoding=UTF-8',
         '-jar', launcherJar,
         '-configuration', configDir,
@@ -786,6 +732,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     outputChannel.appendLine('Starting Groovy Language Server...');
     try {
         await client.start();
+        markStartupPhase('server.client-started');
     } catch (e) {
         updateStatusBar('Error', `Failed to start: ${e}`);
         outputChannel.appendLine(`Failed to start Groovy Language Server: ${e}`);
@@ -831,10 +778,6 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         updateStatusBar(params.state, params.message);
     });
 
-    // Send pre-fetched classpath immediately — before the server's deferred
-    // initial build timer fires. This ensures the first build has full classpath.
-    sendPrefetchedClasspaths(client);
-
     // Push initial configuration (formatter + inlay hints) to the server
     const sendGroovyConfiguration = () => {
         const config = workspace.getConfiguration('groovy');
@@ -879,6 +822,53 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
 
     // ---- Delegate classpath resolution to Red Hat Java extension ----
     await initJavaExtensionClasspath(context, client);
+    logStartupDuration('server.launch', startPhase, 'language client ready');
+}
+
+function prepareWorkspaceDataDir(context: ExtensionContext): WorkspaceDataPreparation {
+    const workspaceStoragePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
+    const dataDir = path.join(workspaceStoragePath, 'groovy_ws');
+    const stateFile = path.join(workspaceStoragePath, WORKSPACE_DATA_STATE_FILE);
+    let resetWorkspace = false;
+    let resetReason = '';
+
+    if (fs.existsSync(stateFile)) {
+        try {
+            const state = JSON.parse(fs.readFileSync(stateFile, 'utf8')) as { version?: number };
+            if (state.version !== WORKSPACE_DATA_VERSION) {
+                resetWorkspace = true;
+                resetReason = `workspace data version ${state.version ?? 'unknown'} -> ${WORKSPACE_DATA_VERSION}`;
+            }
+        } catch {
+            resetWorkspace = true;
+            resetReason = 'invalid workspace data marker';
+        }
+    } else {
+        resetWorkspace = fs.existsSync(dataDir);
+        resetReason = 'missing workspace data marker';
+    }
+
+    if (resetWorkspace && fs.existsSync(dataDir)) {
+        try {
+            fs.rmSync(dataDir, { recursive: true, force: true });
+            outputChannel.appendLine(`Reset persisted workspace data: ${dataDir} (${resetReason})`);
+        } catch (e) {
+            outputChannel.appendLine(`Warning: failed to reset workspace data: ${e}`);
+        }
+    }
+
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(
+        stateFile,
+        JSON.stringify({ version: WORKSPACE_DATA_VERSION, updatedAt: new Date().toISOString() }, null, 2),
+        'utf8'
+    );
+
+    if (!resetWorkspace) {
+        outputChannel.appendLine(`Reusing persisted workspace data: ${dataDir}`);
+    }
+
+    return { dataDir, resetWorkspace };
 }
 
 /**
@@ -898,6 +888,17 @@ async function initJavaExtensionClasspath(
     }
 
     outputChannel.appendLine('[java-ext] Setting up classpath change listeners...');
+    initialClasspathBatchCompleteSent = false;
+
+    const sendInitialClasspathBatchComplete = (reason: string): void => {
+        if (initialClasspathBatchCompleteSent) {
+            return;
+        }
+        initialClasspathBatchCompleteSent = true;
+        lsClient.sendNotification('groovy/classpathBatchComplete', {});
+        outputChannel.appendLine(`[java-ext] Sent groovy/classpathBatchComplete to server (${reason}).`);
+        markStartupPhase('java.classpath-batch-complete', reason);
+    };
 
     // Resolve Java home for filtering JDK entries from classpath
     const javaHomePath = resolveJavaHome() ?? '';
@@ -994,13 +995,13 @@ async function initJavaExtensionClasspath(
             ?? resolveProjectPathFromUri(target.requestUri, projectRootMap)
             ?? inferProjectPathFromEntries(filteredEntries, projectRootMap);
 
-        lsClient.sendNotification('groovy/classpathUpdate', {
+        const sent = sendClasspathUpdateNotification(lsClient, {
             projectUri: target.projectUri,
             projectPath: resolvedProjectPath,
             entries: filteredEntries,
         });
         outputChannel.appendLine(
-            `[java-ext]   Sent ${filteredEntries.length} classpath entries` +
+            `[java-ext]   ${sent ? 'Sent' : 'Skipped duplicate'} ${filteredEntries.length} classpath entries` +
             (finalHasJars ? ' (includes JARs)' : ' (output dirs only, no JARs)')
             + (resolvedProjectPath ? `, projectPath=${resolvedProjectPath}` : '')
         );
@@ -1187,8 +1188,16 @@ async function initJavaExtensionClasspath(
     // when we first fetch. Retry with increasing delays until we get actual JARs.
     // On first failure, trigger java.projectConfiguration.update to force dependency resolution.
     const fetchWithRetry = async (attempt: number = 1, maxAttempts: number = 6): Promise<void> => {
+        if (initialClasspathBatchCompleteSent) {
+            return;
+        }
         const fetched = await fetchAllClasspaths();
-        if (fetched > 0 || attempt >= maxAttempts) {
+        if (fetched > 0) {
+            sendInitialClasspathBatchComplete(`fetched ${fetched} project(s) on attempt ${attempt}`);
+            return;
+        }
+        if (attempt >= maxAttempts) {
+            sendInitialClasspathBatchComplete(`max attempts reached (${attempt})`);
             return;
         }
 
@@ -1236,20 +1245,33 @@ async function initJavaExtensionClasspath(
                     `[java-ext] Projects imported (${uris.length}) — refreshing classpath...`
                 );
                 if (uris.length === 0) {
-                    fetchAllClasspaths();
+                    fetchAllClasspaths()
+                        .then(fetched => {
+                            if (fetched > 0) {
+                                sendInitialClasspathBatchComplete('projects imported (empty payload fallback)');
+                            }
+                        })
+                        .catch(e => outputChannel.appendLine(`[java-ext] onDidProjectsImport fallback error: ${e}`));
                     return;
                 }
 
                 (async () => {
                     const projectRootMap = await collectProjectRootMap();
+                    let fetched = 0;
                     for (const importedUri of uris) {
                         if (isJdtWorkspaceUri(importedUri.toString())) continue;
-                        await fetchClasspathForProject({
+                        const ok = await fetchClasspathForProject({
                             requestUri: importedUri.toString(),
                             projectUri: importedUri.toString(),
                             projectPath: resolveProjectPathFromUri(importedUri.toString(), projectRootMap),
                             source: 'onDidProjectsImport',
                         }, projectRootMap);
+                        if (ok) {
+                            fetched++;
+                        }
+                    }
+                    if (fetched > 0) {
+                        sendInitialClasspathBatchComplete(`projects imported (${fetched} project(s) with jars)`);
                     }
                 })().catch(e => outputChannel.appendLine(`[java-ext] onDidProjectsImport error: ${e}`));
             })
@@ -1270,8 +1292,9 @@ async function initJavaExtensionClasspath(
         );
     }
 
-    // Initial classpath fetch — serverReady() should have ensured the server
-    // is in Standard mode and projects are imported. Fetch with retry as a safety net.
+    // Initial classpath fetch starts immediately and retries until Java import
+    // finishes. This is the single source of truth for the initial
+    // groovy/classpathBatchComplete notification.
     fetchWithRetry();
 }
 
@@ -1428,27 +1451,23 @@ function buildInitializationOptions(): Record<string, unknown> | undefined {
     return Object.keys(initOptions).length > 0 ? initOptions : undefined;
 }
 
-function sendPrefetchedClasspaths(languageClient: LanguageClient): void {
-    if (preFetchedClasspathData.length === 0) {
-        return;
+function sendClasspathUpdateNotification(
+    languageClient: LanguageClient,
+    payload: ClasspathNotificationPayload
+): boolean {
+    const projectKey = payload.projectUri || payload.projectPath || 'unknown-project';
+    const fingerprint = JSON.stringify({
+        projectPath: payload.projectPath ?? '',
+        entries: [...payload.entries].sort(),
+    });
+
+    if (sentClasspathFingerprints.get(projectKey) === fingerprint) {
+        return false;
     }
 
-    outputChannel.appendLine(`[java-ext] Sending ${preFetchedClasspathData.length} pre-fetched classpath(s) to server...`);
-    for (const cp of preFetchedClasspathData) {
-        languageClient.sendNotification('groovy/classpathUpdate', {
-            projectUri: cp.projectUri,
-            projectPath: cp.projectPath,
-            entries: cp.entries,
-        });
-        outputChannel.appendLine(
-            `[java-ext]   Sent ${cp.entries.length} entries for ${cp.projectUri}`
-            + (cp.projectPath ? ` (projectPath=${cp.projectPath})` : '')
-        );
-    }
-
-    preFetchedClasspathData = [];
-    languageClient.sendNotification('groovy/classpathBatchComplete', {});
-    outputChannel.appendLine('[java-ext] Sent groovy/classpathBatchComplete to server.');
+    sentClasspathFingerprints.set(projectKey, fingerprint);
+    languageClient.sendNotification('groovy/classpathUpdate', payload);
+    return true;
 }
 
 function toError(error: unknown): Error {

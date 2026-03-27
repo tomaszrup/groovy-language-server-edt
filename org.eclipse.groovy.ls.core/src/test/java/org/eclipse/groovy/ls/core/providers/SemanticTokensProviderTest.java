@@ -87,6 +87,31 @@ class SemanticTokensProviderTest {
     }
 
     @Test
+    void computesTokensForBestEffortFullRequests() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///SemanticTokensBestEffort.groovy";
+        manager.didOpen(uri, """
+                class Person {
+                    String name
+                    def greet(String other) { other.toUpperCase() }
+                }
+                def p = new Person(name: 'Ada')
+                p.greet('Bob')
+                """);
+
+        SemanticTokensProvider provider = new SemanticTokensProvider(manager);
+
+        SemanticTokensParams params = new SemanticTokensParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        SemanticTokens full = provider.getSemanticTokensFullBestEffort(params);
+
+        assertNotNull(full);
+        assertFalse(full.getData().isEmpty());
+
+        manager.didClose(uri);
+    }
+
+    @Test
     void getModuleNodeReturnsNullForNonGroovyCompilationUnit() throws Exception {
         SemanticTokensProvider provider = new SemanticTokensProvider(new DocumentManager());
         ICompilationUnit unit = mock(ICompilationUnit.class);
@@ -269,7 +294,6 @@ class SemanticTokensProviderTest {
         params.setTextDocument(new TextDocumentIdentifier(uri));
         SemanticTokens goodTokens = provider.getSemanticTokensFull(params);
         assertFalse(goodTokens.getData().isEmpty(), "Valid code should produce tokens");
-        List<Integer> goodData = goodTokens.getData();
 
         // Now insert garbage after the class
         TextDocumentContentChangeEvent change = new TextDocumentContentChangeEvent("""

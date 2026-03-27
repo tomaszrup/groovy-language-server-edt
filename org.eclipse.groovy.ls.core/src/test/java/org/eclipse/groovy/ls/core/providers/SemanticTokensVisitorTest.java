@@ -9,6 +9,7 @@
  *******************************************************************************/
 package org.eclipse.groovy.ls.core.providers;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -449,6 +450,28 @@ class SemanticTokensVisitorTest {
     }
 
     @Test
+    void emitsDedicatedTypeKeywordTokenForTraitDeclaration() {
+        String source = """
+                trait Flyable {
+                    String fly() { 'whoosh' }
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+        assertTrue(hasTokenType(tokens, SemanticTokensProvider.TYPE_TYPE_KEYWORD));
+    }
+
+    @Test
+    void emitsTypeKeywordTokensForClassExtendsAndImplements() {
+        String source = """
+                class Animal {}
+                interface Flyer {}
+                class Bird extends Animal implements Flyer {}
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+        assertEquals(5, countTokenType(tokens, SemanticTokensProvider.TYPE_TYPE_KEYWORD));
+    }
+
+    @Test
     void emitsStructAndMethodForTraitWithMultipleMembers() {
         String source = """
                 trait Describable {
@@ -462,6 +485,38 @@ class SemanticTokensVisitorTest {
         assertTrue(hasTokenType(tokens, SemanticTokensProvider.TYPE_METHOD));
         assertTrue(tokens.stream().anyMatch(
                 t -> (t.modifiers & SemanticTokensProvider.MOD_ABSTRACT) != 0));
+    }
+
+    @Test
+    void emitsPropertyTokenForTraitPropertyDeclaration() {
+        String source = """
+                trait Named {
+                    String name
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+        assertTrue(tokens.stream().anyMatch(t -> "name".equals(t.text)
+                && t.tokenType == SemanticTokensProvider.TYPE_PROPERTY),
+                "Expected trait property declaration to be tokenized as property");
+    }
+
+    @Test
+    void emitsPropertyTokenForImplicitTraitMemberUsageInImplementingClass() {
+        String source = """
+                trait Named {
+                    String name
+                }
+                class Person implements Named {
+                    String label() {
+                        name
+                    }
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+        assertTrue(tokens.stream().anyMatch(t -> t.line == 5
+                && "name".equals(t.text)
+                && t.tokenType == SemanticTokensProvider.TYPE_PROPERTY),
+                "Expected implicit trait member usage to be tokenized as property");
     }
 
     // ---- Generics with bounds ----
@@ -843,7 +898,7 @@ class SemanticTokensVisitorTest {
         ModuleNode moduleNode = parseModule(source);
         SemanticTokensVisitor visitor = new SemanticTokensVisitor(source, range);
         visitor.visitModule(moduleNode);
-        return decode(visitor.getEncodedTokens());
+        return decode(visitor.getEncodedTokens(), source);
     }
 
     private ModuleNode parseModule(String source) {
@@ -859,10 +914,15 @@ class SemanticTokensVisitorTest {
         return tokens.stream().anyMatch(token -> token.tokenType == type);
     }
 
-    private List<DecodedToken> decode(List<Integer> encoded) {
+    private long countTokenType(List<DecodedToken> tokens, int type) {
+        return tokens.stream().filter(token -> token.tokenType == type).count();
+    }
+
+    private List<DecodedToken> decode(List<Integer> encoded, String source) {
         List<DecodedToken> decoded = new ArrayList<>();
         int previousLine = 0;
         int previousColumn = 0;
+        String[] lines = source.split("\n", -1);
 
         for (int i = 0; i + 4 < encoded.size(); i += 5) {
             int deltaLine = encoded.get(i);
@@ -873,8 +933,12 @@ class SemanticTokensVisitorTest {
 
             int line = previousLine + deltaLine;
             int column = deltaLine == 0 ? previousColumn + deltaColumn : deltaColumn;
+                String text = line >= 0 && line < lines.length && column >= 0
+                    && column + length <= lines[line].length()
+                    ? lines[line].substring(column, column + length)
+                    : "";
 
-            decoded.add(new DecodedToken(line, column, length, tokenType, modifiers));
+                decoded.add(new DecodedToken(line, column, length, tokenType, modifiers, text));
             previousLine = line;
             previousColumn = column;
         }
@@ -888,13 +952,15 @@ class SemanticTokensVisitorTest {
         private final int length;
         private final int tokenType;
         private final int modifiers;
+        private final String text;
 
-        private DecodedToken(int line, int column, int length, int tokenType, int modifiers) {
+        private DecodedToken(int line, int column, int length, int tokenType, int modifiers, String text) {
             this.line = line;
             this.column = column;
             this.length = length;
             this.tokenType = tokenType;
             this.modifiers = modifiers;
+            this.text = text;
         }
     }
 }

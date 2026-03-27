@@ -11,8 +11,12 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -124,7 +128,17 @@ public class SemanticTokensProvider {
      */
     public SemanticTokens getSemanticTokensFull(SemanticTokensParams params) {
         String uri = params.getTextDocument().getUri();
-        return computeTokens(uri, null);
+        return computeTokens(uri, null, true);
+    }
+
+    /**
+     * Compute semantic tokens for the full document without using the JDT
+     * working copy. This avoids workspace-lock contention during builds while
+     * still allowing cached AST or standalone parsing to provide tokens.
+     */
+    public SemanticTokens getSemanticTokensFullBestEffort(SemanticTokensParams params) {
+        String uri = params.getTextDocument().getUri();
+        return computeTokens(uri, null, false);
     }
 
     /**
@@ -132,7 +146,16 @@ public class SemanticTokensProvider {
      */
     public SemanticTokens getSemanticTokensRange(SemanticTokensRangeParams params) {
         String uri = params.getTextDocument().getUri();
-        return computeTokens(uri, params.getRange());
+        return computeTokens(uri, params.getRange(), true);
+    }
+
+    /**
+     * Compute semantic tokens for a range without consulting the JDT working
+     * copy. Used while the workspace is building.
+     */
+    public SemanticTokens getSemanticTokensRangeBestEffort(SemanticTokensRangeParams params) {
+        String uri = params.getTextDocument().getUri();
+        return computeTokens(uri, params.getRange(), false);
     }
 
     /**
@@ -141,7 +164,7 @@ public class SemanticTokensProvider {
      * @param uri   the document URI
      * @param range optional LSP range to restrict tokens to (null = full document)
      */
-    private SemanticTokens computeTokens(String uri, org.eclipse.lsp4j.Range range) {
+    private SemanticTokens computeTokens(String uri, org.eclipse.lsp4j.Range range, boolean allowWorkingCopy) {
         String content = documentManager.getContent(uri);
         if (content == null) {
             return new SemanticTokens(Collections.emptyList());
@@ -150,7 +173,7 @@ public class SemanticTokensProvider {
         // Try to get the Groovy AST — first from JDT, then from standalone compiler
         ModuleNode moduleNode = null;
 
-        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        ICompilationUnit workingCopy = allowWorkingCopy ? documentManager.getWorkingCopy(uri) : null;
         if (workingCopy != null) {
             // Try via groovy-eclipse's GroovyCompilationUnit
             moduleNode = getModuleNode(workingCopy);
@@ -164,6 +187,13 @@ public class SemanticTokensProvider {
         // First attempt: try to produce tokens from the JDT/cached module
         List<Integer> tokens = tryVisitModule(moduleNode, content, range, uri);
         if (tokens != null && !tokens.isEmpty()) {
+            if (workingCopy != null && shouldSupplementTraitTokens(content)) {
+                ModuleNode fallback = getStandaloneAST(uri, content);
+                List<Integer> supplemental = tryVisitModule(fallback, content, range, uri + " [standalone]");
+                if (supplemental != null && !supplemental.isEmpty()) {
+                    tokens = mergeTokenData(tokens, supplemental);
+                }
+            }
             return new SemanticTokens(tokens);
         }
 
@@ -183,6 +213,89 @@ public class SemanticTokensProvider {
         return new SemanticTokens(Collections.emptyList());
     }
 
+    private boolean shouldSupplementTraitTokens(String content) {
+        return content.contains("trait ") || content.contains("implements ");
+    }
+
+    private List<Integer> mergeTokenData(List<Integer> primary, List<Integer> supplemental) {
+        Map<String, AbsoluteToken> merged = new HashMap<>();
+        for (AbsoluteToken token : decodeTokenData(primary)) {
+            merged.put(spanKey(token), token);
+        }
+        for (AbsoluteToken token : decodeTokenData(supplemental)) {
+            merged.putIfAbsent(spanKey(token), token);
+        }
+
+        List<AbsoluteToken> ordered = new ArrayList<>(merged.values());
+        ordered.sort(Comparator
+                .comparingInt((AbsoluteToken token) -> token.line)
+                .thenComparingInt(token -> token.column)
+                .thenComparingInt(token -> token.length)
+                .thenComparingInt(token -> token.tokenType)
+                .thenComparingInt(token -> token.modifiers));
+        return encodeTokenData(ordered);
+    }
+
+    private String spanKey(AbsoluteToken token) {
+        return token.line + ":" + token.column + ":" + token.length;
+    }
+
+    private List<AbsoluteToken> decodeTokenData(List<Integer> encoded) {
+        List<AbsoluteToken> decoded = new ArrayList<>();
+        int previousLine = 0;
+        int previousColumn = 0;
+        for (int i = 0; i + 4 < encoded.size(); i += 5) {
+            int deltaLine = encoded.get(i);
+            int deltaColumn = encoded.get(i + 1);
+            int length = encoded.get(i + 2);
+            int tokenType = encoded.get(i + 3);
+            int modifiers = encoded.get(i + 4);
+
+            int line = previousLine + deltaLine;
+            int column = deltaLine == 0 ? previousColumn + deltaColumn : deltaColumn;
+            decoded.add(new AbsoluteToken(line, column, length, tokenType, modifiers));
+            previousLine = line;
+            previousColumn = column;
+        }
+        return decoded;
+    }
+
+    private List<Integer> encodeTokenData(List<AbsoluteToken> tokens) {
+        List<Integer> encoded = new ArrayList<>(tokens.size() * 5);
+        int previousLine = 0;
+        int previousColumn = 0;
+        boolean first = true;
+        for (AbsoluteToken token : tokens) {
+            int deltaLine = first ? token.line : token.line - previousLine;
+            int deltaColumn = first || deltaLine != 0 ? token.column : token.column - previousColumn;
+            encoded.add(deltaLine);
+            encoded.add(deltaColumn);
+            encoded.add(token.length);
+            encoded.add(token.tokenType);
+            encoded.add(token.modifiers);
+            previousLine = token.line;
+            previousColumn = token.column;
+            first = false;
+        }
+        return encoded;
+    }
+
+    private static final class AbsoluteToken {
+        private final int line;
+        private final int column;
+        private final int length;
+        private final int tokenType;
+        private final int modifiers;
+
+        private AbsoluteToken(int line, int column, int length, int tokenType, int modifiers) {
+            this.line = line;
+            this.column = column;
+            this.length = length;
+            this.tokenType = tokenType;
+            this.modifiers = modifiers;
+        }
+    }
+
     /**
      * Try to visit a module and return encoded tokens.
      * Returns null or empty list if the module is unusable.
@@ -195,7 +308,7 @@ public class SemanticTokensProvider {
             return null;
         }
         try {
-            SemanticTokensVisitor visitor = new SemanticTokensVisitor(content, range);
+            SemanticTokensVisitor visitor = new SemanticTokensVisitor(content, range, documentManager);
             visitor.visitModule(moduleNode);
             return visitor.getEncodedTokens();
         } catch (Exception e) {

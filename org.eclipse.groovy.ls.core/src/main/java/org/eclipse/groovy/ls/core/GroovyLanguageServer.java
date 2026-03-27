@@ -69,6 +69,36 @@ import org.eclipse.lsp4j.services.WorkspaceService;
  */
 public class GroovyLanguageServer implements LanguageServer, LanguageClientAware {
 
+    private static final class StartupTracker {
+        private final long startedAt = System.currentTimeMillis();
+        private long lastMarkAt = startedAt;
+
+        synchronized void mark(String phase) {
+            mark(phase, null);
+        }
+
+        synchronized void mark(String phase, String details) {
+            long now = System.currentTimeMillis();
+            long sinceLast = now - lastMarkAt;
+            long total = now - startedAt;
+            GroovyLanguageServerPlugin.logInfo(
+                    "[startup] " + phase
+                    + " (+" + sinceLast + " ms, " + total + " ms total)"
+                    + (details != null ? " - " + details : ""));
+            lastMarkAt = now;
+        }
+
+        synchronized void duration(String phase, long phaseStartAt, String details) {
+            long now = System.currentTimeMillis();
+            long total = now - startedAt;
+            GroovyLanguageServerPlugin.logInfo(
+                    "[startup] " + phase
+                    + " completed in " + (now - phaseStartAt) + " ms"
+                    + " (" + total + " ms total)"
+                    + (details != null ? " - " + details : ""));
+        }
+    }
+
     private static final String STATUS_STARTING = "Starting";
     private static final String STATUS_IMPORTING = "Importing";
     private static final String STATUS_COMPILING = "Compiling";
@@ -90,6 +120,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private final GroovyTextDocumentService textDocumentService;
     private final GroovyWorkspaceService workspaceService;
     private final DocumentManager documentManager;
+    private final StartupTracker startupTracker = new StartupTracker();
 
     private String workspaceRoot;
     private int exitCode = 1; // non-zero until clean shutdown
@@ -125,6 +156,18 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     private final java.util.Set<String> projectsWithClasspath =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicBoolean firstClasspathReceived =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicBoolean firstReadySent =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicBoolean workspaceProjectsReady =
+            new java.util.concurrent.atomic.AtomicBoolean(true);
+    private final java.util.concurrent.atomic.AtomicBoolean workspaceProjectsInitializationScheduled =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicBoolean pendingClasspathBatchComplete =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final java.util.concurrent.ConcurrentLinkedQueue<ClasspathUpdateRequest> pendingClasspathUpdates =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     public GroovyLanguageServer() {
         this.documentManager = new DocumentManager();
@@ -159,6 +202,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             }
             remoteEndpoint.notify("groovy/status", params);
             GroovyLanguageServerPlugin.logInfo("[status] " + state + (message != null ? ": " + message : ""));
+            if (STATUS_READY.equals(state) && firstReadySent.compareAndSet(false, true)) {
+                startupTracker.mark("status.ready", message);
+            }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to send status notification", e);
         }
@@ -167,6 +213,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     @Override
     public CompletableFuture<InitializeResult> initialize(InitializeParams params) {
         return CompletableFuture.supplyAsync(() -> {
+            long initializeStartedAt = System.currentTimeMillis();
+            startupTracker.mark("initialize.begin");
             GroovyLanguageServerPlugin.logInfo("Initializing Groovy Language Server...");
 
             // Read optional pool tuning from initializationOptions
@@ -182,7 +230,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             if (workspaceRoot != null) {
                 GroovyLanguageServerPlugin.logInfo("Workspace root: " + workspaceRoot);
                 sendStatus(STATUS_IMPORTING, "Configuring workspace...");
-                initializeWorkspaceProject();
+                scheduleWorkspaceProjectInitialization();
             }
 
             // Declare server capabilities
@@ -301,6 +349,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             capabilities.setCodeLensProvider(codeLensOptions);
 
             GroovyLanguageServerPlugin.logInfo("Groovy Language Server initialized with capabilities.");
+            startupTracker.duration("initialize", initializeStartedAt, null);
 
             return new InitializeResult(capabilities);
         });
@@ -308,6 +357,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     @Override
     public void initialized(org.eclipse.lsp4j.InitializedParams params) {
+        startupTracker.mark("initialized.notification");
         GroovyLanguageServerPlugin.logInfo("Client confirmed initialization. Server is fully operational.");
 
         // Defer the initial build to give the client time to send the classpathUpdate.
@@ -335,6 +385,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         if (!initialBuildDone.compareAndSet(false, true)) {
             return;
         }
+        startupTracker.mark("initial-build.timer-fired");
         GroovyLanguageServerPlugin.logInfo("Initial build timer fired (no classpath received). Building now.");
         diagnosticsEnabled = true;
         sendStatus(STATUS_COMPILING, "Building workspace...");
@@ -349,13 +400,17 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     void triggerFullBuild() {
         initialBuildScheduler.submit(() -> {
+            boolean initialBuild = !firstFullBuildComplete;
+            long buildStartedAt = System.currentTimeMillis();
             int buildKind;
-            if (!firstFullBuildComplete) {
+            if (initialBuild) {
                 buildKind = org.eclipse.core.resources.IncrementalProjectBuilder.FULL_BUILD;
                 GroovyLanguageServerPlugin.logInfo("Triggering initial FULL workspace build...");
+                startupTracker.mark("build.initial.begin");
             } else {
                 buildKind = org.eclipse.core.resources.IncrementalProjectBuilder.INCREMENTAL_BUILD;
                 GroovyLanguageServerPlugin.logInfo("Triggering INCREMENTAL workspace build...");
+                startupTracker.mark("build.incremental.begin");
             }
             GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerBuild start (kind=" + buildKind + ")");
             buildInProgress = true;
@@ -364,6 +419,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
                 firstFullBuildComplete = true;
                 GroovyLanguageServerPlugin.logInfo("Build completed (kind=" + buildKind + ").");
+                startupTracker.duration(
+                        initialBuild ? "build.initial" : "build.incremental",
+                        buildStartedAt,
+                        "kind=" + buildKind);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Build failed (kind=" + buildKind + ")", e);
                 sendStatus("Error", "Build failed: " + e.getMessage());
@@ -500,6 +559,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                     + (request.projectUri != null
                         ? " for projectUri: " + request.projectUri : " (no project URI)")
                     + (request.projectPath != null ? ", projectPath: " + request.projectPath : ""));
+            if (firstClasspathReceived.compareAndSet(false, true)) {
+                startupTracker.mark(
+                        "classpath.first-update",
+                        request.projectPath != null ? request.projectPath : request.projectUri);
+            }
 
             // Only send "Importing" status once (on the first classpath arrival),
             // not 50 times for 50 subprojects.
@@ -507,6 +571,27 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 sendStatus(STATUS_IMPORTING, "Receiving classpaths...");
             }
 
+            if (!workspaceProjectsReady.get()) {
+                pendingClasspathUpdates.add(request);
+                GroovyLanguageServerPlugin.logInfo(
+                        "[classpathUpdate] Queued until workspace projects are ready: "
+                                + (request.projectPath != null ? request.projectPath : request.projectUri));
+                if (workspaceProjectsReady.get()) {
+                    drainPendingClasspathUpdates();
+                }
+                return;
+            }
+
+            applyClasspathUpdate(request);
+
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("[classpathUpdate] Failed to apply classpath", e);
+            sendStatus("Error", "Classpath update failed: " + e.getMessage());
+        }
+    }
+
+    private void applyClasspathUpdate(ClasspathUpdateRequest request) {
+        try {
             IProject eclipseProject = findEclipseProjectFor(request.projectUri, request.projectPath);
             if (eclipseProject == null || !eclipseProject.isOpen()) {
                 GroovyLanguageServerPlugin.logInfo(
@@ -729,6 +814,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     @JsonNotification("groovy/classpathBatchComplete")
     public void classpathBatchComplete(JsonObject params) {
+        startupTracker.mark("classpath.batch-complete");
+        if (!workspaceProjectsReady.get()) {
+            pendingClasspathBatchComplete.set(true);
+            GroovyLanguageServerPlugin.logInfo(
+                    "[classpathBatchComplete] Queued until workspace projects are ready.");
+            if (workspaceProjectsReady.get()) {
+                drainPendingClasspathUpdates();
+            }
+            return;
+        }
+        handleClasspathBatchComplete();
+    }
+
+    private void handleClasspathBatchComplete() {
         GroovyLanguageServerPlugin.logInfo(
                 "[classpathBatchComplete] All initial classpaths received. Triggering build now.");
         java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture.getAndSet(null);
@@ -737,6 +836,51 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
         if (workspaceRoot != null) {
             triggerFullBuild();
+        }
+    }
+
+    private void scheduleWorkspaceProjectInitialization() {
+        if (workspaceRoot == null) {
+            workspaceProjectsReady.set(true);
+            return;
+        }
+        if (!workspaceProjectsInitializationScheduled.compareAndSet(false, true)) {
+            return;
+        }
+
+        workspaceProjectsReady.set(false);
+        startupTracker.mark("workspace.projects.initialize.scheduled");
+        initialBuildScheduler.submit(() -> {
+            long workspaceInitStartedAt = System.currentTimeMillis();
+            try {
+                initializeWorkspaceProject();
+            } finally {
+                startupTracker.duration(
+                        "workspace.projects.initialize",
+                        workspaceInitStartedAt,
+                        subprojectPathToEclipseName.isEmpty()
+                                ? "single-project workspace"
+                                : subprojectPathToEclipseName.size() + " Eclipse project(s)");
+                workspaceProjectsReady.set(true);
+                workspaceProjectsInitializationScheduled.set(false);
+                drainPendingClasspathUpdates();
+            }
+        });
+    }
+
+    private void drainPendingClasspathUpdates() {
+        int drained = 0;
+        ClasspathUpdateRequest queuedRequest;
+        while ((queuedRequest = pendingClasspathUpdates.poll()) != null) {
+            applyClasspathUpdate(queuedRequest);
+            drained++;
+        }
+        if (drained > 0) {
+            startupTracker.mark("classpath.queued-updates-drained", drained + " update(s)");
+        }
+        if (pendingClasspathBatchComplete.compareAndSet(true, false)) {
+            startupTracker.mark("classpath.batch-complete.replayed");
+            handleClasspathBatchComplete();
         }
     }
 

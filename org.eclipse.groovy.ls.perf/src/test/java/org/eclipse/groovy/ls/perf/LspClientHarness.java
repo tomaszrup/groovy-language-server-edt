@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 
 /**
@@ -52,6 +53,14 @@ public class LspClientHarness implements AutoCloseable {
 
     /** Collected server log messages for debugging. */
     private final List<String> serverLogs = Collections.synchronizedList(new ArrayList<>());
+    private final ConcurrentHashMap<String, Long> firstStatusTimesMs = new ConcurrentHashMap<>();
+    private final AtomicLong processStartedAtMs = new AtomicLong();
+    private final AtomicLong initializeStartedAtMs = new AtomicLong();
+    private final AtomicLong initializeCompletedAtMs = new AtomicLong();
+    private final AtomicLong initializedSentAtMs = new AtomicLong();
+    private final AtomicLong readyAtMs = new AtomicLong();
+    private final AtomicLong semanticTokensRefreshCount = new AtomicLong();
+    private final Object semanticTokensRefreshMonitor = new Object();
 
     // ---- Construction ----
 
@@ -80,6 +89,16 @@ public class LspClientHarness implements AutoCloseable {
      * until the server reports {@code Ready} status.
      */
     public void start() throws Exception {
+        start(true);
+    }
+
+    /**
+     * Start the language server process and complete the LSP handshake.
+     *
+     * @param waitForReady when true, block until the server reports Ready;
+     *                     otherwise return after initialize/initialized.
+     */
+    public void start(boolean waitForReady) throws Exception {
         Path dataDir = Files.createTempDirectory("groovy-ls-perf-data");
         Path launcherJar = findLauncherJar();
         String configDirName = getConfigDirName();
@@ -107,6 +126,7 @@ public class LspClientHarness implements AutoCloseable {
         System.out.println("[Harness] Starting server: " + String.join(" ", cmd));
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(false); // keep stderr separate
+        processStartedAtMs.set(System.currentTimeMillis());
         serverProcess = pb.start();
 
         // Drain stderr in a background thread
@@ -139,18 +159,58 @@ public class LspClientHarness implements AutoCloseable {
         ));
 
         System.out.println("[Harness] Sending initialize...");
+        initializeStartedAtMs.set(System.currentTimeMillis());
         server.initialize(initParams).get(60, TimeUnit.SECONDS);
+        initializeCompletedAtMs.set(System.currentTimeMillis());
         System.out.println("[Harness] Server initialized. Capabilities received.");
 
         // Send initialized
+        initializedSentAtMs.set(System.currentTimeMillis());
         server.initialized(new InitializedParams());
-        System.out.println("[Harness] Sent initialized notification. Waiting for server Ready status...");
+        System.out.println("[Harness] Sent initialized notification.");
 
-        // Wait for Ready
+        if (waitForReady) {
+            waitForReady();
+        }
+    }
+
+    public StartupMetrics getStartupMetrics() {
+        return new StartupMetrics(
+                duration(processStartedAtMs.get(), readyAtMs.get()),
+                duration(initializeStartedAtMs.get(), initializeCompletedAtMs.get()),
+                duration(initializedSentAtMs.get(), readyAtMs.get()),
+                Collections.unmodifiableMap(new TreeMap<>(firstStatusTimesMs)));
+    }
+
+    public long durationFromProcessStart(long endedAtMs) {
+        return duration(processStartedAtMs.get(), endedAtMs);
+    }
+
+    public void waitForReady() throws Exception {
+        System.out.println("[Harness] Waiting for server Ready status...");
         if (!readyLatch.await(serverTimeoutSeconds, TimeUnit.SECONDS)) {
             throw new TimeoutException("Server did not reach Ready status within " + serverTimeoutSeconds + "s");
         }
         System.out.println("[Harness] Server is Ready.");
+    }
+
+    public long getSemanticTokensRefreshCount() {
+        return semanticTokensRefreshCount.get();
+    }
+
+    public boolean waitForSemanticTokensRefresh(long previousCount, long timeout, TimeUnit unit)
+            throws InterruptedException {
+        long deadlineAtMs = System.currentTimeMillis() + unit.toMillis(timeout);
+        synchronized (semanticTokensRefreshMonitor) {
+            while (semanticTokensRefreshCount.get() <= previousCount) {
+                long remainingMs = deadlineAtMs - System.currentTimeMillis();
+                if (remainingMs <= 0) {
+                    return false;
+                }
+                semanticTokensRefreshMonitor.wait(remainingMs);
+            }
+            return true;
+        }
     }
 
     /**
@@ -340,6 +400,13 @@ public class LspClientHarness implements AutoCloseable {
         return Collections.unmodifiableList(serverLogs);
     }
 
+    public record StartupMetrics(
+            long processStartToReadyMs,
+            long initializeRoundTripMs,
+            long initializedToReadyMs,
+            Map<String, Long> firstStatusTimesMs) {
+    }
+
     // ========================================================================
     // Language Client implementation
     // ========================================================================
@@ -358,7 +425,9 @@ public class LspClientHarness implements AutoCloseable {
         public void groovyStatus(JsonObject params) {
             String state = params.has("state") ? params.get("state").getAsString() : "";
             System.out.println("[Server Status] " + state);
+            recordStatus(state);
             if ("Ready".equals(state)) {
+                recordReady();
                 readyLatch.countDown();
             }
         }
@@ -395,6 +464,7 @@ public class LspClientHarness implements AutoCloseable {
             serverLogs.add(msg);
             // Check for Ready status in log messages in case the custom notification isn't captured
             if (msg != null && msg.contains("Ready")) {
+                recordReady();
                 readyLatch.countDown();
             }
         }
@@ -411,7 +481,10 @@ public class LspClientHarness implements AutoCloseable {
 
         @Override
         public CompletableFuture<Void> refreshSemanticTokens() {
-            // Server requests workspace/semanticTokens/refresh — acknowledge it
+            synchronized (semanticTokensRefreshMonitor) {
+                semanticTokensRefreshCount.incrementAndGet();
+                semanticTokensRefreshMonitor.notifyAll();
+            }
             return CompletableFuture.completedFuture(null);
         }
 
@@ -481,11 +554,34 @@ public class LspClientHarness implements AutoCloseable {
                 System.out.println(prefix + line);
                 // Detect Ready status from stderr output too
                 if (line.contains("\"state\":\"Ready\"") || line.contains("state=Ready")) {
+                    recordReady();
                     readyLatch.countDown();
                 }
             }
         } catch (IOException e) {
             // Process ended — expected on shutdown
         }
+    }
+
+    private void recordStatus(String state) {
+        if (state == null || state.isBlank()) {
+            return;
+        }
+        long processStartedAt = processStartedAtMs.get();
+        if (processStartedAt == 0) {
+            return;
+        }
+        firstStatusTimesMs.putIfAbsent(state, System.currentTimeMillis() - processStartedAt);
+    }
+
+    private void recordReady() {
+        readyAtMs.compareAndSet(0L, System.currentTimeMillis());
+    }
+
+    private static long duration(long startedAt, long endedAt) {
+        if (startedAt <= 0 || endedAt <= 0 || endedAt < startedAt) {
+            return -1;
+        }
+        return endedAt - startedAt;
     }
 }

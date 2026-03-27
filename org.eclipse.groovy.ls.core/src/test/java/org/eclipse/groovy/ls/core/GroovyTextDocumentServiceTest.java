@@ -630,6 +630,26 @@ class GroovyTextDocumentServiceTest {
     }
 
     @Test
+    void semanticTokensFullUsesBestEffortProviderDuringBuild() throws Exception {
+        GroovyTextDocumentService service = createService();
+        GroovyLanguageServer server = (GroovyLanguageServer) getField(service, "server");
+        SemanticTokensProvider provider = mock(SemanticTokensProvider.class);
+        setField(service, "semanticTokensProvider", provider);
+        setField(server, "buildInProgress", true);
+
+        org.eclipse.lsp4j.SemanticTokens expected = new org.eclipse.lsp4j.SemanticTokens(List.of(1, 2, 3, 4, 5));
+        when(provider.getSemanticTokensFullBestEffort(any())).thenReturn(expected);
+        when(provider.getSemanticTokensFull(any())).thenThrow(new AssertionError("full provider should not be used during build"));
+
+        SemanticTokensParams params = new SemanticTokensParams(new TextDocumentIdentifier("file:///test.groovy"));
+        org.eclipse.lsp4j.SemanticTokens result = service.semanticTokensFull(params).join();
+
+        assertSame(expected, result);
+        verify(provider).getSemanticTokensFullBestEffort(any());
+        verify(provider, org.mockito.Mockito.never()).getSemanticTokensFull(any());
+    }
+
+    @Test
     void semanticTokensRangeDelegatesToProviderOnSuccess() throws Exception {
         GroovyTextDocumentService service = createService();
         SemanticTokensProvider provider = mock(SemanticTokensProvider.class);
@@ -645,6 +665,30 @@ class GroovyTextDocumentServiceTest {
                         new org.eclipse.lsp4j.Position(10, 0)));
         org.eclipse.lsp4j.SemanticTokens result = service.semanticTokensRange(params).join();
         assertNotNull(result);
+    }
+
+    @Test
+    void semanticTokensRangeUsesBestEffortProviderDuringBuild() throws Exception {
+        GroovyTextDocumentService service = createService();
+        GroovyLanguageServer server = (GroovyLanguageServer) getField(service, "server");
+        SemanticTokensProvider provider = mock(SemanticTokensProvider.class);
+        setField(service, "semanticTokensProvider", provider);
+        setField(server, "buildInProgress", true);
+
+        org.eclipse.lsp4j.SemanticTokens expected = new org.eclipse.lsp4j.SemanticTokens(List.of(1, 2, 3, 4, 5));
+        when(provider.getSemanticTokensRangeBestEffort(any())).thenReturn(expected);
+        when(provider.getSemanticTokensRange(any())).thenThrow(new AssertionError("range provider should not be used during build"));
+
+        SemanticTokensRangeParams params = new SemanticTokensRangeParams(
+                new TextDocumentIdentifier("file:///test.groovy"),
+                new org.eclipse.lsp4j.Range(
+                        new org.eclipse.lsp4j.Position(0, 0),
+                        new org.eclipse.lsp4j.Position(10, 0)));
+        org.eclipse.lsp4j.SemanticTokens result = service.semanticTokensRange(params).join();
+
+        assertSame(expected, result);
+        verify(provider).getSemanticTokensRangeBestEffort(any());
+        verify(provider, org.mockito.Mockito.never()).getSemanticTokensRange(any());
     }
 
     @Test
@@ -748,6 +792,12 @@ class GroovyTextDocumentServiceTest {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
         field.set(target, value);
+    }
+
+    private Object getField(Object target, String fieldName) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(target);
     }
 
     @SuppressWarnings("unchecked")

@@ -9,12 +9,15 @@
  *******************************************************************************/
 package org.eclipse.groovy.ls.core.providers;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.codehaus.groovy.ast.ASTNode;
@@ -45,6 +48,7 @@ import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.Statement;
 import org.codehaus.groovy.control.SourceUnit;
+import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 
@@ -64,8 +68,13 @@ import org.eclipse.lsp4j.Range;
 public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     private static final String JAVA_LANG_OBJECT = "java.lang.Object";
-    private static final String VOID_TYPE = "void";
+    private static final String CLASS_KEYWORD = "class";
+    private static final String ENUM_KEYWORD = "enum";
+    private static final String EXTENDS_KEYWORD = "extends";
+    private static final String IMPLEMENTS_KEYWORD = "implements";
+    private static final String INTERFACE_KEYWORD = "interface";
     private static final String TRAIT_KEYWORD = "trait";
+    private static final String VOID_TYPE = "void";
     private static final int[] NO_POSITION = new int[0];
 
     /** Spock framework block labels that should be highlighted as keywords. */
@@ -94,6 +103,10 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     private final List<RawToken> tokens = new ArrayList<>();
     private final String source;
     private final Range range; // optional restriction range (null = full document)
+    private final DocumentManager documentManager;
+    private final ArrayDeque<ClassNode> classStack = new ArrayDeque<>();
+    private final Map<ClassNode, TraitMemberIndex> traitMemberCache = new IdentityHashMap<>();
+    private ModuleNode currentModule;
     private SourceUnit sourceUnit;
 
     /**
@@ -101,8 +114,18 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
      * @param range  optional LSP range to restrict tokens to (null = full)
      */
     public SemanticTokensVisitor(String source, Range range) {
+        this(source, range, null);
+    }
+
+    /**
+     * @param source the full document source text
+     * @param range  optional LSP range to restrict tokens to (null = full)
+     * @param documentManager used to resolve trait members from open documents
+     */
+    public SemanticTokensVisitor(String source, Range range, DocumentManager documentManager) {
         this.source = source;
         this.range = range;
+        this.documentManager = documentManager;
     }
 
     @Override
@@ -118,6 +141,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
      * Visit the entire module (compilation unit). This is the main entry point.
      */
     public void visitModule(ModuleNode module) {
+        this.currentModule = module;
         this.sourceUnit = module.getContext();
         visitPackage(module);
         collectImportTokens(module);
@@ -392,28 +416,59 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     @Override
     public void visitClass(ClassNode node) {
         if (node.getLineNumber() < 1) return;
+        classStack.push(node);
         int tokenType = getClassTokenType(node);
         int modifiers = getClassModifiers(node);
         String name = node.getNameWithoutPackage();
-        int nameLine = node.getLineNumber() - 1;
-        int nameCol = node.getColumnNumber() - 1;
-        int[] resolved = findNameNear(nameLine, nameCol, name, 10);
-        if (resolved.length > 0) {
-            nameLine = resolved[0];
-            int nameOffset = resolved[1];
-            addToken(nameLine, nameOffset, name.length(), tokenType, modifiers);
-            emitTraitKeywordToken(node, nameLine, nameOffset);
-        }
+        try {
+            int nameLine = node.getLineNumber() - 1;
+            int nameCol = node.getColumnNumber() - 1;
+            int[] resolved = findNameNear(nameLine, nameCol, name, 10);
+            if (resolved.length > 0) {
+                nameLine = resolved[0];
+                int nameOffset = resolved[1];
+                addToken(nameLine, nameOffset, name.length(), tokenType, modifiers);
+                emitDeclarationKeywordToken(node, nameLine, nameOffset);
+            }
 
-        collectAnnotationTokens(node);
-        visitGenerics(node.getGenericsTypes());
-        ClassNode superClass = node.getUnresolvedSuperClass();
-        if (superClass != null && superClass.getLineNumber() > 0
-                && !JAVA_LANG_OBJECT.equals(superClass.getName())) {
-            emitTypeReference(superClass);
+            collectAnnotationTokens(node);
+            visitGenerics(node.getGenericsTypes());
+            ClassNode superClass = node.getUnresolvedSuperClass();
+            if (superClass != null && superClass.getLineNumber() > 0
+                    && !JAVA_LANG_OBJECT.equals(superClass.getName())) {
+                emitKeywordBeforeType(EXTENDS_KEYWORD, superClass);
+                emitTypeReference(superClass);
+            }
+            visitInterfaces(node, node.getInterfaces());
+            super.visitClass(node);
+        } finally {
+            classStack.pop();
         }
-        visitInterfaces(node.getInterfaces());
-        super.visitClass(node);
+    }
+
+    private void emitDeclarationKeywordToken(ClassNode node, int line, int nameOffset) {
+        String keyword = getDeclarationKeyword(node);
+        if (keyword == null) {
+            return;
+        }
+        int kwOffset = findNameInLine(line, 0, keyword);
+        if (kwOffset >= 0 && kwOffset < nameOffset) {
+            addToken(line, kwOffset, keyword.length(),
+                    SemanticTokensProvider.TYPE_TYPE_KEYWORD, 0);
+        }
+    }
+
+    private String getDeclarationKeyword(ClassNode node) {
+        if (node.isEnum()) {
+            return ENUM_KEYWORD;
+        }
+        if (GroovyTypeKindHelper.isTrait(node)) {
+            return TRAIT_KEYWORD;
+        }
+        if (node.isInterface()) {
+            return INTERFACE_KEYWORD;
+        }
+        return CLASS_KEYWORD;
     }
 
     private int getClassTokenType(ClassNode node) {
@@ -440,24 +495,41 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         return modifiers;
     }
 
-    private void emitTraitKeywordToken(ClassNode node, int line, int nameOffset) {
-        if (!GroovyTypeKindHelper.isTrait(node)) {
-            return;
-        }
-        int kwOffset = findNameInLine(line, 0, TRAIT_KEYWORD);
-        if (kwOffset >= 0 && kwOffset < nameOffset) {
-            addToken(line, kwOffset, TRAIT_KEYWORD.length(),
-                    SemanticTokensProvider.TYPE_TYPE_KEYWORD, 0);
-        }
-    }
-
-    private void visitInterfaces(ClassNode[] interfaces) {
+    private void visitInterfaces(ClassNode owner, ClassNode[] interfaces) {
         if (interfaces == null) {
             return;
         }
+        boolean emittedKeyword = false;
+        String keyword = owner.isInterface() && !GroovyTypeKindHelper.isTrait(owner)
+                ? EXTENDS_KEYWORD
+                : IMPLEMENTS_KEYWORD;
         for (ClassNode iface : interfaces) {
             if (iface.getLineNumber() > 0) {
+                if (!emittedKeyword) {
+                    emitKeywordBeforeType(keyword, iface);
+                    emittedKeyword = true;
+                }
                 emitTypeReference(iface);
+            }
+        }
+    }
+
+    private void emitKeywordBeforeType(String keyword, ClassNode typeNode) {
+        if (typeNode == null || typeNode.getLineNumber() < 1) {
+            return;
+        }
+
+        int typeLine = typeNode.getLineNumber() - 1;
+        int typeColumn = Math.max(0, typeNode.getColumnNumber() - 1);
+        for (int searchLine = typeLine; searchLine >= Math.max(0, typeLine - 3); searchLine--) {
+            int kwOffset = findNameInLine(searchLine, 0, keyword);
+            if (kwOffset < 0) {
+                continue;
+            }
+            if (searchLine < typeLine || kwOffset < typeColumn) {
+                addToken(searchLine, kwOffset, keyword.length(),
+                        SemanticTokensProvider.TYPE_TYPE_KEYWORD, 0);
+                return;
             }
         }
     }
@@ -621,8 +693,40 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitProperty(PropertyNode node) {
-        // PropertyNode wraps a FieldNode — visitField handles its field
-        visitField(node.getField());
+        FieldNode field = node.getField();
+        if (field != null && !field.isSynthetic() && field.getLineNumber() > 0) {
+            visitField(field);
+            return;
+        }
+
+        collectAnnotationTokens(node);
+        emitPropertyType(node);
+        emitPropertyNameToken(node);
+        if (field != null) {
+            visitExpression(field.getInitialExpression());
+        }
+    }
+
+    private void emitPropertyType(PropertyNode node) {
+        ClassNode propertyType = node.getType();
+        if (propertyType != null && propertyType.getLineNumber() > 0) {
+            emitTypeReference(propertyType);
+        }
+    }
+
+    private void emitPropertyNameToken(PropertyNode node) {
+        if (node.getLineNumber() < 1) {
+            return;
+        }
+        int[] resolved = findNameNear(node.getLineNumber() - 1,
+                Math.max(0, node.getColumnNumber() - 1), node.getName(), 3);
+        if (resolved.length == 0) {
+            return;
+        }
+
+        addToken(resolved[0], resolved[1], node.getName().length(),
+                SemanticTokensProvider.TYPE_PROPERTY,
+                fieldModifiers(node.getModifiers()));
     }
 
     // ================================================================
@@ -712,11 +816,78 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             if (java.lang.reflect.Modifier.isFinal(field.getModifiers())) {
                 modifiers |= SemanticTokensProvider.MOD_READONLY;
             }
+        } else if (isTraitMemberReference(name)) {
+            tokenType = SemanticTokensProvider.TYPE_PROPERTY;
+            modifiers = getTraitMemberModifiers(name);
         } else {
             tokenType = SemanticTokensProvider.TYPE_VARIABLE;
         }
 
         addToken(line, col, name.length(), tokenType, modifiers);
+    }
+
+    private boolean isTraitMemberReference(String name) {
+        return findTraitMember(name) != null;
+    }
+
+    private int getTraitMemberModifiers(String name) {
+        TraitMemberDescriptor member = findTraitMember(name);
+        return member != null ? member.modifiers : 0;
+    }
+
+    private TraitMemberDescriptor findTraitMember(String name) {
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        ClassNode owner = classStack.peek();
+        if (owner == null) {
+            return null;
+        }
+        TraitMemberIndex index = traitMemberCache.computeIfAbsent(owner, this::indexTraitMembers);
+        return index.byName.get(name);
+    }
+
+    private TraitMemberIndex indexTraitMembers(ClassNode owner) {
+        TraitMemberIndex index = new TraitMemberIndex();
+        if (currentModule == null) {
+            return index;
+        }
+
+        for (FieldNode field : TraitMemberResolver.collectTraitFields(owner, currentModule, documentManager)) {
+            String fieldName = TraitMemberResolver.demangleTraitFieldName(field.getName());
+            index.byName.putIfAbsent(fieldName, new TraitMemberDescriptor(fieldModifiers(field.getModifiers())));
+        }
+
+        for (PropertyNode property : TraitMemberResolver.collectTraitProperties(owner, currentModule, documentManager)) {
+            FieldNode propertyField = property.getField();
+            int rawModifiers = propertyField != null ? propertyField.getModifiers() : property.getModifiers();
+            index.byName.putIfAbsent(property.getName(), new TraitMemberDescriptor(fieldModifiers(rawModifiers)));
+        }
+
+        return index;
+    }
+
+    private int fieldModifiers(int rawModifiers) {
+        int modifiers = 0;
+        if (java.lang.reflect.Modifier.isStatic(rawModifiers)) {
+            modifiers |= SemanticTokensProvider.MOD_STATIC;
+        }
+        if (java.lang.reflect.Modifier.isFinal(rawModifiers)) {
+            modifiers |= SemanticTokensProvider.MOD_READONLY;
+        }
+        return modifiers;
+    }
+
+    private static final class TraitMemberIndex {
+        private final Map<String, TraitMemberDescriptor> byName = new java.util.HashMap<>();
+    }
+
+    private static final class TraitMemberDescriptor {
+        private final int modifiers;
+
+        private TraitMemberDescriptor(int modifiers) {
+            this.modifiers = modifiers;
+        }
     }
 
     @Override

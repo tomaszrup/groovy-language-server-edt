@@ -35,6 +35,30 @@ import static org.junit.jupiter.api.Assertions.*;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 public class GroovyLsPerformanceTest {
 
+    private static final List<String> TOKEN_TYPES = List.of(
+            "namespace",
+            "type",
+            "class",
+            "enum",
+            "interface",
+            "struct",
+            "typeParameter",
+            "parameter",
+            "variable",
+            "property",
+            "enumMember",
+            "decorator",
+            "function",
+            "method",
+            "keyword",
+            "comment",
+            "string",
+            "number",
+            "regexp",
+            "operator",
+            "typeKeyword"
+    );
+
     // ---- Thresholds (p95 in milliseconds) ----
 
     private static final long COMPLETION_DOT_P95_MS         = 2000;
@@ -96,6 +120,8 @@ public class GroovyLsPerformanceTest {
         System.out.println("[PerfTest] Workspace generated at: " + workspaceRoot);
         System.out.println("[PerfTest] Representative files: " + files.size());
         System.out.println("[PerfTest] Stub JARs: " + generator.getJarPaths().size());
+
+        recordRealisticStartupMetrics(serverDir, javaHome, timeout);
 
         // 3. Start the language server
         harness = new LspClientHarness(Path.of(serverDir), javaHome, workspaceRoot, timeout);
@@ -264,8 +290,8 @@ public class GroovyLsPerformanceTest {
 
         for (int i = 0; i < HOVER_ITERATIONS; i++) {
             long start = System.currentTimeMillis();
-            var hover = harness.hover(target.toUri(), hoverLine, hoverCol)
-                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(harness.hover(target.toUri(), hoverLine, hoverCol)
+                .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
             result.record(elapsed);
         }
@@ -334,7 +360,7 @@ public class GroovyLsPerformanceTest {
             harness.didChange(target.toUri(), broken, i + 2);
 
             long start = System.currentTimeMillis();
-            List<Diagnostic> diags = diagFuture.get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(diagFuture.get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
 
             result.record(elapsed);
@@ -379,7 +405,7 @@ public class GroovyLsPerformanceTest {
             harness.didOpen(uri, source);
 
             long start = System.currentTimeMillis();
-            List<Diagnostic> diags = diagFuture.get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(diagFuture.get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
 
             result.record(elapsed);
@@ -405,8 +431,8 @@ public class GroovyLsPerformanceTest {
 
         for (int i = 0; i < SEMANTIC_ITERATIONS; i++) {
             long start = System.currentTimeMillis();
-            var tokens = harness.semanticTokensFull(target.toUri())
-                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(harness.semanticTokensFull(target.toUri())
+                .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
             result.record(elapsed);
         }
@@ -434,8 +460,8 @@ public class GroovyLsPerformanceTest {
 
         for (int i = 0; i < SEMANTIC_LARGE_ITERATIONS; i++) {
             long start = System.currentTimeMillis();
-            var tokens = harness.semanticTokensFull(largeFile.toUri())
-                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(harness.semanticTokensFull(largeFile.toUri())
+                .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
             result.record(elapsed);
         }
@@ -472,8 +498,8 @@ public class GroovyLsPerformanceTest {
 
         for (int i = 0; i < REFERENCES_ITERATIONS; i++) {
             long start = System.currentTimeMillis();
-            var refs = harness.references(target.toUri(), refLine, refCol)
-                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(harness.references(target.toUri(), refLine, refCol)
+                .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
             result.record(elapsed);
         }
@@ -501,8 +527,8 @@ public class GroovyLsPerformanceTest {
 
         for (int i = 0; i < REFERENCES_ITERATIONS; i++) {
             long start = System.currentTimeMillis();
-            var refs = harness.references(target.toUri(), classLine, classCol)
-                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(harness.references(target.toUri(), classLine, classCol)
+                .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
             result.record(elapsed);
         }
@@ -533,8 +559,8 @@ public class GroovyLsPerformanceTest {
         for (int i = 0; i < RENAME_ITERATIONS; i++) {
             long start = System.currentTimeMillis();
             // Request rename (prepare only — we don't apply the edit to keep the workspace stable)
-            var edit = harness.rename(target.toUri(), methodLine, methodCol, "renamedMethod" + i)
-                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            assertNotNull(harness.rename(target.toUri(), methodLine, methodCol, "renamedMethod" + i)
+                .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
             long elapsed = System.currentTimeMillis() - start;
             result.record(elapsed);
         }
@@ -669,6 +695,171 @@ public class GroovyLsPerformanceTest {
             }
         }
         return sb.toString();
+    }
+
+    private void recordStartupMetrics(LspClientHarness.StartupMetrics metrics) {
+        recordSingleMeasurement("Startup (process -> Ready)", metrics.processStartToReadyMs());
+        recordSingleMeasurement("Startup (initialize round trip)", metrics.initializeRoundTripMs());
+        recordSingleMeasurement("Startup (initialized -> Ready)", metrics.initializedToReadyMs());
+        for (Map.Entry<String, Long> entry : metrics.firstStatusTimesMs().entrySet()) {
+            recordSingleMeasurement("Startup status (" + entry.getKey() + ")", entry.getValue());
+        }
+    }
+
+    private void recordRealisticStartupMetrics(String serverDir, String javaHome, long timeout) throws Exception {
+        try (LspClientHarness startupHarness = new LspClientHarness(Path.of(serverDir), javaHome, workspaceRoot, timeout)) {
+            startupHarness.start(false);
+            startupHarness.sendClasspathUpdates(generator.getProjectNames(), generator.getJarPaths());
+            recordFirstUsableSemanticTokensStartup(startupHarness, files.get(0));
+            startupHarness.waitForReady();
+            recordStartupMetrics(startupHarness.getStartupMetrics());
+        }
+    }
+
+    private void recordFirstUsableSemanticTokensStartup(LspClientHarness startupHarness, WorkspaceGenerator.FileInfo fileInfo) throws Exception {
+        System.out.println("[PerfTest] Measuring first usable semantic tokens for: " + fileInfo.toUri());
+
+        String content = fileInfo.readContent();
+        long documentOpenedAtMs = System.currentTimeMillis();
+        startupHarness.didOpen(fileInfo.toUri(), content);
+
+        SemanticTokens usableTokens = null;
+        long usableResponseStartedAtMs = -1;
+        long usableResponseCompletedAtMs = -1;
+        long refreshCount = startupHarness.getSemanticTokensRefreshCount();
+        long deadlineAtMs = documentOpenedAtMs + REQUEST_TIMEOUT_MS;
+        int attempt = 0;
+
+        while (System.currentTimeMillis() < deadlineAtMs) {
+            attempt++;
+            usableResponseStartedAtMs = System.currentTimeMillis();
+            SemanticTokens candidate = startupHarness.semanticTokensFull(fileInfo.toUri())
+                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            usableResponseCompletedAtMs = System.currentTimeMillis();
+
+            if (isUsableStartupSemanticTokens(candidate, content, fileInfo)) {
+                usableTokens = candidate;
+                break;
+            }
+
+            boolean sawRefresh = startupHarness.waitForSemanticTokensRefresh(refreshCount, 1, TimeUnit.SECONDS);
+            refreshCount = startupHarness.getSemanticTokensRefreshCount();
+            if (!sawRefresh) {
+                Thread.sleep(200);
+            }
+        }
+
+        assertNotNull(usableTokens,
+                "Expected usable semantic tokens during startup for " + fileInfo.toUri());
+        assertExpectedStartupTokens(usableTokens, content, fileInfo, attempt);
+
+        recordSingleMeasurement("Startup (usable semantic tokens request)",
+                usableResponseCompletedAtMs - usableResponseStartedAtMs);
+        recordSingleMeasurement("Startup (open -> first usable semantic tokens)",
+                usableResponseCompletedAtMs - documentOpenedAtMs);
+        recordSingleMeasurement("Startup (process -> first usable semantic tokens)",
+                startupHarness.durationFromProcessStart(usableResponseCompletedAtMs));
+    }
+
+    private static boolean isUsableStartupSemanticTokens(
+            SemanticTokens semanticTokens,
+            String content,
+            WorkspaceGenerator.FileInfo fileInfo) {
+        try {
+            assertExpectedStartupTokens(semanticTokens, content, fileInfo, 0);
+            return true;
+        } catch (AssertionError error) {
+            return false;
+        }
+    }
+
+    private static void assertExpectedStartupTokens(
+            SemanticTokens semanticTokens,
+            String content,
+            WorkspaceGenerator.FileInfo fileInfo,
+            int attempt) {
+        assertNotNull(semanticTokens, "Expected a semantic tokens response during startup");
+        assertNotNull(semanticTokens.getData(), "Expected semantic tokens data during startup");
+        assertFalse(semanticTokens.getData().isEmpty(), "Expected non-empty semantic tokens during startup");
+        assertEquals(0, semanticTokens.getData().size() % 5, "Token data must be a multiple of 5");
+
+        List<DecodedSemanticToken> decodedTokens = decodeSemanticTokens(semanticTokens, content);
+        assertFalse(decodedTokens.isEmpty(), "Expected at least one decoded startup semantic token");
+
+        assertTrue(hasTokenWithAnyType(decodedTokens, "trait", Set.of("typeKeyword", "keyword")),
+            "Expected trait keyword token on startup (attempt " + attempt + ")");
+        assertTrue(hasTokenWithAnyType(decodedTokens, fileInfo.simpleClassName(), Set.of("struct", "class", "type")),
+            "Expected trait declaration token on startup (attempt " + attempt + ")");
+
+        assertTrue(
+                hasTokenWithAnyType(decodedTokens, "auditLog0", Set.of("property", "variable"))
+                        || hasTokenWithAnyType(decodedTokens, "entries0", Set.of("property", "variable"))
+                        || hasTokenWithAnyType(decodedTokens, "audit0", Set.of("method", "function"))
+                        || hasTokenWithAnyType(decodedTokens, "action", Set.of("parameter", "variable")),
+                "Expected at least one member or parameter token on startup (attempt " + attempt + ")");
+    }
+
+    private static boolean hasTokenWithAnyType(
+            List<DecodedSemanticToken> decodedTokens,
+            String text,
+            Set<String> tokenTypeNames) {
+        return decodedTokens.stream()
+                .anyMatch(token -> token.text().equals(text) && tokenTypeNames.contains(token.tokenTypeName()));
+    }
+
+    private static List<DecodedSemanticToken> decodeSemanticTokens(SemanticTokens semanticTokens, String content) {
+        List<Integer> data = semanticTokens.getData();
+        String[] lines = content.split("\n", -1);
+        List<DecodedSemanticToken> decodedTokens = new ArrayList<>();
+        int line = 0;
+        int startChar = 0;
+
+        for (int i = 0; i < data.size(); i += 5) {
+            int deltaLine = data.get(i);
+            int deltaStart = data.get(i + 1);
+            int length = data.get(i + 2);
+            int tokenType = data.get(i + 3);
+            int modifiers = data.get(i + 4);
+
+            line += deltaLine;
+            startChar = deltaLine == 0 ? startChar + deltaStart : deltaStart;
+
+            assertTrue(line >= 0 && line < lines.length, "Token line out of bounds: " + line);
+            assertTrue(startChar >= 0 && startChar + length <= lines[line].length(),
+                    "Token span out of bounds at line " + line + ", start " + startChar + ", length " + length);
+            assertTrue(tokenType >= 0 && tokenType < TOKEN_TYPES.size(), "Unknown token type index: " + tokenType);
+
+            decodedTokens.add(new DecodedSemanticToken(
+                    line,
+                    startChar,
+                    length,
+                    tokenType,
+                    modifiers,
+                    lines[line].substring(startChar, startChar + length),
+                    TOKEN_TYPES.get(tokenType)));
+        }
+
+        return decodedTokens;
+    }
+
+    private record DecodedSemanticToken(
+            int line,
+            int startChar,
+            int length,
+            int tokenType,
+            int modifiers,
+            String text,
+            String tokenTypeName) {
+        }
+
+    private void recordSingleMeasurement(String featureName, long elapsedMs) {
+        if (elapsedMs < 0) {
+            return;
+        }
+        PerformanceResult result = new PerformanceResult(featureName);
+        result.record(elapsedMs);
+        System.out.println(result);
+        allResults.add(result);
     }
 
     /**

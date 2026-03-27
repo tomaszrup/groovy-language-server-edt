@@ -781,12 +781,23 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<org.eclipse.lsp4j.SemanticTokens> semanticTokensFull(
             org.eclipse.lsp4j.SemanticTokensParams params) {
-        // Semantic tokens are non-essential during build — return empty to avoid
-        // blocking a thread on the workspace lock.  VS Code will re-request
-        // via workspace/semanticTokens/refresh after the build completes.
+        // During builds, avoid the JDT working-copy path so we do not block on
+        // the workspace lock. If we already have cached AST/content for the
+        // open document, return best-effort tokens immediately instead of
+        // waiting for the full build to complete.
         if (server.isBuildInProgress()) {
+            try {
+            org.eclipse.lsp4j.SemanticTokens tokens =
+                semanticTokensProvider.getSemanticTokensFullBestEffort(params);
+            return CompletableFuture.completedFuture(tokens != null
+                ? tokens
+                : new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>()));
+            } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                "Semantic tokens (full, best-effort) failed", e);
             return CompletableFuture.completedFuture(
-                    new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>()));
+                new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>()));
+            }
         }
 
         String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
@@ -831,6 +842,21 @@ public class GroovyTextDocumentService implements TextDocumentService {
     @Override
     public CompletableFuture<org.eclipse.lsp4j.SemanticTokens> semanticTokensRange(
             org.eclipse.lsp4j.SemanticTokensRangeParams params) {
+        if (server.isBuildInProgress()) {
+            try {
+            org.eclipse.lsp4j.SemanticTokens tokens =
+                semanticTokensProvider.getSemanticTokensRangeBestEffort(params);
+            return CompletableFuture.completedFuture(tokens != null
+                ? tokens
+                : new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>()));
+            } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                "Semantic tokens (range, best-effort) failed", e);
+            return CompletableFuture.completedFuture(
+                new org.eclipse.lsp4j.SemanticTokens(new ArrayList<>()));
+            }
+        }
+
         String uri = params.getTextDocument() != null ? params.getTextDocument().getUri() : null;
         String normalizedUri = uri != null ? DocumentManager.normalizeUri(uri) : null;
 

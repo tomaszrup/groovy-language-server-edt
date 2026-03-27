@@ -6,6 +6,12 @@ import org.springframework.beans.factory.annotation.Autowired
 import spock.lang.Specification
 
 trait AppContextTest {
+    int someInt = 42
+
+    int method() {
+        return someInt * 2
+    }
+
     @Autowired
     ApplicationContext context
     // This trait can be used to share common setup or utilities for tests that require the application context.
@@ -21,6 +27,9 @@ interface SoemethingTest {
 
 @SpringBootTest
 class SampleApplicationSpec extends Specification implements Trat, OthererName, AppContextTest, SoemethingTest {
+
+    @Autowired
+    ApplicationContext context
 
     def "abc loads"() {
         expect:
