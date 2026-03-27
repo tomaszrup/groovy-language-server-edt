@@ -47,6 +47,7 @@ import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
 
 class InlayHintProviderTest {
 
@@ -292,6 +293,97 @@ class InlayHintProviderTest {
         assertNotNull(hints);
         assertTrue(hints.stream().anyMatch(h -> "x:".equals(labelText(h))));
         assertTrue(hints.stream().anyMatch(h -> "y:".equals(labelText(h))));
+    }
+
+    @Test
+    void parameterCollectorVisitModuleUsesBinaryConstructorMetadataForTypeTargets() throws Exception {
+        String source = """
+                class Pt { Pt(int x, int y) {} }
+                new Pt(10, 20)
+                """;
+        ModuleNode module = parseModule(source);
+
+        IMethod sourceConstructor = mock(IMethod.class);
+        when(sourceConstructor.isConstructor()).thenReturn(true);
+        when(sourceConstructor.getParameterTypes()).thenReturn(new String[] {"I", "I"});
+        when(sourceConstructor.getParameterNames()).thenReturn(new String[] {"p50", "p51"});
+        when(sourceConstructor.getFlags()).thenReturn(0);
+
+        IType sourceType = mock(IType.class);
+        when(sourceType.getMethods()).thenReturn(new IMethod[] {sourceConstructor});
+
+        IMethod binaryConstructor = mock(IMethod.class);
+        when(binaryConstructor.isConstructor()).thenReturn(true);
+        when(binaryConstructor.getParameterTypes()).thenReturn(new String[] {"I", "I"});
+        when(binaryConstructor.getParameterNames()).thenReturn(new String[] {"x", "y"});
+        when(binaryConstructor.getFlags()).thenReturn(0);
+
+        IType binaryType = mock(IType.class);
+        when(binaryType.getMethods()).thenReturn(new IMethod[] {binaryConstructor});
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.codeSelect(org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.eq(0)))
+                .thenReturn(new IJavaElement[] {sourceType});
+
+        try (MockedStatic<JavaBinaryMemberResolver> resolverMock = org.mockito.Mockito.mockStatic(JavaBinaryMemberResolver.class)) {
+            resolverMock.when(() -> JavaBinaryMemberResolver.resolveMemberSource(sourceType)).thenReturn(binaryType);
+
+            Object collector = createCollector(source, new Range(new Position(0, 0), new Position(5, 0)), workingCopy);
+            invokeCollector(collector, "visitModule", new Class<?>[] {ModuleNode.class}, new Object[] {module});
+
+            @SuppressWarnings("unchecked")
+            List<InlayHint> hints = (List<InlayHint>) invokeCollector(collector, "getHints", new Class<?>[0], new Object[0]);
+            assertNotNull(hints);
+            assertTrue(hints.stream().anyMatch(h -> "x:".equals(labelText(h))));
+            assertTrue(hints.stream().anyMatch(h -> "y:".equals(labelText(h))));
+            assertTrue(hints.stream().noneMatch(h -> "p50:".equals(labelText(h))));
+            assertTrue(hints.stream().noneMatch(h -> "p51:".equals(labelText(h))));
+        }
+    }
+
+    @Test
+    void parameterCollectorVisitModuleRemapsConstructorMethodTargetsToBinaryMetadata() throws Exception {
+        String source = """
+                class Pt { Pt(int x, int y) {} }
+                new Pt(10, 20)
+                """;
+        ModuleNode module = parseModule(source);
+
+        IType sourceType = mock(IType.class);
+        IMethod sourceConstructor = mock(IMethod.class);
+        when(sourceConstructor.isConstructor()).thenReturn(true);
+        when(sourceConstructor.getParameterTypes()).thenReturn(new String[] {"I", "I"});
+        when(sourceConstructor.getParameterNames()).thenReturn(new String[] {"p50", "p51"});
+        when(sourceConstructor.getFlags()).thenReturn(0);
+        when(sourceConstructor.getDeclaringType()).thenReturn(sourceType);
+
+        IMethod binaryConstructor = mock(IMethod.class);
+        when(binaryConstructor.isConstructor()).thenReturn(true);
+        when(binaryConstructor.getParameterTypes()).thenReturn(new String[] {"I", "I"});
+        when(binaryConstructor.getParameterNames()).thenReturn(new String[] {"x", "y"});
+        when(binaryConstructor.getFlags()).thenReturn(0);
+
+        IType binaryType = mock(IType.class);
+        when(binaryType.getMethods()).thenReturn(new IMethod[] {binaryConstructor});
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.codeSelect(org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.eq(0)))
+                .thenReturn(new IJavaElement[] {sourceConstructor});
+
+        try (MockedStatic<JavaBinaryMemberResolver> resolverMock = org.mockito.Mockito.mockStatic(JavaBinaryMemberResolver.class)) {
+            resolverMock.when(() -> JavaBinaryMemberResolver.resolveMemberSource(sourceType)).thenReturn(binaryType);
+
+            Object collector = createCollector(source, new Range(new Position(0, 0), new Position(5, 0)), workingCopy);
+            invokeCollector(collector, "visitModule", new Class<?>[] {ModuleNode.class}, new Object[] {module});
+
+            @SuppressWarnings("unchecked")
+            List<InlayHint> hints = (List<InlayHint>) invokeCollector(collector, "getHints", new Class<?>[0], new Object[0]);
+            assertNotNull(hints);
+            assertTrue(hints.stream().anyMatch(h -> "x:".equals(labelText(h))));
+            assertTrue(hints.stream().anyMatch(h -> "y:".equals(labelText(h))));
+            assertTrue(hints.stream().noneMatch(h -> "p50:".equals(labelText(h))));
+            assertTrue(hints.stream().noneMatch(h -> "p51:".equals(labelText(h))));
+        }
     }
 
     @Test

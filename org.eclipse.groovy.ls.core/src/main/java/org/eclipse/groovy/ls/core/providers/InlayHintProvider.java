@@ -921,17 +921,67 @@ public class InlayHintProvider {
                 throws JavaModelException {
             if (element instanceof IMethod method) {
                 if (method.isConstructor()) {
-                    constructors.add(method);
+                    constructors.add(remapConstructorToResolved(method));
                 }
                 return;
             }
 
             if (element instanceof IType type) {
-                for (IMethod method : type.getMethods()) {
+                IType resolvedType = JavaBinaryMemberResolver.resolveMemberSource(type);
+                if (resolvedType == null) {
+                    resolvedType = type;
+                }
+                for (IMethod method : resolvedType.getMethods()) {
                     if (method.isConstructor()) {
                         constructors.add(method);
                     }
                 }
+            }
+        }
+
+        private IMethod remapConstructorToResolved(IMethod sourceMethod) throws JavaModelException {
+            if (sourceMethod == null || !sourceMethod.isConstructor()) {
+                return sourceMethod;
+            }
+
+            IType declaringType = sourceMethod.getDeclaringType();
+            if (declaringType == null) {
+                return sourceMethod;
+            }
+
+            IType resolvedType = JavaBinaryMemberResolver.resolveMemberSource(declaringType);
+            if (resolvedType == null || resolvedType == declaringType) {
+                return sourceMethod;
+            }
+
+            String[] sourceParameterTypes = sourceMethod.getParameterTypes();
+            for (IMethod candidate : resolvedType.getMethods()) {
+                if (candidate.isConstructor() && hasMatchingParameterTypes(sourceParameterTypes, candidate)) {
+                    return candidate;
+                }
+            }
+
+            return sourceMethod;
+        }
+
+        private boolean hasMatchingParameterTypes(String[] sourceParameterTypes, IMethod candidate) {
+            try {
+                String[] candidateParameterTypes = candidate.getParameterTypes();
+                if (sourceParameterTypes == null
+                        || candidateParameterTypes == null
+                        || sourceParameterTypes.length != candidateParameterTypes.length) {
+                    return false;
+                }
+
+                for (int index = 0; index < sourceParameterTypes.length; index++) {
+                    if (!sourceParameterTypes[index].equals(candidateParameterTypes[index])) {
+                        return false;
+                    }
+                }
+
+                return true;
+            } catch (Exception ignored) {
+                return false;
             }
         }
 
