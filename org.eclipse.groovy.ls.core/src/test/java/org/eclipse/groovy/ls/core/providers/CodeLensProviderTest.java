@@ -19,12 +19,17 @@ import static org.mockito.Mockito.when;
 import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.lsp4j.CodeLens;
+import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.CodeLensParams;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
 
 import com.google.gson.JsonObject;
 
@@ -121,6 +126,67 @@ class CodeLensProviderTest {
         assertNotNull(result);
         assertNotNull(result.getCommand());
         assertEquals(REFERENCES_UNAVAILABLE_TITLE, result.getCommand().getTitle());
+    }
+
+    @Test
+    void resolveCodeLensLeavesUnusedDeclarationHidden() {
+        String uri = "file:///Foo.groovy";
+        String handleId = "=Proj/src<pkg{File.groovy[Foo~unused";
+        IJavaElement element = mock(IJavaElement.class);
+        when(element.exists()).thenReturn(true);
+
+        CodeLens lens = new CodeLens();
+        lens.setRange(new Range(new Position(3, 4), new Position(3, 4)));
+        JsonObject data = new JsonObject();
+        data.addProperty("handleId", handleId);
+        data.addProperty("uri", uri);
+        lens.setData(data);
+
+        try (MockedStatic<JavaCore> javaCoreMock = org.mockito.Mockito.mockStatic(JavaCore.class);
+             MockedStatic<ReferenceSearchHelper> searchMock = org.mockito.Mockito.mockStatic(ReferenceSearchHelper.class)) {
+
+            javaCoreMock.when(() -> JavaCore.create(handleId)).thenReturn(element);
+            searchMock.when(() -> ReferenceSearchHelper.findReferenceLocations(element, uri, documentManager))
+                    .thenReturn(List.of());
+
+            CodeLens result = provider.resolveCodeLens(lens);
+
+            assertNotNull(result);
+            assertNull(result.getCommand());
+        }
+    }
+
+    @Test
+    void resolveCodeLensAddsShowReferencesCommandWhenReferencesExist() {
+        String uri = "file:///Foo.groovy";
+        String handleId = "=Proj/src<pkg{File.groovy[Foo~bar";
+        IJavaElement element = mock(IJavaElement.class);
+        when(element.exists()).thenReturn(true);
+
+        CodeLens lens = new CodeLens();
+        Position position = new Position(1, 2);
+        lens.setRange(new Range(position, position));
+        JsonObject data = new JsonObject();
+        data.addProperty("handleId", handleId);
+        data.addProperty("uri", uri);
+        lens.setData(data);
+
+        List<Location> locations = List.of(new Location(uri, new Range(position, position)));
+
+        try (MockedStatic<JavaCore> javaCoreMock = org.mockito.Mockito.mockStatic(JavaCore.class);
+             MockedStatic<ReferenceSearchHelper> searchMock = org.mockito.Mockito.mockStatic(ReferenceSearchHelper.class)) {
+
+            javaCoreMock.when(() -> JavaCore.create(handleId)).thenReturn(element);
+            searchMock.when(() -> ReferenceSearchHelper.findReferenceLocations(element, uri, documentManager))
+                    .thenReturn(locations);
+
+            CodeLens result = provider.resolveCodeLens(lens);
+
+            assertNotNull(result.getCommand());
+            assertEquals("1 reference", result.getCommand().getTitle());
+            assertEquals("groovy.showReferences", result.getCommand().getCommand());
+            assertEquals(List.of(uri, position, locations), result.getCommand().getArguments());
+        }
     }
 
     // ---- offsetToPosition ----
@@ -253,6 +319,8 @@ class CodeLensProviderTest {
 
         when(mockType.getMethods()).thenReturn(new org.eclipse.jdt.core.IMethod[]{mockMethod});
         when(mockType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[0]);
+        localProvider.referencedElements.add(mockType);
+        localProvider.referencedElements.add(mockMethod);
 
         java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
         java.lang.reflect.Method m = CodeLensProvider.class.getDeclaredMethod(
@@ -287,6 +355,8 @@ class CodeLensProviderTest {
         when(innerType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[0]);
 
         when(outerType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[]{innerType});
+        localProvider.referencedElements.add(outerType);
+        localProvider.referencedElements.add(innerType);
 
         java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
         String content = "class Outer {\n    class Inner {}\n}";
@@ -300,7 +370,7 @@ class CodeLensProviderTest {
     }
 
     @Test
-    void addCodeLensesForTypeIncludesDeclarationsWithoutInitialReferenceCheck() throws Exception {
+    void addCodeLensesForTypeSkipsDeclarationsWithoutReferences() throws Exception {
         RecordingCodeLensProvider localProvider = new RecordingCodeLensProvider(documentManager);
         org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
         org.eclipse.jdt.core.ISourceRange typeNameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
@@ -325,6 +395,8 @@ class CodeLensProviderTest {
 
         when(mockType.getMethods()).thenReturn(new org.eclipse.jdt.core.IMethod[]{referencedMethod, unusedMethod});
         when(mockType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[0]);
+        localProvider.referencedElements.add(mockType);
+        localProvider.referencedElements.add(referencedMethod);
 
         java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
         java.lang.reflect.Method m = CodeLensProvider.class.getDeclaredMethod(
@@ -332,13 +404,15 @@ class CodeLensProviderTest {
         m.setAccessible(true);
         m.invoke(localProvider, mockType, "class Foo {\n    void bar() {}\n    void baz() {}\n}", "file:///Foo.groovy", lenses);
 
-    assertEquals(3, lenses.size());
-    JsonObject typeData = (JsonObject) lenses.get(0).getData();
-    JsonObject firstMethodData = (JsonObject) lenses.get(1).getData();
-    JsonObject secondMethodData = (JsonObject) lenses.get(2).getData();
-    assertEquals("=Proj/src<pkg{File.groovy[Foo", typeData.get("handleId").getAsString());
-    assertEquals("=Proj/src<pkg{File.groovy[Foo~bar", firstMethodData.get("handleId").getAsString());
-    assertEquals("=Proj/src<pkg{File.groovy[Foo~baz", secondMethodData.get("handleId").getAsString());
+        assertEquals(2, lenses.size());
+        JsonObject typeData = (JsonObject) lenses.get(0).getData();
+        JsonObject firstMethodData = (JsonObject) lenses.get(1).getData();
+        assertEquals("=Proj/src<pkg{File.groovy[Foo", typeData.get("handleId").getAsString());
+        assertEquals("=Proj/src<pkg{File.groovy[Foo~bar", firstMethodData.get("handleId").getAsString());
+        assertTrue(lenses.stream().noneMatch(lens -> {
+            JsonObject lensData = (JsonObject) lens.getData();
+            return "=Proj/src<pkg{File.groovy[Foo~baz".equals(lensData.get("handleId").getAsString());
+        }));
     }
 
     @Test

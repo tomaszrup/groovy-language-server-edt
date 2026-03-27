@@ -178,6 +178,12 @@ public class CodeLensProvider {
             }
             int count = locations.size();
 
+            if (count == 0) {
+                // Leave the lens without a command so clients do not render a
+                // visible "0 references" label for unused declarations.
+                return codeLens;
+            }
+
             String label = count == 1 ? "1 reference" : count + " references";
 
             Command cmd = new Command(label, SHOW_REFERENCES_COMMAND);
@@ -203,17 +209,16 @@ public class CodeLensProvider {
 
     private void addCodeLensesForType(IType type, String content, String uri, List<CodeLens> lenses)
             throws JavaModelException {
-        // Initial code lens creation must stay cheap because it shares the
-        // background executor with folding, inlay hints, and document symbols.
-        // Actual reference counting is deferred to resolveCodeLens.
-        CodeLens typeLens = createUnresolvedCodeLens(type, content);
+        // Only publish declarations that have at least one reference so the
+        // client never renders placeholder lenses for unused symbols.
+        CodeLens typeLens = createCodeLensIfReferenced(type, content, uri);
         if (typeLens != null) {
             lenses.add(typeLens);
         }
 
         // Code lens for each method
         for (IMethod method : type.getMethods()) {
-            CodeLens methodLens = createUnresolvedCodeLens(method, content);
+            CodeLens methodLens = createCodeLensIfReferenced(method, content, uri);
             if (methodLens != null) {
                 lenses.add(methodLens);
             }

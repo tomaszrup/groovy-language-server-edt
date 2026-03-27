@@ -8,8 +8,8 @@ import spock.lang.Specification
 trait AppContextTest {
     int someInt = 42
 
-    int method() {
-        return someInt * 2
+    int method(int c) {
+        return someInt * c
     }
 
     @Autowired
@@ -34,9 +34,10 @@ class SampleApplicationSpec extends Specification implements Trat, OthererName, 
     def "abc loads"() {
         expect:
         true
-        def x = new Bababxa()
+        method(2)
+        def x = new Bababxa("Test Name")
         def z = add(5, 10)
-        context.getApplicationName()
+        def y = context.getApplicationName()
     }
 
     @Override
