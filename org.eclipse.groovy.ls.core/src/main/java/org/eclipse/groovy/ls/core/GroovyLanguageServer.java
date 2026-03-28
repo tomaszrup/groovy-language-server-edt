@@ -105,6 +105,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private static final String STATUS_READY = "Ready";
     private static final String GROOVY_PROJECT_NAME = "GroovyProject";
     private static final String GROOVY_PROJECT_PREFIX = "Groovy_";
+    private static final String EXTERNAL_GROOVY_PROJECT_PREFIX = "ExtGroovy_";
     private static final String LINKED_FOLDER_NAME = "linked";
     private static final String GROOVY_NATURE_ID = "org.eclipse.jdt.groovy.core.groovyNature";
     private static final String JRE_CONTAINER_ID = "org.eclipse.jdt.launching.JRE_CONTAINER";
@@ -1586,15 +1587,17 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     /**
      * Delete any stale Eclipse projects from previous runs.
-     * Projects named "Groovy_*" or "GroovyProject" are removed so that
-     * fresh linked-folder projects can be created cleanly.
+     * Projects named "Groovy_*", "ExtGroovy_*", or "GroovyProject" are removed
+     * so that fresh linked-folder projects can be created cleanly.
      */
     private void cleanupStaleProjects() {
         try {
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject p : projects) {
                 String name = p.getName();
-                if (name.startsWith(GROOVY_PROJECT_PREFIX) || name.equals(GROOVY_PROJECT_NAME)) {
+                if (name.startsWith(GROOVY_PROJECT_PREFIX)
+                        || name.startsWith(EXTERNAL_GROOVY_PROJECT_PREFIX)
+                        || name.equals(GROOVY_PROJECT_NAME)) {
                     GroovyLanguageServerPlugin.logInfo(
                             "[workspace] Deleting stale project: " + name);
                     // IMPORTANT: first arg=false means do NOT delete disk contents.

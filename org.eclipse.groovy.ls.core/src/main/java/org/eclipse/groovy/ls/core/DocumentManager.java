@@ -55,6 +55,8 @@ import org.eclipse.lsp4j.services.LanguageClient;
 public class DocumentManager {
 
     private static final String CLASSES_LOG_SEGMENT = " classes=";
+    private static final String EXTERNAL_PROJECT_PREFIX = "ExtGroovy_";
+    private static final String LINKED_FOLDER_NAME = "linked";
     private static final long STANDALONE_PARSE_DEBOUNCE_MS = 300;
 
     // ── codeSelect result cache ───────────────────────────────────────────
@@ -936,17 +938,32 @@ public class DocumentManager {
 
             // Multiple matches: prefer the file whose project's effective
             // content root is the longest (most specific).  This is consistent
-            // with GroovyLanguageServer.findEclipseProjectByPath().
+            // with GroovyLanguageServer.findEclipseProjectByPath().  When two
+            // projects point at the same root, prefer the one with the richer
+            // resolved classpath and avoid catch-all ExtGroovy_* fallbacks.
             ICompilationUnit bestCu = null;
             int bestContentRootLength = -1;
+            int bestLibraryEntryCount = -1;
+            boolean bestIsExternalFallback = true;
 
             for (IFile file : files) {
                 org.eclipse.jdt.core.IJavaElement element = JavaCore.create(file);
                 if (element instanceof ICompilationUnit cu) {
-                    int contentRootLen = getProjectContentRootLength(file.getProject());
+                    IProject project = file.getProject();
+                    int contentRootLen = getProjectContentRootLength(project);
+                    int libraryEntryCount = getProjectLibraryEntryCount(project);
+                    boolean isExternalFallback = isExternalFallbackProject(project);
 
-                    if (contentRootLen > bestContentRootLength) {
+                    if (contentRootLen > bestContentRootLength
+                            || (contentRootLen == bestContentRootLength
+                                    && libraryEntryCount > bestLibraryEntryCount)
+                            || (contentRootLen == bestContentRootLength
+                                    && libraryEntryCount == bestLibraryEntryCount
+                                    && bestIsExternalFallback
+                                    && !isExternalFallback)) {
                         bestContentRootLength = contentRootLen;
+                        bestLibraryEntryCount = libraryEntryCount;
+                        bestIsExternalFallback = isExternalFallback;
                         bestCu = cu;
                     }
                 }
@@ -976,7 +993,7 @@ public class DocumentManager {
     private int getProjectContentRootLength(IProject project) {
         // 1. Check for a "linked" folder — this is the primary mechanism
         //    used by on-the-fly subproject setup
-        IResource linkedRoot = project.findMember("linked");
+        IResource linkedRoot = project.findMember(LINKED_FOLDER_NAME);
         if (linkedRoot != null && linkedRoot.isLinked()) {
             org.eclipse.core.runtime.IPath linkedLocation =
                     linkedRoot.getLocation();
@@ -1006,6 +1023,29 @@ public class DocumentManager {
         // 3. Fallback: workspace-internal project without linked folder.
         //    Return 0 so it loses to any project with a real content root.
         return 0;
+    }
+
+    private int getProjectLibraryEntryCount(IProject project) {
+        try {
+            IJavaProject javaProject = JavaCore.create(project);
+            if (javaProject == null) {
+                return 0;
+            }
+
+            int count = 0;
+            for (IClasspathEntry entry : javaProject.getRawClasspath()) {
+                if (entry.getEntryKind() == IClasspathEntry.CPE_LIBRARY) {
+                    count++;
+                }
+            }
+            return count;
+        } catch (JavaModelException e) {
+            return 0;
+        }
+    }
+
+    private boolean isExternalFallbackProject(IProject project) {
+        return project != null && project.getName().startsWith(EXTERNAL_PROJECT_PREFIX);
     }
 
     /**
@@ -1053,14 +1093,23 @@ public class DocumentManager {
         try {
             IWorkspace workspace = ResourcesPlugin.getWorkspace();
 
+            IProject existingProject = findExistingProjectForRoot(workspace, projectRoot);
+            if (existingProject != null) {
+                refreshProjectLinkedRoot(existingProject);
+                GroovyLanguageServerPlugin.logInfo(
+                        "Reusing existing Eclipse project '" + existingProject.getName()
+                        + "' for " + projectRoot.getAbsolutePath());
+                return;
+            }
+
             // Generate a unique project name based on the directory name
             String baseName = projectRoot.getName();
-            String projectName = "ExtGroovy_" + baseName;
+            String projectName = EXTERNAL_PROJECT_PREFIX + baseName;
 
             // Ensure unique name if a project with this name already exists
             int counter = 1;
             while (workspace.getRoot().getProject(projectName).exists()) {
-                projectName = "ExtGroovy_" + baseName + "_" + counter++;
+                projectName = EXTERNAL_PROJECT_PREFIX + baseName + "_" + counter++;
             }
 
             IProject project = workspace.getRoot().getProject(projectName);
@@ -1095,6 +1144,39 @@ public class DocumentManager {
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to import external project from " + projectRoot.getAbsolutePath(), e);
+        }
+    }
+
+    private IProject findExistingProjectForRoot(IWorkspace workspace, java.io.File projectRoot) {
+        String targetPath = projectRoot.getAbsolutePath();
+        for (IProject project : workspace.getRoot().getProjects()) {
+            if (!project.exists() || !project.isOpen()) {
+                continue;
+            }
+
+            IResource linkedRoot = project.findMember(LINKED_FOLDER_NAME);
+            if (linkedRoot == null || !linkedRoot.isLinked()) {
+                continue;
+            }
+
+            org.eclipse.core.runtime.IPath linkedLocation = linkedRoot.getLocation();
+            if (linkedLocation != null
+                    && targetPath.equals(linkedLocation.toFile().getAbsolutePath())) {
+                return project;
+            }
+        }
+        return null;
+    }
+
+    private void refreshProjectLinkedRoot(IProject project) {
+        try {
+            IResource linkedRoot = project.findMember(LINKED_FOLDER_NAME);
+            if (linkedRoot != null) {
+                linkedRoot.refreshLocal(IResource.DEPTH_INFINITE, new NullProgressMonitor());
+            }
+        } catch (org.eclipse.core.runtime.CoreException e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to refresh linked root for project " + project.getName(), e);
         }
     }
 
