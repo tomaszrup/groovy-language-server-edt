@@ -9,10 +9,11 @@
  *******************************************************************************/
 package org.eclipse.groovy.ls.core.providers;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -23,8 +24,6 @@ import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
-import org.eclipse.jdt.core.search.SearchEngine;
-import org.eclipse.jdt.core.search.SearchParticipant;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchMatch;
 import org.eclipse.jdt.core.search.SearchRequestor;
@@ -69,8 +68,6 @@ final class ReferenceSearchHelper {
             IJavaSearchScope scope = SearchScopeHelper.createSourceScope(javaProject, uri);
 
             boolean[] found = {false};
-            SearchEngine engine = new SearchEngine();
-
             org.eclipse.core.runtime.IProgressMonitor cancelOnFound =
                     new org.eclipse.core.runtime.NullProgressMonitor() {
                         @Override
@@ -79,8 +76,7 @@ final class ReferenceSearchHelper {
                         }
                     };
 
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+            JdtSearchSupport.search(pattern,
                     scope,
                     new SearchRequestor() {
                         @Override
@@ -101,6 +97,7 @@ final class ReferenceSearchHelper {
     private static List<Location> findReferenceLocationsWithJdt(
             IJavaElement element, String uri, DocumentManager documentManager) {
         List<Location> locations = new ArrayList<>();
+        Map<String, String> contentCache = new HashMap<>();
         try {
             SearchPattern pattern = SearchPattern.createPattern(
                     element, IJavaSearchConstants.REFERENCES);
@@ -110,15 +107,12 @@ final class ReferenceSearchHelper {
 
             org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
             IJavaSearchScope scope = SearchScopeHelper.createSourceScope(javaProject, uri);
-            SearchEngine engine = new SearchEngine();
-
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+            JdtSearchSupport.search(pattern,
                     scope,
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
-                            Location location = toLocation(match, documentManager);
+                            Location location = toLocation(match, documentManager, contentCache);
                             if (location != null) {
                                 locations.add(location);
                             }
@@ -257,7 +251,9 @@ final class ReferenceSearchHelper {
         return uri != null && uri.toLowerCase(java.util.Locale.ROOT).endsWith(".groovy");
     }
 
-    private static Location toLocation(SearchMatch match, DocumentManager documentManager) {
+    private static Location toLocation(SearchMatch match,
+            DocumentManager documentManager,
+            Map<String, String> contentCache) {
         try {
             IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -265,7 +261,7 @@ final class ReferenceSearchHelper {
             }
 
             String targetUri = DocumentManager.normalizeUri(resource.getLocationURI().toString());
-            String content = readContent(documentManager, targetUri, resource);
+            String content = readContent(documentManager, targetUri, resource, contentCache);
 
             int startOffset = match.getOffset();
             int endOffset = startOffset + match.getLength();
@@ -284,21 +280,17 @@ final class ReferenceSearchHelper {
         }
     }
 
+    @SuppressWarnings("unused")
     private static String readContent(
             DocumentManager documentManager, String targetUri, IResource resource) {
-        String content = documentManager.getContent(targetUri);
-        if (content != null) {
-            return content;
-        }
+        return readContent(documentManager, targetUri, resource, null);
+    }
 
-        if (resource instanceof IFile file) {
-            try (java.io.InputStream is = file.getContents()) {
-                return new String(is.readAllBytes(), StandardCharsets.UTF_8);
-            } catch (Exception e) {
-                return null;
-            }
-        }
-
-        return null;
+    private static String readContent(
+            DocumentManager documentManager,
+            String targetUri,
+            IResource resource,
+            Map<String, String> contentCache) {
+        return JdtSearchSupport.readContent(documentManager, targetUri, resource, contentCache);
     }
 }

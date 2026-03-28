@@ -405,6 +405,7 @@ class GroovyTextDocumentServiceTest {
         service.didChange(changeParams);
 
         assertEquals("class Changed {}", documentManager.getContent("file:///test/Change.groovy"));
+        verify(diagnostics).publishDiagnosticsAfterChange("file:///test/Change.groovy");
     }
 
     // ---- Additional delegation tests for untested methods ----

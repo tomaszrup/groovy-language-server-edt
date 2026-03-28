@@ -13,12 +13,20 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import org.codehaus.groovy.ast.ClassHelper;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.MethodNode;
@@ -26,12 +34,18 @@ import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 class TraitMemberResolverTest {
 
     private final GroovyCompilerService compilerService = new GroovyCompilerService();
     private final DocumentManager documentManager = new DocumentManager();
+
+    @AfterEach
+    void tearDown() {
+        TraitMemberResolver.invalidateCache();
+    }
 
     @Test
     void resolveTraitClassNodeFindsDeclarationInCurrentModule() {
@@ -332,6 +346,91 @@ class TraitMemberResolverTest {
         assertEquals(emptyRef, resolved); // Returns original when name is empty
     }
 
+    @Test
+    void findTraitDeclarationUriRefreshesAfterInvalidation() {
+        AtomicReference<Set<String>> openUris = new AtomicReference<>(Set.of("file:///trait-one.groovy"));
+        Map<String, ModuleNode> modules = new HashMap<>();
+        modules.put("file:///trait-one.groovy", moduleWith(createTrait("pkg.MyTrait")));
+
+        DocumentManager mockDocumentManager = mockDocumentManager(openUris, modules);
+        ClassNode ifaceRef = new ClassNode("pkg.MyTrait", 0, ClassHelper.OBJECT_TYPE);
+        ModuleNode currentModule = emptyModule();
+
+        assertEquals("file:///trait-one.groovy",
+                TraitMemberResolver.findTraitDeclarationUri(ifaceRef, "file:///current.groovy", currentModule, mockDocumentManager));
+
+        openUris.set(Set.of("file:///trait-two.groovy"));
+        modules.put("file:///trait-two.groovy", moduleWith(createTrait("pkg.MyTrait")));
+
+        assertEquals("file:///trait-one.groovy",
+                TraitMemberResolver.findTraitDeclarationUri(ifaceRef, "file:///current.groovy", currentModule, mockDocumentManager));
+
+        TraitMemberResolver.invalidateCache();
+        modules.remove("file:///trait-one.groovy");
+
+        assertEquals("file:///trait-two.groovy",
+                TraitMemberResolver.findTraitDeclarationUri(ifaceRef, "file:///current.groovy", currentModule, mockDocumentManager));
+    }
+
+    @Test
+    void collectTraitFieldsRefreshesHelperLookupAfterInvalidation() {
+        AtomicReference<Set<String>> openUris = new AtomicReference<>(Set.of("file:///trait-fields-one.groovy"));
+        Map<String, ModuleNode> modules = new HashMap<>();
+
+        ClassNode firstTrait = createTrait("pkg.MyTrait");
+        ClassNode firstHelper = createFieldHelper("pkg.MyTrait", "pkg_MyTrait__firstField");
+        modules.put("file:///trait-fields-one.groovy", moduleWith(firstTrait, firstHelper));
+
+        DocumentManager mockDocumentManager = mockDocumentManager(openUris, modules);
+        ModuleNode currentModule = emptyModule();
+        ClassNode owner = createOwnerWithTrait("pkg.Owner", "pkg.MyTrait");
+
+        List<FieldNode> firstFields = TraitMemberResolver.collectTraitFields(owner, currentModule, mockDocumentManager);
+        assertEquals(1, firstFields.size());
+        assertEquals("firstField", TraitMemberResolver.demangleTraitFieldName(firstFields.get(0).getName()));
+
+        ClassNode secondTrait = createTrait("pkg.MyTrait");
+        ClassNode secondHelper = createFieldHelper("pkg.MyTrait", "pkg_MyTrait__secondField");
+        openUris.set(Set.of("file:///trait-fields-two.groovy"));
+        modules.put("file:///trait-fields-two.groovy", moduleWith(secondTrait, secondHelper));
+
+        List<FieldNode> cachedFields = TraitMemberResolver.collectTraitFields(owner, currentModule, mockDocumentManager);
+        assertEquals(1, cachedFields.size());
+        assertEquals("firstField", TraitMemberResolver.demangleTraitFieldName(cachedFields.get(0).getName()));
+
+        TraitMemberResolver.invalidateCache();
+        modules.remove("file:///trait-fields-one.groovy");
+
+        List<FieldNode> refreshedFields = TraitMemberResolver.collectTraitFields(owner, currentModule, mockDocumentManager);
+        assertEquals(1, refreshedFields.size());
+        assertEquals("secondField", TraitMemberResolver.demangleTraitFieldName(refreshedFields.get(0).getName()));
+    }
+
+    @Test
+    void resolveTraitClassNodeUsesCachedDeclarationUntilInvalidated() {
+        AtomicReference<Set<String>> openUris = new AtomicReference<>(Set.of("file:///trait-node-one.groovy"));
+        Map<String, ModuleNode> modules = new HashMap<>();
+        ClassNode firstTrait = createTrait("pkg.MyTrait");
+        modules.put("file:///trait-node-one.groovy", moduleWith(firstTrait));
+
+        DocumentManager mockDocumentManager = mockDocumentManager(openUris, modules);
+        ClassNode ifaceRef = new ClassNode("pkg.MyTrait", 0, ClassHelper.OBJECT_TYPE);
+        ModuleNode currentModule = emptyModule();
+
+        assertSame(firstTrait, TraitMemberResolver.resolveTraitClassNode(ifaceRef, currentModule, mockDocumentManager));
+
+        ClassNode secondTrait = createTrait("pkg.MyTrait");
+        openUris.set(Set.of("file:///trait-node-two.groovy"));
+        modules.put("file:///trait-node-two.groovy", moduleWith(secondTrait));
+
+        assertSame(firstTrait, TraitMemberResolver.resolveTraitClassNode(ifaceRef, currentModule, mockDocumentManager));
+
+        TraitMemberResolver.invalidateCache();
+        modules.remove("file:///trait-node-one.groovy");
+
+        assertSame(secondTrait, TraitMemberResolver.resolveTraitClassNode(ifaceRef, currentModule, mockDocumentManager));
+    }
+
     private ModuleNode parseModule(String source, String uri) {
         GroovyCompilerService.ParseResult result = compilerService.parse(uri, source);
         assertTrue(result.hasAST(), "Expected parser to produce AST for trait fixture");
@@ -344,6 +443,46 @@ class TraitMemberResolverTest {
                 .filter(classNode -> simpleName.equals(classNode.getNameWithoutPackage()))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("Class not found: " + simpleName));
+    }
+
+    private DocumentManager mockDocumentManager(AtomicReference<Set<String>> openUris, Map<String, ModuleNode> modules) {
+        DocumentManager mockDocumentManager = mock(DocumentManager.class);
+        when(mockDocumentManager.getOpenDocumentUris()).thenAnswer(invocation -> openUris.get());
+        when(mockDocumentManager.getCachedGroovyAST(anyString())).thenAnswer(invocation ->
+                modules.get(invocation.getArgument(0, String.class)));
+        return mockDocumentManager;
+    }
+
+    private ModuleNode emptyModule() {
+        ModuleNode module = mock(ModuleNode.class);
+        when(module.getClasses()).thenReturn(List.of());
+        return module;
+    }
+
+    private ModuleNode moduleWith(ClassNode... classes) {
+        ModuleNode module = mock(ModuleNode.class);
+        when(module.getClasses()).thenReturn(List.of(classes));
+        return module;
+    }
+
+    private ClassNode createTrait(String name) {
+        ClassNode trait = new ClassNode(name, 0, ClassHelper.OBJECT_TYPE);
+        trait.setLineNumber(1);
+        return trait;
+    }
+
+    private ClassNode createOwnerWithTrait(String ownerName, String traitName) {
+        ClassNode owner = new ClassNode(ownerName, 0, ClassHelper.OBJECT_TYPE);
+        owner.setLineNumber(1);
+        owner.setInterfaces(new ClassNode[]{new ClassNode(traitName, 0, ClassHelper.OBJECT_TYPE)});
+        return owner;
+    }
+
+    private ClassNode createFieldHelper(String traitName, String fieldName) {
+        ClassNode helper = new ClassNode(traitName + "$Trait$FieldHelper", 0, ClassHelper.OBJECT_TYPE);
+        helper.setLineNumber(1);
+        helper.addField(new FieldNode(fieldName, 0, ClassHelper.STRING_TYPE, helper, null));
+        return helper;
     }
 
     // ================================================================

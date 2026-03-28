@@ -37,6 +37,7 @@ import org.eclipse.groovy.ls.core.providers.ReferenceProvider;
 import org.eclipse.groovy.ls.core.providers.RenameProvider;
 import org.eclipse.groovy.ls.core.providers.SemanticTokensProvider;
 import org.eclipse.groovy.ls.core.providers.SignatureHelpProvider;
+import org.eclipse.groovy.ls.core.providers.TraitMemberResolver;
 import org.eclipse.groovy.ls.core.providers.TypeDefinitionProvider;
 import org.eclipse.groovy.ls.core.providers.TypeHierarchyProvider;
 import org.eclipse.lsp4j.*;
@@ -268,6 +269,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
         GroovyLanguageServerPlugin.logInfo("Document opened: " + uri);
         documentManager.didOpen(uri, text);
+        TraitMemberResolver.invalidateCache();
 
         // A newly opened document may still be waiting for its background JDT
         // working-copy refresh. Publish syntax-only diagnostics during that
@@ -310,6 +312,11 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
         // Invalidate inlay hint hierarchy cache — types may have changed
         inlayHintProvider.invalidateCache(uri);
+        TraitMemberResolver.invalidateCache();
+
+        // Invalidate shared hierarchy cache used by type hierarchy and
+        // generated accessor resolution.
+        typeHierarchyProvider.invalidateCache();
 
         // Invalidate ALL code lens resolve cache entries — editing file A
         // may change reference counts displayed in file B's code lenses.
@@ -320,7 +327,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
         // Re-publish diagnostics after changes
         if (server.areDiagnosticsEnabled()) {
-            diagnosticsProvider.publishDiagnosticsDebounced(uri);
+            diagnosticsProvider.publishDiagnosticsAfterChange(uri);
         }
     }
 
@@ -329,6 +336,8 @@ public class GroovyTextDocumentService implements TextDocumentService {
         String uri = params.getTextDocument().getUri();
         GroovyLanguageServerPlugin.logInfo("Document closed: " + uri);
         documentManager.didClose(uri);
+        TraitMemberResolver.invalidateCache();
+        typeHierarchyProvider.invalidateCache();
 
         // Clear diagnostics for closed document
         diagnosticsProvider.clearDiagnostics(uri);
@@ -345,6 +354,8 @@ public class GroovyTextDocumentService implements TextDocumentService {
         // Invalidate type hierarchy cache on save — structural changes
         // (new supertypes, removed interfaces) are picked up at this point.
         completionProvider.invalidateHierarchyCache();
+        TraitMemberResolver.invalidateCache();
+        typeHierarchyProvider.invalidateCache();
 
         // Invalidate type-name cache on save — new types or removed types
         // should be reflected in subsequent type-name completions.
@@ -1363,6 +1374,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
         pendingCodeActions.clear();
         pendingCompletions.values().forEach(f -> f.cancel(true));
         pendingCompletions.clear();
+        codeActionProvider.invalidateCache();
+        TraitMemberResolver.invalidateCache();
+        typeHierarchyProvider.invalidateCache();
         diagnosticsProvider.shutdown();
     }
 }

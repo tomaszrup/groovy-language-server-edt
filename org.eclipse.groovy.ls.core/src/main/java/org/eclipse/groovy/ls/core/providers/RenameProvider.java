@@ -33,7 +33,6 @@ import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
-import org.eclipse.jdt.core.search.SearchParticipant;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.Position;
@@ -187,16 +186,15 @@ public class RenameProvider {
             }
 
             Map<String, List<TextEdit>> editsByUri = new HashMap<>();
-            SearchEngine engine = new SearchEngine();
+            Map<String, String> contentCache = new HashMap<>();
             IJavaSearchScope scope = createProjectScope(workingCopy);
 
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+            JdtSearchSupport.search(pattern,
                     scope,
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
-                            addRenameEdit(match, newName, editsByUri);
+                            addRenameEdit(match, newName, editsByUri, contentCache);
                         }
                     },
                     null);
@@ -207,7 +205,7 @@ public class RenameProvider {
 
             // Enhanced rename: additional edits for specific element types
             IJavaElement element = elements[0];
-            addEnhancedRenameEdits(element, newName, editsByUri);
+            addEnhancedRenameEdits(element, newName, editsByUri, contentCache);
 
             WorkspaceEdit edit = new WorkspaceEdit();
             edit.setChanges(editsByUri);
@@ -221,8 +219,16 @@ public class RenameProvider {
     /**
      * Add a text edit for a search match to the rename edit map.
      */
+    @SuppressWarnings("unused")
     private void addRenameEdit(SearchMatch match, String newName,
                                 Map<String, List<TextEdit>> editsByUri) {
+        addRenameEdit(match, newName, editsByUri, new HashMap<>());
+    }
+
+    private void addRenameEdit(SearchMatch match,
+            String newName,
+            Map<String, List<TextEdit>> editsByUri,
+            Map<String, String> contentCache) {
         try {
             IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -234,7 +240,7 @@ public class RenameProvider {
             int endOffset = startOffset + match.getLength();
 
             // Get file content for offset→position conversion
-            String content = readContent(targetUri, resource);
+            String content = readContent(targetUri, resource, contentCache);
 
             if (content == null) {
                 return;
@@ -252,21 +258,15 @@ public class RenameProvider {
         }
     }
 
+    @SuppressWarnings("unused")
     private String readContent(String targetUri, IResource resource) {
-        String content = documentManager.getContent(targetUri);
-        if (content != null) {
-            return content;
-        }
+        return readContent(targetUri, resource, new HashMap<>());
+    }
 
-        if (resource instanceof org.eclipse.core.resources.IFile file) {
-            try (java.io.InputStream is = file.getContents()) {
-                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            } catch (Exception e) {
-                return null;
-            }
-        }
-
-        return null;
+    private String readContent(String targetUri,
+            IResource resource,
+            Map<String, String> contentCache) {
+        return JdtSearchSupport.readContent(documentManager, targetUri, resource, contentCache);
     }
 
     private Position offsetToPosition(String content, int offset) {
@@ -294,13 +294,14 @@ public class RenameProvider {
      * </ul>
      */
     private void addEnhancedRenameEdits(IJavaElement element, String newName,
-                                         Map<String, List<TextEdit>> editsByUri) {
+                                         Map<String, List<TextEdit>> editsByUri,
+                                         Map<String, String> contentCache) {
         try {
             if (element instanceof IType type) {
-                addImportRenameEdits(type, newName, editsByUri);
-                addConstructorRenameEdits(type, newName, editsByUri);
+                addImportRenameEdits(type, newName, editsByUri, contentCache);
+                addConstructorRenameEdits(type, newName, editsByUri, contentCache);
             } else if (element instanceof IField field) {
-                addAccessorRenameEdits(field, newName, editsByUri);
+                addAccessorRenameEdits(field, newName, editsByUri, contentCache);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Enhanced rename edits failed", e);
@@ -315,7 +316,8 @@ public class RenameProvider {
      * all files in all projects and extremely slow in large workspaces.
      */
     private void addImportRenameEdits(IType type, String newName,
-                                       Map<String, List<TextEdit>> editsByUri) {
+                                       Map<String, List<TextEdit>> editsByUri,
+                                       Map<String, String> contentCache) {
         try {
             String oldSimpleName = type.getElementName();
 
@@ -327,9 +329,7 @@ public class RenameProvider {
                 return;
             }
 
-            SearchEngine engine = new SearchEngine();
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+            JdtSearchSupport.search(pattern,
                     SearchEngine.createWorkspaceScope(), // workspace-wide: imports can be in any project
                     new SearchRequestor() {
                         @Override
@@ -342,8 +342,7 @@ public class RenameProvider {
                                 // Only process import statement matches
                                 org.eclipse.core.resources.IResource res = match.getResource();
                                 String uri = res.getLocationURI().toString();
-                                String content = readContent(uri,
-                                        res instanceof org.eclipse.core.resources.IFile f ? f : null);
+                                String content = readContent(uri, res, contentCache);
                                 if (content == null) return;
 
                                 int startOffset = match.getOffset();
@@ -398,14 +397,14 @@ public class RenameProvider {
      * When renaming a type, also rename its constructors.
      */
     private void addConstructorRenameEdits(IType type, String newName,
-                                            Map<String, List<TextEdit>> editsByUri) {
+                                            Map<String, List<TextEdit>> editsByUri,
+                                            Map<String, String> contentCache) {
         try {
             for (IMethod method : type.getMethods()) {
                 if (method.isConstructor()) {
                     SearchPattern pattern = SearchPattern.createPattern(
                             method, IJavaSearchConstants.ALL_OCCURRENCES);
                     if (pattern != null) {
-                        SearchEngine engine = new SearchEngine();
                         IJavaSearchScope ctorScope;
                         try {
                             org.eclipse.jdt.core.IJavaProject proj = type.getJavaProject();
@@ -415,13 +414,12 @@ public class RenameProvider {
                         } catch (Exception e) {
                             ctorScope = SearchEngine.createWorkspaceScope();
                         }
-                        engine.search(pattern,
-                                new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                        JdtSearchSupport.search(pattern,
                                 ctorScope,
                                 new SearchRequestor() {
                                     @Override
                                     public void acceptSearchMatch(SearchMatch match) {
-                                        addRenameEdit(match, newName, editsByUri);
+                                        addRenameEdit(match, newName, editsByUri, contentCache);
                                     }
                                 },
                                 null);
@@ -441,7 +439,8 @@ public class RenameProvider {
      * and {@code isFieldName()} if they exist.
      */
     private void addAccessorRenameEdits(IField field, String newName,
-                                         Map<String, List<TextEdit>> editsByUri) {
+                                         Map<String, List<TextEdit>> editsByUri,
+                                         Map<String, String> contentCache) {
         try {
             IType declaringType = field.getDeclaringType();
             if (declaringType == null) return;
@@ -451,22 +450,22 @@ public class RenameProvider {
             String newCapName = capitalize(newName);
 
             // Look for getOldName, setOldName, isOldName
-            renameAccessorIfExists(declaringType, "get" + oldCapName, "get" + newCapName, editsByUri);
-            renameAccessorIfExists(declaringType, "set" + oldCapName, "set" + newCapName, editsByUri);
-            renameAccessorIfExists(declaringType, "is" + oldCapName, "is" + newCapName, editsByUri);
+            renameAccessorIfExists(declaringType, "get" + oldCapName, "get" + newCapName, editsByUri, contentCache);
+            renameAccessorIfExists(declaringType, "set" + oldCapName, "set" + newCapName, editsByUri, contentCache);
+            renameAccessorIfExists(declaringType, "is" + oldCapName, "is" + newCapName, editsByUri, contentCache);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Accessor rename failed", e);
         }
     }
 
     private void renameAccessorIfExists(IType type, String oldAccessorName, String newAccessorName,
-                                         Map<String, List<TextEdit>> editsByUri) throws Exception {
+                                         Map<String, List<TextEdit>> editsByUri,
+                                         Map<String, String> contentCache) throws Exception {
         for (IMethod method : type.getMethods()) {
             if (method.getElementName().equals(oldAccessorName)) {
                 SearchPattern pattern = SearchPattern.createPattern(
                         method, IJavaSearchConstants.ALL_OCCURRENCES);
                 if (pattern != null) {
-                    SearchEngine engine = new SearchEngine();
                     IJavaSearchScope methodScope;
                     try {
                         org.eclipse.jdt.core.IJavaProject proj = type.getJavaProject();
@@ -476,13 +475,12 @@ public class RenameProvider {
                     } catch (Exception e) {
                         methodScope = SearchEngine.createWorkspaceScope();
                     }
-                    engine.search(pattern,
-                            new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                    JdtSearchSupport.search(pattern,
                             methodScope,
                             new SearchRequestor() {
                                 @Override
                                 public void acceptSearchMatch(SearchMatch match) {
-                                    addRenameEdit(match, newAccessorName, editsByUri);
+                                    addRenameEdit(match, newAccessorName, editsByUri, contentCache);
                                 }
                             },
                             null);

@@ -1127,7 +1127,7 @@ public class DefinitionProvider {
             }
 
             // Check supertypes
-            org.eclipse.jdt.core.ITypeHierarchy hierarchy = receiverType.newSupertypeHierarchy(null);
+            org.eclipse.jdt.core.ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(receiverType);
             if (hierarchy != null) {
                 for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
                     for (org.eclipse.jdt.core.IMethod method : superType.getMethods()) {

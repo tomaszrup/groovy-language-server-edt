@@ -52,6 +52,10 @@ public class TypeHierarchyProvider {
         this.documentManager = documentManager;
     }
 
+    public void invalidateCache() {
+        TypeHierarchyCache.clear();
+    }
+
     /**
      * Prepare the type hierarchy by resolving the type at the cursor position.
      */
@@ -72,7 +76,7 @@ public class TypeHierarchyProvider {
             }
 
             int offset = positionToOffset(content, position);
-            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
             if (elements == null || elements.length == 0) {
                 return result;
             }
@@ -105,7 +109,10 @@ public class TypeHierarchyProvider {
         }
 
         try {
-            ITypeHierarchy hierarchy = type.newSupertypeHierarchy(null);
+            ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(type);
+            if (hierarchy == null) {
+                return result;
+            }
             IType[] supertypes = hierarchy.getSupertypes(type);
             for (IType supertype : supertypes) {
                 TypeHierarchyItem item = buildTypeHierarchyItem(supertype);
@@ -132,7 +139,10 @@ public class TypeHierarchyProvider {
         }
 
         try {
-            ITypeHierarchy hierarchy = type.newTypeHierarchy(null);
+            ITypeHierarchy hierarchy = TypeHierarchyCache.getTypeHierarchy(type);
+            if (hierarchy == null) {
+                return result;
+            }
             IType[] subtypes = hierarchy.getSubtypes(type);
             for (IType subtype : subtypes) {
                 TypeHierarchyItem item = buildTypeHierarchyItem(subtype);

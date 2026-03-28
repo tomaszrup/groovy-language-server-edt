@@ -13,12 +13,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticSeverity;
 import org.junit.jupiter.api.Test;
@@ -45,6 +48,29 @@ class DiagnosticsProviderCollectionTest {
         assertFalse(diagnostics.isEmpty(), "Should detect syntax errors");
         assertTrue(diagnostics.stream()
                 .allMatch(d -> d.getSeverity() == DiagnosticSeverity.Error));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsUsesCachedSyntaxErrorsBeforeWorkingCopyReconcile() throws Exception {
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public ICompilationUnit getWorkingCopy(String uri) {
+                return workingCopy;
+            }
+        };
+        String uri = "file:///CollectBrokenCached.groovy";
+        documentManager.didOpen(uri, "class BrokenCached { def x = }\n");
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> true);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertFalse(diagnostics.isEmpty(), "Should reuse cached syntax diagnostics");
+        verifyNoInteractions(workingCopy);
 
         documentManager.didClose(uri);
     }

@@ -34,7 +34,7 @@ final class GeneratedAccessorResolver {
             return method;
         }
 
-        ITypeHierarchy hierarchy = memberSource.newSupertypeHierarchy(null);
+        ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(memberSource);
         if (hierarchy == null) {
             return null;
         }

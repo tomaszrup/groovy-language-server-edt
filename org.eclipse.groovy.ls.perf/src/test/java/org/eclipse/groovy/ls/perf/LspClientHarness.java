@@ -330,6 +330,14 @@ public class LspClientHarness implements AutoCloseable {
         return server.getTextDocumentService().references(params);
     }
 
+    /** Request document highlights at the given position. */
+    public CompletableFuture<List<? extends DocumentHighlight>> documentHighlight(String uri, int line, int character) {
+        DocumentHighlightParams params = new DocumentHighlightParams(
+                new TextDocumentIdentifier(uri),
+                new Position(line, character));
+        return server.getTextDocumentService().documentHighlight(params);
+    }
+
     /** Request rename at the given position. */
     public CompletableFuture<WorkspaceEdit> rename(String uri, int line, int character, String newName) {
         RenameParams params = new RenameParams(
@@ -373,6 +381,11 @@ public class LspClientHarness implements AutoCloseable {
                 new TextDocumentIdentifier(uri),
                 new Range(new Position(startLine, 0), new Position(endLine, 0)));
         return server.getTextDocumentService().inlayHint(params);
+    }
+
+    /** Request workspace symbols using the workspace service. */
+    public CompletableFuture<Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>>> workspaceSymbol(String query) {
+        return server.getWorkspaceService().symbol(new WorkspaceSymbolParams(query));
     }
 
     // ========================================================================

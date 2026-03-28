@@ -121,6 +121,20 @@ public class DiagnosticsProvider {
     // results would be stale, so it skips the expensive reconcile.
     private final java.util.Map<String, java.util.concurrent.atomic.AtomicLong> diagnosticVersions =
             new java.util.concurrent.ConcurrentHashMap<>();
+    // Per-URI version counter for syntax-preview publishes triggered by
+    // didChange. These publishes are intentionally independent from the
+    // debounced full-diagnostics scheduling so the fast syntax pass is not
+    // cancelled by the follow-up full pass.
+    private final java.util.Map<String, java.util.concurrent.atomic.AtomicLong> syntaxPreviewVersions =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    // Keep syntax previews off the main diagnostics scheduler so a queued or
+    // blocked JDT reconcile cannot delay the fast syntax-only publish.
+    private final java.util.concurrent.ExecutorService syntaxPreviewExecutor =
+            java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "groovy-ls-diagnostics-syntax-preview");
+                t.setDaemon(true);
+                return t;
+            });
     // Per-URI "in-flight" flag: prevents overlapping reconcile tasks for the
     // same file.  At most ONE diagnostics task can be running per URI.  If a
     // new task fires while one is already running, it marks "re-run needed"
@@ -264,6 +278,7 @@ public class DiagnosticsProvider {
         latestDiagnosticsByUri.remove(normalizedUri);
         diagnosticsInFlight.remove(normalizedUri);
         diagnosticVersions.remove(normalizedUri);
+        syntaxPreviewVersions.remove(normalizedUri);
 
         // Cancel any scheduled but not-yet-started diagnostic task for this URI.
         // Without this, a debounced task from didOpen can fire after didClose,
@@ -419,6 +434,27 @@ public class DiagnosticsProvider {
         pendingPublish.put(normalizedUri, future);
     }
 
+    /**
+     * Publish a fast syntax-only preview immediately after a document change,
+     * then schedule the normal debounced full diagnostics pass.
+     */
+    public void publishDiagnosticsAfterChange(String uri) {
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+        java.util.concurrent.atomic.AtomicLong previewVersion =
+                syntaxPreviewVersions.computeIfAbsent(normalizedUri,
+                        key -> new java.util.concurrent.atomic.AtomicLong(0));
+        long myPreviewVersion = previewVersion.incrementAndGet();
+
+        syntaxPreviewExecutor.execute(() -> {
+            if (previewVersion.get() != myPreviewVersion) {
+                return;
+            }
+            publishSyntaxDiagnostics(uri);
+        });
+
+        publishDiagnosticsDebounced(uri);
+    }
+
     private void publishSyntaxDiagnostics(String uri) {
         String normalizedUri = DocumentManager.normalizeUri(uri);
         if (client == null) {
@@ -468,6 +504,18 @@ public class DiagnosticsProvider {
                 "[classpath-check] uri=" + uri
                 + " checkerPresent=" + (checker != null)
                 + " hasClasspath=" + hasClasspath);
+
+        GroovyCompilerService.ParseResult cachedParse =
+                documentManager.getCompilerService().getCachedResult(uri);
+        if (cachedParse != null && hasSyntaxErrors(cachedParse)) {
+            collectFromParseResult(cachedParse, diagnostics);
+
+            boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+            if (!hasClasspath && initComplete) {
+                diagnostics.add(createNoClasspathWarning(content));
+            }
+            return diagnostics;
+        }
 
         if (!hasClasspath) {
             GroovyLanguageServerPlugin.logInfo(
@@ -1008,6 +1056,20 @@ public class DiagnosticsProvider {
             result = compilerService.parse(uri, content);
         }
 
+        collectFromParseResult(result, diagnostics);
+    }
+
+    private boolean hasSyntaxErrors(GroovyCompilerService.ParseResult result) {
+        return result != null && result.getErrors() != null && !result.getErrors().isEmpty();
+    }
+
+    private void collectFromParseResult(
+            GroovyCompilerService.ParseResult result,
+            List<Diagnostic> diagnostics) {
+        if (result == null || result.getErrors() == null) {
+            return;
+        }
+
         for (org.codehaus.groovy.syntax.SyntaxException error : result.getErrors()) {
             Diagnostic diagnostic = new Diagnostic();
             diagnostic.setSeverity(DiagnosticSeverity.Error);
@@ -1153,9 +1215,13 @@ public class DiagnosticsProvider {
      * Shut down the diagnostics scheduler. Called during server shutdown.
      */
     public void shutdown() {
+        syntaxPreviewExecutor.shutdownNow();
         scheduler.shutdownNow();
         pendingPublish.values().forEach(f -> f.cancel(true));
         pendingPublish.clear();
         diagnosticsInFlight.clear();
+        latestDiagnosticsByUri.clear();
+        diagnosticVersions.clear();
+        syntaxPreviewVersions.clear();
     }
 }

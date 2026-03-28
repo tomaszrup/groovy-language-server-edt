@@ -39,7 +39,6 @@ import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
-import org.eclipse.jdt.core.search.SearchParticipant;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.CallHierarchyIncomingCall;
@@ -138,10 +137,8 @@ public class CallHierarchyProvider {
             // Group search matches by enclosing method
             Map<String, IncomingCallData> callerMap = new HashMap<>();
             IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
-            SearchEngine engine = new SearchEngine();
 
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+            JdtSearchSupport.search(pattern,
                     scope,
                     new SearchRequestor() {
                         @Override

@@ -1,6 +1,7 @@
 package org.eclipse.groovy.ls.perf;
 
 import org.eclipse.lsp4j.*;
+import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.junit.jupiter.api.*;
 
 import java.io.IOException;
@@ -69,6 +70,8 @@ public class GroovyLsPerformanceTest {
     private static final long DIAGNOSTICS_UNUSED_P95_MS      = 3000;
     private static final long SEMANTIC_TOKENS_P95_MS         = 1500;
     private static final long SEMANTIC_TOKENS_LARGE_P95_MS   = 3000;
+    private static final long DOCUMENT_HIGHLIGHT_P95_MS      = 1000;
+    private static final long WORKSPACE_SYMBOL_P95_MS        = 3000;
     private static final long REFERENCES_LOCAL_P95_MS        = 3000;
     private static final long REFERENCES_WIDE_P95_MS         = 8000;
     private static final long RENAME_P95_MS                  = 8000;
@@ -81,6 +84,8 @@ public class GroovyLsPerformanceTest {
     private static final int DIAGNOSTICS_ITERATIONS   = 30;
     private static final int SEMANTIC_ITERATIONS      = 30;
     private static final int SEMANTIC_LARGE_ITERATIONS= 20;
+    private static final int DOCUMENT_HIGHLIGHT_ITERATIONS = 30;
+    private static final int WORKSPACE_SYMBOL_ITERATIONS = 20;
     private static final int REFERENCES_ITERATIONS    = 20;
     private static final int RENAME_ITERATIONS        = 10;
     private static final int CHURN_ROUNDS             = 3;
@@ -618,6 +623,60 @@ public class GroovyLsPerformanceTest {
         allResults.add(result);
         // No strict p95 threshold — just verify no crash and reasonable timing
         result.assertMaxThreshold(30_000); // Should complete within 30s per round
+    }
+
+    @Test
+    @Order(14)
+    @DisplayName("Document highlight: local symbol in active file")
+    void testDocumentHighlightLocalSymbol() throws Exception {
+        PerformanceResult result = new PerformanceResult("Document highlight");
+        WorkspaceGenerator.FileInfo target = files.get(0);
+
+        String[] lines = target.readContent().split("\n");
+        int highlightLine = findLineContaining(lines, "entries0");
+        if (highlightLine < 0) highlightLine = findLineContaining(lines, "auditLog0");
+        if (highlightLine < 0) highlightLine = findLineContaining(lines, "computeStatistics0");
+        if (highlightLine < 0) highlightLine = 10;
+
+        int highlightCol = lines[highlightLine].indexOf("entries0");
+        if (highlightCol < 0) highlightCol = lines[highlightLine].indexOf("auditLog0");
+        if (highlightCol < 0) highlightCol = lines[highlightLine].indexOf("computeStatistics0");
+        if (highlightCol < 0) highlightCol = 8;
+
+        for (int i = 0; i < DOCUMENT_HIGHLIGHT_ITERATIONS; i++) {
+            long start = System.currentTimeMillis();
+            assertNotNull(harness.documentHighlight(target.toUri(), highlightLine, highlightCol)
+                    .get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+            long elapsed = System.currentTimeMillis() - start;
+            result.record(elapsed);
+        }
+
+        System.out.println(result);
+        allResults.add(result);
+        result.assertP95Threshold(DOCUMENT_HIGHLIGHT_P95_MS);
+    }
+
+    @Test
+    @Order(15)
+    @DisplayName("Workspace symbol: exact generated class query")
+    void testWorkspaceSymbolQuery() throws Exception {
+        PerformanceResult result = new PerformanceResult("Workspace symbol");
+        WorkspaceGenerator.FileInfo target = files.get(0);
+        String query = target.simpleClassName();
+
+        for (int i = 0; i < WORKSPACE_SYMBOL_ITERATIONS; i++) {
+            long start = System.currentTimeMillis();
+            Either<List<? extends SymbolInformation>, List<? extends WorkspaceSymbol>> symbols =
+                    harness.workspaceSymbol(query).get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertNotNull(symbols);
+            result.record(elapsed);
+        }
+
+        System.out.println(result);
+        allResults.add(result);
+        result.assertP95Threshold(WORKSPACE_SYMBOL_P95_MS);
     }
 
     // ========================================================================

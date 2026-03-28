@@ -1391,7 +1391,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
         if (method != null) return method;
 
         // Check supertypes
-        ITypeHierarchy hierarchy = type.newSupertypeHierarchy(null);
+        ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(type);
         if (hierarchy != null) {
             IType[] supers = hierarchy.getAllSupertypes(type);
             for (IType superType : supers) {

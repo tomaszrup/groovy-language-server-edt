@@ -17,7 +17,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.jdt.core.search.SearchMatch;
@@ -220,9 +222,9 @@ class ReferenceProviderTest {
     }
 
     private Location invokeToLocation(ReferenceProvider provider, SearchMatch match) throws Exception {
-        Method method = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
+        Method method = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class, Map.class);
         method.setAccessible(true);
-        return (Location) method.invoke(provider, match);
+        return (Location) method.invoke(provider, match, new HashMap<String, String>());
     }
 
     private Position invokeOffsetToPosition(ReferenceProvider provider, String content, int offset) throws Exception {
@@ -268,9 +270,7 @@ class ReferenceProviderTest {
         when(match.getOffset()).thenReturn(0);
         when(match.getLength()).thenReturn(5);
 
-        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
-        m.setAccessible(true);
-        Location loc = (Location) m.invoke(rp, match);
+        Location loc = invokeToLocation(rp, match);
 
         assertNotNull(loc);
         assertEquals("file:///RefTarget.groovy", loc.getUri());
@@ -290,9 +290,7 @@ class ReferenceProviderTest {
         when(match.getOffset()).thenReturn(6);
         when(match.getLength()).thenReturn(5);
 
-        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
-        m.setAccessible(true);
-        Location loc = (Location) m.invoke(rp, match);
+        Location loc = invokeToLocation(rp, match);
 
         assertNotNull(loc);
         assertEquals(0, loc.getRange().getStart().getLine());
@@ -308,9 +306,7 @@ class ReferenceProviderTest {
         SearchMatch match = mock(SearchMatch.class);
         when(match.getResource()).thenReturn(null);
 
-        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
-        m.setAccessible(true);
-        Location loc = (Location) m.invoke(rp, match);
+        Location loc = invokeToLocation(rp, match);
 
         assertNull(loc);
     }
@@ -325,9 +321,7 @@ class ReferenceProviderTest {
         when(resource.getLocationURI()).thenReturn(null);
         when(match.getResource()).thenReturn(resource);
 
-        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
-        m.setAccessible(true);
-        Location loc = (Location) m.invoke(rp, match);
+        Location loc = invokeToLocation(rp, match);
 
         assertNull(loc);
     }
@@ -344,9 +338,7 @@ class ReferenceProviderTest {
         when(match.getOffset()).thenReturn(10);
         when(match.getLength()).thenReturn(3);
 
-        Method m = ReferenceProvider.class.getDeclaredMethod("toLocation", SearchMatch.class);
-        m.setAccessible(true);
-        Location loc = (Location) m.invoke(rp, match);
+        Location loc = invokeToLocation(rp, match);
 
         assertNotNull(loc);
         assertEquals(0, loc.getRange().getStart().getLine());
@@ -364,9 +356,9 @@ class ReferenceProviderTest {
         dm.didOpen(uri, "content here");
 
         Method m = ReferenceProvider.class.getDeclaredMethod("readContent", String.class,
-                org.eclipse.core.resources.IResource.class);
+            org.eclipse.core.resources.IResource.class, Map.class);
         m.setAccessible(true);
-        String content = (String) m.invoke(rp, uri, null);
+        String content = (String) m.invoke(rp, uri, null, new HashMap<String, String>());
 
         assertEquals("content here", content);
         dm.didClose(uri);
@@ -378,9 +370,9 @@ class ReferenceProviderTest {
         ReferenceProvider rp = new ReferenceProvider(dm);
 
         Method m = ReferenceProvider.class.getDeclaredMethod("readContent", String.class,
-                org.eclipse.core.resources.IResource.class);
+            org.eclipse.core.resources.IResource.class, Map.class);
         m.setAccessible(true);
-        String content = (String) m.invoke(rp, "file:///NonExistent.groovy", null);
+        String content = (String) m.invoke(rp, "file:///NonExistent.groovy", null, new HashMap<String, String>());
 
         assertNull(content);
     }

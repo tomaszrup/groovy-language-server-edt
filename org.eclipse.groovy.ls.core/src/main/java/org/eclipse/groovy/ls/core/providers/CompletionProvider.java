@@ -387,12 +387,11 @@ public class CompletionProvider {
                     "[completion] Warming type index for project: " + projectName);
             long start = System.currentTimeMillis();
 
-            SearchEngine engine = new SearchEngine();
             IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
                     new IJavaElement[]{project},
                     IJavaSearchScope.SOURCES | IJavaSearchScope.APPLICATION_LIBRARIES);
 
-            engine.searchAllTypeNames(
+            JdtSearchSupport.searchAllTypeNames(
                     null, SearchPattern.R_PATTERN_MATCH,
                     "*".toCharArray(), SearchPattern.R_PATTERN_MATCH,
                     IJavaSearchConstants.TYPE,
@@ -2170,14 +2169,13 @@ public class CompletionProvider {
         final String[] firstFqn = new String[1];
 
         try {
-            SearchEngine engine = new SearchEngine();
             IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
                     new IJavaElement[] { project },
                     IJavaSearchScope.SOURCES
                             | IJavaSearchScope.APPLICATION_LIBRARIES
                             | IJavaSearchScope.REFERENCED_PROJECTS);
 
-            engine.searchAllTypeNames(
+            JdtSearchSupport.searchAllTypeNames(
                     null,
                     SearchPattern.R_PATTERN_MATCH,
                     simpleName.toCharArray(),
@@ -2268,11 +2266,10 @@ public class CompletionProvider {
                 addImportedAnnotationCompletions(project, existingImports, prefix, items, seenSimpleNames);
             }
 
-            SearchEngine engine = new SearchEngine();
             searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                    searchContext, items, engine, IJavaSearchScope.SOURCES, "5_");
+                    searchContext, items, IJavaSearchScope.SOURCES, "5_");
             searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                    searchContext, items, engine, IJavaSearchScope.APPLICATION_LIBRARIES, "6_");
+                    searchContext, items, IJavaSearchScope.APPLICATION_LIBRARIES, "6_");
 
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"
                     + prefix + "': " + items.size() + " results");
@@ -2304,15 +2301,15 @@ public class CompletionProvider {
 
     private void searchTypeNames(IJavaProject project, String prefix, boolean annotationOnly,
                                  Set<String> seenSimpleNames, TypeSearchContext searchContext,
-                                 List<CompletionItem> items, SearchEngine engine,
-                                 int scopeMask, String sortPrefix) throws JavaModelException {
+                                 List<CompletionItem> items,
+                                 int scopeMask, String sortPrefix) throws org.eclipse.core.runtime.CoreException {
         if (items.size() >= MAX_TYPE_RESULTS) {
             return;
         }
 
         IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
                 new IJavaElement[]{project}, scopeMask);
-        engine.searchAllTypeNames(
+        JdtSearchSupport.searchAllTypeNames(
                 null,
                 SearchPattern.R_PATTERN_MATCH,
                 (prefix.isEmpty() ? "*" : prefix).toCharArray(),

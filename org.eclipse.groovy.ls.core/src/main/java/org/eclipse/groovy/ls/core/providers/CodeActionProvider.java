@@ -113,6 +113,10 @@ public class CodeActionProvider {
         this.diagnosticsProvider = diagnosticsProvider;
     }
 
+    public void invalidateCache() {
+        importSearchCache.clear();
+    }
+
     private static String getDiagnosticCode(Diagnostic diag) {
         if (diag.getCode() == null) return null;
         if (diag.getCode().isLeft()) return diag.getCode().getLeft();
@@ -455,8 +459,6 @@ public class CodeActionProvider {
                             | IJavaSearchScope.SYSTEM_LIBRARIES
                             | IJavaSearchScope.REFERENCED_PROJECTS);
 
-            SearchEngine searchEngine = new SearchEngine();
-
             // Collect matching type names
             List<TypeNameMatch> matches = new ArrayList<>();
             TypeNameMatchRequestor requestor = new TypeNameMatchRequestor() {
@@ -482,7 +484,7 @@ public class CodeActionProvider {
                 @Override public void worked(int work) {}
             };
 
-            searchEngine.searchAllTypeNames(
+                JdtSearchSupport.searchAllTypeNames(
                     null,                                    // any package
                     SearchPattern.R_EXACT_MATCH,
                     simpleName.toCharArray(),                // type simple name

@@ -10,7 +10,9 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
@@ -22,7 +24,6 @@ import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
-import org.eclipse.jdt.core.search.SearchParticipant;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.ImplementationParams;
@@ -115,15 +116,14 @@ public class ImplementationProvider {
 
     private void search(SearchPattern pattern, List<Location> locations) throws org.eclipse.core.runtime.CoreException {
         IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
-        SearchEngine engine = new SearchEngine();
+        Map<String, String> contentCache = new HashMap<>();
 
-        engine.search(pattern,
-                new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+        JdtSearchSupport.search(pattern,
                 scope,
                 new SearchRequestor() {
                     @Override
                     public void acceptSearchMatch(SearchMatch match) {
-                        Location location = toLocation(match);
+                        Location location = toLocation(match, contentCache);
                         if (location != null) {
                             locations.add(location);
                         }
@@ -135,7 +135,12 @@ public class ImplementationProvider {
     /**
      * Convert a JDT {@link SearchMatch} to an LSP {@link Location}.
      */
+    @SuppressWarnings("unused")
     private Location toLocation(SearchMatch match) {
+        return toLocation(match, new HashMap<>());
+    }
+
+    private Location toLocation(SearchMatch match, Map<String, String> contentCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -143,7 +148,7 @@ public class ImplementationProvider {
             }
 
             String targetUri = resource.getLocationURI().toString();
-            String content = readContent(targetUri, resource);
+            String content = readContent(targetUri, resource, contentCache);
 
             int startOffset = match.getOffset();
             int endOffset = startOffset + match.getLength();
@@ -164,21 +169,15 @@ public class ImplementationProvider {
         }
     }
 
+    @SuppressWarnings("unused")
     private String readContent(String targetUri, org.eclipse.core.resources.IResource resource) {
-        String content = documentManager.getContent(targetUri);
-        if (content != null) {
-            return content;
-        }
+        return readContent(targetUri, resource, new HashMap<>());
+    }
 
-        if (resource instanceof org.eclipse.core.resources.IFile file) {
-            try (java.io.InputStream is = file.getContents()) {
-                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            } catch (Exception e) {
-                return null;
-            }
-        }
-
-        return null;
+    private String readContent(String targetUri,
+            org.eclipse.core.resources.IResource resource,
+            Map<String, String> contentCache) {
+        return JdtSearchSupport.readContent(documentManager, targetUri, resource, contentCache);
     }
 
     // ---- Helpers ----

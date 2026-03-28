@@ -365,6 +365,30 @@ class GroovyLanguageServerCoreMethodsTest {
     }
 
     @Test
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    void shutdownClearsClasspathTrackingState() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+
+        Field pathMapField = GroovyLanguageServer.class.getDeclaredField("subprojectPathToEclipseName");
+        pathMapField.setAccessible(true);
+        ((java.util.Map) pathMapField.get(server)).put("/workspace/app", "app");
+
+        Field projectsWithClasspathField = GroovyLanguageServer.class.getDeclaredField("projectsWithClasspath");
+        projectsWithClasspathField.setAccessible(true);
+        ((Set) projectsWithClasspathField.get(server)).add("app");
+
+        Field pendingClasspathUpdatesField = GroovyLanguageServer.class.getDeclaredField("pendingClasspathUpdates");
+        pendingClasspathUpdatesField.setAccessible(true);
+        ((java.util.Queue) pendingClasspathUpdatesField.get(server)).add("queued");
+
+        server.shutdown().join();
+
+        assertTrue(((java.util.Map<?, ?>) pathMapField.get(server)).isEmpty());
+        assertTrue(((Set<?>) projectsWithClasspathField.get(server)).isEmpty());
+        assertTrue(((java.util.Queue<?>) pendingClasspathUpdatesField.get(server)).isEmpty());
+    }
+
+    @Test
     void exitDoesNotThrowWithoutPlugin() {
         GroovyLanguageServer server = new GroovyLanguageServer();
         GroovyLanguageServerPlugin.setLanguageServer(null);

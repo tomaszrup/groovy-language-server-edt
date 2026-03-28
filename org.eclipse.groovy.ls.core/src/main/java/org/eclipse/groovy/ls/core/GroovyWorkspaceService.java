@@ -29,6 +29,7 @@ import java.util.regex.Pattern;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.providers.InlayHintSettings;
+import org.eclipse.groovy.ls.core.providers.JdtSearchSupport;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
@@ -40,9 +41,10 @@ import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
-import org.eclipse.jdt.core.search.SearchParticipant;
-import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchRequestor;
+import org.eclipse.jdt.core.search.SearchPattern;
+import org.eclipse.jdt.core.search.TypeNameMatch;
+import org.eclipse.jdt.core.search.TypeNameMatchRequestor;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.services.WorkspaceService;
@@ -58,12 +60,17 @@ public class GroovyWorkspaceService implements WorkspaceService {
     private static final String JSON_ENABLED = "enabled";
     private static final String LOG_NEW_URI = " new=";
     private static final String LOG_EDITS = " edits=";
-        private static final String IMPORT_PREFIX = "import ";
-        private static final Pattern PACKAGE_DECLARATION_PATTERN = Pattern.compile(
+    private static final int MAX_WORKSPACE_SYMBOL_RESULTS = 200;
+    private static final long WORKSPACE_GROOVY_FILES_CACHE_TTL_MS = 30_000;
+    private static final String IMPORT_PREFIX = "import ";
+    private static final Pattern PACKAGE_DECLARATION_PATTERN = Pattern.compile(
             "(?m)^\\s*package\\s+([\\w.]+)\\s*;?\\s*$");
 
     private final GroovyLanguageServer server;
     private final DocumentManager documentManager;
+    private volatile List<Path> cachedWorkspaceGroovyFiles = List.of();
+    private volatile long workspaceGroovyFilesCacheTimestampMs;
+    private final Object workspaceGroovyFilesCacheLock = new Object();
 
     public GroovyWorkspaceService(GroovyLanguageServer server, DocumentManager documentManager) {
         this.server = server;
@@ -75,6 +82,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             WorkspaceSymbolParams params) {
         return CompletableFuture.supplyAsync(() -> {
             List<SymbolInformation> symbols = new ArrayList<>();
+            Set<String> seenHandles = new HashSet<>();
             String query = params.getQuery();
 
             if (query == null || query.isEmpty()) {
@@ -82,36 +90,44 @@ public class GroovyWorkspaceService implements WorkspaceService {
             }
 
             try {
-                SearchEngine searchEngine = new SearchEngine();
-                SearchPattern pattern = SearchPattern.createPattern(
-                        query,
-                        IJavaSearchConstants.TYPE,
-                        IJavaSearchConstants.DECLARATIONS,
-                        SearchPattern.R_CAMELCASE_MATCH | SearchPattern.R_PREFIX_MATCH);
-
-                if (pattern == null) {
-                    return Either.forLeft(symbols);
-                }
-
-                // Search across all Java projects in the workspace
                 IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
 
-                searchEngine.search(pattern,
-                        new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
-                        scope,
-                        new SearchRequestor() {
+                org.eclipse.core.runtime.IProgressMonitor stopAfterLimit =
+                        new org.eclipse.core.runtime.NullProgressMonitor() {
                             @Override
-                            public void acceptSearchMatch(SearchMatch match) {
-                                Object element = match.getElement();
-                                if (element instanceof IJavaElement javaElement) {
-                                    SymbolInformation symbol = toSymbolInformation(javaElement);
-                                    if (symbol != null) {
-                                        symbols.add(symbol);
-                                    }
+                            public boolean isCanceled() {
+                                return symbols.size() >= MAX_WORKSPACE_SYMBOL_RESULTS;
+                            }
+                        };
+
+                JdtSearchSupport.searchAllTypeNames(
+                        null,
+                        SearchPattern.R_PATTERN_MATCH,
+                        query.toCharArray(),
+                        SearchPattern.R_CAMELCASE_MATCH | SearchPattern.R_PREFIX_MATCH,
+                        IJavaSearchConstants.TYPE,
+                        scope,
+                        new TypeNameMatchRequestor() {
+                            @Override
+                            public void acceptTypeNameMatch(TypeNameMatch match) {
+                                IType type = match.getType();
+                                if (type == null) {
+                                    return;
+                                }
+
+                                String handle = type.getHandleIdentifier();
+                                if (handle != null && !seenHandles.add(handle)) {
+                                    return;
+                                }
+
+                                SymbolInformation symbol = toSymbolInformation(type);
+                                if (symbol != null) {
+                                    symbols.add(symbol);
                                 }
                             }
                         },
-                        null);
+                        IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
+                        stopAfterLimit);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError("Workspace symbol search failed", e);
             }
@@ -277,6 +293,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
     private SourceChangeSummary refreshChangedSourceFiles(DidChangeWatchedFilesParams params) {
         boolean hasSourceChange = false;
         boolean hasJavaSourceChange = false;
+        boolean hasGroovySourceChange = false;
         for (FileEvent event : params.getChanges()) {
             String uri = event.getUri();
             if (!isSourceFileUri(uri)) {
@@ -286,8 +303,13 @@ public class GroovyWorkspaceService implements WorkspaceService {
             hasSourceChange = true;
             if (isJavaFileUri(uri)) {
                 hasJavaSourceChange = true;
+            } else if (isGroovyFileUri(uri)) {
+                hasGroovySourceChange = true;
             }
             refreshWorkspaceFile(uri);
+        }
+        if (hasGroovySourceChange) {
+            invalidateWorkspaceGroovyFilesCache();
         }
         return new SourceChangeSummary(hasSourceChange, hasJavaSourceChange);
     }
@@ -702,31 +724,51 @@ public class GroovyWorkspaceService implements WorkspaceService {
     }
 
     private List<Path> collectWorkspaceGroovyFiles() {
-        List<Path> groovyFiles = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        if (workspaceGroovyFilesCacheTimestampMs > 0
+                && now - workspaceGroovyFilesCacheTimestampMs <= WORKSPACE_GROOVY_FILES_CACHE_TTL_MS) {
+            return cachedWorkspaceGroovyFiles;
+        }
 
-        try {
-            ResourcesPlugin.getWorkspace().getRoot().accept(resource -> {
-                if (resource.getType() == IResource.FILE
-                        && "groovy".equals(resource.getFileExtension())
-                        && resource.getLocationURI() != null) {
-                    try {
-                        groovyFiles.add(Paths.get(resource.getLocationURI()));
-                    } catch (Exception ignored) {
-                        // Skip malformed URIs
+        synchronized (workspaceGroovyFilesCacheLock) {
+            if (workspaceGroovyFilesCacheTimestampMs > 0
+                    && now - workspaceGroovyFilesCacheTimestampMs <= WORKSPACE_GROOVY_FILES_CACHE_TTL_MS) {
+                return cachedWorkspaceGroovyFiles;
+            }
+
+            List<Path> groovyFiles = new ArrayList<>();
+
+            try {
+                ResourcesPlugin.getWorkspace().getRoot().accept(resource -> {
+                    if (resource.getType() == IResource.FILE
+                            && "groovy".equals(resource.getFileExtension())
+                            && resource.getLocationURI() != null) {
+                        try {
+                            groovyFiles.add(Paths.get(resource.getLocationURI()));
+                        } catch (Exception ignored) {
+                            // Skip malformed URIs
+                        }
                     }
-                }
-                return true;
-            });
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError(
-                    "Failed to scan workspace via Eclipse resources", e);
-        }
+                    return true;
+                });
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                        "Failed to scan workspace via Eclipse resources", e);
+            }
 
-        if (groovyFiles.isEmpty()) {
-            collectGroovyFilesFromFileSystem(groovyFiles);
-        }
+            if (groovyFiles.isEmpty()) {
+                collectGroovyFilesFromFileSystem(groovyFiles);
+            }
 
-        return groovyFiles;
+            cachedWorkspaceGroovyFiles = List.copyOf(groovyFiles);
+            workspaceGroovyFilesCacheTimestampMs = System.currentTimeMillis();
+            return cachedWorkspaceGroovyFiles;
+        }
+    }
+
+    private void invalidateWorkspaceGroovyFilesCache() {
+        cachedWorkspaceGroovyFiles = List.of();
+        workspaceGroovyFilesCacheTimestampMs = 0L;
     }
 
     private void collectGroovyFilesFromFileSystem(List<Path> groovyFiles) {
@@ -884,6 +926,8 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
         GroovyLanguageServerPlugin.logInfo(
                 "[rename-trace] didRenameFiles: hasSourceRename=true hasJavaRename=" + summary.hasJavaRename);
+
+        invalidateWorkspaceGroovyFilesCache();
 
         final boolean javaRename = summary.hasJavaRename;
         CompletableFuture.runAsync(() -> {
@@ -1187,10 +1231,8 @@ public class GroovyWorkspaceService implements WorkspaceService {
     private Map<String, List<SearchMatch>> collectGroovyMoveMatches(SearchPattern pattern)
             {
         Map<String, List<SearchMatch>> matchesByUri = new HashMap<>();
-        SearchEngine engine = new SearchEngine();
         try {
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+            JdtSearchSupport.search(pattern,
                     SearchEngine.createWorkspaceScope(),
                     new SearchRequestor() {
                         @Override
@@ -1513,14 +1555,13 @@ public class GroovyWorkspaceService implements WorkspaceService {
             }
 
             Map<String, List<TextEdit>> editsByUri = new HashMap<>();
-            SearchEngine engine = new SearchEngine();
-            engine.search(pattern,
-                    new SearchParticipant[] { SearchEngine.getDefaultSearchParticipant() },
+            Map<String, String> sourceCache = new HashMap<>();
+            JdtSearchSupport.search(pattern,
                     SearchEngine.createWorkspaceScope(),
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
-                            addWorkspaceRenameEdit(match, newTypeName, editsByUri, groovyTargetsOnly);
+                            addWorkspaceRenameEdit(match, newTypeName, editsByUri, groovyTargetsOnly, sourceCache);
                         }
                     },
                     null);
@@ -1564,11 +1605,21 @@ public class GroovyWorkspaceService implements WorkspaceService {
         return null;
     }
 
+    @SuppressWarnings("unused")
     private void addWorkspaceRenameEdit(
             SearchMatch match,
             String newTypeName,
             Map<String, List<TextEdit>> editsByUri,
             boolean groovyTargetsOnly) {
+        addWorkspaceRenameEdit(match, newTypeName, editsByUri, groovyTargetsOnly, new HashMap<>());
+    }
+
+    private void addWorkspaceRenameEdit(
+            SearchMatch match,
+            String newTypeName,
+            Map<String, List<TextEdit>> editsByUri,
+            boolean groovyTargetsOnly,
+            Map<String, String> sourceCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -1585,7 +1636,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             if (groovyTargetsOnly && !isGroovyFileUri(targetUri)) {
                 return;
             }
-            String content = getSourceText(targetUri);
+            String content = sourceCache.computeIfAbsent(targetUri, this::getSourceText);
             if (content == null) {
                 return;
             }

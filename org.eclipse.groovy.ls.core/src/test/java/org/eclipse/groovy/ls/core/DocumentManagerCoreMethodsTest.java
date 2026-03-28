@@ -769,4 +769,33 @@ class DocumentManagerCoreMethodsTest {
         dm.dispose();
         assertNull(dm.getContent(uri));
     }
+
+    @Test
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    void disposeClearsAuxiliaryCachesAndClientState() throws Exception {
+        DocumentManager dm = new DocumentManager();
+
+        java.lang.reflect.Field clientUrisField = DocumentManager.class.getDeclaredField("clientUris");
+        clientUrisField.setAccessible(true);
+        ((java.util.Map) clientUrisField.get(dm)).put("file:///aux.groovy", "file:///aux.groovy");
+
+        java.lang.reflect.Field importedProjectRootsField = DocumentManager.class.getDeclaredField("importedProjectRoots");
+        importedProjectRootsField.setAccessible(true);
+        ((java.util.Set) importedProjectRootsField.get(dm)).add("/tmp/project");
+
+        java.lang.reflect.Field codeSelectCacheField = DocumentManager.class.getDeclaredField("codeSelectCache");
+        codeSelectCacheField.setAccessible(true);
+        ((java.util.Map) codeSelectCacheField.get(dm)).put("file:///aux.groovy#1:1", null);
+
+        java.lang.reflect.Field languageClientField = DocumentManager.class.getDeclaredField("languageClient");
+        languageClientField.setAccessible(true);
+        languageClientField.set(dm, mock(LanguageClient.class));
+
+        dm.dispose();
+
+        assertTrue(((java.util.Map<?, ?>) clientUrisField.get(dm)).isEmpty());
+        assertTrue(((java.util.Set<?>) importedProjectRootsField.get(dm)).isEmpty());
+        assertTrue(((java.util.Map<?, ?>) codeSelectCacheField.get(dm)).isEmpty());
+        assertNull(languageClientField.get(dm));
+    }
 }

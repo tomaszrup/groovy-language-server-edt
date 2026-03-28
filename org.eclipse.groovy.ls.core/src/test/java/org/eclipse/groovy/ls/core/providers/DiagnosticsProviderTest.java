@@ -22,9 +22,12 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 import org.eclipse.core.resources.IMarker;
@@ -467,6 +470,30 @@ class DiagnosticsProviderTest {
         provider.clearDiagnostics("file:///SomeFile.groovy");
         List<Diagnostic> diags = provider.getLatestDiagnostics("file:///SomeFile.groovy");
         assertTrue(diags.isEmpty());
+    }
+
+    @Test
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    void shutdownClearsCachedDiagnosticsState() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+
+        Field latestDiagnosticsField = DiagnosticsProvider.class.getDeclaredField("latestDiagnosticsByUri");
+        latestDiagnosticsField.setAccessible(true);
+        ((Map) latestDiagnosticsField.get(provider)).put("file:///shutdown.groovy", List.of(new Diagnostic()));
+
+        Field diagnosticVersionsField = DiagnosticsProvider.class.getDeclaredField("diagnosticVersions");
+        diagnosticVersionsField.setAccessible(true);
+        ((Map) diagnosticVersionsField.get(provider)).put("file:///shutdown.groovy", new AtomicLong(1));
+
+        Field syntaxPreviewVersionsField = DiagnosticsProvider.class.getDeclaredField("syntaxPreviewVersions");
+        syntaxPreviewVersionsField.setAccessible(true);
+        ((Map) syntaxPreviewVersionsField.get(provider)).put("file:///shutdown.groovy", new AtomicLong(1));
+
+        provider.shutdown();
+
+        assertTrue(((Map<?, ?>) latestDiagnosticsField.get(provider)).isEmpty());
+        assertTrue(((Map<?, ?>) diagnosticVersionsField.get(provider)).isEmpty());
+        assertTrue(((Map<?, ?>) syntaxPreviewVersionsField.get(provider)).isEmpty());
     }
 
     @Test

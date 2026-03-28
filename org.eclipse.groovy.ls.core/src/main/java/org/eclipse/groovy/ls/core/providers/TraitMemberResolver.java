@@ -10,8 +10,11 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.codehaus.groovy.ast.ClassNode;
@@ -33,7 +36,39 @@ import org.eclipse.groovy.ls.core.DocumentManager;
  */
 public final class TraitMemberResolver {
 
+    private static final int LOOKUP_CACHE_SIZE = 512;
+    private static final long LOOKUP_CACHE_TTL_MS = 60_000;
+
+    private record CachedLookup(String uri, boolean found, long timestampMs) {
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestampMs > LOOKUP_CACHE_TTL_MS;
+        }
+    }
+
+    @SuppressWarnings("serial")
+    private static final Map<String, CachedLookup> TRAIT_DECLARATION_URI_CACHE =
+            Collections.synchronizedMap(new LinkedHashMap<String, CachedLookup>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedLookup> eldest) {
+                    return size() > LOOKUP_CACHE_SIZE;
+                }
+            });
+
+    @SuppressWarnings("serial")
+    private static final Map<String, CachedLookup> TRAIT_HELPER_URI_CACHE =
+            Collections.synchronizedMap(new LinkedHashMap<String, CachedLookup>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedLookup> eldest) {
+                    return size() > LOOKUP_CACHE_SIZE;
+                }
+            });
+
     private TraitMemberResolver() {
+    }
+
+    public static void invalidateCache() {
+        TRAIT_DECLARATION_URI_CACHE.clear();
+        TRAIT_HELPER_URI_CACHE.clear();
     }
 
     /**
@@ -366,18 +401,17 @@ public final class TraitMemberResolver {
             return null;
         }
 
-        String fqn = ifaceRef.getName();
-        for (String uri : documentManager.getOpenDocumentUris()) {
-            // Use cached ASTs only — never trigger on-demand parsing here.
-            // In large workspaces this loop covers many files; parsing each
-            // uncached file would cause severe CPU spikes and hover latency.
-            ModuleNode otherModule = documentManager.getCachedGroovyAST(uri);
-            ClassNode matched = findMatchingClass(otherModule, currentModule, fqn, simpleName);
-            if (matched != null) {
-                return matched;
-            }
+        String declarationUri = findTraitDeclarationUriInOpenDocuments(
+                ifaceRef,
+                simpleName,
+                currentModule,
+                documentManager);
+        if (declarationUri == null) {
+            return null;
         }
-        return null;
+
+        ModuleNode otherModule = documentManager.getCachedGroovyAST(declarationUri);
+        return findMatchingClass(otherModule, currentModule, ifaceRef.getName(), simpleName);
     }
 
     private static String findTraitDeclarationUriInOpenDocuments(ClassNode ifaceRef,
@@ -389,12 +423,20 @@ public final class TraitMemberResolver {
         }
 
         String fqn = ifaceRef.getName();
+        CachedLookup cached = getCachedLookup(TRAIT_DECLARATION_URI_CACHE, traitLookupKey(fqn, simpleName));
+        if (cached != null) {
+            return cached.found() ? cached.uri() : null;
+        }
+
         for (String uri : documentManager.getOpenDocumentUris()) {
             ModuleNode otherModule = documentManager.getCachedGroovyAST(uri);
             if (findMatchingClass(otherModule, currentModule, fqn, simpleName) != null) {
+                putLookup(TRAIT_DECLARATION_URI_CACHE, traitLookupKey(fqn, simpleName), uri);
                 return uri;
             }
         }
+
+        putLookup(TRAIT_DECLARATION_URI_CACHE, traitLookupKey(fqn, simpleName), null);
         return null;
     }
 
@@ -444,15 +486,28 @@ public final class TraitMemberResolver {
             return helper;
         }
 
+        String helperFqn = traitNode.getName() + "$Trait$FieldHelper";
+        CachedLookup cached = getCachedLookup(TRAIT_HELPER_URI_CACHE, helperFqn);
+        if (cached != null) {
+            if (!cached.found()) {
+                return null;
+            }
+            ModuleNode cachedModule = documentManager.getCachedGroovyAST(cached.uri());
+            return findFieldHelperNode(traitNode, cachedModule);
+        }
+
         for (String uri : documentManager.getOpenDocumentUris()) {
             ModuleNode otherModule = documentManager.getCachedGroovyAST(uri);
             if (otherModule != null && otherModule != currentModule) {
                 helper = findFieldHelperNode(traitNode, otherModule);
                 if (helper != null) {
+                    putLookup(TRAIT_HELPER_URI_CACHE, helperFqn, uri);
                     return helper;
                 }
             }
         }
+
+        putLookup(TRAIT_HELPER_URI_CACHE, helperFqn, null);
         return null;
     }
 
@@ -530,5 +585,28 @@ public final class TraitMemberResolver {
     private static boolean isTraitDeclaredMethod(MethodNode method) {
         String name = method.getName();
         return name != null && !name.startsWith("<") && !name.startsWith("$");
+    }
+
+    private static String traitLookupKey(String fqn, String simpleName) {
+        if (fqn != null && fqn.contains(".")) {
+            return "fqn:" + fqn;
+        }
+        return "simple:" + simpleName;
+    }
+
+    private static CachedLookup getCachedLookup(Map<String, CachedLookup> cache, String key) {
+        CachedLookup cached = cache.get(key);
+        if (cached == null) {
+            return null;
+        }
+        if (cached.isExpired()) {
+            cache.remove(key);
+            return null;
+        }
+        return cached;
+    }
+
+    private static void putLookup(Map<String, CachedLookup> cache, String key, String uri) {
+        cache.put(key, new CachedLookup(uri, uri != null, System.currentTimeMillis()));
     }
 }

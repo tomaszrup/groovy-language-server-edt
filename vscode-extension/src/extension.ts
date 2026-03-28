@@ -28,6 +28,7 @@ let client: LanguageClient | undefined;
 let outputChannel: OutputChannel;
 let statusBarItem: StatusBarItem;
 let isRestarting = false;
+let activeServerSession: ServerSessionScope | undefined;
 
 interface ClasspathNotificationPayload {
     projectUri: string;
@@ -42,10 +43,78 @@ interface JavaClasspathTarget {
     source: string;
 }
 
+interface ServerSessionScope {
+    client?: LanguageClient;
+    disposed: boolean;
+    disposables: vscode.Disposable[];
+}
+
 /** Cached Java extension API (obtained during wait phase). */
 let cachedJavaApi: any = null;
 const sentClasspathFingerprints = new Map<string, string>();
-let initialClasspathBatchCompleteSent = false;
+
+function createServerSessionScope(): ServerSessionScope {
+    return {
+        disposed: false,
+        disposables: [],
+    };
+}
+
+function addSessionDisposables(scope: ServerSessionScope, ...disposables: vscode.Disposable[]): void {
+    if (scope.disposed) {
+        for (const disposable of disposables) {
+            disposable.dispose();
+        }
+        return;
+    }
+    scope.disposables.push(...disposables);
+}
+
+function isServerSessionActive(scope: ServerSessionScope, languageClient?: LanguageClient): boolean {
+    if (scope.disposed || activeServerSession !== scope) {
+        return false;
+    }
+    return !languageClient || client === languageClient;
+}
+
+function disposeServerSessionScope(scope: ServerSessionScope | undefined = activeServerSession): void {
+    if (!scope || scope.disposed) {
+        return;
+    }
+
+    scope.disposed = true;
+    for (let i = scope.disposables.length - 1; i >= 0; i--) {
+        try {
+            scope.disposables[i].dispose();
+        } catch (e) {
+            outputChannel?.appendLine(`Error disposing Groovy session resource: ${e}`);
+        }
+    }
+    scope.disposables.length = 0;
+
+    if (activeServerSession === scope) {
+        activeServerSession = undefined;
+    }
+}
+
+async function stopLanguageServer(): Promise<void> {
+    const existingSession = activeServerSession;
+    const existingClient = client;
+
+    disposeServerSessionScope(existingSession);
+
+    if (existingClient) {
+        try {
+            await existingClient.stop();
+        } catch (e) {
+            outputChannel.appendLine(`Error stopping language server: ${e}`);
+        }
+    }
+
+    if (client === existingClient) {
+        client = undefined;
+    }
+}
 
 class StartupTrace {
     private readonly startedAt = Date.now();
@@ -82,6 +151,7 @@ let startupTrace: StartupTrace | undefined;
 /** Scheme for virtual source documents from JARs/JDK. */
 const GROOVY_SOURCE_SCHEME = 'groovy-source';
 const GRADLE_CLASSPATH_LINE_PREFIX = 'GROOVY_LS_CP::';
+const REPRESENTATIVE_SOURCE_GLOB = '{src/main/java/**/*.java,src/main/groovy/**/*.groovy,src/test/java/**/*.java,src/test/groovy/**/*.groovy}';
 const MINIMUM_JAVA_MAJOR = 21;
 const WORKSPACE_DATA_VERSION = 2;
 const WORKSPACE_DATA_STATE_FILE = 'groovy_ws_state.json';
@@ -94,13 +164,15 @@ const WORKSPACE_DATA_STATE_FILE = 'groovy_ws_state.json';
 let cachedProjectRootMap: Map<string, string> | undefined;
 /** Timestamp of the last cache refresh — used for staleness checks. */
 let projectRootMapTimestamp = 0;
+/** Cache representative source lookups per project root to avoid repeated findFiles scans. */
+const representativeSourceUriCache = new Map<string, string | null>();
 
 /**
  * Content provider for groovy-source:// virtual documents.
  * When VS Code opens a groovy-source URI (e.g., from go-to-definition on a binary type),
  * this provider asks the language server to resolve the source content.
  */
-class GroovySourceContentProvider implements vscode.TextDocumentContentProvider {
+class GroovySourceContentProvider implements vscode.TextDocumentContentProvider, vscode.Disposable {
     private readonly _client: LanguageClient
     private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri>();
     readonly onDidChange = this._onDidChange.event;
@@ -120,6 +192,10 @@ class GroovySourceContentProvider implements vscode.TextDocumentContentProvider 
             outputChannel.appendLine(`[groovy-source] Failed to resolve: ${uri.toString()} — ${e}`);
             return `// Error resolving source: ${e}\n`;
         }
+    }
+
+    dispose(): void {
+        this._onDidChange.dispose();
     }
 }
 
@@ -180,6 +256,7 @@ async function collectProjectRootMap(): Promise<Map<string, string>> {
 function invalidateProjectRootMapCache(): void {
     cachedProjectRootMap = undefined;
     projectRootMapTimestamp = 0;
+    representativeSourceUriCache.clear();
 }
 
 function resolveProjectPathFromUri(
@@ -206,26 +283,20 @@ function resolveProjectPathFromUri(
 }
 
 async function findRepresentativeSourceUri(projectPath: string): Promise<string | undefined> {
-    const projectUri = vscode.Uri.file(projectPath);
-    const patterns = [
-        'src/main/java/**/*.java',
-        'src/main/groovy/**/*.groovy',
-        'src/test/java/**/*.java',
-        'src/test/groovy/**/*.groovy',
-    ];
-
-    for (const pattern of patterns) {
-        const matches = await workspace.findFiles(
-            new vscode.RelativePattern(projectUri, pattern),
-            '**/build/**',
-            1
-        );
-        if (matches.length > 0) {
-            return matches[0].toString();
-        }
+    const normalizedProjectPath = normalizeFsPath(projectPath);
+    if (representativeSourceUriCache.has(normalizedProjectPath)) {
+        return representativeSourceUriCache.get(normalizedProjectPath) ?? undefined;
     }
 
-    return undefined;
+    const projectUri = vscode.Uri.file(projectPath);
+    const matches = await workspace.findFiles(
+        new vscode.RelativePattern(projectUri, REPRESENTATIVE_SOURCE_GLOB),
+        '**/build/**',
+        1
+    );
+    const sourceUri = matches[0]?.toString();
+    representativeSourceUriCache.set(normalizedProjectPath, sourceUri ?? null);
+    return sourceUri;
 }
 
 function findGradleWrapper(startDir: string): string | undefined {
@@ -503,9 +574,7 @@ export async function activate(context: ExtensionContext): Promise<void> {
             beginStartupTrace();
             updateStatusBar('Starting', 'Restarting...');
             isRestarting = true;
-            if (client) {
-                await client.stop();
-            }
+            await stopLanguageServer();
             await startLanguageServer(context);
         })
     );
@@ -569,14 +638,7 @@ async function activateJavaExtension(): Promise<boolean> {
 }
 
 export async function deactivate(): Promise<void> {
-    if (client) {
-        try {
-            await client.stop();
-        } catch (e) {
-            outputChannel.appendLine(`Error stopping language server: ${e}`);
-        }
-        client = undefined;
-    }
+    await stopLanguageServer();
     updateStatusBar('Stopped');
 }
 
@@ -681,11 +743,12 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     } as Executable;
 
     // 8. Define client options
+    const session = createServerSessionScope();
+    activeServerSession = session;
     const groovyWatcher = workspace.createFileSystemWatcher('**/*.groovy');
     const javaWatcher = workspace.createFileSystemWatcher('**/*.java');
-    const gradleWatcher = workspace.createFileSystemWatcher('**/build.gradle');
-    const pomWatcher = workspace.createFileSystemWatcher('**/pom.xml');
-    context.subscriptions.push(groovyWatcher, javaWatcher, gradleWatcher, pomWatcher);
+    const buildDescriptorWatcher = workspace.createFileSystemWatcher('{**/build.gradle,**/pom.xml}');
+    addSessionDisposables(session, groovyWatcher, javaWatcher, buildDescriptorWatcher);
 
     // Build initializationOptions from user settings
     const initOptions = buildInitializationOptions();
@@ -699,7 +762,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         ],
         initializationOptions: initOptions,
         synchronize: {
-            fileEvents: [groovyWatcher, javaWatcher, gradleWatcher, pomWatcher],
+            fileEvents: [groovyWatcher, javaWatcher, buildDescriptorWatcher],
         },
         outputChannel: outputChannel,
         traceOutputChannel: outputChannel,
@@ -716,10 +779,12 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
 
     // Invalidate the cached project root map when build files change so that
     // subsequent classpath events pick up new or removed subprojects.
-    const buildFileWatcher = workspace.createFileSystemWatcher('{**/build.gradle,**/pom.xml}');
-    buildFileWatcher.onDidCreate(() => invalidateProjectRootMapCache());
-    buildFileWatcher.onDidDelete(() => invalidateProjectRootMapCache());
-    context.subscriptions.push(buildFileWatcher);
+    addSessionDisposables(
+        session,
+        buildDescriptorWatcher.onDidChange(() => invalidateProjectRootMapCache()),
+        buildDescriptorWatcher.onDidCreate(() => invalidateProjectRootMapCache()),
+        buildDescriptorWatcher.onDidDelete(() => invalidateProjectRootMapCache())
+    );
 
     // 9. Create and start the language client
     client = new LanguageClient(
@@ -728,6 +793,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         serverOptions,
         clientOptions
     );
+    session.client = client;
 
     outputChannel.appendLine('Starting Groovy Language Server...');
     try {
@@ -736,6 +802,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     } catch (e) {
         updateStatusBar('Error', `Failed to start: ${e}`);
         outputChannel.appendLine(`Failed to start Groovy Language Server: ${e}`);
+        disposeServerSessionScope(session);
         window.showErrorMessage(
             `Groovy Language Server failed to start: ${e instanceof Error ? e.message : String(e)}. ` +
             'Check the output channel for details.'
@@ -746,37 +813,48 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     outputChannel.appendLine('Groovy Language Server started successfully.');
 
     // Monitor client state for unexpected crashes
-    client.onDidChangeState((e) => {
-        if (e.newState === 1 /* Stopped */ && e.oldState === 2 /* Running */) {
-            if (isRestarting) {
-                return;
-            }
-            outputChannel.appendLine('Groovy Language Server stopped unexpectedly.');
-            updateStatusBar('Error', 'Server stopped unexpectedly');
-            window.showErrorMessage(
-                'Groovy Language Server stopped unexpectedly. ' +
-                'Use "Groovy: Restart Language Server" to restart.',
-                'Restart'
-            ).then(choice => {
-                if (choice === 'Restart') {
-                    vscode.commands.executeCommand('groovy.restartServer');
+    addSessionDisposables(
+        session,
+        client.onDidChangeState((e) => {
+            if (e.newState === 1 /* Stopped */ && e.oldState === 2 /* Running */) {
+                if (isRestarting || !isServerSessionActive(session, client)) {
+                    return;
                 }
-            });
-        }
-    });
+                outputChannel.appendLine('Groovy Language Server stopped unexpectedly.');
+                updateStatusBar('Error', 'Server stopped unexpectedly');
+                window.showErrorMessage(
+                    'Groovy Language Server stopped unexpectedly. ' +
+                    'Use "Groovy: Restart Language Server" to restart.',
+                    'Restart'
+                ).then(choice => {
+                    if (choice === 'Restart') {
+                        vscode.commands.executeCommand('groovy.restartServer');
+                    }
+                });
+            }
+        })
+    );
 
     // Register the virtual document content provider for groovy-source:// URIs
     const sourceProvider = new GroovySourceContentProvider(client);
-    context.subscriptions.push(
+    addSessionDisposables(
+        session,
+        sourceProvider,
         vscode.workspace.registerTextDocumentContentProvider(GROOVY_SOURCE_SCHEME, sourceProvider)
     );
     outputChannel.appendLine('Registered groovy-source:// content provider.');
 
     // Listen for custom status notifications from the server
-    client.onNotification('groovy/status', (params: StatusNotification) => {
-        outputChannel.appendLine(`[status] ${params.state}${params.message ? ': ' + params.message : ''}`);
-        updateStatusBar(params.state, params.message);
-    });
+    addSessionDisposables(
+        session,
+        client.onNotification('groovy/status', (params: StatusNotification) => {
+            if (!isServerSessionActive(session, client)) {
+                return;
+            }
+            outputChannel.appendLine(`[status] ${params.state}${params.message ? ': ' + params.message : ''}`);
+            updateStatusBar(params.state, params.message);
+        })
+    );
 
     // Push initial configuration (formatter + inlay hints) to the server
     const sendGroovyConfiguration = () => {
@@ -812,16 +890,18 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     sendGroovyConfiguration();
 
     // Watch for configuration changes and forward to server
-    context.subscriptions.push(
+    addSessionDisposables(
+        session,
         workspace.onDidChangeConfiguration((e) => {
-            if (client && (e.affectsConfiguration('groovy.ls.logLevel') || e.affectsConfiguration('groovy.format') || e.affectsConfiguration('groovy.inlayHints'))) {
+            if (isServerSessionActive(session, client)
+                && (e.affectsConfiguration('groovy.ls.logLevel') || e.affectsConfiguration('groovy.format') || e.affectsConfiguration('groovy.inlayHints'))) {
                 sendGroovyConfiguration();
             }
         })
     );
 
     // ---- Delegate classpath resolution to Red Hat Java extension ----
-    await initJavaExtensionClasspath(context, client);
+    await initJavaExtensionClasspath(session, client);
     logStartupDuration('server.launch', startPhase, 'language client ready');
 }
 
@@ -877,7 +957,7 @@ function prepareWorkspaceDataDir(context: ExtensionContext): WorkspaceDataPrepar
  * and sent immediately after client.start().
  */
 async function initJavaExtensionClasspath(
-    context: ExtensionContext,
+    session: ServerSessionScope,
     lsClient: LanguageClient
 ): Promise<void> {
     // Use the cached Java API from the wait phase
@@ -888,13 +968,30 @@ async function initJavaExtensionClasspath(
     }
 
     outputChannel.appendLine('[java-ext] Setting up classpath change listeners...');
-    initialClasspathBatchCompleteSent = false;
+    let initialClasspathBatchCompleteSent = false;
+    let initialClasspathFetchStarted = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let pendingInitialRetryTargets: JavaClasspathTarget[] = [];
+    const isActive = (): boolean => isServerSessionActive(session, lsClient);
+    const clearRetryTimer = (): void => {
+        if (retryTimer) {
+            clearTimeout(retryTimer);
+            retryTimer = undefined;
+        }
+    };
+
+    addSessionDisposables(session, new vscode.Disposable(() => {
+        initialClasspathBatchCompleteSent = true;
+        pendingInitialRetryTargets = [];
+        clearRetryTimer();
+    }));
 
     const sendInitialClasspathBatchComplete = (reason: string): void => {
-        if (initialClasspathBatchCompleteSent) {
+        if (initialClasspathBatchCompleteSent || !isActive()) {
             return;
         }
         initialClasspathBatchCompleteSent = true;
+        clearRetryTimer();
         lsClient.sendNotification('groovy/classpathBatchComplete', {});
         outputChannel.appendLine(`[java-ext] Sent groovy/classpathBatchComplete to server (${reason}).`);
         markStartupPhase('java.classpath-batch-complete', reason);
@@ -914,6 +1011,10 @@ async function initJavaExtensionClasspath(
     const fetchRawEntries = async (
         target: JavaClasspathTarget
     ): Promise<{ rawEntries: string[]; hasJars: boolean }> => {
+        if (!isActive()) {
+            return { rawEntries: [], hasJars: false };
+        }
+
         let result: { classpaths: string[]; modulepaths: string[] } | null = null;
 
         if (typeof javaApi.getClasspaths === 'function') {
@@ -954,6 +1055,9 @@ async function initJavaExtensionClasspath(
         // Approach 3: Gradle wrapper fallback (async — does not block extension host)
         if ((rawEntries.length === 0 || !hasJars) && target.projectPath) {
             const gradleEntries = await resolveGradleClasspath(target.projectPath);
+            if (!isActive()) {
+                return { rawEntries: [], hasJars: false };
+            }
             if (gradleEntries.length > 0) {
                 rawEntries = Array.from(new Set([...rawEntries, ...gradleEntries]));
                 hasJars = rawEntries.some(e => e.toLowerCase().endsWith('.jar'));
@@ -969,6 +1073,10 @@ async function initJavaExtensionClasspath(
         target: JavaClasspathTarget,
         projectRootMap: Map<string, string>
     ): boolean => {
+        if (!isActive()) {
+            return false;
+        }
+
         const filteredEntries: string[] = [];
         let skippedJdk = 0;
 
@@ -1012,6 +1120,10 @@ async function initJavaExtensionClasspath(
         target: JavaClasspathTarget,
         projectRootMap: Map<string, string>
     ): Promise<boolean> => {
+        if (!isActive()) {
+            return false;
+        }
+
         try {
             outputChannel.appendLine(
                 `[java-ext] Fetching classpath for project: ${target.projectUri}`
@@ -1019,6 +1131,9 @@ async function initJavaExtensionClasspath(
             );
 
             const { rawEntries, hasJars } = await fetchRawEntries(target);
+            if (!isActive()) {
+                return false;
+            }
 
             outputChannel.appendLine(
                 `[java-ext]   getClasspaths: ${rawEntries.length} entries, hasJars=${hasJars}`
@@ -1037,6 +1152,42 @@ async function initJavaExtensionClasspath(
             outputChannel.appendLine(`[java-ext]   → error: ${e}`);
             return false;
         }
+    };
+
+    const fetchClasspathBatch = async (
+        targets: JavaClasspathTarget[],
+        projectRootMap: Map<string, string>
+    ): Promise<number> => {
+        if (!isActive()) {
+            return 0;
+        }
+
+        if (targets.length > 0) {
+            outputChannel.appendLine(`[java-ext] Total ${targets.length} project(s) to fetch classpath for`);
+        }
+
+        let fetched = 0;
+        const batchSize = 20;
+        for (let i = 0; i < targets.length; i += batchSize) {
+            if (!isActive()) {
+                return fetched;
+            }
+            const batch = targets.slice(i, i + batchSize);
+            const results = await Promise.allSettled(
+                batch.map(target => fetchClasspathForProject(target, projectRootMap))
+            );
+            if (!isActive()) {
+                return fetched;
+            }
+            for (const result of results) {
+                if (result.status === 'fulfilled' && result.value) {
+                    fetched++;
+                }
+            }
+        }
+
+        outputChannel.appendLine(`[java-ext] Sent classpath for ${fetched}/${targets.length} project(s)`);
+        return fetched;
     };
 
     /** Check whether a project URI should be included based on JDT workspace and root-folder heuristics. */
@@ -1063,8 +1214,14 @@ async function initJavaExtensionClasspath(
         wsRootPath: string
     ): Promise<void> => {
         for (const [projDirNorm, projDir] of projectRootMap) {
+            if (!isActive()) {
+                return;
+            }
             if (projDirNorm === wsRootPath || knownPaths.has(projDirNorm)) continue;
             const sourceUri = await findRepresentativeSourceUri(projDir);
+            if (!isActive()) {
+                return;
+            }
             if (!sourceUri) {
                 outputChannel.appendLine(`[java-ext] Skipping probe for ${projDir} (no source file found)`);
                 continue;
@@ -1079,11 +1236,21 @@ async function initJavaExtensionClasspath(
     // Fetch classpath for all Java projects known to JDT LS.
     // Returns the number of projects that had actual JAR entries.
     const fetchAllClasspaths = async (): Promise<number> => {
+        if (!isActive()) {
+            return 0;
+        }
+
         try {
             const projectRootMap = await collectProjectRootMap();
+            if (!isActive()) {
+                return 0;
+            }
 
             const projectUris: string[] =
                 (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
+            if (!isActive()) {
+                return 0;
+            }
             outputChannel.appendLine(`[java-ext] java.project.getAll returned ${projectUris.length} project(s):`);
             for (const uri of projectUris) {
                 outputChannel.appendLine(`[java-ext]   - ${uri}`);
@@ -1119,26 +1286,8 @@ async function initJavaExtensionClasspath(
             }));
 
             await addBuildFileScanTargets(targets, knownPaths, projectRootMap, wsRootPath);
-
-            if (targets.length > 0) {
-                outputChannel.appendLine(`[java-ext] Total ${targets.length} project(s) to fetch classpath for`);
-            }
-
-            let fetched = 0;
-            // Fetch classpaths in parallel batches of 20 to avoid
-            // sequential round-trips for large multi-project workspaces.
-            const BATCH_SIZE = 20;
-            for (let i = 0; i < targets.length; i += BATCH_SIZE) {
-                const batch = targets.slice(i, i + BATCH_SIZE);
-                const results = await Promise.allSettled(
-                    batch.map(target => fetchClasspathForProject(target, projectRootMap))
-                );
-                for (const r of results) {
-                    if (r.status === 'fulfilled' && r.value) fetched++;
-                }
-            }
-            outputChannel.appendLine(`[java-ext] Sent classpath for ${fetched}/${targets.length} project(s)`);
-            return fetched;
+            pendingInitialRetryTargets = targets;
+            return fetchClasspathBatch(targets, projectRootMap);
         } catch (e) {
             outputChannel.appendLine(`[java-ext] Failed to enumerate projects: ${e}`);
             return fetchClasspathFallback();
@@ -1147,30 +1296,66 @@ async function initJavaExtensionClasspath(
 
     /** Fallback: try workspace folders directly. */
     const fetchClasspathFallback = async (): Promise<number> => {
+        if (!isActive()) {
+            return 0;
+        }
+
         const folders = workspace.workspaceFolders;
         if (!folders) return 0;
         const projectRootMap = await collectProjectRootMap();
-        let fetched = 0;
+        if (!isActive()) {
+            return 0;
+        }
+        const targets: JavaClasspathTarget[] = [];
         for (const folder of folders) {
             const representativeUri = await findRepresentativeSourceUri(folder.uri.fsPath);
-            const ok = await fetchClasspathForProject({
+            if (!isActive()) {
+                return 0;
+            }
+            targets.push({
                 requestUri: representativeUri ?? folder.uri.toString(),
                 projectUri: folder.uri.toString(),
                 projectPath: folder.uri.fsPath,
                 source: 'workspace-folder-fallback',
-            }, projectRootMap);
-            if (ok) fetched++;
+            });
         }
-        return fetched;
+        pendingInitialRetryTargets = targets;
+        return fetchClasspathBatch(targets, projectRootMap);
+    };
+
+    const fetchPendingInitialTargets = async (): Promise<number> => {
+        if (!isActive()) {
+            return 0;
+        }
+
+        if (pendingInitialRetryTargets.length === 0) {
+            return fetchAllClasspaths();
+        }
+
+        const projectRootMap = await collectProjectRootMap();
+        if (!isActive()) {
+            return 0;
+        }
+        return fetchClasspathBatch(pendingInitialRetryTargets, projectRootMap);
     };
 
     /** Force project configuration updates for all Java projects. */
     const forceProjectConfigurationUpdates = async (): Promise<void> => {
+        if (!isActive()) {
+            return;
+        }
+
         outputChannel.appendLine('[java-ext] No JARs on first attempt. Forcing project configuration update...');
         try {
             const projectUris: string[] =
                 (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
+            if (!isActive()) {
+                return;
+            }
             for (const uri of projectUris) {
+                if (!isActive()) {
+                    return;
+                }
                 if (isJdtWorkspaceUri(uri)) continue;
                 try {
                     outputChannel.appendLine(`[java-ext]   Requesting config update for: ${uri}`);
@@ -1188,15 +1373,20 @@ async function initJavaExtensionClasspath(
     // when we first fetch. Retry with increasing delays until we get actual JARs.
     // On first failure, trigger java.projectConfiguration.update to force dependency resolution.
     const fetchWithRetry = async (attempt: number = 1, maxAttempts: number = 6): Promise<void> => {
-        if (initialClasspathBatchCompleteSent) {
+        if (initialClasspathBatchCompleteSent || !isActive()) {
             return;
         }
-        const fetched = await fetchAllClasspaths();
+        const fetched = attempt === 1 ? await fetchAllClasspaths() : await fetchPendingInitialTargets();
+        if (!isActive()) {
+            return;
+        }
         if (fetched > 0) {
+            pendingInitialRetryTargets = [];
             sendInitialClasspathBatchComplete(`fetched ${fetched} project(s) on attempt ${attempt}`);
             return;
         }
         if (attempt >= maxAttempts) {
+            pendingInitialRetryTargets = [];
             sendInitialClasspathBatchComplete(`max attempts reached (${attempt})`);
             return;
         }
@@ -1210,15 +1400,51 @@ async function initJavaExtensionClasspath(
             `[java-ext] No JARs yet (attempt ${attempt}/${maxAttempts}). ` +
             `Retrying in ${delay / 1000}s...`
         );
-        setTimeout(() => fetchWithRetry(attempt + 1, maxAttempts).catch(e =>
-            outputChannel.appendLine(`[java-ext] fetchWithRetry error: ${e}`)
-        ), delay);
+        if (!isActive()) {
+            return;
+        }
+        retryTimer = setTimeout(() => {
+            if (!isActive()) {
+                return;
+            }
+            retryTimer = undefined;
+            fetchWithRetry(attempt + 1, maxAttempts).catch(e =>
+                outputChannel.appendLine(`[java-ext] fetchWithRetry error: ${e}`)
+            );
+        }, delay);
+    };
+
+    const startInitialClasspathFetch = (reason: string, delay: number = 0): void => {
+        if (initialClasspathBatchCompleteSent || initialClasspathFetchStarted || !isActive()) {
+            return;
+        }
+
+        initialClasspathFetchStarted = true;
+        outputChannel.appendLine(`[java-ext] Starting initial classpath fetch (${reason})...`);
+
+        const runFetch = () => {
+            retryTimer = undefined;
+            if (!isActive()) {
+                return;
+            }
+            fetchWithRetry().catch(e => outputChannel.appendLine(`[java-ext] initial classpath fetch error: ${e}`));
+        };
+
+        if (delay > 0) {
+            retryTimer = setTimeout(runFetch, delay);
+        } else {
+            runFetch();
+        }
     };
 
     // Listen for classpath changes from the Java extension
     if (typeof javaApi.onDidClasspathUpdate === 'function') {
-        context.subscriptions.push(
+        addSessionDisposables(
+            session,
             javaApi.onDidClasspathUpdate(async (uri: vscode.Uri) => {
+                if (!isActive()) {
+                    return;
+                }
                 outputChannel.appendLine(`[java-ext] Classpath updated for: ${uri.toString()}`);
                 if (isJdtWorkspaceUri(uri.toString())) {
                     outputChannel.appendLine('[java-ext] Ignoring classpath update for jdt_ws project.');
@@ -1226,6 +1452,9 @@ async function initJavaExtensionClasspath(
                 }
                 // Re-fetch only the changed project (not all — each project has isolated classpath)
                 const projectRootMap = await collectProjectRootMap();
+                if (!isActive()) {
+                    return;
+                }
                 await fetchClasspathForProject({
                     requestUri: uri.toString(),
                     projectUri: uri.toString(),
@@ -1239,15 +1468,23 @@ async function initJavaExtensionClasspath(
 
     // Listen for project import completion
     if (typeof javaApi.onDidProjectsImport === 'function') {
-        context.subscriptions.push(
+        addSessionDisposables(
+            session,
             javaApi.onDidProjectsImport((uris: vscode.Uri[]) => {
+                if (!isActive()) {
+                    return;
+                }
                 outputChannel.appendLine(
                     `[java-ext] Projects imported (${uris.length}) — refreshing classpath...`
                 );
                 if (uris.length === 0) {
                     fetchAllClasspaths()
                         .then(fetched => {
+                            if (!isActive()) {
+                                return;
+                            }
                             if (fetched > 0) {
+                                pendingInitialRetryTargets = [];
                                 sendInitialClasspathBatchComplete('projects imported (empty payload fallback)');
                             }
                         })
@@ -1257,8 +1494,14 @@ async function initJavaExtensionClasspath(
 
                 (async () => {
                     const projectRootMap = await collectProjectRootMap();
+                    if (!isActive()) {
+                        return;
+                    }
                     let fetched = 0;
                     for (const importedUri of uris) {
+                        if (!isActive()) {
+                            return;
+                        }
                         if (isJdtWorkspaceUri(importedUri.toString())) continue;
                         const ok = await fetchClasspathForProject({
                             requestUri: importedUri.toString(),
@@ -1271,6 +1514,7 @@ async function initJavaExtensionClasspath(
                         }
                     }
                     if (fetched > 0) {
+                        pendingInitialRetryTargets = [];
                         sendInitialClasspathBatchComplete(`projects imported (${fetched} project(s) with jars)`);
                     }
                 })().catch(e => outputChannel.appendLine(`[java-ext] onDidProjectsImport error: ${e}`));
@@ -1281,12 +1525,15 @@ async function initJavaExtensionClasspath(
 
     // Also listen for the standard Java extension server ready event
     if (typeof javaApi.onDidServerModeChange === 'function') {
-        context.subscriptions.push(
+        addSessionDisposables(
+            session,
             javaApi.onDidServerModeChange((mode: string) => {
+                if (!isActive()) {
+                    return;
+                }
                 outputChannel.appendLine(`[java-ext] Server mode changed: ${mode}`);
                 if (mode === 'Standard') {
-                    // Standard mode is ready — fetch classpath with retries
-                    setTimeout(() => fetchWithRetry(), 3000);
+                    startInitialClasspathFetch('server mode standard', 3000);
                 }
             })
         );
@@ -1295,7 +1542,7 @@ async function initJavaExtensionClasspath(
     // Initial classpath fetch starts immediately and retries until Java import
     // finishes. This is the single source of truth for the initial
     // groovy/classpathBatchComplete notification.
-    fetchWithRetry();
+    startInitialClasspathFetch('extension initialization');
 }
 
 // ---- Helper functions ----

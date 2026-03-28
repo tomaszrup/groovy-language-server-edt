@@ -18,6 +18,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -812,6 +813,45 @@ class GroovyWorkspaceServiceTest {
                 new Object[] {source, "MyAnnotation", "NewAnnotation"});
         assertNotNull(edit);
         assertEquals("NewAnnotation", edit.getNewText());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void collectWorkspaceGroovyFilesReturnsCachedListWhenFresh() throws Exception {
+        Path cached = Path.of("/tmp/Cached.groovy");
+
+        java.lang.reflect.Field filesField = GroovyWorkspaceService.class
+                .getDeclaredField("cachedWorkspaceGroovyFiles");
+        filesField.setAccessible(true);
+        filesField.set(service, List.of(cached));
+
+        java.lang.reflect.Field timestampField = GroovyWorkspaceService.class
+                .getDeclaredField("workspaceGroovyFilesCacheTimestampMs");
+        timestampField.setAccessible(true);
+        timestampField.setLong(service, System.currentTimeMillis());
+
+        List<Path> result = (List<Path>) invoke("collectWorkspaceGroovyFiles",
+                new Class<?>[] {}, new Object[] {});
+
+        assertEquals(List.of(cached), result);
+    }
+
+    @Test
+    void invalidateWorkspaceGroovyFilesCacheClearsCachedEntries() throws Exception {
+        java.lang.reflect.Field filesField = GroovyWorkspaceService.class
+                .getDeclaredField("cachedWorkspaceGroovyFiles");
+        filesField.setAccessible(true);
+        filesField.set(service, List.of(Path.of("/tmp/Cached.groovy")));
+
+        java.lang.reflect.Field timestampField = GroovyWorkspaceService.class
+                .getDeclaredField("workspaceGroovyFilesCacheTimestampMs");
+        timestampField.setAccessible(true);
+        timestampField.setLong(service, System.currentTimeMillis());
+
+        invoke("invalidateWorkspaceGroovyFilesCache", new Class<?>[] {}, new Object[] {});
+
+        assertEquals(List.of(), filesField.get(service));
+        assertEquals(0L, timestampField.getLong(service));
     }
 
     // ---- Helpers ----

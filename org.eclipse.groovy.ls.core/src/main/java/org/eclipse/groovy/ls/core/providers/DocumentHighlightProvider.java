@@ -22,7 +22,6 @@ import org.eclipse.jdt.core.search.IJavaSearchConstants;
 import org.eclipse.jdt.core.search.IJavaSearchScope;
 import org.eclipse.jdt.core.search.SearchEngine;
 import org.eclipse.jdt.core.search.SearchMatch;
-import org.eclipse.jdt.core.search.SearchParticipant;
 import org.eclipse.jdt.core.search.SearchPattern;
 import org.eclipse.jdt.core.search.SearchRequestor;
 import org.eclipse.lsp4j.DocumentHighlight;
@@ -92,13 +91,11 @@ public class DocumentHighlightProvider {
             // workspace-wide search is wasteful in large projects.
             IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
                     new org.eclipse.jdt.core.IJavaElement[]{workingCopy});
-            SearchEngine engine = new SearchEngine();
 
             // Normalize the target URI for comparison
             String normalizedUri = normalizeUri(uri);
 
-            engine.search(pattern,
-                    new SearchParticipant[]{SearchEngine.getDefaultSearchParticipant()},
+                JdtSearchSupport.search(pattern,
                     scope,
                     createHighlightRequestor(highlights, normalizedUri, content),
                     null);

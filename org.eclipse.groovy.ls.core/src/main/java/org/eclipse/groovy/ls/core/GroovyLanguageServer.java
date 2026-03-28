@@ -481,6 +481,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         initialBuildScheduler.shutdownNow();
         textDocumentService.shutdown();
         documentManager.dispose();
+        pendingClasspathUpdates.clear();
+        projectsWithClasspath.clear();
+        subprojectPathToEclipseName.clear();
         exitCode = 0; // clean shutdown
         return CompletableFuture.completedFuture(null);
     }
