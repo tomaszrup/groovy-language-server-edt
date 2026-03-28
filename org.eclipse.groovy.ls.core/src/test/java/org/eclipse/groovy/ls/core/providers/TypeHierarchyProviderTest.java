@@ -145,6 +145,65 @@ class TypeHierarchyProviderTest {
         assertTrue(subtypes.isEmpty());
     }
 
+    @Test
+    void findTypeInWorkspaceReturnsCachedResolvedType() throws Exception {
+        org.eclipse.jdt.core.IType mockType = org.mockito.Mockito.mock(org.eclipse.jdt.core.IType.class);
+        org.mockito.Mockito.when(mockType.exists()).thenReturn(true);
+
+        java.lang.reflect.Field field = TypeHierarchyProvider.class.getDeclaredField("resolvedTypesByFqn");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, org.eclipse.jdt.core.IType> cache =
+                (java.util.Map<String, org.eclipse.jdt.core.IType>) field.get(provider);
+        cache.put("com.example.Cached", mockType);
+
+        java.lang.reflect.Method method = TypeHierarchyProvider.class.getDeclaredMethod(
+                "findTypeInWorkspace", String.class);
+        method.setAccessible(true);
+
+        Object result = method.invoke(provider, "com.example.Cached");
+        assertEquals(mockType, result);
+    }
+
+    @Test
+    void findTypeInWorkspaceReturnsNullForCachedMiss() throws Exception {
+        java.lang.reflect.Field field = TypeHierarchyProvider.class.getDeclaredField("missingTypesByFqn");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> cache = (java.util.Set<String>) field.get(provider);
+        cache.add("com.example.Missing");
+
+        java.lang.reflect.Method method = TypeHierarchyProvider.class.getDeclaredMethod(
+                "findTypeInWorkspace", String.class);
+        method.setAccessible(true);
+
+        Object result = method.invoke(provider, "com.example.Missing");
+        assertNull(result);
+    }
+
+    @Test
+    void invalidateCacheClearsTypeLookupCaches() throws Exception {
+        org.eclipse.jdt.core.IType mockType = org.mockito.Mockito.mock(org.eclipse.jdt.core.IType.class);
+
+        java.lang.reflect.Field resolvedField = TypeHierarchyProvider.class.getDeclaredField("resolvedTypesByFqn");
+        resolvedField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, org.eclipse.jdt.core.IType> resolvedCache =
+                (java.util.Map<String, org.eclipse.jdt.core.IType>) resolvedField.get(provider);
+        resolvedCache.put("com.example.Cached", mockType);
+
+        java.lang.reflect.Field missingField = TypeHierarchyProvider.class.getDeclaredField("missingTypesByFqn");
+        missingField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> missingCache = (java.util.Set<String>) missingField.get(provider);
+        missingCache.add("com.example.Missing");
+
+        provider.invalidateCache();
+
+        assertTrue(resolvedCache.isEmpty());
+        assertTrue(missingCache.isEmpty());
+    }
+
     // ---- offsetToPosition / positionToOffset ----
 
     @Test

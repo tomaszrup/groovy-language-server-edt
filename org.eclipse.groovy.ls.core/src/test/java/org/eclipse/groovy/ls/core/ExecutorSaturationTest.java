@@ -767,4 +767,36 @@ class ExecutorSaturationTest {
         System.out.println("[CodeSelectCache] TTL expiry test passed: "
                 + codeSelectCount.get() + " actual codeSelect() calls after 5.1s wait");
     }
+
+    @Test
+    @Order(12)
+    @DisplayName("Queue saturation: rejected hover falls back immediately instead of waiting for timeout")
+    void rejectedHoverFallsBackImmediately() throws Exception {
+        GroovyTextDocumentService service = createService();
+        service.configureRequestPool(1, 1);
+
+        CountDownLatch releaseHover = new CountDownLatch(1);
+        HoverProvider provider = mock(HoverProvider.class);
+        when(provider.getHover(any())).thenAnswer(invocation -> {
+            releaseHover.await(5, TimeUnit.SECONDS);
+            return new Hover(new MarkupContent("plaintext", "ok"));
+        });
+        setField(service, "hoverProvider", provider);
+
+        CompletableFuture<Hover> running = service.hover(hoverParams("file:///immediate-1.groovy"));
+        CompletableFuture<Hover> queued = service.hover(hoverParams("file:///immediate-2.groovy"));
+
+        long startedAt = System.nanoTime();
+        CompletableFuture<Hover> rejected = service.hover(hoverParams("file:///immediate-3.groovy"));
+        Hover result = rejected.get(1, TimeUnit.SECONDS);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+
+        releaseHover.countDown();
+        assertNull(result, "Rejected request should return the hover fallback immediately");
+        assertTrue(elapsedMs < 1000,
+                "Rejected request should not wait for the 10s timeout, took " + elapsedMs + " ms");
+
+        running.get(5, TimeUnit.SECONDS);
+        queued.get(5, TimeUnit.SECONDS);
+    }
 }

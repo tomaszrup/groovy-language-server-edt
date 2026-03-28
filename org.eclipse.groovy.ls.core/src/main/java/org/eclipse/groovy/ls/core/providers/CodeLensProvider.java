@@ -14,9 +14,18 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
+import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
+import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.InnerClassNode;
+import org.codehaus.groovy.ast.MethodNode;
+import org.codehaus.groovy.ast.ModuleNode;
+import org.codehaus.groovy.ast.stmt.BlockStatement;
+import org.codehaus.groovy.ast.stmt.Statement;
+import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -47,8 +56,14 @@ public class CodeLensProvider {
     private static final String HANDLE_ID_KEY = "handleId";
     private static final String URI_KEY = "uri";
     private static final String SHOW_REFERENCES_COMMAND = "groovy.showReferences";
+    private static final String ZERO_REFERENCES_COMMAND = "groovy.codeLensNoop";
     private static final String SHOW_OUTPUT_COMMAND = "groovy.showOutputChannel";
+    private static final String ZERO_REFERENCES_TITLE = "0 references";
     private static final String REFERENCES_UNAVAILABLE_TITLE = "References unavailable";
+    private static final Set<String> SPOCK_LIFECYCLE_METHODS =
+            Set.of("setup", "cleanup", "setupSpec", "cleanupSpec");
+    private static final Set<String> SPOCK_LABELS =
+            Set.of("given", "when", "then", "expect", "where", "and");
     private static final int RESOLVE_CACHE_SIZE = 300;
 
     private final DocumentManager documentManager;
@@ -98,8 +113,9 @@ public class CodeLensProvider {
      * Lenses are returned <em>unresolved</em> — only positions and handle
      * identifiers are populated.  The expensive reference count is deferred
      * to {@link #resolveCodeLens(CodeLens)} which VS Code calls lazily as
-     * each lens scrolls into view.  This avoids O(n) workspace searches
-     * per element on every keystroke in large workspaces.
+     * each lens scrolls into view.  We intentionally do not pre-filter by
+     * reference count here: probing each declaration up front turned a single
+     * code-lens refresh into O(n) search requests for the whole file.
      */
     public List<CodeLens> getCodeLenses(CodeLensParams params) {
         String uri = params.getTextDocument().getUri();
@@ -179,8 +195,7 @@ public class CodeLensProvider {
             int count = locations.size();
 
             if (count == 0) {
-                // Leave the lens without a command so clients do not render a
-                // visible "0 references" label for unused declarations.
+                codeLens.setCommand(zeroReferencesCommand());
                 return codeLens;
             }
 
@@ -205,29 +220,246 @@ public class CodeLensProvider {
         return new Command(REFERENCES_UNAVAILABLE_TITLE, SHOW_OUTPUT_COMMAND);
     }
 
+    private static Command zeroReferencesCommand() {
+        return new Command(ZERO_REFERENCES_TITLE, ZERO_REFERENCES_COMMAND);
+    }
+
     // ---- Helpers ----
 
     private void addCodeLensesForType(IType type, String content, String uri, List<CodeLens> lenses)
             throws JavaModelException {
-        // Only publish declarations that have at least one reference so the
-        // client never renders placeholder lenses for unused symbols.
-        CodeLens typeLens = createCodeLensIfReferenced(type, content, uri);
+        addCodeLensesForType(type, content, uri, lenses, documentManager.getCachedGroovyAST(uri));
+    }
+
+    private void addCodeLensesForType(
+            IType type,
+            String content,
+            String uri,
+            List<CodeLens> lenses,
+            ModuleNode cachedAst) throws JavaModelException {
+        CodeLens typeLens = createUnresolvedCodeLens(type, content);
         if (typeLens != null) {
             lenses.add(typeLens);
         }
 
-        // Code lens for each method
         for (IMethod method : type.getMethods()) {
-            CodeLens methodLens = createCodeLensIfReferenced(method, content, uri);
+            if (shouldSkipMethodCodeLens(method, content, uri, cachedAst)) {
+                continue;
+            }
+            CodeLens methodLens = createUnresolvedCodeLens(method, content);
             if (methodLens != null) {
                 lenses.add(methodLens);
             }
         }
 
-        // Recurse into inner types
         for (IType innerType : type.getTypes()) {
-            addCodeLensesForType(innerType, content, uri, lenses);
+            addCodeLensesForType(innerType, content, uri, lenses, cachedAst);
         }
+    }
+
+    boolean shouldSkipMethodCodeLens(IMethod method, String uri) {
+        return shouldSkipMethodCodeLens(method, documentManager.getContent(uri), uri,
+                documentManager.getCachedGroovyAST(uri));
+    }
+
+    private boolean shouldSkipMethodCodeLens(
+            IMethod method, String content, String uri, ModuleNode cachedAst) {
+        try {
+            if (method == null || uri == null || !isSpockSpecification(method.getDeclaringType())) {
+                return false;
+            }
+
+            String methodName = method.getElementName();
+            if (isSpockLifecycleMethod(methodName) || !isValidIdentifier(methodName)) {
+                return true;
+            }
+
+            return isIdentifierNamedSpockFeatureMethod(method, content, cachedAst);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    boolean isSpockSpecification(IType type) {
+        try {
+            if (type == null) {
+                return false;
+            }
+            String superclassName = type.getSuperclassName();
+            return "Specification".equals(superclassName)
+                    || "spock.lang.Specification".equals(superclassName);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    boolean isSpockLifecycleMethod(String methodName) {
+        return methodName != null && SPOCK_LIFECYCLE_METHODS.contains(methodName);
+    }
+
+    boolean isValidIdentifier(String name) {
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        if (!Character.isJavaIdentifierStart(name.charAt(0))) {
+            return false;
+        }
+        for (int i = 1; i < name.length(); i++) {
+            if (!Character.isJavaIdentifierPart(name.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isIdentifierNamedSpockFeatureMethod(
+            IMethod method, String content, ModuleNode cachedAst) {
+        if (cachedAst == null || content == null) {
+            return false;
+        }
+
+        MethodNode astMethod = findMatchingAstMethod(cachedAst, method, content);
+        if (astMethod == null || astMethod.getCode() == null) {
+            return false;
+        }
+
+        return containsSpockLabels(astMethod, cachedAst);
+    }
+
+    private MethodNode findMatchingAstMethod(ModuleNode module, IMethod method, String content) {
+        if (module == null || method == null || content == null) {
+            return null;
+        }
+
+        ClassNode declaringClass = findMatchingClassNode(module, safeTypeName(method));
+        if (declaringClass == null) {
+            return null;
+        }
+
+        int targetLine = methodNameLine(method, content);
+        if (targetLine < 0) {
+            return null;
+        }
+
+        for (MethodNode candidate : declaringClass.getDeclaredMethods(method.getElementName())) {
+            if (candidate.getLineNumber() == targetLine) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private ClassNode findMatchingClassNode(ModuleNode module, String typeName) {
+        if (module == null || typeName == null || typeName.isBlank()) {
+            return null;
+        }
+
+        for (ClassNode classNode : module.getClasses()) {
+            ClassNode match = findMatchingClassNode(classNode, typeName);
+            if (match != null) {
+                return match;
+            }
+        }
+        return null;
+    }
+
+    private ClassNode findMatchingClassNode(ClassNode classNode, String typeName) {
+        if (classNode == null) {
+            return null;
+        }
+        if (matchesTypeName(classNode, typeName)) {
+            return classNode;
+        }
+
+        java.util.Iterator<InnerClassNode> innerIter = classNode.getInnerClasses();
+        while (innerIter.hasNext()) {
+            ClassNode match = findMatchingClassNode(innerIter.next(), typeName);
+            if (match != null) {
+                return match;
+            }
+        }
+        return null;
+    }
+
+    private boolean matchesTypeName(ClassNode classNode, String typeName) {
+        String astName = classNode.getName();
+        if (typeName.equals(astName)) {
+            return true;
+        }
+
+        String astNameWithoutPackage = classNode.getNameWithoutPackage();
+        if (typeName.equals(astNameWithoutPackage)) {
+            return true;
+        }
+
+        int dollarIdx = astNameWithoutPackage.lastIndexOf('$');
+        return dollarIdx >= 0 && dollarIdx < astNameWithoutPackage.length() - 1
+                && typeName.equals(astNameWithoutPackage.substring(dollarIdx + 1));
+    }
+
+    private String safeTypeName(IMethod method) {
+        try {
+            IType declaringType = method.getDeclaringType();
+            if (declaringType == null) {
+                return null;
+            }
+
+            String fullName = declaringType.getFullyQualifiedName('$');
+            if (fullName != null && !fullName.isBlank()) {
+                return fullName;
+            }
+            return declaringType.getElementName();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private int methodNameLine(IMethod method, String content) {
+        try {
+            ISourceRange nameRange = method.getNameRange();
+            if (nameRange == null || nameRange.getOffset() < 0) {
+                return -1;
+            }
+            return offsetToPosition(content, nameRange.getOffset()).getLine() + 1;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private boolean containsSpockLabels(MethodNode methodNode, ModuleNode module) {
+        if (methodNode == null || methodNode.getCode() == null) {
+            return false;
+        }
+
+        boolean[] found = {false};
+        methodNode.getCode().visit(new ClassCodeVisitorSupport() {
+            @Override
+            protected SourceUnit getSourceUnit() {
+                return module != null ? module.getContext() : null;
+            }
+
+            @Override
+            public void visitBlockStatement(BlockStatement block) {
+                if (found[0] || block == null) {
+                    return;
+                }
+
+                for (Statement stmt : block.getStatements()) {
+                    List<String> labels = stmt.getStatementLabels();
+                    if (labels == null) {
+                        continue;
+                    }
+                    for (String label : labels) {
+                        if (SPOCK_LABELS.contains(label)) {
+                            found[0] = true;
+                            return;
+                        }
+                    }
+                }
+                super.visitBlockStatement(block);
+            }
+        });
+        return found[0];
     }
 
     CodeLens createCodeLensIfReferenced(IJavaElement element, String content, String uri) {

@@ -15,24 +15,36 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
+import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
+import org.eclipse.core.resources.IWorkspace;
+import org.eclipse.core.resources.IWorkspaceRoot;
+import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.Flags;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IOrdinaryClassFile;
 import org.eclipse.jdt.core.IPackageFragment;
@@ -50,6 +62,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.mockito.MockedStatic;
 
 /**
  * Tests for pure-text and AST utility methods in {@link DefinitionProvider}.
@@ -1454,6 +1467,136 @@ class DefinitionProviderTest {
         assertNull(result);
     }
 
+    @Test
+    void resolveClassNodeToITypeCachesResolvedLookupWithinRequest() throws Exception {
+        IJavaProject project = mock(IJavaProject.class);
+        IType resolvedType = mock(IType.class);
+        when(project.findType("java.util.List")).thenReturn(resolvedType);
+
+        ClassNode classNode = org.codehaus.groovy.ast.ClassHelper.make("java.util.List");
+        ModuleNode module = parseModule("class Dummy {}", "file:///resolveTypeCacheHit.groovy");
+        Object context = newSourceLookupContext();
+
+        assertSame(resolvedType, invokeResolveClassNodeToIType(classNode, module, project, context));
+        assertSame(resolvedType, invokeResolveClassNodeToIType(classNode, module, project, context));
+
+        verify(project, times(1)).findType("java.util.List");
+    }
+
+    @Test
+    void resolveClassNodeToITypeCachesMissedLookupWithinRequest() throws Exception {
+        IJavaProject project = mock(IJavaProject.class);
+        when(project.findType("com.unknown.Type")).thenReturn(null);
+
+        ClassNode classNode = org.codehaus.groovy.ast.ClassHelper.make("com.unknown.Type");
+        ModuleNode module = parseModule("class Dummy {}", "file:///resolveTypeCacheMiss.groovy");
+        Object context = newSourceLookupContext();
+
+        assertNull(invokeResolveClassNodeToIType(classNode, module, project, context));
+        assertNull(invokeResolveClassNodeToIType(classNode, module, project, context));
+
+        verify(project, times(1)).findType("com.unknown.Type");
+    }
+
+    @Test
+    void findSourceOnDiskCachesResolvedLocationWithinRequest() throws Exception {
+        Path projectDir = Files.createTempDirectory("definition-disk-hit");
+        Path sourceFile = projectDir.resolve("src/main/groovy/com/example/Foo.groovy");
+        Files.createDirectories(sourceFile.getParent());
+        Files.writeString(sourceFile, "class Foo {}\n");
+
+        Object context = newSourceLookupContext();
+        Location first = invokeFindSourceOnDisk(projectDir.toFile(), "com/example/Foo", context);
+        assertNotNull(first);
+
+        Files.delete(sourceFile);
+
+        Location second = invokeFindSourceOnDisk(projectDir.toFile(), "com/example/Foo", context);
+        assertSame(first, second);
+    }
+
+    @Test
+    void findSourceOnDiskCachesMissedLocationWithinRequest() throws Exception {
+        Path projectDir = Files.createTempDirectory("definition-disk-miss");
+        Object context = newSourceLookupContext();
+
+        assertNull(invokeFindSourceOnDisk(projectDir.toFile(), "com/example/Foo", context));
+
+        Path sourceFile = projectDir.resolve("src/main/groovy/com/example/Foo.groovy");
+        Files.createDirectories(sourceFile.getParent());
+        Files.writeString(sourceFile, "class Foo {}\n");
+
+        assertNull(invokeFindSourceOnDisk(projectDir.toFile(), "com/example/Foo", context));
+    }
+
+    @Test
+    void findSourceInWorkspaceCachesResolvedLocationWithinRequest() throws Exception {
+        Object context = newSourceLookupContext();
+        IWorkspace workspace = mock(IWorkspace.class);
+        IWorkspaceRoot root = mock(IWorkspaceRoot.class);
+        IProject project = mock(IProject.class);
+        org.eclipse.core.resources.IFile match = mock(org.eclipse.core.resources.IFile.class);
+        org.eclipse.core.resources.IFile missing = mock(org.eclipse.core.resources.IFile.class);
+        AtomicBoolean exists = new AtomicBoolean(true);
+
+        when(workspace.getRoot()).thenReturn(root);
+        when(root.getProjects()).thenReturn(new IProject[]{project});
+        when(project.isOpen()).thenReturn(true);
+        when(project.members()).thenReturn(new IResource[0]);
+        when(project.getFile(anyString())).thenAnswer(invocation -> {
+            String path = invocation.getArgument(0, String.class);
+            return "src/main/groovy/com/example/Foo.groovy".equals(path) ? match : missing;
+        });
+        when(match.exists()).thenAnswer(invocation -> exists.get());
+        when(match.getLocationURI()).thenReturn(URI.create("file:///tmp/Foo.groovy"));
+        when(missing.exists()).thenReturn(false);
+
+        try (MockedStatic<ResourcesPlugin> resourcesPlugin = org.mockito.Mockito.mockStatic(ResourcesPlugin.class)) {
+            resourcesPlugin.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+
+            Location first = invokeFindSourceInWorkspace("com.example.Foo", context);
+            assertNotNull(first);
+
+            exists.set(false);
+
+            Location second = invokeFindSourceInWorkspace("com.example.Foo", context);
+            assertSame(first, second);
+        }
+    }
+
+    @Test
+    void findSourceInWorkspaceCachesMissedLocationWithinRequest() throws Exception {
+        Object context = newSourceLookupContext();
+        IWorkspace workspace = mock(IWorkspace.class);
+        IWorkspaceRoot root = mock(IWorkspaceRoot.class);
+        IProject project = mock(IProject.class);
+        org.eclipse.core.resources.IFile match = mock(org.eclipse.core.resources.IFile.class);
+        org.eclipse.core.resources.IFile missing = mock(org.eclipse.core.resources.IFile.class);
+        AtomicBoolean exists = new AtomicBoolean(false);
+
+        when(workspace.getRoot()).thenReturn(root);
+        when(root.getProjects()).thenReturn(new IProject[]{project});
+        when(project.isOpen()).thenReturn(true);
+        when(project.members()).thenReturn(new IResource[0]);
+        when(project.getFile(anyString())).thenAnswer(invocation -> {
+            String path = invocation.getArgument(0, String.class);
+            return "src/main/groovy/com/example/Foo.groovy".equals(path) ? match : missing;
+        });
+        when(match.exists()).thenAnswer(invocation -> exists.get());
+        when(match.getLocationURI()).thenReturn(URI.create("file:///tmp/Foo.groovy"));
+        when(missing.exists()).thenReturn(false);
+
+        try (MockedStatic<ResourcesPlugin> resourcesPlugin = org.mockito.Mockito.mockStatic(ResourcesPlugin.class)) {
+            resourcesPlugin.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+
+            assertNull(invokeFindSourceInWorkspace("com.example.Foo", context));
+
+            exists.set(true);
+
+            assertNull(invokeFindSourceInWorkspace("com.example.Foo", context));
+        }
+    }
+
     // ================================================================
     // findMethodCallAtOffset tests
     // ================================================================
@@ -1567,6 +1710,41 @@ class DefinitionProviderTest {
                 ClassNode.class, ModuleNode.class, org.eclipse.jdt.core.IJavaProject.class);
         m.setAccessible(true);
         return (IType) m.invoke(provider, classNode, module, project);
+    }
+
+    private Object newSourceLookupContext() throws Exception {
+        for (Class<?> innerClass : DefinitionProvider.class.getDeclaredClasses()) {
+            if ("SourceLookupContext".equals(innerClass.getSimpleName())) {
+                var ctor = innerClass.getDeclaredConstructor();
+                ctor.setAccessible(true);
+                return ctor.newInstance();
+            }
+        }
+        throw new IllegalStateException("SourceLookupContext not found");
+    }
+
+    private IType invokeResolveClassNodeToIType(ClassNode classNode, ModuleNode module,
+            org.eclipse.jdt.core.IJavaProject project, Object context) throws Exception {
+        Method m = DefinitionProvider.class.getDeclaredMethod("resolveClassNodeToIType",
+                ClassNode.class, ModuleNode.class, org.eclipse.jdt.core.IJavaProject.class,
+                context.getClass());
+        m.setAccessible(true);
+        return (IType) m.invoke(provider, classNode, module, project, context);
+    }
+
+    private Location invokeFindSourceOnDisk(java.io.File projectDir, String pathSuffix,
+            Object context) throws Exception {
+        Method m = DefinitionProvider.class.getDeclaredMethod("findSourceOnDisk",
+                java.io.File.class, String.class, context.getClass());
+        m.setAccessible(true);
+        return (Location) m.invoke(provider, projectDir, pathSuffix, context);
+    }
+
+    private Location invokeFindSourceInWorkspace(String fqn, Object context) throws Exception {
+        Method m = DefinitionProvider.class.getDeclaredMethod("findSourceInWorkspace",
+                String.class, context.getClass());
+        m.setAccessible(true);
+        return (Location) m.invoke(provider, fqn, context);
     }
 
     private Object invokeFindMethodCallAtOffset(ModuleNode module, int offset, String methodName, String uri) throws Exception {

@@ -56,6 +56,27 @@ class SemanticTokensProviderTest {
     }
 
     @Test
+    void returnsEmptyWhenRequestThreadIsInterrupted() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///InterruptedSemanticTokens.groovy";
+        manager.didOpen(uri, "class Sample { String value }\n");
+
+        SemanticTokensProvider provider = new SemanticTokensProvider(manager);
+        SemanticTokensParams params = new SemanticTokensParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+
+        Thread.currentThread().interrupt();
+        try {
+            SemanticTokens tokens = provider.getSemanticTokensFullBestEffort(params);
+            assertNotNull(tokens);
+            assertTrue(tokens.getData().isEmpty());
+        } finally {
+            Thread.interrupted();
+            manager.didClose(uri);
+        }
+    }
+
+    @Test
     void computesTokensForFullAndRangeRequests() {
         DocumentManager manager = new DocumentManager();
         String uri = "file:///SemanticTokensProviderData.groovy";
@@ -507,4 +528,3 @@ class SemanticTokensProviderTest {
         return method.invoke(provider, unit);
     }
 }
-

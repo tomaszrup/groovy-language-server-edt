@@ -11,7 +11,12 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Supplier;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
@@ -56,17 +61,19 @@ import org.eclipse.lsp4j.Range;
  */
 public class DefinitionProvider {
 
+    private static final class SourceLookupContext {
+        private final Map<String, Boolean> canResolveSourceCache = new HashMap<>();
+        private final Map<String, IType> resolvedTypes = new HashMap<>();
+        private final Set<String> missingTypes = new HashSet<>();
+        private final Map<String, Location> resolvedLocations = new HashMap<>();
+        private final Set<String> missingLocations = new HashSet<>();
+    }
+
     private final DocumentManager documentManager;
 
     private static final String EXT_JAVA = ".java";
     private static final String EXT_GROOVY = ".groovy";
     private static final String STATIC_PREFIX = "static ";
-
-    /**
-     * Per-request cache for {@link #canResolveSource(String)} results.
-     * Cleared at the start of each {@link #getDefinition} call.
-     */
-    private final java.util.Map<String, Boolean> canResolveSourceCache = new java.util.HashMap<>();
 
     /**
      * Tracks the project that last successfully resolved a definition so that
@@ -78,33 +85,105 @@ public class DefinitionProvider {
         this.documentManager = documentManager;
     }
 
+    private static String projectCacheKey(org.eclipse.jdt.core.IJavaProject project) {
+        if (project == null) {
+            return "<null>";
+        }
+        try {
+            String name = project.getElementName();
+            if (name != null && !name.isEmpty()) {
+                return name;
+            }
+        } catch (Exception e) {
+            // Ignore and fall back to identity below.
+        }
+        return Integer.toHexString(System.identityHashCode(project));
+    }
+
+    private IType findTypeCached(org.eclipse.jdt.core.IJavaProject project,
+            String fqn,
+            SourceLookupContext context) throws JavaModelException {
+        if (project == null || fqn == null || fqn.isEmpty()) {
+            return null;
+        }
+
+        String cacheKey = projectCacheKey(project) + ":" + fqn;
+        if (context != null) {
+            if (context.missingTypes.contains(cacheKey)) {
+                return null;
+            }
+            IType cached = context.resolvedTypes.get(cacheKey);
+            if (cached != null) {
+                return cached;
+            }
+        }
+
+        IType resolved = project.findType(fqn);
+        if (context != null) {
+            context.resolvedTypes.remove(cacheKey);
+            context.missingTypes.remove(cacheKey);
+            if (resolved == null) {
+                context.missingTypes.add(cacheKey);
+            } else {
+                context.resolvedTypes.put(cacheKey, resolved);
+            }
+        }
+        return resolved;
+    }
+
+    private Location getCachedLocation(SourceLookupContext context,
+            String cacheKey,
+            Supplier<Location> resolver) {
+        if (context == null) {
+            return resolver.get();
+        }
+        if (context.missingLocations.contains(cacheKey)) {
+            return null;
+        }
+        Location cached = context.resolvedLocations.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        Location resolved = resolver.get();
+        context.resolvedLocations.remove(cacheKey);
+        context.missingLocations.remove(cacheKey);
+        if (resolved == null) {
+            context.missingLocations.add(cacheKey);
+        } else {
+            context.resolvedLocations.put(cacheKey, resolved);
+        }
+        return resolved;
+    }
+
     /**
      * Compute the definition location(s) for the element at the cursor.
      */
     public List<Location> getDefinition(DefinitionParams params) {
-        canResolveSourceCache.clear();
+        SourceLookupContext sourceLookupContext = new SourceLookupContext();
         String uri = params.getTextDocument().getUri();
         Position position = params.getPosition();
 
-        List<Location> jdtLocations = resolveViaJdt(uri, position);
+        List<Location> jdtLocations = resolveViaJdt(uri, position, sourceLookupContext);
         if (!jdtLocations.isEmpty()) {
             return jdtLocations;
         }
 
         // Check if this is a temp source file from a JAR (outside workspace)
-        List<Location> tempLocs = getDefinitionFromTempSourceFile(uri, position);
+        List<Location> tempLocs = getDefinitionFromTempSourceFile(uri, position, sourceLookupContext);
         if (tempLocs != null && !tempLocs.isEmpty()) {
             return tempLocs;
         }
 
         // Fallback: use Groovy AST for within-file navigation
-        return getDefinitionFromGroovyAST(uri, position);
+        return getDefinitionFromGroovyAST(uri, position, sourceLookupContext);
     }
 
     /**
      * Try to resolve definition via JDT codeSelect.
      */
-    private List<Location> resolveViaJdt(String uri, Position position) {
+    private List<Location> resolveViaJdt(String uri, Position position,
+            SourceLookupContext sourceLookupContext) {
         List<Location> locations = new ArrayList<>();
         ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
         if (workingCopy == null) {
@@ -115,6 +194,10 @@ public class DefinitionProvider {
             if (content == null) {
                 return locations;
             }
+            Map<String, String> contentCache = new HashMap<>();
+            Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
+            contentCache.put(uri, content);
+            lineIndexCache.put(uri, PositionUtils.buildLineIndex(content));
             int offset = positionToOffset(content, position);
             String word = extractWordAt(content, offset);
             GroovyLanguageServerPlugin.logInfo("[definition] codeSelect at offset " + offset
@@ -122,7 +205,8 @@ public class DefinitionProvider {
 
             IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
             if (elements != null) {
-                resolveElementLocations(elements, locations);
+                resolveElementLocations(
+                        elements, locations, contentCache, lineIndexCache, sourceLookupContext);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Definition JDT failed for " + uri + ", falling back to AST", e);
@@ -134,10 +218,25 @@ public class DefinitionProvider {
      * Convert resolved JDT elements to locations.
      */
     private void resolveElementLocations(IJavaElement[] elements, List<Location> locations) {
+        resolveElementLocations(elements, locations, new HashMap<>(), new HashMap<>());
+    }
+
+    private void resolveElementLocations(IJavaElement[] elements,
+            List<Location> locations,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        resolveElementLocations(elements, locations, contentCache, lineIndexCache, null);
+    }
+
+    private void resolveElementLocations(IJavaElement[] elements,
+            List<Location> locations,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache,
+            SourceLookupContext sourceLookupContext) {
         for (IJavaElement element : elements) {
             GroovyLanguageServerPlugin.logInfo("[definition] resolved: "
                     + element.getElementName() + " (" + element.getClass().getName() + ")");
-            Location location = toLocation(element);
+            Location location = toLocation(element, contentCache, lineIndexCache, sourceLookupContext);
             if (location != null) {
                 GroovyLanguageServerPlugin.logInfo("[definition] location: "
                         + location.getUri() + " " + location.getRange().getStart().getLine()
@@ -155,8 +254,21 @@ public class DefinitionProvider {
      * Handles both workspace source files and binary types from JARs.
      */
     private Location toLocation(IJavaElement element) {
+        return toLocation(element, new HashMap<>(), new HashMap<>());
+    }
+
+    private Location toLocation(IJavaElement element,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        return toLocation(element, contentCache, lineIndexCache, null);
+    }
+
+    private Location toLocation(IJavaElement element,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache,
+            SourceLookupContext sourceLookupContext) {
         try {
-            Location resourceLoc = toLocationFromResource(element);
+            Location resourceLoc = toLocationFromResource(element, contentCache, lineIndexCache);
             if (resourceLoc != null) {
                 return resourceLoc;
             }
@@ -166,7 +278,7 @@ public class DefinitionProvider {
                 return null;
             }
 
-            return resolveLocationForType(type);
+            return resolveLocationForType(type, sourceLookupContext);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to resolve location for " + element.getElementName(), e);
             return null;
@@ -178,6 +290,12 @@ public class DefinitionProvider {
      * Only returns locations for actual source files (.java, .groovy), never for .class files.
      */
     private Location toLocationFromResource(IJavaElement element) throws JavaModelException {
+        return toLocationFromResource(element, new HashMap<>(), new HashMap<>());
+    }
+
+    private Location toLocationFromResource(IJavaElement element,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) throws JavaModelException {
         IResource resource = element.getResource();
         if (resource == null) {
             ICompilationUnit cu = (ICompilationUnit) element.getAncestor(IJavaElement.COMPILATION_UNIT);
@@ -197,7 +315,8 @@ public class DefinitionProvider {
             if (element instanceof ISourceReference sourceRef) {
                 ISourceRange nameRange = sourceRef.getNameRange();
                 if (nameRange != null && nameRange.getOffset() >= 0) {
-                    range = offsetRangeToLspRange(targetUri, resource, nameRange);
+                    range = offsetRangeToLspRange(
+                            targetUri, resource, nameRange, contentCache, lineIndexCache);
                 }
             }
             return new Location(targetUri, range);
@@ -225,6 +344,10 @@ public class DefinitionProvider {
      * Try all strategies to resolve a location for a binary type using real source only.
      */
     private Location resolveLocationForType(IType type) {
+        return resolveLocationForType(type, null);
+    }
+
+    private Location resolveLocationForType(IType type, SourceLookupContext sourceLookupContext) {
         String fqn = type.getFullyQualifiedName();
         GroovyLanguageServerPlugin.logInfo("[definition] Binary type: " + fqn
                 + " — searching for source");
@@ -232,7 +355,7 @@ public class DefinitionProvider {
         // 1) Fast, targeted: derive source from the binary type's classpath entry.
         //    Works for sibling project build outputs (build/classes/, build/libs/)
         //    and project output folders (bin/).
-        Location binaryDerivedLoc = findSourceFromBinaryRoot(type, fqn);
+        Location binaryDerivedLoc = findSourceFromBinaryRoot(type, fqn, sourceLookupContext);
         if (binaryDerivedLoc != null) {
             GroovyLanguageServerPlugin.logInfo(
                     "[definition] Found source via binary root: " + binaryDerivedLoc.getUri());
@@ -240,7 +363,7 @@ public class DefinitionProvider {
         }
 
         // 2) Broader: search all workspace projects via Eclipse resource model.
-        Location workspaceLoc = findSourceInWorkspace(fqn);
+        Location workspaceLoc = findSourceInWorkspace(fqn, sourceLookupContext);
         if (workspaceLoc != null) {
             GroovyLanguageServerPlugin.logInfo("[definition] Found source in workspace: "
                     + workspaceLoc.getUri());
@@ -299,6 +422,17 @@ public class DefinitionProvider {
      * find the owning IProject's linked folder and check source dirs on disk.
      */
     private Location findSourceFromBinaryRoot(IType type, String fqn) {
+        return findSourceFromBinaryRoot(type, fqn, null);
+    }
+
+    private Location findSourceFromBinaryRoot(IType type, String fqn,
+            SourceLookupContext sourceLookupContext) {
+        return getCachedLocation(sourceLookupContext, "binary-root:" + fqn,
+                () -> findSourceFromBinaryRootUncached(type, fqn, sourceLookupContext));
+    }
+
+    private Location findSourceFromBinaryRootUncached(IType type, String fqn,
+            SourceLookupContext sourceLookupContext) {
         try {
             IPackageFragmentRoot pfr =
                     (IPackageFragmentRoot) type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT);
@@ -319,7 +453,7 @@ public class DefinitionProvider {
                 if (projectRoot != null) {
                     GroovyLanguageServerPlugin.logInfo(
                             "[definition] Derived project root: " + projectRoot.getAbsolutePath());
-                    Location loc = findSourceOnDisk(projectRoot, pathSuffix);
+                    Location loc = findSourceOnDisk(projectRoot, pathSuffix, sourceLookupContext);
                     if (loc != null) return loc;
                 }
             }
@@ -329,7 +463,7 @@ public class DefinitionProvider {
             IProject owningProject = pfr.getJavaProject() != null
                     ? pfr.getJavaProject().getProject() : null;
             if (owningProject != null && owningProject.isOpen()) {
-                Location loc = searchLinkedFoldersOnDisk(owningProject, pathSuffix);
+                Location loc = searchLinkedFoldersOnDisk(owningProject, pathSuffix, sourceLookupContext);
                 if (loc != null) return loc;
             }
 
@@ -363,12 +497,17 @@ public class DefinitionProvider {
      * Each linked folder may point to a different filesystem directory.
      */
     private Location searchLinkedFoldersOnDisk(IProject project, String pathSuffix) {
+        return searchLinkedFoldersOnDisk(project, pathSuffix, null);
+    }
+
+    private Location searchLinkedFoldersOnDisk(IProject project, String pathSuffix,
+            SourceLookupContext sourceLookupContext) {
         try {
             for (IResource member : project.members()) {
                 if (member instanceof org.eclipse.core.resources.IFolder folder) {
                     org.eclipse.core.runtime.IPath loc = folder.getLocation();
                     if (loc != null) {
-                        Location result = findSourceOnDisk(loc.toFile(), pathSuffix);
+                        Location result = findSourceOnDisk(loc.toFile(), pathSuffix, sourceLookupContext);
                         if (result != null) return result;
                     }
                 }
@@ -396,6 +535,15 @@ public class DefinitionProvider {
     }
 
     private Location findSourceInWorkspace(String fqn) {
+        return findSourceInWorkspace(fqn, null);
+    }
+
+    private Location findSourceInWorkspace(String fqn, SourceLookupContext sourceLookupContext) {
+        return getCachedLocation(sourceLookupContext, "workspace:" + fqn,
+                () -> findSourceInWorkspaceUncached(fqn));
+    }
+
+    private Location findSourceInWorkspaceUncached(String fqn) {
         try {
             String pathSuffix = fqn.replace('.', '/');
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
@@ -451,6 +599,18 @@ public class DefinitionProvider {
     }
 
     private Location findSourceOnDisk(java.io.File projectDir, String pathSuffix) {
+        return findSourceOnDisk(projectDir, pathSuffix, null);
+    }
+
+    private Location findSourceOnDisk(java.io.File projectDir, String pathSuffix,
+            SourceLookupContext sourceLookupContext) {
+        String basePath = (projectDir != null) ? projectDir.getAbsolutePath() : "<null>";
+        return getCachedLocation(sourceLookupContext,
+                "disk:" + basePath + ":" + pathSuffix,
+                () -> findSourceOnDiskUncached(projectDir, pathSuffix));
+    }
+
+    private Location findSourceOnDiskUncached(java.io.File projectDir, String pathSuffix) {
         if (projectDir == null || !projectDir.isDirectory()) return null;
         String[] extensions = {EXT_GROOVY, EXT_JAVA};
         for (String ext : extensions) {
@@ -471,17 +631,16 @@ public class DefinitionProvider {
      * Reads the target file content to compute the conversion.
      */
     private Range offsetRangeToLspRange(String uri, IResource resource, ISourceRange sourceRange) {
+        return offsetRangeToLspRange(uri, resource, sourceRange, new HashMap<>(), new HashMap<>());
+    }
+
+    private Range offsetRangeToLspRange(String uri,
+            IResource resource,
+            ISourceRange sourceRange,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
-            // Try to get content from DocumentManager (if open)
-            String content = documentManager.getContent(uri);
-
-            // If not open, read from the file system
-            if (content == null && resource instanceof org.eclipse.core.resources.IFile ifile) {
-                try (java.io.InputStream is = ifile.getContents()) {
-                    content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                }
-            }
-
+            String content = getContent(uri, resource, contentCache);
             if (content == null) {
                 return new Range(new Position(0, 0), new Position(0, 0));
             }
@@ -489,7 +648,7 @@ public class DefinitionProvider {
             int startOffset = sourceRange.getOffset();
             int endOffset = startOffset + sourceRange.getLength();
 
-            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
+            PositionUtils.LineIndex lineIndex = lineIndexFor(uri, content, lineIndexCache);
             Position start = lineIndex.offsetToPosition(startOffset);
             Position end = lineIndex.offsetToPosition(endOffset);
 
@@ -527,7 +686,8 @@ public class DefinitionProvider {
      * Parses imports and type references to resolve the target type,
      * then finds its source from the appropriate sources JAR or JDK src.zip.
      */
-    private List<Location> getDefinitionFromTempSourceFile(String uri, Position position) {
+    private List<Location> getDefinitionFromTempSourceFile(String uri, Position position,
+            SourceLookupContext sourceLookupContext) {
         // Only handle groovy-source: virtual documents (handle any normalization form)
         if (!uri.startsWith("groovy-source:")) return Collections.emptyList();
 
@@ -549,14 +709,14 @@ public class DefinitionProvider {
                 "[definition] Virtual source navigation: word='" + word + "' in " + uri);
 
         // Try to resolve FQN from imports
-        String fqn = resolveTypeFromSource(content, word);
+        String fqn = resolveTypeFromSource(content, word, sourceLookupContext);
         if (fqn == null) return Collections.emptyList();
 
         GroovyLanguageServerPlugin.logInfo("[definition] Resolved to FQN: " + fqn);
 
         // Try to find source for this FQN
         List<Location> locations = new ArrayList<>();
-        Location loc = navigateToFqn(fqn, word);
+        Location loc = navigateToFqn(fqn, word, sourceLookupContext);
         if (loc != null) {
             locations.add(loc);
         }
@@ -568,15 +728,20 @@ public class DefinitionProvider {
      * import statements and package declarations from source content.
      */
     private String resolveTypeFromSource(String content, String simpleName) {
+        return resolveTypeFromSource(content, simpleName, null);
+    }
+
+    private String resolveTypeFromSource(String content, String simpleName,
+            SourceLookupContext sourceLookupContext) {
         String[] lines = content.split("\n");
         String packageName = parsePackageName(lines);
 
-        String fromImports = resolveFromImports(lines, simpleName);
+        String fromImports = resolveFromImports(lines, simpleName, sourceLookupContext);
         if (fromImports != null) {
             return fromImports;
         }
 
-        return resolveFromContext(lines, packageName, simpleName);
+        return resolveFromContext(lines, packageName, simpleName, sourceLookupContext);
     }
 
     private String parsePackageName(String[] lines) {
@@ -590,8 +755,13 @@ public class DefinitionProvider {
     }
 
     private String resolveFromImports(String[] lines, String simpleName) {
+        return resolveFromImports(lines, simpleName, null);
+    }
+
+    private String resolveFromImports(String[] lines, String simpleName,
+            SourceLookupContext sourceLookupContext) {
         for (String line : lines) {
-            String result = tryResolveImportLine(line.trim(), simpleName);
+            String result = tryResolveImportLine(line.trim(), simpleName, sourceLookupContext);
             if (result != null) {
                 return result;
             }
@@ -600,6 +770,11 @@ public class DefinitionProvider {
     }
 
     private String tryResolveImportLine(String trimmed, String simpleName) {
+        return tryResolveImportLine(trimmed, simpleName, null);
+    }
+
+    private String tryResolveImportLine(String trimmed, String simpleName,
+            SourceLookupContext sourceLookupContext) {
         if (!trimmed.startsWith("import ")) {
             return null;
         }
@@ -630,7 +805,7 @@ public class DefinitionProvider {
         if (importLine.endsWith(".*")) {
             String pkg = importLine.substring(0, importLine.length() - 2);
             String candidateFqn = pkg + "." + simpleName;
-            if (canResolveSource(candidateFqn)) {
+            if (canResolveSource(candidateFqn, sourceLookupContext)) {
                 return candidateFqn;
             }
         }
@@ -638,15 +813,20 @@ public class DefinitionProvider {
     }
 
     private String resolveFromContext(String[] lines, String packageName, String simpleName) {
+        return resolveFromContext(lines, packageName, simpleName, null);
+    }
+
+    private String resolveFromContext(String[] lines, String packageName, String simpleName,
+            SourceLookupContext sourceLookupContext) {
         if (packageName != null) {
             String samePkg = packageName + "." + simpleName;
-            if (canResolveSource(samePkg)) {
+            if (canResolveSource(samePkg, sourceLookupContext)) {
                 return samePkg;
             }
         }
 
         String javaLang = "java.lang." + simpleName;
-        if (canResolveSource(javaLang)) {
+        if (canResolveSource(javaLang, sourceLookupContext)) {
             return javaLang;
         }
 
@@ -672,14 +852,22 @@ public class DefinitionProvider {
      * Check if we can find source for a given FQN (in sources JARs, JDK, or workspace).
      */
     private boolean canResolveSource(String fqn) {
-        Boolean cached = canResolveSourceCache.get(fqn);
+        return canResolveSource(fqn, null);
+    }
+
+    private boolean canResolveSource(String fqn, SourceLookupContext sourceLookupContext) {
+        if (sourceLookupContext == null) {
+            return canResolveSourceUncached(fqn, null);
+        }
+
+        Boolean cached = sourceLookupContext.canResolveSourceCache.get(fqn);
         if (cached != null) return cached;
-        boolean result = canResolveSourceUncached(fqn);
-        canResolveSourceCache.put(fqn, result);
+        boolean result = canResolveSourceUncached(fqn, sourceLookupContext);
+        sourceLookupContext.canResolveSourceCache.put(fqn, result);
         return result;
     }
 
-    private boolean canResolveSourceUncached(String fqn) {
+    private boolean canResolveSourceUncached(String fqn, SourceLookupContext sourceLookupContext) {
         // Use JDT's indexed type search — covers JDK, workspace source, and
         // binary types on the classpath.  Much faster than manual filesystem
         // scanning or opening src.zip.
@@ -689,7 +877,9 @@ public class DefinitionProvider {
         if (remembered != null && remembered.isOpen()) {
             try {
                 org.eclipse.jdt.core.IJavaProject jp = JavaCore.create(remembered);
-                if (jp != null && jp.exists() && jp.findType(fqn) != null) return true;
+                if (jp != null && jp.exists() && findTypeCached(jp, fqn, sourceLookupContext) != null) {
+                    return true;
+                }
             } catch (Exception e) { /* ignore */ }
         }
 
@@ -700,7 +890,7 @@ public class DefinitionProvider {
                 if (!project.isOpen() || project.equals(remembered)) continue;
                 org.eclipse.jdt.core.IJavaProject javaProject = JavaCore.create(project);
                 if (javaProject != null && javaProject.exists()) {
-                    IType type = javaProject.findType(fqn);
+                    IType type = findTypeCached(javaProject, fqn, sourceLookupContext);
                     if (type != null) {
                         currentDefinitionProject = project;
                         return true;
@@ -719,12 +909,17 @@ public class DefinitionProvider {
      * Tries workspace, sources JARs, JDK src.zip, and JDT project types.
      */
     private Location navigateToFqn(String fqn, String simpleName) {
-        Location wsLoc = findSourceInWorkspace(fqn);
+        return navigateToFqn(fqn, simpleName, null);
+    }
+
+    private Location navigateToFqn(String fqn, String simpleName,
+            SourceLookupContext sourceLookupContext) {
+        Location wsLoc = findSourceInWorkspace(fqn, sourceLookupContext);
         if (wsLoc != null) {
             return wsLoc;
         }
 
-        Location jdtLoc = navigateViaJdtProject(fqn, simpleName);
+        Location jdtLoc = navigateViaJdtProject(fqn, simpleName, sourceLookupContext);
         if (jdtLoc != null) {
             return jdtLoc;
         }
@@ -733,18 +928,23 @@ public class DefinitionProvider {
     }
 
     private Location navigateViaJdtProject(String fqn, String simpleName) {
+        return navigateViaJdtProject(fqn, simpleName, null);
+    }
+
+    private Location navigateViaJdtProject(String fqn, String simpleName,
+            SourceLookupContext sourceLookupContext) {
         try {
             // Try the project that last succeeded first to avoid iterating all 50+.
             IProject remembered = currentDefinitionProject;
             if (remembered != null && remembered.isOpen()) {
-                Location loc = navigateViaProject(remembered, fqn, simpleName);
+                Location loc = navigateViaProject(remembered, fqn, simpleName, sourceLookupContext);
                 if (loc != null) return loc;
             }
 
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject project : projects) {
                 if (!project.isOpen() || project.equals(remembered)) continue;
-                Location loc = navigateViaProject(project, fqn, simpleName);
+                Location loc = navigateViaProject(project, fqn, simpleName, sourceLookupContext);
                 if (loc != null) {
                     currentDefinitionProject = project;
                     return loc;
@@ -757,11 +957,16 @@ public class DefinitionProvider {
     }
 
     private Location navigateViaProject(IProject project, String fqn, String simpleName) throws JavaModelException {
+        return navigateViaProject(project, fqn, simpleName, null);
+    }
+
+    private Location navigateViaProject(IProject project, String fqn, String simpleName,
+            SourceLookupContext sourceLookupContext) throws JavaModelException {
         org.eclipse.jdt.core.IJavaProject javaProject = JavaCore.create(project);
         if (javaProject == null || !javaProject.exists()) {
             return null;
         }
-        IType type = javaProject.findType(fqn);
+        IType type = findTypeCached(javaProject, fqn, sourceLookupContext);
         if (type == null) {
             return null;
         }
@@ -805,6 +1010,11 @@ public class DefinitionProvider {
      * Finds declarations of the symbol under the cursor within the same file.
      */
     private List<Location> getDefinitionFromGroovyAST(String uri, Position position) {
+        return getDefinitionFromGroovyAST(uri, position, null);
+    }
+
+    private List<Location> getDefinitionFromGroovyAST(String uri, Position position,
+            SourceLookupContext sourceLookupContext) {
         List<Location> locations = new ArrayList<>();
 
         String content = documentManager.getContent(uri);
@@ -845,7 +1055,8 @@ public class DefinitionProvider {
         }
 
         // 3) Check if the word is a method call after a dot — resolve via JDT
-        Location dotCallResult = resolveAstDotMethodCall(ast, content, offset, word, uri);
+        Location dotCallResult = resolveAstDotMethodCall(
+                ast, content, offset, word, uri, sourceLookupContext);
         if (dotCallResult != null) {
             locations.add(dotCallResult);
             return locations;
@@ -859,7 +1070,7 @@ public class DefinitionProvider {
         }
 
         // 5) Check static imports — resolve the member's containing class via JDT
-        Location staticImportResult = resolveStaticImportMember(ast, word);
+        Location staticImportResult = resolveStaticImportMember(ast, word, sourceLookupContext);
         if (staticImportResult != null) {
             locations.add(staticImportResult);
             return locations;
@@ -1023,6 +1234,12 @@ public class DefinitionProvider {
      */
     private Location resolveAstDotMethodCall(ModuleNode ast, String content, int offset,
                                               String word, String uri) {
+        return resolveAstDotMethodCall(ast, content, offset, word, uri, null);
+    }
+
+    private Location resolveAstDotMethodCall(ModuleNode ast, String content, int offset,
+                                              String word, String uri,
+                                              SourceLookupContext sourceLookupContext) {
         try {
             // Check if preceded by a dot
             int wordStart = offset;
@@ -1076,7 +1293,8 @@ public class DefinitionProvider {
                 // Resolve the first part as a type
                 ClassNode receiverClassNode = resolveReceiverClassNode(ast, firstPart);
                 if (receiverClassNode != null) {
-                    receiverType = resolveClassNodeToIType(receiverClassNode, ast, project);
+                    receiverType = resolveClassNodeToIType(
+                            receiverClassNode, ast, project, sourceLookupContext);
                 }
 
                 // Walk remaining parts as inner classes/types
@@ -1095,17 +1313,22 @@ public class DefinitionProvider {
 
             // Fallback: AST-based resolution for complex receivers like "new Foo().method()"
             if (receiverType == null) {
-                receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content);
+                receiverType = resolveReceiverTypeFromAst(
+                        ast, project, offset, word, content, sourceLookupContext);
             }
 
             if (receiverType == null) return null;
+            Map<String, String> contentCache = new HashMap<>();
+            Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
+            contentCache.put(uri, content);
+            lineIndexCache.put(uri, PositionUtils.buildLineIndex(content));
 
             // If word starts with uppercase, it might be an inner class reference
             // (e.g., SomeClass.InnerClass)
             if (!word.isEmpty() && Character.isUpperCase(word.charAt(0))) {
                 IType innerType = receiverType.getType(word);
                 if (innerType != null && innerType.exists()) {
-                    Location loc = toLocation(innerType);
+                    Location loc = toLocation(innerType, contentCache, lineIndexCache);
                     if (loc != null) return loc;
                 }
             }
@@ -1113,7 +1336,7 @@ public class DefinitionProvider {
             // Find the method and navigate to it
             for (org.eclipse.jdt.core.IMethod method : receiverType.getMethods()) {
                 if (word.equals(method.getElementName())) {
-                    Location loc = toLocation(method);
+                    Location loc = toLocation(method, contentCache, lineIndexCache);
                     if (loc != null) return loc;
                 }
             }
@@ -1121,7 +1344,7 @@ public class DefinitionProvider {
             // Check fields (e.g., SomeClass.STATIC_MEMBER or SomeClass.InnerClass.FIELD)
             for (org.eclipse.jdt.core.IField field : receiverType.getFields()) {
                 if (word.equals(field.getElementName())) {
-                    Location loc = toLocation(field);
+                    Location loc = toLocation(field, contentCache, lineIndexCache);
                     if (loc != null) return loc;
                 }
             }
@@ -1132,20 +1355,21 @@ public class DefinitionProvider {
                 for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
                     for (org.eclipse.jdt.core.IMethod method : superType.getMethods()) {
                         if (word.equals(method.getElementName())) {
-                            Location loc = toLocation(method);
+                            Location loc = toLocation(method, contentCache, lineIndexCache);
                             if (loc != null) return loc;
                         }
                     }
                     for (org.eclipse.jdt.core.IField field : superType.getFields()) {
                         if (word.equals(field.getElementName())) {
-                            Location loc = toLocation(field);
+                            Location loc = toLocation(field, contentCache, lineIndexCache);
                             if (loc != null) return loc;
                         }
                     }
                 }
             }
 
-            Location generatedAccessorLoc = resolveGeneratedAccessorLocation(receiverType, word);
+            Location generatedAccessorLoc = resolveGeneratedAccessorLocation(
+                    receiverType, word, contentCache, lineIndexCache);
             if (generatedAccessorLoc != null) {
                 return generatedAccessorLoc;
             }
@@ -1157,21 +1381,56 @@ public class DefinitionProvider {
 
     private Location resolveGeneratedAccessorLocation(IType receiverType, String memberName)
             throws JavaModelException {
+        return resolveGeneratedAccessorLocation(
+                receiverType, memberName, new HashMap<>(), new HashMap<>());
+    }
+
+    private Location resolveGeneratedAccessorLocation(IType receiverType,
+            String memberName,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache)
+            throws JavaModelException {
         org.eclipse.jdt.core.IMethod generatedMethod = GeneratedAccessorResolver.findMethod(receiverType, memberName);
         if (generatedMethod != null) {
             IType declaringType = generatedMethod.getDeclaringType();
             if (declaringType != null) {
-                return toLocation(declaringType);
+                return toLocation(declaringType, contentCache, lineIndexCache);
             }
         }
 
         JavaRecordSourceSupport.RecordComponentInfo component =
                 GeneratedAccessorResolver.findRecordComponent(receiverType, memberName);
         if (component != null) {
-            return toLocation(receiverType);
+            return toLocation(receiverType, contentCache, lineIndexCache);
         }
 
         return null;
+    }
+
+    private String getContent(String uri, IResource resource, Map<String, String> contentCache) {
+        if (contentCache.containsKey(uri)) {
+            return contentCache.get(uri);
+        }
+
+        String content = documentManager.getContent(uri);
+        if (content == null && resource instanceof org.eclipse.core.resources.IFile ifile) {
+            try (java.io.InputStream is = ifile.getContents()) {
+                content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                content = null;
+            }
+        }
+
+        contentCache.put(uri, content);
+        return content;
+    }
+
+    private PositionUtils.LineIndex lineIndexFor(String uri,
+            String content,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        return lineIndexCache.computeIfAbsent(
+                uri,
+                ignored -> PositionUtils.buildLineIndex(content));
     }
 
     /**
@@ -1180,7 +1439,8 @@ public class DefinitionProvider {
      * This handles complex receiver expressions like {@code new Foo().method()}.
      */
     private IType resolveReceiverTypeFromAst(ModuleNode ast, org.eclipse.jdt.core.IJavaProject project,
-                                              int offset, String methodName, String content) {
+                                              int offset, String methodName, String content,
+                                              SourceLookupContext sourceLookupContext) {
         MethodCallExpression found = findMethodCallAtOffset(ast, offset, methodName, content);
         if (found == null) return null;
 
@@ -1193,7 +1453,7 @@ public class DefinitionProvider {
         GroovyLanguageServerPlugin.logInfo("[definition-ast] AST fallback: receiver ClassNode='"
                 + receiverClassNode.getName() + "' for method '" + methodName + "'");
 
-        return resolveClassNodeToIType(receiverClassNode, ast, project);
+        return resolveClassNodeToIType(receiverClassNode, ast, project, sourceLookupContext);
     }
 
     /**
@@ -1362,18 +1622,24 @@ public class DefinitionProvider {
 
     private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module,
                                            org.eclipse.jdt.core.IJavaProject project) {
+        return resolveClassNodeToIType(typeNode, module, project, null);
+    }
+
+    private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module,
+                                           org.eclipse.jdt.core.IJavaProject project,
+                                           SourceLookupContext sourceLookupContext) {
         if (typeNode == null || project == null) return null;
         try {
             String typeName = typeNode.getName();
             if (typeName == null || typeName.isEmpty()) return null;
 
             if (typeName.contains(".")) {
-                IType type = project.findType(typeName);
+                IType type = findTypeCached(project, typeName, sourceLookupContext);
                 if (type != null) return type;
                 // Groovy AST uses '$' for inner classes, but JDT findType
                 // expects '.' — try replacing '$' with '.'
                 if (typeName.contains("$")) {
-                    type = project.findType(typeName.replace('$', '.'));
+                    type = findTypeCached(project, typeName.replace('$', '.'), sourceLookupContext);
                     if (type != null) return type;
                 }
             }
@@ -1382,7 +1648,7 @@ public class DefinitionProvider {
             for (org.codehaus.groovy.ast.ImportNode imp : module.getImports()) {
                 ClassNode impType = imp.getType();
                 if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
-                    IType type = project.findType(impType.getName());
+                    IType type = findTypeCached(project, impType.getName(), sourceLookupContext);
                     if (type != null) return type;
                 }
             }
@@ -1391,7 +1657,7 @@ public class DefinitionProvider {
             for (org.codehaus.groovy.ast.ImportNode starImport : module.getStarImports()) {
                 String pkgName = starImport.getPackageName();
                 if (pkgName != null) {
-                    IType type = project.findType(pkgName + typeName);
+                    IType type = findTypeCached(project, pkgName + typeName, sourceLookupContext);
                     if (type != null) return type;
                 }
             }
@@ -1400,7 +1666,7 @@ public class DefinitionProvider {
             String pkg = module.getPackageName();
             if (pkg != null && !pkg.isEmpty()) {
                 if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
-                IType type = project.findType(pkg + "." + typeName);
+                IType type = findTypeCached(project, pkg + "." + typeName, sourceLookupContext);
                 if (type != null) return type;
             }
 
@@ -1408,7 +1674,7 @@ public class DefinitionProvider {
             String[] autoPackages = {"java.lang.", "java.util.", "java.io.",
                     "groovy.lang.", "groovy.util.", "java.math."};
             for (String autoPkg : autoPackages) {
-                IType type = project.findType(autoPkg + typeName);
+                IType type = findTypeCached(project, autoPkg + typeName, sourceLookupContext);
                 if (type != null) return type;
             }
         } catch (JavaModelException e) {
@@ -1462,14 +1728,16 @@ public class DefinitionProvider {
      * {@code import static org.junit.Assert.assertEquals}).
      * Looks up the containing class via JDT and navigates to the member.
      */
-    private Location resolveStaticImportMember(ModuleNode ast, String word) {
+    private Location resolveStaticImportMember(ModuleNode ast, String word,
+            SourceLookupContext sourceLookupContext) {
         // Check named static imports
         for (ImportNode imp : ast.getStaticImports().values()) {
             String fieldName = imp.getFieldName();
             if (fieldName != null && fieldName.equals(word)) {
                 ClassNode type = imp.getType();
                 if (type != null) {
-                    Location loc = navigateToFqn(type.getName(), type.getNameWithoutPackage());
+                    Location loc = navigateToFqn(
+                            type.getName(), type.getNameWithoutPackage(), sourceLookupContext);
                     if (loc != null) return loc;
                 }
             }
@@ -1478,7 +1746,8 @@ public class DefinitionProvider {
         for (ImportNode imp : ast.getStaticStarImports().values()) {
             ClassNode type = imp.getType();
             if (type != null) {
-                Location loc = navigateToFqn(type.getName(), type.getNameWithoutPackage());
+                Location loc = navigateToFqn(
+                        type.getName(), type.getNameWithoutPackage(), sourceLookupContext);
                 if (loc != null) return loc;
             }
         }

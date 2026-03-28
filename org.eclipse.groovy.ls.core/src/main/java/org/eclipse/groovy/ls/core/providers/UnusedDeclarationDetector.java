@@ -475,8 +475,9 @@ public class UnusedDeclarationDetector {
             int startOffset = nameRange.getOffset();
             int endOffset = startOffset + nameRange.getLength();
 
-            Position start = offsetToPosition(content, startOffset);
-            Position end = offsetToPosition(content, endOffset);
+            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
+            Position start = lineIndex.offsetToPosition(startOffset);
+            Position end = lineIndex.offsetToPosition(endOffset);
 
             String kind = element instanceof IType ? "type" : "method";
 

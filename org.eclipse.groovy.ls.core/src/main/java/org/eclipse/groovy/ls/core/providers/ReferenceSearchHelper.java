@@ -9,9 +9,11 @@
  *******************************************************************************/
 package org.eclipse.groovy.ls.core.providers;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -31,9 +33,61 @@ import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 
-final class ReferenceSearchHelper {
+public final class ReferenceSearchHelper {
+
+    private static final int GROOVY_FILE_LIST_CACHE_SIZE = 32;
+    private static final long GROOVY_FILE_LIST_CACHE_TTL_MS = 10_000;
+    private static final int FILE_CONTENT_CACHE_SIZE = 128;
+    private static final long FILE_CONTENT_CACHE_TTL_MS = 10_000;
+
+    private record CachedGroovyFiles(List<IFile> files, long timestampMs) {
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestampMs > GROOVY_FILE_LIST_CACHE_TTL_MS;
+        }
+    }
+
+    private record CachedFileContent(String content, long modificationStamp, long timestampMs) {
+        boolean matches(long currentModificationStamp) {
+            return modificationStamp == currentModificationStamp
+                    && System.currentTimeMillis() - timestampMs <= FILE_CONTENT_CACHE_TTL_MS;
+        }
+    }
+
+    private static final Map<String, CachedGroovyFiles> SCOPED_GROOVY_FILE_CACHE =
+            java.util.Collections.synchronizedMap(new LinkedHashMap<>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedGroovyFiles> eldest) {
+                    return size() > GROOVY_FILE_LIST_CACHE_SIZE;
+                }
+            });
+
+    private static final Map<String, CachedFileContent> FILE_CONTENT_CACHE =
+            java.util.Collections.synchronizedMap(new LinkedHashMap<>(128, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedFileContent> eldest) {
+                    return size() > FILE_CONTENT_CACHE_SIZE;
+                }
+            });
 
     private ReferenceSearchHelper() {
+    }
+
+    /**
+     * Invalidate cached on-disk content for a single document URI.
+     */
+    public static void invalidateFileContentCache(String uri) {
+        if (uri == null) {
+            return;
+        }
+        FILE_CONTENT_CACHE.remove(DocumentManager.normalizeUri(uri));
+    }
+
+    /**
+     * Clear all textual-reference caches after workspace-level file changes.
+     */
+    public static void clearCaches() {
+        SCOPED_GROOVY_FILE_CACHE.clear();
+        FILE_CONTENT_CACHE.clear();
     }
 
     /**
@@ -98,6 +152,7 @@ final class ReferenceSearchHelper {
             IJavaElement element, String uri, DocumentManager documentManager) {
         List<Location> locations = new ArrayList<>();
         Map<String, String> contentCache = new HashMap<>();
+        Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
         try {
             SearchPattern pattern = SearchPattern.createPattern(
                     element, IJavaSearchConstants.REFERENCES);
@@ -112,7 +167,7 @@ final class ReferenceSearchHelper {
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
-                            Location location = toLocation(match, documentManager, contentCache);
+                            Location location = toLocation(match, documentManager, contentCache, lineIndexCache);
                             if (location != null) {
                                 locations.add(location);
                             }
@@ -147,6 +202,7 @@ final class ReferenceSearchHelper {
         org.eclipse.jdt.core.ISourceRange declarationRange = getDeclarationRange(element);
         List<Location> locations = new ArrayList<>();
         Set<String> visitedUris = new HashSet<>();
+        Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
 
         for (IFile file : candidateFiles) {
             if (file == null || file.getLocationURI() == null) {
@@ -162,6 +218,7 @@ final class ReferenceSearchHelper {
             if (content == null) {
                 continue;
             }
+            PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
 
             Matcher matcher = pattern.matcher(content);
             while (matcher.find()) {
@@ -169,8 +226,8 @@ final class ReferenceSearchHelper {
                         matcher.start(), matcher.end())) {
                     continue;
                 }
-                Position start = PositionUtils.offsetToPosition(content, matcher.start());
-                Position end = PositionUtils.offsetToPosition(content, matcher.end());
+                Position start = lineIndex.offsetToPosition(matcher.start());
+                Position end = lineIndex.offsetToPosition(matcher.end());
                 locations.add(new Location(targetUri, new Range(start, end)));
                 if (stopAfterFirst) {
                     return locations;
@@ -187,8 +244,20 @@ final class ReferenceSearchHelper {
             return List.of();
         }
 
+        List<org.eclipse.jdt.core.IPackageFragmentRoot> roots =
+                SearchScopeHelper.getSourceRoots(javaProject, uri);
+        if (roots.isEmpty()) {
+            return List.of();
+        }
+
+        String cacheKey = buildScopedGroovyFileCacheKey(javaProject, roots);
+        CachedGroovyFiles cached = SCOPED_GROOVY_FILE_CACHE.get(cacheKey);
+        if (cached != null && !cached.isExpired()) {
+            return cached.files();
+        }
+
         List<IFile> files = new ArrayList<>();
-        for (org.eclipse.jdt.core.IPackageFragmentRoot root : SearchScopeHelper.getSourceRoots(javaProject, uri)) {
+        for (org.eclipse.jdt.core.IPackageFragmentRoot root : roots) {
             try {
                 IResource resource = root.getResource();
                 if (resource == null) {
@@ -205,7 +274,46 @@ final class ReferenceSearchHelper {
                 // Ignore one broken root and continue scanning others.
             }
         }
-        return files;
+        List<IFile> snapshot = List.copyOf(files);
+        SCOPED_GROOVY_FILE_CACHE.put(cacheKey,
+                new CachedGroovyFiles(snapshot, System.currentTimeMillis()));
+        return snapshot;
+    }
+
+    private static String buildScopedGroovyFileCacheKey(
+            org.eclipse.jdt.core.IJavaProject javaProject,
+            List<org.eclipse.jdt.core.IPackageFragmentRoot> roots) {
+        StringBuilder key = new StringBuilder(projectCacheKey(javaProject)).append('|');
+        for (org.eclipse.jdt.core.IPackageFragmentRoot root : roots) {
+            if (root == null) {
+                continue;
+            }
+            key.append(root.getPath()).append('|');
+        }
+        return key.toString();
+    }
+
+    private static String projectCacheKey(org.eclipse.jdt.core.IJavaProject javaProject) {
+        if (javaProject == null) {
+            return "null-project";
+        }
+        try {
+            String handleId = javaProject.getHandleIdentifier();
+            if (handleId != null && !handleId.isBlank()) {
+                return handleId;
+            }
+        } catch (Exception e) {
+            // Fall through to other identifiers.
+        }
+        try {
+            String name = javaProject.getElementName();
+            if (name != null && !name.isBlank()) {
+                return name;
+            }
+        } catch (Exception e) {
+            // Fall through to identity hash below.
+        }
+        return "project@" + System.identityHashCode(javaProject);
     }
 
     private static org.eclipse.jdt.core.ISourceRange getDeclarationRange(IJavaElement element) {
@@ -253,7 +361,8 @@ final class ReferenceSearchHelper {
 
     private static Location toLocation(SearchMatch match,
             DocumentManager documentManager,
-            Map<String, String> contentCache) {
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -267,8 +376,9 @@ final class ReferenceSearchHelper {
             int endOffset = startOffset + match.getLength();
             Range range;
             if (content != null) {
-                Position start = PositionUtils.offsetToPosition(content, startOffset);
-                Position end = PositionUtils.offsetToPosition(content, endOffset);
+                PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
+                Position start = lineIndex.offsetToPosition(startOffset);
+                Position end = lineIndex.offsetToPosition(endOffset);
                 range = new Range(start, end);
             } else {
                 range = new Range(new Position(0, 0), new Position(0, 0));
@@ -278,6 +388,19 @@ final class ReferenceSearchHelper {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static PositionUtils.LineIndex lineIndexFor(
+            String targetUri,
+            String content,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        PositionUtils.LineIndex cached = lineIndexCache.get(targetUri);
+        if (cached != null) {
+            return cached;
+        }
+        PositionUtils.LineIndex built = PositionUtils.buildLineIndex(content);
+        lineIndexCache.put(targetUri, built);
+        return built;
     }
 
     @SuppressWarnings("unused")
@@ -291,6 +414,51 @@ final class ReferenceSearchHelper {
             String targetUri,
             IResource resource,
             Map<String, String> contentCache) {
-        return JdtSearchSupport.readContent(documentManager, targetUri, resource, contentCache);
+        if (contentCache != null && contentCache.containsKey(targetUri)) {
+            return contentCache.get(targetUri);
+        }
+
+        String content = documentManager.getContent(targetUri);
+        if (content == null && resource instanceof IFile file) {
+            content = readCachedFileContent(targetUri, file);
+        }
+
+        if (contentCache != null) {
+            contentCache.put(targetUri, content);
+        }
+        return content;
+    }
+
+    private static String readCachedFileContent(String targetUri, IFile file) {
+        long modificationStamp = safeModificationStamp(file);
+        if (modificationStamp != IResource.NULL_STAMP) {
+            CachedFileContent cached = FILE_CONTENT_CACHE.get(targetUri);
+            if (cached != null && cached.matches(modificationStamp)) {
+                return cached.content();
+            }
+        }
+
+        String content = readFileContent(file);
+        if (content != null && modificationStamp != IResource.NULL_STAMP) {
+            FILE_CONTENT_CACHE.put(targetUri,
+                    new CachedFileContent(content, modificationStamp, System.currentTimeMillis()));
+        }
+        return content;
+    }
+
+    private static long safeModificationStamp(IFile file) {
+        try {
+            return file.getModificationStamp();
+        } catch (Exception e) {
+            return IResource.NULL_STAMP;
+        }
+    }
+
+    private static String readFileContent(IFile file) {
+        try (java.io.InputStream is = file.getContents()) {
+            return new String(is.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

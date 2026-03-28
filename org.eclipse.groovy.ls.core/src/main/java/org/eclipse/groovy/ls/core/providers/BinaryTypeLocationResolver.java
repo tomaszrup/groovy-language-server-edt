@@ -101,8 +101,9 @@ final class BinaryTypeLocationResolver {
         if (classIdx < 0) classIdx = source.indexOf("enum " + simpleName);
         if (classIdx < 0) classIdx = source.indexOf("trait " + simpleName);
         if (classIdx >= 0) {
-            Position start = PositionUtils.offsetToPosition(source, classIdx);
-            Position end = PositionUtils.offsetToPosition(source, classIdx + simpleName.length() + 6);
+            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(source);
+            Position start = lineIndex.offsetToPosition(classIdx);
+            Position end = lineIndex.offsetToPosition(classIdx + simpleName.length() + 6);
             return new Range(start, end);
         }
         return new Range(new Position(0, 0), new Position(0, 0));

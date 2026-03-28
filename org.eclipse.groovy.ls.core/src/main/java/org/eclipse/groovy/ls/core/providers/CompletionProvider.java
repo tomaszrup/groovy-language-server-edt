@@ -11,6 +11,7 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,6 +37,7 @@ import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.ExpressionStatement;
 import org.codehaus.groovy.ast.stmt.Statement;
 import org.codehaus.groovy.control.SourceUnit;
+import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.core.resources.IProject;
@@ -97,6 +99,11 @@ public class CompletionProvider {
             this.existingImports = existingImports;
             this.importInsertLine = importInsertLine;
         }
+    }
+
+    private static final class TypeResolutionContext {
+        private final Map<String, IType> resolvedTypes = new HashMap<>();
+        private final Set<String> missingTypes = new HashSet<>();
     }
 
     private record ScopedVariable(String name, ClassNode type) {
@@ -346,11 +353,45 @@ public class CompletionProvider {
         }
     }
 
+    private static final int EXACT_TYPE_CACHE_SIZE = 300;
+    private static final long EXACT_TYPE_CACHE_TTL_MS = 30_000;
+
+    private record CachedResolvedType(IType type, boolean missing, long timestampMs) {
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestampMs > EXACT_TYPE_CACHE_TTL_MS;
+        }
+    }
+
+    private static final int DOT_RECONCILE_MISS_CACHE_SIZE = 200;
+    private static final long DOT_RECONCILE_MISS_TTL_MS = 30_000;
+
+    private record CachedDotReconcileMiss(long timestampMs) {
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestampMs > DOT_RECONCILE_MISS_TTL_MS;
+        }
+    }
+
     private final Map<String, CachedTypeNames> typeNameCache =
             java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(32, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, CachedTypeNames> eldest) {
                     return size() > TYPE_NAME_CACHE_SIZE;
+                }
+            });
+
+    private final Map<String, CachedResolvedType> exactTypeCache =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedResolvedType> eldest) {
+                    return size() > EXACT_TYPE_CACHE_SIZE;
+                }
+            });
+
+    private final Map<String, CachedDotReconcileMiss> dotReconcileMissCache =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedDotReconcileMiss> eldest) {
+                    return size() > DOT_RECONCILE_MISS_CACHE_SIZE;
                 }
             });
 
@@ -365,6 +406,8 @@ public class CompletionProvider {
      */
     public void invalidateTypeNameCache() {
         typeNameCache.clear();
+        exactTypeCache.clear();
+        dotReconcileMissCache.clear();
     }
 
     /**
@@ -421,6 +464,112 @@ public class CompletionProvider {
         this.documentManager = documentManager;
     }
 
+    private static String projectCacheKey(IJavaProject project) {
+        if (project == null) {
+            return "<null>";
+        }
+        try {
+            String name = project.getElementName();
+            if (name != null && !name.isEmpty()) {
+                return name;
+            }
+        } catch (Exception e) {
+            // Ignore and fall back to identity below.
+        }
+        return Integer.toHexString(System.identityHashCode(project));
+    }
+
+    private static String exactTypeCacheKey(IJavaProject project, String lookupKey) {
+        return projectCacheKey(project) + ":" + lookupKey;
+    }
+
+    private CachedResolvedType getResolvedTypeCacheEntry(String cacheKey) {
+        CachedResolvedType cached = exactTypeCache.get(cacheKey);
+        if (cached != null && cached.isExpired()) {
+            exactTypeCache.remove(cacheKey);
+            return null;
+        }
+        return cached;
+    }
+
+    private CachedResolvedType getResolvedTypeFromCaches(TypeResolutionContext context, String cacheKey) {
+        if (context != null) {
+            if (context.missingTypes.contains(cacheKey)) {
+                return new CachedResolvedType(null, true, 0L);
+            }
+            IType requestResolved = context.resolvedTypes.get(cacheKey);
+            if (requestResolved != null) {
+                return new CachedResolvedType(requestResolved, false, 0L);
+            }
+        }
+
+        CachedResolvedType cached = getResolvedTypeCacheEntry(cacheKey);
+        if (cached != null && context != null) {
+            if (cached.missing()) {
+                context.missingTypes.add(cacheKey);
+            } else {
+                context.resolvedTypes.put(cacheKey, cached.type());
+            }
+        }
+        return cached;
+    }
+
+    private void cacheResolvedType(TypeResolutionContext context, String cacheKey, IType resolved) {
+        if (context != null) {
+            context.resolvedTypes.remove(cacheKey);
+            context.missingTypes.remove(cacheKey);
+            if (resolved == null) {
+                context.missingTypes.add(cacheKey);
+            } else {
+                context.resolvedTypes.put(cacheKey, resolved);
+            }
+        }
+
+        exactTypeCache.put(cacheKey,
+                new CachedResolvedType(resolved, resolved == null, System.currentTimeMillis()));
+    }
+
+    private IType findTypeCached(IJavaProject project,
+            String lookupFqn,
+            TypeResolutionContext context) throws JavaModelException {
+        if (project == null || lookupFqn == null || lookupFqn.isEmpty()) {
+            return null;
+        }
+
+        String cacheKey = exactTypeCacheKey(project, "find:" + lookupFqn);
+        CachedResolvedType cached = getResolvedTypeFromCaches(context, cacheKey);
+        if (cached != null) {
+            return cached.missing() ? null : cached.type();
+        }
+
+        IType resolved = project.findType(lookupFqn);
+        cacheResolvedType(context, cacheKey, resolved);
+        return resolved;
+    }
+
+    private String dotReconcileMissKey(String uri, String content, int dotPos) {
+        String safeUri = (uri != null) ? uri : "<null>";
+        return safeUri + ":" + dotPos + ":" + content.length() + ":" + content.hashCode();
+    }
+
+    private boolean shouldSkipPatchedDotReconcile(String uri, String content, int dotPos) {
+        CachedDotReconcileMiss cached = dotReconcileMissCache.get(dotReconcileMissKey(uri, content, dotPos));
+        if (cached != null && cached.isExpired()) {
+            dotReconcileMissCache.remove(dotReconcileMissKey(uri, content, dotPos));
+            return false;
+        }
+        return cached != null;
+    }
+
+    private void rememberPatchedDotReconcileMiss(String uri, String content, int dotPos) {
+        dotReconcileMissCache.put(dotReconcileMissKey(uri, content, dotPos),
+                new CachedDotReconcileMiss(System.currentTimeMillis()));
+    }
+
+    private void clearPatchedDotReconcileMiss(String uri, String content, int dotPos) {
+        dotReconcileMissCache.remove(dotReconcileMissKey(uri, content, dotPos));
+    }
+
     // =========================================================================
     // Main entry point
     // =========================================================================
@@ -431,8 +580,13 @@ public class CompletionProvider {
     public List<CompletionItem> getCompletions(CompletionParams params) {
         List<CompletionItem> items = new ArrayList<>();
 
+        if (Thread.currentThread().isInterrupted()) {
+            return items;
+        }
+
         String uri = params.getTextDocument().getUri();
         Position position = params.getPosition();
+        TypeResolutionContext typeResolutionContext = new TypeResolutionContext();
 
         GroovyLanguageServerPlugin.logInfo("[completion] Request at " + uri
                 + " line=" + position.getLine() + " char=" + position.getCharacter());
@@ -466,17 +620,33 @@ public class CompletionProvider {
 
         try {
             if (isDotCompletion) {
+                if (Thread.currentThread().isInterrupted()) {
+                    return items;
+                }
                 int dotPos = prefixStart - 1; // position of the '.'
-                items.addAll(getDotCompletions(workingCopy, uri, content, position, dotPos, prefix));
+                items.addAll(getDotCompletions(
+                        workingCopy, uri, content, position, dotPos, prefix, typeResolutionContext));
                 // Never add keywords/types after a dot — only member completions
             } else if (isAnnotationCompletion) {
+                if (Thread.currentThread().isInterrupted()) {
+                    return items;
+                }
                 // After '@', only annotation types are valid.
-                items.addAll(getTypeCompletions(workingCopy, uri, content, prefix, true));
+                items.addAll(getTypeCompletions(
+                        workingCopy, uri, content, prefix, true, typeResolutionContext));
             } else {
                 // Non-dot context: identifiers + types + keywords
-                items.addAll(getIdentifierCompletions(workingCopy, uri, position, prefix));
+                items.addAll(getIdentifierCompletions(
+                        workingCopy, uri, position, prefix, typeResolutionContext));
+                if (Thread.currentThread().isInterrupted()) {
+                    return items;
+                }
                 if (!prefix.isEmpty()) {
-                    items.addAll(getTypeCompletions(workingCopy, uri, content, prefix, false));
+                    items.addAll(getTypeCompletions(
+                            workingCopy, uri, content, prefix, false, typeResolutionContext));
+                    if (Thread.currentThread().isInterrupted()) {
+                        return items;
+                    }
                     items.addAll(getKeywordCompletions(prefix));
                 }
             }
@@ -510,35 +680,64 @@ public class CompletionProvider {
     private List<CompletionItem> getDotCompletions(ICompilationUnit workingCopy,
                                                     String lspUri, String content,
                                                     Position position, int dotPos,
-                                                    String prefix) {
+                                                    String prefix,
+                                                    TypeResolutionContext typeResolutionContext) {
         List<CompletionItem> items = new ArrayList<>();
+        if (Thread.currentThread().isInterrupted()) {
+            return items;
+        }
 
-        // When the prefix is empty (cursor right after the dot), the source
-        // contains an incomplete expression like "foo." which breaks the
-        // Groovy parser and causes codeSelect to return 0 elements.
-        // Temporarily insert a dummy identifier after the dot so the parser
-        // produces a valid AST. Restore only AFTER all fallback attempts,
-        // so that AST-based fallbacks also see a valid AST.
-        boolean patched = patchContentForDotCompletion(workingCopy, content, dotPos, prefix);
+        // Walk backwards from the dot to find the identifier before it.
+        int exprEnd = dotPos; // content[dotPos] == '.'
+        int exprStart = exprEnd - 1;
+        while (exprStart >= 0 && Character.isJavaIdentifierPart(content.charAt(exprStart))) {
+            exprStart--;
+        }
+        exprStart++;
 
-        try {
-            // Walk backwards from the dot to find the identifier before it
-            int exprEnd = dotPos; // content[dotPos] == '.'
-            int exprStart = exprEnd - 1;
-            while (exprStart >= 0 && Character.isJavaIdentifierPart(content.charAt(exprStart))) {
-                exprStart--;
-            }
-            exprStart++;
+        if (exprStart >= exprEnd) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] No identifier before dot at " + dotPos);
+            return items;
+        }
 
-            if (exprStart >= exprEnd) {
-                GroovyLanguageServerPlugin.logInfo(
-                        "[completion] No identifier before dot at " + dotPos);
+        String exprName = content.substring(exprStart, exprEnd);
+        GroovyLanguageServerPlugin.logInfo("[completion] Dot on '" + exprName + "'");
+
+        // Fast path for "foo.|": try direct member lookup and cached AST
+        // first. They are usually enough for locals/fields after typing '.',
+        // and they avoid a full working-copy reconcile on the request thread.
+        if (prefix.isEmpty()) {
+            if (Thread.currentThread().isInterrupted()) {
                 return items;
             }
+            addCheapDotCompletions(
+                    workingCopy, lspUri, position, exprName, prefix, items, typeResolutionContext);
+            if (!items.isEmpty()) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[completion] Dot completion resolved without patched reconcile");
+                return items;
+            }
+            if (shouldSkipPatchedDotReconcile(lspUri, content, dotPos)) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[completion] Skipping repeated patched reconcile for unresolved dot completion");
+                return items;
+            }
+        }
 
-            String exprName = content.substring(exprStart, exprEnd);
-            GroovyLanguageServerPlugin.logInfo("[completion] Dot on '" + exprName + "'");
+        boolean patched = false;
+        try {
+            // When the prefix is empty (cursor right after the dot), the source
+            // contains an incomplete expression like "foo." which breaks the
+            // Groovy parser and causes codeSelect to return 0 elements.
+            // Temporarily insert a dummy identifier after the dot so the parser
+            // produces a valid AST. Restore only AFTER all fallback attempts,
+            // so that AST-based fallbacks also see a valid AST.
+            patched = patchContentForDotCompletion(workingCopy, content, dotPos, prefix);
 
+            if (Thread.currentThread().isInterrupted()) {
+                return items;
+            }
             IJavaElement[] elements = workingCopy.codeSelect(exprStart, exprEnd - exprStart);
             GroovyLanguageServerPlugin.logInfo(
                     "[completion] codeSelect returned " + elements.length + " element(s)");
@@ -550,7 +749,7 @@ public class CompletionProvider {
                         + " '" + element.getElementName() + "'");
 
                 IJavaProject project = findWorkingProject(workingCopy);
-                IType type = resolveElementType(element, project);
+                IType type = resolveElementType(element, project, typeResolutionContext);
 
                 if (type != null) {
                     GroovyLanguageServerPlugin.logInfo(
@@ -570,8 +769,12 @@ public class CompletionProvider {
             // If codeSelect failed (e.g. broken AST after typing dot),
             // try direct JDT model lookup for the field
             if (items.isEmpty()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    return items;
+                }
                 IJavaProject proj = findWorkingProject(workingCopy);
-                IType fieldType = findFieldTypeDirectly(workingCopy, lspUri, exprName, proj);
+                IType fieldType = findFieldTypeDirectly(
+                        workingCopy, lspUri, exprName, proj, typeResolutionContext);
                 if (fieldType != null) {
                     GroovyLanguageServerPlugin.logInfo(
                             "[completion] Direct field lookup resolved: "
@@ -582,7 +785,11 @@ public class CompletionProvider {
 
             // AST-based dot completion fallback: resolve the expression type via the AST
             if (items.isEmpty()) {
-                addAstDotCompletions(workingCopy, lspUri, position, exprName, prefix, items);
+                if (Thread.currentThread().isInterrupted()) {
+                    return items;
+                }
+                addAstDotCompletions(
+                        workingCopy, lspUri, position, exprName, prefix, items, typeResolutionContext);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[completion] Dot completion failed", e);
@@ -593,7 +800,42 @@ public class CompletionProvider {
             }
         }
 
+        if (prefix.isEmpty()) {
+            if (patched && items.isEmpty()) {
+                rememberPatchedDotReconcileMiss(lspUri, content, dotPos);
+            } else if (!items.isEmpty()) {
+                clearPatchedDotReconcileMiss(lspUri, content, dotPos);
+            }
+        }
+
         return items;
+    }
+
+    private void addCheapDotCompletions(ICompilationUnit workingCopy, String lspUri,
+                                        Position position, String exprName, String prefix,
+                                        List<CompletionItem> items,
+                                        TypeResolutionContext typeResolutionContext) {
+        try {
+            IJavaProject project = findWorkingProject(workingCopy);
+            if (project != null) {
+                IType fieldType = findDirectMemberType(
+                        workingCopy, exprName, project, typeResolutionContext);
+                if (fieldType != null) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[completion] Direct member lookup resolved: "
+                            + fieldType.getFullyQualifiedName());
+                    addMembersOfType(fieldType, prefix, false, items);
+                }
+            }
+        } catch (JavaModelException e) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] Cheap direct dot lookup failed: " + e.getMessage());
+        }
+
+        if (items.isEmpty()) {
+            addCachedAstDotCompletions(
+                    workingCopy, lspUri, position, exprName, prefix, items, typeResolutionContext);
+        }
     }
 
     /**
@@ -643,6 +885,12 @@ public class CompletionProvider {
      */
     private IType resolveElementType(IJavaElement element, IJavaProject project)
             throws JavaModelException {
+        return resolveElementType(element, project, null);
+    }
+
+    private IType resolveElementType(IJavaElement element, IJavaProject project,
+            TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
 
         if (element instanceof IType typeElement) {
             return typeElement;
@@ -671,7 +919,7 @@ public class CompletionProvider {
         GroovyLanguageServerPlugin.logInfo(
                 "[completion]   typeSig='" + typeSig + "' → '" + typeName + "'");
 
-        return resolveTypeName(typeName, declaringType, project);
+        return resolveTypeName(typeName, declaringType, project, typeResolutionContext);
     }
 
     /**
@@ -679,8 +927,14 @@ public class CompletionProvider {
      */
     private IType resolveTypeName(String typeName, IType declaringType,
                                    IJavaProject project) throws JavaModelException {
+        return resolveTypeName(typeName, declaringType, project, null);
+    }
+
+    private IType resolveTypeName(String typeName, IType declaringType,
+                                   IJavaProject project,
+                                   TypeResolutionContext typeResolutionContext) throws JavaModelException {
         // 1. Direct lookup (works for fully-qualified names)
-        IType type = project.findType(typeName);
+        IType type = findTypeCached(project, typeName, typeResolutionContext);
         if (type != null) return type;
 
         // 2. Resolve through declaring type's import context
@@ -690,14 +944,14 @@ public class CompletionProvider {
                 String fqn = resolved[0][0].isEmpty()
                         ? resolved[0][1]
                         : resolved[0][0] + "." + resolved[0][1];
-                type = project.findType(fqn);
+                type = findTypeCached(project, fqn, typeResolutionContext);
                 if (type != null) return type;
             }
         }
 
         // 3. Try Groovy auto-import packages
         for (String pkg : GROOVY_AUTO_PACKAGES) {
-            type = project.findType(pkg + typeName);
+            type = findTypeCached(project, pkg + typeName, typeResolutionContext);
             if (type != null) return type;
         }
 
@@ -986,37 +1240,93 @@ public class CompletionProvider {
      */
     private IType findFieldTypeDirectly(ICompilationUnit workingCopy, String lspUri,
                                          String fieldName, IJavaProject project) {
+        return findFieldTypeDirectly(workingCopy, lspUri, fieldName, project, null);
+    }
+
+    private IType findFieldTypeDirectly(ICompilationUnit workingCopy, String lspUri,
+                                         String fieldName, IJavaProject project,
+                                         TypeResolutionContext typeResolutionContext) {
         try {
-            for (IType type : workingCopy.getTypes()) {
-                // Check fields
-                IField field = type.getField(fieldName);
-                if (field != null && field.exists()) {
-                    String typeSig = field.getTypeSignature();
-                    String typeName = Signature.toString(typeSig);
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[completion] Direct field lookup: " + fieldName + " -> " + typeName);
-                    return resolveTypeName(typeName, type, project);
-                }
-                // Check no-arg methods (in case 'foo.' refers to a method result)
-                for (IMethod method : type.getMethods()) {
-                    if (method.getElementName().equals(fieldName)
-                            && method.getParameterTypes().length == 0) {
-                        String returnSig = method.getReturnType();
-                        String returnName = Signature.toString(returnSig);
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[completion] Direct method lookup: " + fieldName + "() -> " + returnName);
-                        return resolveTypeName(returnName, type, project);
-                    }
-                }
+            IType directMemberType = findDirectMemberType(
+                    workingCopy, fieldName, project, typeResolutionContext);
+            if (directMemberType != null) {
+                return directMemberType;
             }
 
             // Check trait-inherited fields/methods for the field name
-            IType traitFieldType = findFieldTypeInTraits(workingCopy, lspUri, fieldName, project);
+            IType traitFieldType = findFieldTypeInTraits(
+                    workingCopy, lspUri, fieldName, project, typeResolutionContext);
             if (traitFieldType != null) {
                 return traitFieldType;
             }
         } catch (JavaModelException e) {
             GroovyLanguageServerPlugin.logError("[completion] Direct field lookup failed", e);
+        }
+        return null;
+    }
+
+    private IType findDirectMemberType(ICompilationUnit workingCopy, String memberName,
+                                       IJavaProject project) throws JavaModelException {
+        return findDirectMemberType(workingCopy, memberName, project, null);
+    }
+
+    private IType findDirectMemberType(ICompilationUnit workingCopy, String memberName,
+                                       IJavaProject project,
+                                       TypeResolutionContext typeResolutionContext) throws JavaModelException {
+        if (workingCopy == null || project == null) {
+            return null;
+        }
+        for (IType type : workingCopy.getTypes()) {
+            IType fieldType = findDirectFieldType(type, memberName, project, typeResolutionContext);
+            if (fieldType != null) {
+                return fieldType;
+            }
+
+            IType methodType = findDirectMethodReturnType(type, memberName, project, typeResolutionContext);
+            if (methodType != null) {
+                return methodType;
+            }
+        }
+        return null;
+    }
+
+    private IType findDirectFieldType(IType type, String fieldName, IJavaProject project)
+            throws JavaModelException {
+        return findDirectFieldType(type, fieldName, project, null);
+    }
+
+    private IType findDirectFieldType(IType type, String fieldName, IJavaProject project,
+            TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
+        IField field = type.getField(fieldName);
+        if (field == null || !field.exists()) {
+            return null;
+        }
+
+        String typeSig = field.getTypeSignature();
+        String typeName = Signature.toString(typeSig);
+        GroovyLanguageServerPlugin.logInfo(
+                "[completion] Direct field lookup: " + fieldName + " -> " + typeName);
+        return resolveTypeName(typeName, type, project, typeResolutionContext);
+    }
+
+    private IType findDirectMethodReturnType(IType type, String methodName, IJavaProject project)
+            throws JavaModelException {
+        return findDirectMethodReturnType(type, methodName, project, null);
+    }
+
+    private IType findDirectMethodReturnType(IType type, String methodName, IJavaProject project,
+            TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
+        for (IMethod method : type.getMethods()) {
+            if (method.getElementName().equals(methodName)
+                    && method.getParameterTypes().length == 0) {
+                String returnSig = method.getReturnType();
+                String returnName = Signature.toString(returnSig);
+                GroovyLanguageServerPlugin.logInfo(
+                        "[completion] Direct method lookup: " + methodName + "() -> " + returnName);
+                return resolveTypeName(returnName, type, project, typeResolutionContext);
+            }
         }
         return null;
     }
@@ -1028,11 +1338,18 @@ public class CompletionProvider {
      */
     private IType findFieldTypeInTraits(ICompilationUnit workingCopy, String lspUri,
                                          String fieldName, IJavaProject project) {
+        return findFieldTypeInTraits(workingCopy, lspUri, fieldName, project, null);
+    }
+
+    private IType findFieldTypeInTraits(ICompilationUnit workingCopy, String lspUri,
+                                         String fieldName, IJavaProject project,
+                                         TypeResolutionContext typeResolutionContext) {
         ModuleNode ast = resolveAst(workingCopy, lspUri);
         if (ast == null) return null;
 
         for (ClassNode classNode : ast.getClasses()) {
-            IType resolved = findFieldTypeInClassTraits(classNode, ast, fieldName, project);
+            IType resolved = findFieldTypeInClassTraits(
+                    classNode, ast, fieldName, project, typeResolutionContext);
             if (resolved != null) {
                 return resolved;
             }
@@ -1045,8 +1362,19 @@ public class CompletionProvider {
         return ast != null ? ast : getModuleFromWorkingCopy(workingCopy);
     }
 
+    private ModuleNode resolveCachedAst(ICompilationUnit workingCopy, String lspUri) {
+        ModuleNode ast = (lspUri != null) ? documentManager.getCachedGroovyAST(lspUri) : null;
+        return ast != null ? ast : getModuleFromWorkingCopy(workingCopy);
+    }
+
     private IType findFieldTypeInClassTraits(ClassNode classNode, ModuleNode ast,
                                              String fieldName, IJavaProject project) {
+        return findFieldTypeInClassTraits(classNode, ast, fieldName, project, null);
+    }
+
+    private IType findFieldTypeInClassTraits(ClassNode classNode, ModuleNode ast,
+                                             String fieldName, IJavaProject project,
+                                             TypeResolutionContext typeResolutionContext) {
         if (classNode.getLineNumber() < 0) {
             return null;
         }
@@ -1056,7 +1384,8 @@ public class CompletionProvider {
         }
 
         for (ClassNode ifaceRef : interfaces) {
-            IType resolved = findFieldTypeInTraitInterface(ifaceRef, classNode, ast, fieldName, project);
+            IType resolved = findFieldTypeInTraitInterface(
+                    ifaceRef, classNode, ast, fieldName, project, typeResolutionContext);
             if (resolved != null) {
                 return resolved;
             }
@@ -1067,27 +1396,46 @@ public class CompletionProvider {
     private IType findFieldTypeInTraitInterface(ClassNode ifaceRef, ClassNode classNode,
                                                 ModuleNode ast, String fieldName,
                                                 IJavaProject project) {
-        IType jdtResolved = resolveFieldTypeFromTraitJdt(ifaceRef, classNode, ast, fieldName, project);
+        return findFieldTypeInTraitInterface(
+                ifaceRef, classNode, ast, fieldName, project, null);
+    }
+
+    private IType findFieldTypeInTraitInterface(ClassNode ifaceRef, ClassNode classNode,
+                                                ModuleNode ast, String fieldName,
+                                                IJavaProject project,
+                                                TypeResolutionContext typeResolutionContext) {
+        IType jdtResolved = resolveFieldTypeFromTraitJdt(
+                ifaceRef, classNode, ast, fieldName, project, typeResolutionContext);
         if (jdtResolved != null) {
             return jdtResolved;
         }
-        return resolveFieldTypeFromTraitAst(ifaceRef, ast, fieldName, project);
+        return resolveFieldTypeFromTraitAst(
+                ifaceRef, ast, fieldName, project, typeResolutionContext);
     }
 
     private IType resolveFieldTypeFromTraitJdt(ClassNode ifaceRef, ClassNode classNode,
                                                ModuleNode ast, String fieldName,
                                                IJavaProject project) {
-        IType traitType = resolveTraitType(ifaceRef, classNode, ast, project);
+        return resolveFieldTypeFromTraitJdt(
+                ifaceRef, classNode, ast, fieldName, project, null);
+    }
+
+    private IType resolveFieldTypeFromTraitJdt(ClassNode ifaceRef, ClassNode classNode,
+                                               ModuleNode ast, String fieldName,
+                                               IJavaProject project,
+                                               TypeResolutionContext typeResolutionContext) {
+        IType traitType = resolveTraitType(ifaceRef, classNode, ast, project, typeResolutionContext);
         if (traitType == null) {
             return null;
         }
 
         try {
-            IType directFieldType = resolveTraitDirectFieldType(traitType, fieldName, project);
+            IType directFieldType = resolveTraitDirectFieldType(
+                    traitType, fieldName, project, typeResolutionContext);
             if (directFieldType != null) {
                 return directFieldType;
             }
-            return resolveTraitAccessorType(traitType, fieldName, project);
+            return resolveTraitAccessorType(traitType, fieldName, project, typeResolutionContext);
         } catch (JavaModelException e) {
             return null;
         }
@@ -1095,6 +1443,13 @@ public class CompletionProvider {
 
     private IType resolveTraitDirectFieldType(IType traitType, String fieldName,
                                               IJavaProject project)
+            throws JavaModelException {
+        return resolveTraitDirectFieldType(traitType, fieldName, project, null);
+    }
+
+    private IType resolveTraitDirectFieldType(IType traitType, String fieldName,
+                                              IJavaProject project,
+                                              TypeResolutionContext typeResolutionContext)
             throws JavaModelException {
         IField traitField = traitType.getField(fieldName);
         if (traitField == null || !traitField.exists()) {
@@ -1104,11 +1459,18 @@ public class CompletionProvider {
         String typeName = Signature.toString(traitField.getTypeSignature());
         GroovyLanguageServerPlugin.logInfo(
                 "[completion] Trait field lookup: " + fieldName + " -> " + typeName);
-        return resolveTypeName(typeName, traitType, project);
+        return resolveTypeName(typeName, traitType, project, typeResolutionContext);
     }
 
     private IType resolveTraitAccessorType(IType traitType, String fieldName,
                                            IJavaProject project)
+            throws JavaModelException {
+        return resolveTraitAccessorType(traitType, fieldName, project, null);
+    }
+
+    private IType resolveTraitAccessorType(IType traitType, String fieldName,
+                                           IJavaProject project,
+                                           TypeResolutionContext typeResolutionContext)
             throws JavaModelException {
         String capitalized = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
         for (IMethod method : traitType.getMethods()) {
@@ -1116,7 +1478,7 @@ public class CompletionProvider {
                 String returnName = Signature.toString(method.getReturnType());
                 GroovyLanguageServerPlugin.logInfo(
                         "[completion] Trait property lookup: " + fieldName + " -> " + returnName);
-                return resolveTypeName(returnName, traitType, project);
+                return resolveTypeName(returnName, traitType, project, typeResolutionContext);
             }
         }
         return null;
@@ -1131,33 +1493,48 @@ public class CompletionProvider {
 
     private IType resolveFieldTypeFromTraitAst(ClassNode ifaceRef, ModuleNode ast,
                                                String fieldName, IJavaProject project) {
+        return resolveFieldTypeFromTraitAst(ifaceRef, ast, fieldName, project, null);
+    }
+
+    private IType resolveFieldTypeFromTraitAst(ClassNode ifaceRef, ModuleNode ast,
+                                               String fieldName, IJavaProject project,
+                                               TypeResolutionContext typeResolutionContext) {
         ClassNode resolvedTraitNode = TraitMemberResolver.resolveTraitClassNode(
                 ifaceRef, ast, documentManager);
         if (resolvedTraitNode == null || resolvedTraitNode.getLineNumber() < 0) {
             return null;
         }
 
-        IType propertyType = resolveTraitAstPropertyType(resolvedTraitNode, fieldName, ast, project);
+        IType propertyType = resolveTraitAstPropertyType(
+                resolvedTraitNode, fieldName, ast, project, typeResolutionContext);
         if (propertyType != null) {
             return propertyType;
         }
 
-        IType fieldType = resolveTraitAstFieldType(resolvedTraitNode, fieldName, ast, project);
+        IType fieldType = resolveTraitAstFieldType(
+                resolvedTraitNode, fieldName, ast, project, typeResolutionContext);
         if (fieldType != null) {
             return fieldType;
         }
 
-        return resolveTraitFieldHelperType(resolvedTraitNode, fieldName, ast, project);
+        return resolveTraitFieldHelperType(
+                resolvedTraitNode, fieldName, ast, project, typeResolutionContext);
     }
 
     private IType resolveTraitAstPropertyType(ClassNode traitNode, String fieldName,
-                                              ModuleNode ast, IJavaProject project) {
+                                           ModuleNode ast, IJavaProject project) {
+        return resolveTraitAstPropertyType(traitNode, fieldName, ast, project, null);
+    }
+
+    private IType resolveTraitAstPropertyType(ClassNode traitNode, String fieldName,
+                                           ModuleNode ast, IJavaProject project,
+                                           TypeResolutionContext typeResolutionContext) {
         for (PropertyNode prop : traitNode.getProperties()) {
             if (fieldName.equals(prop.getName()) && prop.getType() != null) {
                 String typeName = prop.getType().getName();
                 GroovyLanguageServerPlugin.logInfo(
                         "[completion] Trait AST property: " + fieldName + " -> " + typeName);
-                return resolveTypeNameFromAST(typeName, ast, project);
+                return resolveTypeNameFromAST(typeName, ast, project, typeResolutionContext);
             }
         }
         return null;
@@ -1165,12 +1542,18 @@ public class CompletionProvider {
 
     private IType resolveTraitAstFieldType(ClassNode traitNode, String fieldName,
                                            ModuleNode ast, IJavaProject project) {
+        return resolveTraitAstFieldType(traitNode, fieldName, ast, project, null);
+    }
+
+    private IType resolveTraitAstFieldType(ClassNode traitNode, String fieldName,
+                                           ModuleNode ast, IJavaProject project,
+                                           TypeResolutionContext typeResolutionContext) {
         for (FieldNode field : traitNode.getFields()) {
             if (fieldName.equals(field.getName()) && field.getType() != null) {
                 String typeName = field.getType().getName();
                 GroovyLanguageServerPlugin.logInfo(
                         "[completion] Trait AST field: " + fieldName + " -> " + typeName);
-                return resolveTypeNameFromAST(typeName, ast, project);
+                return resolveTypeNameFromAST(typeName, ast, project, typeResolutionContext);
             }
         }
         return null;
@@ -1178,6 +1561,12 @@ public class CompletionProvider {
 
     private IType resolveTraitFieldHelperType(ClassNode traitNode, String fieldName,
                                               ModuleNode ast, IJavaProject project) {
+        return resolveTraitFieldHelperType(traitNode, fieldName, ast, project, null);
+    }
+
+    private IType resolveTraitFieldHelperType(ClassNode traitNode, String fieldName,
+                                              ModuleNode ast, IJavaProject project,
+                                              TypeResolutionContext typeResolutionContext) {
         ClassNode helperNode = TraitMemberResolver.findFieldHelperNode(traitNode, ast);
         if (helperNode == null) {
             return null;
@@ -1189,7 +1578,7 @@ public class CompletionProvider {
                 String typeName = helperField.getType().getName();
                 GroovyLanguageServerPlugin.logInfo(
                         "[completion] Trait FieldHelper field: " + fieldName + " -> " + typeName);
-                return resolveTypeNameFromAST(typeName, ast, project);
+                return resolveTypeNameFromAST(typeName, ast, project, typeResolutionContext);
             }
         }
         return null;
@@ -1201,20 +1590,26 @@ public class CompletionProvider {
      */
     private IType resolveTypeNameFromAST(String typeName,
                                           ModuleNode module, IJavaProject project) {
+        return resolveTypeNameFromAST(typeName, module, project, null);
+    }
+
+    private IType resolveTypeNameFromAST(String typeName,
+                                          ModuleNode module, IJavaProject project,
+                                          TypeResolutionContext typeResolutionContext) {
         try {
-            IType resolved = resolveQualifiedType(typeName, project);
+            IType resolved = resolveQualifiedType(typeName, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            resolved = resolveImportedAstType(typeName, module, project);
+            resolved = resolveImportedAstType(typeName, module, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            resolved = resolveSamePackageAstType(typeName, module, project);
+            resolved = resolveSamePackageAstType(typeName, module, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            resolved = resolveAstAutoImportType(typeName, project);
+            resolved = resolveAstAutoImportType(typeName, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            return resolveStarImportedAstType(typeName, module, project);
+            return resolveStarImportedAstType(typeName, module, project, typeResolutionContext);
         } catch (JavaModelException e) {
             // ignore
         }
@@ -1223,15 +1618,27 @@ public class CompletionProvider {
 
     private IType resolveQualifiedType(String typeName, IJavaProject project)
             throws JavaModelException {
-        return typeName.contains(".") ? project.findType(typeName) : null;
+        return resolveQualifiedType(typeName, project, null);
+    }
+
+    private IType resolveQualifiedType(String typeName, IJavaProject project,
+            TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
+        return typeName.contains(".") ? findTypeCached(project, typeName, typeResolutionContext) : null;
     }
 
     private IType resolveImportedAstType(String typeName, ModuleNode module,
                                          IJavaProject project) throws JavaModelException {
+        return resolveImportedAstType(typeName, module, project, null);
+    }
+
+    private IType resolveImportedAstType(String typeName, ModuleNode module,
+                                         IJavaProject project,
+                                         TypeResolutionContext typeResolutionContext) throws JavaModelException {
         for (ImportNode imp : module.getImports()) {
             ClassNode impType = imp.getType();
             if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
-                IType resolved = project.findType(impType.getName());
+                IType resolved = findTypeCached(project, impType.getName(), typeResolutionContext);
                 if (resolved != null) {
                     return resolved;
                 }
@@ -1242,18 +1649,32 @@ public class CompletionProvider {
 
     private IType resolveSamePackageAstType(String typeName, ModuleNode module,
                                             IJavaProject project) throws JavaModelException {
+        return resolveSamePackageAstType(typeName, module, project, null);
+    }
+
+    private IType resolveSamePackageAstType(String typeName, ModuleNode module,
+                                            IJavaProject project,
+                                            TypeResolutionContext typeResolutionContext) throws JavaModelException {
         String pkg = normalizePackageName(module.getPackageName());
-        return (pkg != null && !pkg.isEmpty()) ? project.findType(pkg + "." + typeName) : null;
+        return (pkg != null && !pkg.isEmpty())
+                ? findTypeCached(project, pkg + "." + typeName, typeResolutionContext)
+                : null;
     }
 
     private IType resolveAstAutoImportType(String typeName, IJavaProject project)
+            throws JavaModelException {
+        return resolveAstAutoImportType(typeName, project, null);
+    }
+
+    private IType resolveAstAutoImportType(String typeName, IJavaProject project,
+            TypeResolutionContext typeResolutionContext)
             throws JavaModelException {
         String[] autoPackages = {
             JAVA_LANG_PACKAGE, JAVA_UTIL_PACKAGE, JAVA_IO_PACKAGE,
             GROOVY_LANG_PACKAGE, GROOVY_UTIL_PACKAGE
         };
         for (String autoPkg : autoPackages) {
-            IType resolved = project.findType(autoPkg + typeName);
+            IType resolved = findTypeCached(project, autoPkg + typeName, typeResolutionContext);
             if (resolved != null) {
                 return resolved;
             }
@@ -1263,10 +1684,16 @@ public class CompletionProvider {
 
     private IType resolveStarImportedAstType(String typeName, ModuleNode module,
                                              IJavaProject project) throws JavaModelException {
+        return resolveStarImportedAstType(typeName, module, project, null);
+    }
+
+    private IType resolveStarImportedAstType(String typeName, ModuleNode module,
+                                             IJavaProject project,
+                                             TypeResolutionContext typeResolutionContext) throws JavaModelException {
         for (ImportNode starImport : module.getStarImports()) {
             String pkgName = starImport.getPackageName();
             if (pkgName != null) {
-                IType resolved = project.findType(pkgName + typeName);
+                IType resolved = findTypeCached(project, pkgName + typeName, typeResolutionContext);
                 if (resolved != null) {
                     return resolved;
                 }
@@ -1287,6 +1714,13 @@ public class CompletionProvider {
     private List<CompletionItem> getIdentifierCompletions(ICompilationUnit workingCopy,
                                                           String lspUri, Position position,
                                                           String prefix) {
+        return getIdentifierCompletions(workingCopy, lspUri, position, prefix, null);
+    }
+
+    private List<CompletionItem> getIdentifierCompletions(ICompilationUnit workingCopy,
+                                                          String lspUri, Position position,
+                                                          String prefix,
+                                                          TypeResolutionContext typeResolutionContext) {
         List<CompletionItem> items = new ArrayList<>();
         if (prefix.isEmpty()) return items;
 
@@ -1294,7 +1728,8 @@ public class CompletionProvider {
             addTypeIdentifierCompletions(workingCopy, prefix, items);
 
             // Also add members inherited from traits/interfaces
-            addTraitIdentifierCompletions(workingCopy, lspUri, prefix, items);
+            addTraitIdentifierCompletions(
+                    workingCopy, lspUri, prefix, items, typeResolutionContext);
 
             addScopedAstIdentifierCompletions(workingCopy, lspUri, position, prefix, items);
 
@@ -1381,6 +1816,14 @@ public class CompletionProvider {
                                                 String lspUri,
                                                 String prefix,
                                                 List<CompletionItem> items) {
+        addTraitIdentifierCompletions(workingCopy, lspUri, prefix, items, null);
+    }
+
+    private void addTraitIdentifierCompletions(ICompilationUnit workingCopy,
+                                                String lspUri,
+                                                String prefix,
+                                                List<CompletionItem> items,
+                                                TypeResolutionContext typeResolutionContext) {
         ModuleNode ast = resolveAst(workingCopy, lspUri);
         if (ast == null) return;
 
@@ -1390,7 +1833,8 @@ public class CompletionProvider {
         Set<String> seen = collectSeenCompletionNames(items);
 
         for (ClassNode classNode : ast.getClasses()) {
-            addTraitCompletionsForClass(classNode, ast, prefix, project, seen, items);
+            addTraitCompletionsForClass(
+                    classNode, ast, prefix, project, seen, items, typeResolutionContext);
         }
     }
 
@@ -1432,6 +1876,13 @@ public class CompletionProvider {
     private void addTraitCompletionsForClass(ClassNode classNode, ModuleNode ast,
                                              String prefix, IJavaProject project,
                                              Set<String> seen, List<CompletionItem> items) {
+        addTraitCompletionsForClass(classNode, ast, prefix, project, seen, items, null);
+    }
+
+    private void addTraitCompletionsForClass(ClassNode classNode, ModuleNode ast,
+                                             String prefix, IJavaProject project,
+                                             Set<String> seen, List<CompletionItem> items,
+                                             TypeResolutionContext typeResolutionContext) {
         if (classNode.getLineNumber() < 0) {
             return;
         }
@@ -1441,7 +1892,8 @@ public class CompletionProvider {
         }
 
         for (ClassNode ifaceRef : interfaces) {
-            IType traitType = resolveTraitType(ifaceRef, classNode, ast, project);
+            IType traitType = resolveTraitType(
+                    ifaceRef, classNode, ast, project, typeResolutionContext);
             addTraitJdtIdentifierCompletions(traitType, prefix, seen, items);
             addTraitAstIdentifierCompletions(ifaceRef, ast, prefix, seen, items);
         }
@@ -1794,7 +2246,43 @@ public class CompletionProvider {
     private void addAstDotCompletions(ICompilationUnit workingCopy, String lspUri,
                                        Position position, String exprName, String prefix,
                                        List<CompletionItem> items) {
+        addAstDotCompletions(workingCopy, lspUri, position, exprName, prefix, items, null);
+    }
+
+    private void addAstDotCompletions(ICompilationUnit workingCopy, String lspUri,
+                                       Position position, String exprName, String prefix,
+                                       List<CompletionItem> items,
+                                       TypeResolutionContext typeResolutionContext) {
         ModuleNode ast = resolveAst(workingCopy, lspUri);
+        addAstDotCompletions(
+                workingCopy, position, exprName, prefix, items, ast, typeResolutionContext);
+    }
+
+    private void addCachedAstDotCompletions(ICompilationUnit workingCopy, String lspUri,
+                                            Position position, String exprName, String prefix,
+                                            List<CompletionItem> items) {
+        addCachedAstDotCompletions(workingCopy, lspUri, position, exprName, prefix, items, null);
+    }
+
+    private void addCachedAstDotCompletions(ICompilationUnit workingCopy, String lspUri,
+                                            Position position, String exprName, String prefix,
+                                            List<CompletionItem> items,
+                                            TypeResolutionContext typeResolutionContext) {
+        ModuleNode ast = resolveCachedAst(workingCopy, lspUri);
+        addAstDotCompletions(
+                workingCopy, position, exprName, prefix, items, ast, typeResolutionContext);
+    }
+
+    private void addAstDotCompletions(ICompilationUnit workingCopy, Position position,
+                                      String exprName, String prefix,
+                                      List<CompletionItem> items, ModuleNode ast) {
+        addAstDotCompletions(workingCopy, position, exprName, prefix, items, ast, null);
+    }
+
+    private void addAstDotCompletions(ICompilationUnit workingCopy, Position position,
+                                      String exprName, String prefix,
+                                      List<CompletionItem> items, ModuleNode ast,
+                                      TypeResolutionContext typeResolutionContext) {
         if (ast == null) return;
 
         IJavaProject project = findWorkingProject(workingCopy);
@@ -1802,7 +2290,7 @@ public class CompletionProvider {
         for (ClassNode classNode : ast.getClasses()) {
             if (classNode.getLineNumber() >= 0) {
                 ClassNode exprType = resolveAstExpressionType(classNode, ast, position, exprName);
-                addAstResolvedTypeMembers(exprType, project, prefix, items);
+                addAstResolvedTypeMembers(exprType, project, prefix, items, typeResolutionContext);
                 if (!items.isEmpty()) return;
             }
         }
@@ -1810,7 +2298,7 @@ public class CompletionProvider {
         // Script-level local variables: check the module statement block directly
         ClassNode scriptType = resolveLocalVariableTypeInBlock(
                 ast.getStatementBlock(), exprName);
-        addAstResolvedTypeMembers(scriptType, project, prefix, items);
+        addAstResolvedTypeMembers(scriptType, project, prefix, items, typeResolutionContext);
     }
 
     private ClassNode resolveAstExpressionType(ClassNode classNode, ModuleNode ast,
@@ -2017,11 +2505,17 @@ public class CompletionProvider {
 
     private void addAstResolvedTypeMembers(ClassNode exprType, IJavaProject project,
                                            String prefix, List<CompletionItem> items) {
+        addAstResolvedTypeMembers(exprType, project, prefix, items, null);
+    }
+
+    private void addAstResolvedTypeMembers(ClassNode exprType, IJavaProject project,
+                                           String prefix, List<CompletionItem> items,
+                                           TypeResolutionContext typeResolutionContext) {
         if (exprType == null || project == null) {
             return;
         }
         try {
-            IType jdtType = resolveAstTypeInProject(project, exprType);
+            IType jdtType = resolveAstTypeInProject(project, exprType, typeResolutionContext);
             if (jdtType != null) {
                 GroovyLanguageServerPlugin.logInfo(
                         "[completion] AST dot fallback resolved: " + jdtType.getFullyQualifiedName());
@@ -2035,13 +2529,19 @@ public class CompletionProvider {
 
     private IType resolveAstTypeInProject(IJavaProject project, ClassNode exprType)
             throws JavaModelException {
-        IType jdtType = project.findType(exprType.getName());
+        return resolveAstTypeInProject(project, exprType, null);
+    }
+
+    private IType resolveAstTypeInProject(IJavaProject project, ClassNode exprType,
+            TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
+        IType jdtType = findTypeCached(project, exprType.getName(), typeResolutionContext);
         if (jdtType != null) {
             return jdtType;
         }
         String simpleName = exprType.getNameWithoutPackage();
         for (String pkg : GROOVY_AUTO_PACKAGES) {
-            IType autoImported = project.findType(pkg + simpleName);
+            IType autoImported = findTypeCached(project, pkg + simpleName, typeResolutionContext);
             if (autoImported != null) {
                 return autoImported;
             }
@@ -2068,6 +2568,12 @@ public class CompletionProvider {
      */
     private IType resolveTraitType(ClassNode ifaceRef, ClassNode owner,
                                     ModuleNode module, IJavaProject project) {
+        return resolveTraitType(ifaceRef, owner, module, project, null);
+    }
+
+    private IType resolveTraitType(ClassNode ifaceRef, ClassNode owner,
+                                    ModuleNode module, IJavaProject project,
+                                    TypeResolutionContext typeResolutionContext) {
         String ifaceSimple = ifaceRef.getNameWithoutPackage();
         if (ifaceSimple == null || ifaceSimple.isEmpty()) return null;
 
@@ -2077,19 +2583,22 @@ public class CompletionProvider {
         }
 
         try {
-            IType resolved = resolveTraitTypeByFqn(ifaceRef, project);
+            IType resolved = resolveTraitTypeByFqn(ifaceRef, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            resolved = resolveTraitTypeByOwnerPackage(ifaceSimple, ownerPkg, project);
+            resolved = resolveTraitTypeByOwnerPackage(
+                    ifaceSimple, ownerPkg, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            resolved = resolveTraitTypeByImports(ifaceSimple, module, project);
+            resolved = resolveTraitTypeByImports(
+                    ifaceSimple, module, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            resolved = resolveTraitTypeByAutoImports(ifaceSimple, project);
+            resolved = resolveTraitTypeByAutoImports(
+                    ifaceSimple, project, typeResolutionContext);
             if (resolved != null) return resolved;
 
-            return searchTypeBySimpleName(project, ifaceSimple, ownerPkg);
+            return searchTypeBySimpleName(project, ifaceSimple, ownerPkg, typeResolutionContext);
         } catch (JavaModelException e) {
             // ignore
         }
@@ -2098,27 +2607,48 @@ public class CompletionProvider {
 
     private IType resolveTraitTypeByFqn(ClassNode ifaceRef, IJavaProject project)
             throws JavaModelException {
+        return resolveTraitTypeByFqn(ifaceRef, project, null);
+    }
+
+    private IType resolveTraitTypeByFqn(ClassNode ifaceRef, IJavaProject project,
+            TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
         String fqn = ifaceRef.getName();
-        return (fqn != null && fqn.contains(".")) ? project.findType(fqn) : null;
+        return (fqn != null && fqn.contains("."))
+                ? findTypeCached(project, fqn, typeResolutionContext)
+                : null;
     }
 
     private IType resolveTraitTypeByOwnerPackage(String ifaceSimple, String ownerPkg,
                                                  IJavaProject project)
             throws JavaModelException {
+        return resolveTraitTypeByOwnerPackage(ifaceSimple, ownerPkg, project, null);
+    }
+
+    private IType resolveTraitTypeByOwnerPackage(String ifaceSimple, String ownerPkg,
+                                                 IJavaProject project,
+                                                 TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
         return (ownerPkg != null && !ownerPkg.isEmpty())
-                ? project.findType(ownerPkg + "." + ifaceSimple)
+                ? findTypeCached(project, ownerPkg + "." + ifaceSimple, typeResolutionContext)
                 : null;
     }
 
     private IType resolveTraitTypeByImports(String ifaceSimple, ModuleNode module,
                                             IJavaProject project) throws JavaModelException {
+        return resolveTraitTypeByImports(ifaceSimple, module, project, null);
+    }
+
+    private IType resolveTraitTypeByImports(String ifaceSimple, ModuleNode module,
+                                            IJavaProject project,
+                                            TypeResolutionContext typeResolutionContext) throws JavaModelException {
         if (module == null) {
             return null;
         }
         for (org.codehaus.groovy.ast.ImportNode imp : module.getImports()) {
             ClassNode impType = imp.getType();
             if (impType != null && ifaceSimple.equals(impType.getNameWithoutPackage())) {
-                IType resolved = project.findType(impType.getName());
+                IType resolved = findTypeCached(project, impType.getName(), typeResolutionContext);
                 if (resolved != null) {
                     return resolved;
                 }
@@ -2127,7 +2657,8 @@ public class CompletionProvider {
         for (org.codehaus.groovy.ast.ImportNode starImport : module.getStarImports()) {
             String pkgName = normalizePackageName(starImport.getPackageName());
             if (pkgName != null && !pkgName.isEmpty()) {
-                IType resolved = project.findType(pkgName + "." + ifaceSimple);
+                IType resolved = findTypeCached(
+                        project, pkgName + "." + ifaceSimple, typeResolutionContext);
                 if (resolved != null) {
                     return resolved;
                 }
@@ -2138,11 +2669,17 @@ public class CompletionProvider {
 
     private IType resolveTraitTypeByAutoImports(String ifaceSimple, IJavaProject project)
             throws JavaModelException {
+        return resolveTraitTypeByAutoImports(ifaceSimple, project, null);
+    }
+
+    private IType resolveTraitTypeByAutoImports(String ifaceSimple, IJavaProject project,
+            TypeResolutionContext typeResolutionContext)
+            throws JavaModelException {
         String[] autoPackages = {
             GROOVY_LANG_PACKAGE, GROOVY_UTIL_PACKAGE, JAVA_LANG_PACKAGE, JAVA_UTIL_PACKAGE
         };
         for (String pkg : autoPackages) {
-            IType resolved = project.findType(pkg + ifaceSimple);
+            IType resolved = findTypeCached(project, pkg + ifaceSimple, typeResolutionContext);
             if (resolved != null) {
                 return resolved;
             }
@@ -2162,9 +2699,22 @@ public class CompletionProvider {
     private IType searchTypeBySimpleName(IJavaProject project,
                                           String simpleName,
                                           String preferredPackage) {
+        return searchTypeBySimpleName(project, simpleName, preferredPackage, null);
+    }
+
+    private IType searchTypeBySimpleName(IJavaProject project,
+                                          String simpleName,
+                                          String preferredPackage,
+                                          TypeResolutionContext typeResolutionContext) {
         if (simpleName == null || simpleName.isEmpty()) return null;
 
         final String normalizedPreferredPackage = normalizePackageName(preferredPackage);
+        String cacheKey = exactTypeCacheKey(project,
+                "search:" + normalizedPreferredPackage + ":" + simpleName);
+        CachedResolvedType cached = getResolvedTypeFromCaches(typeResolutionContext, cacheKey);
+        if (cached != null) {
+            return cached.missing() ? null : cached.type();
+        }
         final String[] preferredFqn = new String[1];
         final String[] firstFqn = new String[1];
 
@@ -2210,15 +2760,18 @@ public class CompletionProvider {
                     null);
 
             String chosen = (preferredFqn[0] != null) ? preferredFqn[0] : firstFqn[0];
-            if (chosen != null) {
-                return project.findType(chosen);
-            }
+            IType resolved = (chosen != null)
+                    ? findTypeCached(project, chosen, typeResolutionContext)
+                    : null;
+            cacheResolvedType(typeResolutionContext, cacheKey, resolved);
+            return resolved;
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logInfo(
                     "[completion] Trait type search fallback failed for '"
                             + simpleName + "': " + e.getMessage());
         }
 
+        cacheResolvedType(typeResolutionContext, cacheKey, null);
         return null;
     }
 
@@ -2238,8 +2791,20 @@ public class CompletionProvider {
                                  String content,
                                                      String prefix,
                                                      boolean annotationOnly) {
+        return getTypeCompletions(workingCopy, uri, content, prefix, annotationOnly, null);
+    }
+
+    private List<CompletionItem> getTypeCompletions(ICompilationUnit workingCopy,
+                                 String uri,
+                                 String content,
+                                                     String prefix,
+                                                     boolean annotationOnly,
+                                                     TypeResolutionContext typeResolutionContext) {
         List<CompletionItem> items = new ArrayList<>();
         if (prefix.isEmpty() && !annotationOnly) return items;
+        if (Thread.currentThread().isInterrupted()) {
+            return items;
+        }
 
         try {
             IJavaProject project = findWorkingProject(workingCopy);
@@ -2263,13 +2828,21 @@ public class CompletionProvider {
                     annotationOnly, currentPackage, existingImports, importInsertLine);
 
             if (annotationOnly) {
-                addImportedAnnotationCompletions(project, existingImports, prefix, items, seenSimpleNames);
+                addImportedAnnotationCompletions(
+                        project, existingImports, prefix, items, seenSimpleNames, typeResolutionContext);
             }
 
+            if (Thread.currentThread().isInterrupted()) {
+                return items;
+            }
             searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                    searchContext, items, IJavaSearchScope.SOURCES, "5_");
+                    searchContext, items, IJavaSearchScope.SOURCES, "5_", typeResolutionContext);
+            if (Thread.currentThread().isInterrupted()) {
+                return items;
+            }
             searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                    searchContext, items, IJavaSearchScope.APPLICATION_LIBRARIES, "6_");
+                    searchContext, items, IJavaSearchScope.APPLICATION_LIBRARIES, "6_",
+                    typeResolutionContext);
 
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"
                     + prefix + "': " + items.size() + " results");
@@ -2289,7 +2862,15 @@ public class CompletionProvider {
     private boolean isSearchResultEligible(String simpleName, String fqn, int modifiers,
                                            boolean annotationOnly, IJavaProject project,
                                            Set<String> seenSimpleNames) {
-        if (annotationOnly && !isAnnotationTypeCandidate(project, fqn, modifiers)) {
+        return isSearchResultEligible(
+                simpleName, fqn, modifiers, annotationOnly, project, seenSimpleNames, null);
+    }
+
+    private boolean isSearchResultEligible(String simpleName, String fqn, int modifiers,
+                                           boolean annotationOnly, IJavaProject project,
+                                           Set<String> seenSimpleNames,
+                                           TypeResolutionContext typeResolutionContext) {
+        if (annotationOnly && !isAnnotationTypeCandidate(project, fqn, modifiers, typeResolutionContext)) {
             return false;
         }
         if (seenSimpleNames.contains(simpleName)) {
@@ -2303,12 +2884,23 @@ public class CompletionProvider {
                                  Set<String> seenSimpleNames, TypeSearchContext searchContext,
                                  List<CompletionItem> items,
                                  int scopeMask, String sortPrefix) throws org.eclipse.core.runtime.CoreException {
-        if (items.size() >= MAX_TYPE_RESULTS) {
+        searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
+                searchContext, items, scopeMask, sortPrefix, null);
+    }
+
+    private void searchTypeNames(IJavaProject project, String prefix, boolean annotationOnly,
+                                 Set<String> seenSimpleNames, TypeSearchContext searchContext,
+                                 List<CompletionItem> items,
+                                 int scopeMask, String sortPrefix,
+                                 TypeResolutionContext typeResolutionContext)
+            throws org.eclipse.core.runtime.CoreException {
+        if (items.size() >= MAX_TYPE_RESULTS || Thread.currentThread().isInterrupted()) {
             return;
         }
 
         IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
                 new IJavaElement[]{project}, scopeMask);
+        IProgressMonitor searchMonitor = createSearchMonitor(() -> items.size() >= MAX_TYPE_RESULTS);
         JdtSearchSupport.searchAllTypeNames(
                 null,
                 SearchPattern.R_PATTERN_MATCH,
@@ -2321,7 +2913,7 @@ public class CompletionProvider {
                     public void acceptType(int modifiers, char[] packageName,
                                            char[] simpleTypeName,
                                            char[][] enclosingTypeNames, String path) {
-                        if (items.size() >= MAX_TYPE_RESULTS) {
+                        if (items.size() >= MAX_TYPE_RESULTS || Thread.currentThread().isInterrupted()) {
                             return;
                         }
 
@@ -2330,14 +2922,39 @@ public class CompletionProvider {
                         String fqn = pkg.isEmpty() ? simpleName : pkg + "." + simpleName;
 
                         if (isSearchResultEligible(simpleName, fqn, modifiers, annotationOnly,
-                                project, seenSimpleNames)) {
+                                project, seenSimpleNames, typeResolutionContext)) {
                             items.add(buildTypeSearchItem(simpleName, pkg, modifiers,
                                     fqn, searchContext, sortPrefix));
                         }
                     }
                 },
                 IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
-                null);
+                searchMonitor);
+    }
+
+    private IProgressMonitor createSearchMonitor(java.util.function.BooleanSupplier additionalCancelCondition) {
+        return new IProgressMonitor() {
+            private volatile boolean cancelled = false;
+
+            @Override public void beginTask(String name, int totalWork) {}
+            @Override public void done() {}
+            @Override public void internalWorked(double work) {}
+            @Override public void setTaskName(String name) {}
+            @Override public void subTask(String name) {}
+            @Override public void worked(int work) {}
+
+            @Override
+            public boolean isCanceled() {
+                return cancelled
+                        || Thread.currentThread().isInterrupted()
+                        || (additionalCancelCondition != null && additionalCancelCondition.getAsBoolean());
+            }
+
+            @Override
+            public void setCanceled(boolean value) {
+                cancelled = value;
+            }
+        };
     }
 
     private CompletionItem buildTypeSearchItem(String simpleName, String pkg, int modifiers,
@@ -2388,8 +3005,18 @@ public class CompletionProvider {
                                                   String prefix,
                                                   List<CompletionItem> items,
                                                   Set<String> seenSimpleNames) {
+        addImportedAnnotationCompletions(project, existingImports, prefix, items, seenSimpleNames, null);
+    }
+
+    private void addImportedAnnotationCompletions(IJavaProject project,
+                                                  Set<String> existingImports,
+                                                  String prefix,
+                                                  List<CompletionItem> items,
+                                                  Set<String> seenSimpleNames,
+                                                  TypeResolutionContext typeResolutionContext) {
         for (String fqn : existingImports) {
-            addImportedAnnotationCompletion(project, fqn, prefix, items, seenSimpleNames);
+            addImportedAnnotationCompletion(
+                    project, fqn, prefix, items, seenSimpleNames, typeResolutionContext);
         }
     }
 
@@ -2398,9 +3025,18 @@ public class CompletionProvider {
                                                  String prefix,
                                                  List<CompletionItem> items,
                                                  Set<String> seenSimpleNames) {
+        addImportedAnnotationCompletion(project, fqn, prefix, items, seenSimpleNames, null);
+    }
+
+    private void addImportedAnnotationCompletion(IJavaProject project,
+                                                 String fqn,
+                                                 String prefix,
+                                                 List<CompletionItem> items,
+                                                 Set<String> seenSimpleNames,
+                                                 TypeResolutionContext typeResolutionContext) {
         int lastDot = fqn.lastIndexOf('.');
         String simpleName = lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn;
-        if (!matchesPrefix(simpleName, prefix) || !isAnnotationImport(project, fqn)) {
+        if (!matchesPrefix(simpleName, prefix) || !isAnnotationImport(project, fqn, typeResolutionContext)) {
             return;
         }
         if (!seenSimpleNames.add(simpleName)) {
@@ -2417,8 +3053,13 @@ public class CompletionProvider {
     }
 
     private boolean isAnnotationImport(IJavaProject project, String fqn) {
+        return isAnnotationImport(project, fqn, null);
+    }
+
+    private boolean isAnnotationImport(IJavaProject project, String fqn,
+            TypeResolutionContext typeResolutionContext) {
         try {
-            IType type = project.findType(fqn);
+            IType type = findTypeCached(project, fqn, typeResolutionContext);
             return type != null && type.exists() && type.isAnnotation();
         } catch (JavaModelException e) {
             return false;
@@ -2426,12 +3067,17 @@ public class CompletionProvider {
     }
 
     private boolean isAnnotationTypeCandidate(IJavaProject project, String fqn, int modifiers) {
+        return isAnnotationTypeCandidate(project, fqn, modifiers, null);
+    }
+
+    private boolean isAnnotationTypeCandidate(IJavaProject project, String fqn, int modifiers,
+            TypeResolutionContext typeResolutionContext) {
         if (Flags.isAnnotation(modifiers)) {
             return true;
         }
 
         try {
-            IType type = project.findType(fqn);
+            IType type = findTypeCached(project, fqn, typeResolutionContext);
             return type != null && type.exists() && type.isAnnotation();
         } catch (JavaModelException e) {
             return false;

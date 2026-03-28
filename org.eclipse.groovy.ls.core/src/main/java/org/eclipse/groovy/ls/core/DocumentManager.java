@@ -35,6 +35,7 @@ import org.eclipse.core.resources.IWorkspace;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.core.runtime.Path;
+import org.eclipse.groovy.ls.core.providers.ReferenceSearchHelper;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaProject;
@@ -54,6 +55,7 @@ import org.eclipse.lsp4j.services.LanguageClient;
 public class DocumentManager {
 
     private static final String CLASSES_LOG_SEGMENT = " classes=";
+    private static final long STANDALONE_PARSE_DEBOUNCE_MS = 300;
 
     // ── codeSelect result cache ───────────────────────────────────────────
     //  Avoids redundant codeSelect() calls when multiple providers resolve
@@ -82,6 +84,13 @@ public class DocumentManager {
      * Tracks open documents: URI → current source text.
      */
     private final Map<String, StringBuilder> openDocuments = new ConcurrentHashMap<>();
+
+    /**
+     * Monotonic version per open document. Incremented on every didChange so
+     * background didOpen/replay refreshes can detect when content changed mid-
+     * reconcile and retry against the latest snapshot.
+     */
+    private final Map<String, Long> documentVersions = new ConcurrentHashMap<>();
 
     /**
      * Maps normalized URIs to the latest client-supplied URI form.
@@ -152,6 +161,8 @@ public class DocumentManager {
             });
     private volatile java.util.concurrent.ScheduledFuture<?> pendingRefresh;
     private volatile java.util.concurrent.ScheduledFuture<?> pendingCodeLensRefresh;
+    private final Map<String, java.util.concurrent.ScheduledFuture<?>> pendingStandaloneParseFutures =
+            new ConcurrentHashMap<>();
 
     // ---- Client connection ----
 
@@ -335,6 +346,7 @@ public class DocumentManager {
         String clientUri = uri;
         uri = normalizeUri(uri);
         openDocuments.put(uri, new StringBuilder(text));
+        documentVersions.put(uri, 0L);
         if (clientUri != null) {
             clientUris.put(uri, clientUri);
         }
@@ -343,7 +355,7 @@ public class DocumentManager {
         // so that semantic tokens / hover / etc. work even before JDT is ready.
         compilerService.parse(uri, text);
 
-        scheduleWorkingCopyRefresh(uri, text, "didOpen");
+        scheduleWorkingCopyRefresh(uri, "didOpen");
     }
 
     /**
@@ -362,13 +374,12 @@ public class DocumentManager {
             if (compilerService.getCachedResult(normalizedUri) == null) {
                 compilerService.parse(normalizedUri, content);
             }
-            scheduleWorkingCopyRefresh(normalizedUri, content, "replay");
+            scheduleWorkingCopyRefresh(normalizedUri, "replay");
         }
     }
 
-    private void scheduleWorkingCopyRefresh(String normalizedUri, String text, String trigger) {
+    private void scheduleWorkingCopyRefresh(String normalizedUri, String trigger) {
         final String bgUri = normalizedUri;
-        final String bgText = text;
 
         java.util.concurrent.Future<?> prev = pendingOpenFutures.remove(bgUri);
         if (prev != null) {
@@ -379,7 +390,7 @@ public class DocumentManager {
                 new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.Future<?> future = didOpenExecutor.submit(() -> {
             try {
-                refreshWorkingCopy(bgUri, bgText, trigger);
+                refreshWorkingCopy(bgUri, trigger);
             } finally {
                 pendingOpenFutures.remove(bgUri, futureRef.get());
             }
@@ -388,7 +399,7 @@ public class DocumentManager {
         pendingOpenFutures.put(bgUri, future);
     }
 
-    private void refreshWorkingCopy(String uri, String text, String trigger) {
+    private void refreshWorkingCopy(String uri, String trigger) {
         if (!openDocuments.containsKey(uri)) {
             GroovyLanguageServerPlugin.logInfo(
                     trigger + " background task skipped (already closed): " + uri);
@@ -423,8 +434,27 @@ public class DocumentManager {
         }
 
         try {
-            workingCopy.getBuffer().setContents(text);
-            workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
+            int reconcileAttempts = 0;
+            while (openDocuments.containsKey(uri)) {
+                long expectedVersion = currentDocumentVersion(uri);
+                String latestContent = getContent(uri);
+                if (latestContent == null) {
+                    break;
+                }
+
+                workingCopy.getBuffer().setContents(latestContent);
+                workingCopy.reconcile(ICompilationUnit.NO_AST, true, true, workingCopyOwner, null);
+
+                long observedVersion = currentDocumentVersion(uri);
+                if (observedVersion == expectedVersion) {
+                    break;
+                }
+
+                reconcileAttempts++;
+                GroovyLanguageServerPlugin.logInfo(
+                        "JDT working copy content changed during reconcile for " + uri
+                        + " (trigger=" + trigger + ", retry=" + reconcileAttempts + ")");
+            }
 
             if (openDocuments.containsKey(uri)) {
                 workingCopies.put(uri, workingCopy);
@@ -468,6 +498,7 @@ public class DocumentManager {
         // so previously resolved elements at any offset may be stale.
         invalidateCodeSelectCache(uri);
         compilerService.invalidateDocumentFamily(uri);
+        ReferenceSearchHelper.invalidateFileContentCache(uri);
 
         StringBuilder content = openDocuments.get(uri);
         if (content == null) {
@@ -492,6 +523,7 @@ public class DocumentManager {
                 }
             }
         }
+        documentVersions.compute(uri, (ignored, version) -> version == null ? 1L : version + 1L);
 
         // Update the JDT working copy buffer so that subsequent operations
         // (completion, hover, etc.) see the latest content. We intentionally
@@ -506,9 +538,41 @@ public class DocumentManager {
                 GroovyLanguageServerPlugin.logError("Failed to update working copy buffer for " + uri, e);
             }
         } else {
-            // Fallback: re-parse with Groovy compiler
-            compilerService.parse(uri, content.toString());
+            // Fallback: debounce standalone parsing so external/non-project
+            // files do not pay a full Groovy compile on every keystroke.
+            scheduleStandaloneParseRefresh(uri);
         }
+    }
+
+    private void scheduleStandaloneParseRefresh(String normalizedUri) {
+        java.util.concurrent.ScheduledFuture<?> existing =
+                pendingStandaloneParseFutures.remove(normalizedUri);
+        if (existing != null) {
+            existing.cancel(false);
+        }
+
+        final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<?>> futureRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.ScheduledFuture<?> future = refreshScheduler.schedule(() -> {
+            try {
+                if (workingCopies.containsKey(normalizedUri)) {
+                    return;
+                }
+
+                String latestContent = getContent(normalizedUri);
+                if (latestContent == null) {
+                    return;
+                }
+
+                if (compilerService.getCachedResult(normalizedUri) == null) {
+                    compilerService.parse(normalizedUri, latestContent);
+                }
+            } finally {
+                pendingStandaloneParseFutures.remove(normalizedUri, futureRef.get());
+            }
+        }, STANDALONE_PARSE_DEBOUNCE_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        futureRef.set(future);
+        pendingStandaloneParseFutures.put(normalizedUri, future);
     }
 
     /**
@@ -517,9 +581,16 @@ public class DocumentManager {
     public void didClose(String uri) {
         uri = normalizeUri(uri);
         openDocuments.remove(uri);
+        documentVersions.remove(uri);
         clientUris.remove(uri);
         invalidateCodeSelectCache(uri);
         compilerService.invalidateDocumentFamily(uri);
+        ReferenceSearchHelper.invalidateFileContentCache(uri);
+        java.util.concurrent.ScheduledFuture<?> pendingStandaloneParse =
+                pendingStandaloneParseFutures.remove(uri);
+        if (pendingStandaloneParse != null) {
+            pendingStandaloneParse.cancel(false);
+        }
 
         // Cancel any in-flight didOpen background task for this URI.
         // This prevents the background task from creating a working copy
@@ -771,6 +842,10 @@ public class DocumentManager {
     public boolean isReadyForDiagnostics(String uri) {
         String normalizedUri = normalizeUri(uri);
         return hasJdtWorkingCopy(normalizedUri) || !pendingOpenFutures.containsKey(normalizedUri);
+    }
+
+    private long currentDocumentVersion(String uri) {
+        return documentVersions.getOrDefault(uri, 0L);
     }
 
     private void notifyWorkingCopyReady(String uri) {
@@ -1150,6 +1225,9 @@ public class DocumentManager {
         refreshScheduler.shutdownNow();
         pendingOpenFutures.values().forEach(f -> f.cancel(true));
         pendingOpenFutures.clear();
+        pendingStandaloneParseFutures.values().forEach(f -> f.cancel(true));
+        pendingStandaloneParseFutures.clear();
+        documentVersions.clear();
         for (var entry : workingCopies.entrySet()) {
             try {
                 entry.getValue().discardWorkingCopy();

@@ -15,15 +15,21 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.codehaus.groovy.ast.ModuleNode;
 import org.eclipse.jdt.core.IBuffer;
@@ -490,6 +496,79 @@ class DocumentManagerCoreMethodsTest {
         manager.didClose(uri);
     }
 
+    @Test
+    void didChangeDebouncesStandaloneCacheRefreshWithoutWorkingCopy() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/DebouncedStandalone.groovy";
+        manager.didOpen(uri, "class Original {}\n");
+        assertFalse(manager.hasJdtWorkingCopy(uri));
+        assertNotNull(manager.getCompilerService().getCachedResult(uri));
+
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change =
+                new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setText("class Updated {}\n");
+
+        manager.didChange(uri, java.util.List.of(change));
+
+        assertNull(manager.getCompilerService().getCachedResult(uri));
+        assertNull(manager.getCachedGroovyAST(uri));
+
+        try {
+            waitForCondition(() -> {
+                GroovyCompilerService.ParseResult result =
+                        manager.getCompilerService().getCachedResult(uri);
+                return result != null
+                        && result.hasAST()
+                        && result.getModuleNode() != null
+                        && !result.getModuleNode().getClasses().isEmpty()
+                        && "Updated".equals(
+                                result.getModuleNode().getClasses().get(0).getNameWithoutPackage());
+            }, 2000);
+        } finally {
+            manager.didClose(uri);
+        }
+    }
+
+    @Test
+    void refreshWorkingCopyRetriesWhenDocumentChangesDuringReconcile() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///test/RetryReconcile.groovy";
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+        manager.didOpen(uri, "class Before {}\n");
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IBuffer buffer = mock(IBuffer.class);
+        when(workingCopy.getBuffer()).thenReturn(buffer);
+        getWorkingCopies(manager).put(normalizedUri, workingCopy);
+
+        AtomicInteger reconcileCount = new AtomicInteger();
+        doAnswer(invocation -> {
+            if (reconcileCount.getAndIncrement() == 0) {
+                getOpenDocuments(manager).put(normalizedUri, new StringBuilder("class After {}\n"));
+                getDocumentVersions(manager).compute(
+                        normalizedUri,
+                        (ignored, version) -> version == null ? 1L : version + 1L);
+            }
+            return null;
+        }).when(workingCopy).reconcile(
+                ICompilationUnit.NO_AST, true, true, manager.getWorkingCopyOwner(), null);
+
+        invokeRefreshWorkingCopy(manager, normalizedUri, "test");
+
+        org.mockito.InOrder order = inOrder(buffer, workingCopy);
+        order.verify(buffer).setContents("class Before {}\n");
+        order.verify(workingCopy).reconcile(
+                ICompilationUnit.NO_AST, true, true, manager.getWorkingCopyOwner(), null);
+        order.verify(buffer).setContents("class After {}\n");
+        order.verify(workingCopy).reconcile(
+                ICompilationUnit.NO_AST, true, true, manager.getWorkingCopyOwner(), null);
+        verify(workingCopy, times(2)).reconcile(
+                ICompilationUnit.NO_AST, true, true, manager.getWorkingCopyOwner(), null);
+        assertEquals("class After {}\n", manager.getContent(uri));
+
+        manager.didClose(uri);
+    }
+
     // ================================================================
     // getGroovyAST expansion
     // ================================================================
@@ -596,11 +675,33 @@ class DocumentManagerCoreMethodsTest {
         return (java.io.File) method.invoke(manager, file);
     }
 
+    private void invokeRefreshWorkingCopy(DocumentManager manager, String uri, String trigger)
+            throws Exception {
+        Method method = DocumentManager.class.getDeclaredMethod(
+                "refreshWorkingCopy", String.class, String.class);
+        method.setAccessible(true);
+        method.invoke(manager, uri, trigger);
+    }
+
     @SuppressWarnings("unchecked")
     private java.util.Map<String, ICompilationUnit> getWorkingCopies(DocumentManager manager) throws Exception {
         java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("workingCopies");
         field.setAccessible(true);
         return (java.util.Map<String, ICompilationUnit>) field.get(manager);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, StringBuilder> getOpenDocuments(DocumentManager manager) throws Exception {
+        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("openDocuments");
+        field.setAccessible(true);
+        return (Map<String, StringBuilder>) field.get(manager);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Long> getDocumentVersions(DocumentManager manager) throws Exception {
+        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("documentVersions");
+        field.setAccessible(true);
+        return (Map<String, Long>) field.get(manager);
     }
 
     // ================================================================
@@ -787,6 +888,12 @@ class DocumentManagerCoreMethodsTest {
         codeSelectCacheField.setAccessible(true);
         ((java.util.Map) codeSelectCacheField.get(dm)).put("file:///aux.groovy#1:1", null);
 
+        java.lang.reflect.Field pendingStandaloneParseFuturesField =
+                DocumentManager.class.getDeclaredField("pendingStandaloneParseFutures");
+        pendingStandaloneParseFuturesField.setAccessible(true);
+        ((java.util.Map) pendingStandaloneParseFuturesField.get(dm)).put(
+                "file:///aux.groovy", mock(java.util.concurrent.ScheduledFuture.class));
+
         java.lang.reflect.Field languageClientField = DocumentManager.class.getDeclaredField("languageClient");
         languageClientField.setAccessible(true);
         languageClientField.set(dm, mock(LanguageClient.class));
@@ -796,6 +903,19 @@ class DocumentManagerCoreMethodsTest {
         assertTrue(((java.util.Map<?, ?>) clientUrisField.get(dm)).isEmpty());
         assertTrue(((java.util.Set<?>) importedProjectRootsField.get(dm)).isEmpty());
         assertTrue(((java.util.Map<?, ?>) codeSelectCacheField.get(dm)).isEmpty());
+        assertTrue(((java.util.Map<?, ?>) pendingStandaloneParseFuturesField.get(dm)).isEmpty());
         assertNull(languageClientField.get(dm));
+    }
+
+    private void waitForCondition(java.util.function.BooleanSupplier condition, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        assertTrue(condition.getAsBoolean(), "Condition was not satisfied within " + timeoutMs + " ms");
     }
 }

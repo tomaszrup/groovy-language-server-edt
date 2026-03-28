@@ -94,10 +94,11 @@ public class DocumentHighlightProvider {
 
             // Normalize the target URI for comparison
             String normalizedUri = normalizeUri(uri);
+            PositionUtils.LineIndex fallbackLineIndex = PositionUtils.buildLineIndex(content);
 
-                JdtSearchSupport.search(pattern,
+            JdtSearchSupport.search(pattern,
                     scope,
-                    createHighlightRequestor(highlights, normalizedUri, content),
+                    createHighlightRequestor(highlights, normalizedUri, content, fallbackLineIndex),
                     null);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -109,7 +110,10 @@ public class DocumentHighlightProvider {
     }
 
     private SearchRequestor createHighlightRequestor(
-            List<DocumentHighlight> highlights, String normalizedUri, String fallbackContent) {
+            List<DocumentHighlight> highlights,
+            String normalizedUri,
+            String fallbackContent,
+            PositionUtils.LineIndex fallbackLineIndex) {
         return new SearchRequestor() {
             @Override
             public void acceptSearchMatch(SearchMatch match) {
@@ -126,11 +130,14 @@ public class DocumentHighlightProvider {
                 if (matchContent == null) {
                     matchContent = fallbackContent;
                 }
+                PositionUtils.LineIndex lineIndex = matchContent.equals(fallbackContent)
+                        ? fallbackLineIndex
+                        : PositionUtils.buildLineIndex(matchContent);
 
                 int startOffset = match.getOffset();
                 int endOffset = startOffset + match.getLength();
-                Position start = offsetToPosition(matchContent, startOffset);
-                Position end = offsetToPosition(matchContent, endOffset);
+                Position start = lineIndex.offsetToPosition(startOffset);
+                Position end = lineIndex.offsetToPosition(endOffset);
 
                 DocumentHighlightKind kind = resolveHighlightKind(match);
                 highlights.add(new DocumentHighlight(new Range(start, end), kind));
@@ -168,9 +175,10 @@ public class DocumentHighlightProvider {
 
         Pattern pat = Pattern.compile("\\b" + Pattern.quote(word) + "\\b");
         Matcher matcher = pat.matcher(content);
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
         while (matcher.find()) {
-            Position start = offsetToPosition(content, matcher.start());
-            Position end = offsetToPosition(content, matcher.end());
+            Position start = lineIndex.offsetToPosition(matcher.start());
+            Position end = lineIndex.offsetToPosition(matcher.end());
             highlights.add(new DocumentHighlight(
                     new Range(start, end), DocumentHighlightKind.Text));
         }

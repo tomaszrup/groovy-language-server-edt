@@ -70,6 +70,7 @@ public class ReferenceProvider {
     private List<Location> getReferencesWithJdt(String uri, Position position, boolean includeDeclaration) {
         List<Location> locations = new ArrayList<>();
         Map<String, String> contentCache = new HashMap<>();
+        Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
 
         ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
         if (workingCopy == null) {
@@ -111,7 +112,7 @@ public class ReferenceProvider {
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
-                            Location location = toLocation(match, contentCache);
+                            Location location = toLocation(match, contentCache, lineIndexCache);
                             if (location != null) {
                                 locations.add(location);
                             }
@@ -131,6 +132,12 @@ public class ReferenceProvider {
      * Convert a JDT {@link SearchMatch} to an LSP {@link Location}.
      */
     private Location toLocation(SearchMatch match, Map<String, String> contentCache) {
+        return toLocation(match, contentCache, new HashMap<>());
+    }
+
+    private Location toLocation(SearchMatch match,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -147,8 +154,9 @@ public class ReferenceProvider {
 
             Range range;
             if (content != null) {
-                Position start = offsetToPosition(content, startOffset);
-                Position end = offsetToPosition(content, endOffset);
+                PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
+                Position start = lineIndex.offsetToPosition(startOffset);
+                Position end = lineIndex.offsetToPosition(endOffset);
                 range = new Range(start, end);
             } else {
                 range = new Range(new Position(0, 0), new Position(0, 0));
@@ -166,6 +174,18 @@ public class ReferenceProvider {
             org.eclipse.core.resources.IResource resource,
             Map<String, String> contentCache) {
         return JdtSearchSupport.readContent(documentManager, targetUri, resource, contentCache);
+    }
+
+    private PositionUtils.LineIndex lineIndexFor(String targetUri,
+            String content,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        PositionUtils.LineIndex cached = lineIndexCache.get(targetUri);
+        if (cached != null) {
+            return cached;
+        }
+        PositionUtils.LineIndex built = PositionUtils.buildLineIndex(content);
+        lineIndexCache.put(targetUri, built);
+        return built;
     }
 
     private Position offsetToPosition(String content, int offset) {
@@ -208,11 +228,12 @@ public class ReferenceProvider {
 
         Pattern pattern = Pattern.compile("\\b" + Pattern.quote(word) + "\\b");
         Matcher matcher = pattern.matcher(content);
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
         while (matcher.find()) {
             int matchStart = matcher.start();
             int matchEnd = matcher.end();
-            Position start = offsetToPosition(content, matchStart);
-            Position end = offsetToPosition(content, matchEnd);
+            Position start = lineIndex.offsetToPosition(matchStart);
+            Position end = lineIndex.offsetToPosition(matchEnd);
             locations.add(new Location(uri, new Range(start, end)));
         }
 

@@ -30,6 +30,7 @@ import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.providers.InlayHintSettings;
 import org.eclipse.groovy.ls.core.providers.JdtSearchSupport;
+import org.eclipse.groovy.ls.core.providers.ReferenceSearchHelper;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
@@ -309,6 +310,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             refreshWorkspaceFile(uri);
         }
         if (hasGroovySourceChange) {
+            ReferenceSearchHelper.clearCaches();
             invalidateWorkspaceGroovyFilesCache();
         }
         return new SourceChangeSummary(hasSourceChange, hasJavaSourceChange);
@@ -927,6 +929,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
         GroovyLanguageServerPlugin.logInfo(
                 "[rename-trace] didRenameFiles: hasSourceRename=true hasJavaRename=" + summary.hasJavaRename);
 
+        ReferenceSearchHelper.clearCaches();
         invalidateWorkspaceGroovyFilesCache();
 
         final boolean javaRename = summary.hasJavaRename;

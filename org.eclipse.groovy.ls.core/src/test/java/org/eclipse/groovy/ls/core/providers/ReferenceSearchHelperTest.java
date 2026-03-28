@@ -14,9 +14,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.ByteArrayInputStream;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import org.eclipse.core.resources.IFile;
@@ -30,9 +34,15 @@ import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 class ReferenceSearchHelperTest {
+
+    @BeforeEach
+    void clearReferenceCaches() {
+        ReferenceSearchHelper.clearCaches();
+    }
 
     @Test
     void hasReferencesFallsBackToGroovyProjectTextSearch() throws Exception {
@@ -99,19 +109,164 @@ class ReferenceSearchHelperTest {
         }
     }
 
+    @Test
+    void findReferenceLocationsCachesScopedGroovyFilesBetweenCalls() throws Exception {
+        TestFixture fixture = createFixture(
+                "sharedHelper",
+                """
+                class SupportSpec {
+                    void sharedHelper() {}
+                }
+                """,
+                """
+                class UseSpec {
+                    void runIt() {
+                        sharedHelper()
+                    }
+                }
+                """);
+
+        try {
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+
+            verify(fixture.rootResource, times(1)).accept(any(IResourceVisitor.class));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    void findReferenceLocationsCachesClosedFileContentsByModificationStamp() throws Exception {
+        TestFixture fixture = createFixture(
+                Long.toHexString(System.nanoTime()),
+                "sharedHelper",
+                """
+                class SupportSpec {
+                    void sharedHelper() {}
+                }
+                """,
+                """
+                class UseSpec {
+                    void runIt() {
+                        sharedHelper()
+                    }
+                }
+                """,
+                false);
+
+        try {
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+
+            verify(fixture.usageFile, times(1)).getContents();
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    void invalidateFileContentCacheForcesClosedFileContentReload() throws Exception {
+        TestFixture fixture = createFixture(
+                Long.toHexString(System.nanoTime()),
+                "sharedHelper",
+                """
+                class SupportSpec {
+                    void sharedHelper() {}
+                }
+                """,
+                """
+                class UseSpec {
+                    void runIt() {
+                        sharedHelper()
+                    }
+                }
+                """,
+                false);
+
+        try {
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+            verify(fixture.usageFile, times(1)).getContents();
+
+            ReferenceSearchHelper.invalidateFileContentCache(fixture.usageUri);
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+
+            verify(fixture.usageFile, times(2)).getContents();
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    void clearCachesForcesScopedGroovyFilesRescan() throws Exception {
+        TestFixture fixture = createFixture(
+                "sharedHelper",
+                """
+                class SupportSpec {
+                    void sharedHelper() {}
+                }
+                """,
+                """
+                class UseSpec {
+                    void runIt() {
+                        sharedHelper()
+                    }
+                }
+                """);
+
+        try {
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+            verify(fixture.rootResource, times(1)).accept(any(IResourceVisitor.class));
+
+            ReferenceSearchHelper.clearCaches();
+            ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+
+            verify(fixture.rootResource, times(2)).accept(any(IResourceVisitor.class));
+        } finally {
+            fixture.close();
+        }
+    }
+
     private TestFixture createFixture(
             String symbolName, String declarationContent, String usageContent) throws Exception {
+        return createFixture(Long.toHexString(System.nanoTime()),
+                symbolName, declarationContent, usageContent, true);
+    }
+
+    private TestFixture createFixture(
+            String fixtureId,
+            String symbolName,
+            String declarationContent,
+            String usageContent,
+            boolean openUsageDocument) throws Exception {
         DocumentManager documentManager = new DocumentManager();
         String declarationUri = DocumentManager.normalizeUri(
-            "file:///c:/workspace/project/src/test/groovy/SupportSpec.groovy");
+            "file:///c:/workspace/project-" + fixtureId + "/src/test/groovy/SupportSpec.groovy");
         String usageUri = DocumentManager.normalizeUri(
-            "file:///c:/workspace/project/src/test/groovy/UseSpec.groovy");
+            "file:///c:/workspace/project-" + fixtureId + "/src/test/groovy/UseSpec.groovy");
 
         documentManager.didOpen(declarationUri, declarationContent);
-        documentManager.didOpen(usageUri, usageContent);
+        if (openUsageDocument) {
+            documentManager.didOpen(usageUri, usageContent);
+        }
 
         IFile declarationFile = mockGroovyFile(declarationUri);
         IFile usageFile = mockGroovyFile(usageUri);
+        when(usageFile.getModificationStamp()).thenReturn(1L);
+        when(usageFile.getContents()).thenAnswer(invocation ->
+                new ByteArrayInputStream(usageContent.getBytes(StandardCharsets.UTF_8)));
 
         IResource rootResource = mock(IResource.class);
         doAnswer(invocation -> {
@@ -141,7 +296,8 @@ class ReferenceSearchHelperTest {
         when(method.getJavaProject()).thenReturn(javaProject);
 
         return new TestFixture(documentManager, method, declarationUri, usageUri,
-                declarationContent, declarationOffset);
+                declarationContent, declarationOffset, rootResource, usageFile,
+                openUsageDocument);
     }
 
     private IFile mockGroovyFile(String uri) throws Exception {
@@ -158,6 +314,9 @@ class ReferenceSearchHelperTest {
         private final String usageUri;
         private final String declarationContent;
         private final int declarationOffset;
+        private final IResource rootResource;
+        private final IFile usageFile;
+        private final boolean usageDocumentOpen;
 
         private TestFixture(
                 DocumentManager documentManager,
@@ -165,18 +324,26 @@ class ReferenceSearchHelperTest {
                 String declarationUri,
                 String usageUri,
                 String declarationContent,
-                int declarationOffset) {
+                int declarationOffset,
+                IResource rootResource,
+                IFile usageFile,
+                boolean usageDocumentOpen) {
             this.documentManager = documentManager;
             this.method = method;
             this.declarationUri = declarationUri;
             this.usageUri = usageUri;
             this.declarationContent = declarationContent;
             this.declarationOffset = declarationOffset;
+            this.rootResource = rootResource;
+            this.usageFile = usageFile;
+            this.usageDocumentOpen = usageDocumentOpen;
         }
 
         private void close() {
             documentManager.didClose(declarationUri);
-            documentManager.didClose(usageUri);
+            if (usageDocumentOpen) {
+                documentManager.didClose(usageUri);
+            }
         }
     }
 }

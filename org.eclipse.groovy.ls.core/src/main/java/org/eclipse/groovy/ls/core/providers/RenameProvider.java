@@ -139,7 +139,8 @@ public class RenameProvider {
             start--;
         }
         int end = start + word.length();
-        return new Range(offsetToPosition(content, start), offsetToPosition(content, end));
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
+        return new Range(lineIndex.offsetToPosition(start), lineIndex.offsetToPosition(end));
     }
 
     /**
@@ -187,6 +188,7 @@ public class RenameProvider {
 
             Map<String, List<TextEdit>> editsByUri = new HashMap<>();
             Map<String, String> contentCache = new HashMap<>();
+            Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
             IJavaSearchScope scope = createProjectScope(workingCopy);
 
             JdtSearchSupport.search(pattern,
@@ -194,7 +196,7 @@ public class RenameProvider {
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
-                            addRenameEdit(match, newName, editsByUri, contentCache);
+                            addRenameEdit(match, newName, editsByUri, contentCache, lineIndexCache);
                         }
                     },
                     null);
@@ -205,7 +207,7 @@ public class RenameProvider {
 
             // Enhanced rename: additional edits for specific element types
             IJavaElement element = elements[0];
-            addEnhancedRenameEdits(element, newName, editsByUri, contentCache);
+            addEnhancedRenameEdits(element, newName, editsByUri, contentCache, lineIndexCache);
 
             WorkspaceEdit edit = new WorkspaceEdit();
             edit.setChanges(editsByUri);
@@ -229,6 +231,14 @@ public class RenameProvider {
             String newName,
             Map<String, List<TextEdit>> editsByUri,
             Map<String, String> contentCache) {
+        addRenameEdit(match, newName, editsByUri, contentCache, new HashMap<>());
+    }
+
+    private void addRenameEdit(SearchMatch match,
+            String newName,
+            Map<String, List<TextEdit>> editsByUri,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -246,8 +256,9 @@ public class RenameProvider {
                 return;
             }
 
-            Position start = offsetToPosition(content, startOffset);
-            Position end = offsetToPosition(content, endOffset);
+            PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
+            Position start = lineIndex.offsetToPosition(startOffset);
+            Position end = lineIndex.offsetToPosition(endOffset);
             Range range = new Range(start, end);
 
             TextEdit textEdit = new TextEdit(range, newName);
@@ -267,6 +278,18 @@ public class RenameProvider {
             IResource resource,
             Map<String, String> contentCache) {
         return JdtSearchSupport.readContent(documentManager, targetUri, resource, contentCache);
+    }
+
+    private PositionUtils.LineIndex lineIndexFor(String targetUri,
+            String content,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        PositionUtils.LineIndex cached = lineIndexCache.get(targetUri);
+        if (cached != null) {
+            return cached;
+        }
+        PositionUtils.LineIndex built = PositionUtils.buildLineIndex(content);
+        lineIndexCache.put(targetUri, built);
+        return built;
     }
 
     private Position offsetToPosition(String content, int offset) {
@@ -295,13 +318,14 @@ public class RenameProvider {
      */
     private void addEnhancedRenameEdits(IJavaElement element, String newName,
                                          Map<String, List<TextEdit>> editsByUri,
-                                         Map<String, String> contentCache) {
+                                         Map<String, String> contentCache,
+                                         Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             if (element instanceof IType type) {
-                addImportRenameEdits(type, newName, editsByUri, contentCache);
-                addConstructorRenameEdits(type, newName, editsByUri, contentCache);
+                addImportRenameEdits(type, newName, editsByUri, contentCache, lineIndexCache);
+                addConstructorRenameEdits(type, newName, editsByUri, contentCache, lineIndexCache);
             } else if (element instanceof IField field) {
-                addAccessorRenameEdits(field, newName, editsByUri, contentCache);
+                addAccessorRenameEdits(field, newName, editsByUri, contentCache, lineIndexCache);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Enhanced rename edits failed", e);
@@ -317,7 +341,8 @@ public class RenameProvider {
      */
     private void addImportRenameEdits(IType type, String newName,
                                        Map<String, List<TextEdit>> editsByUri,
-                                       Map<String, String> contentCache) {
+                                       Map<String, String> contentCache,
+                                       Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             String oldSimpleName = type.getElementName();
 
@@ -363,8 +388,9 @@ public class RenameProvider {
                                 int nameStart = startOffset + simpleIdx;
                                 int nameEnd = nameStart + oldSimpleName.length();
 
-                                Position start = offsetToPosition(content, nameStart);
-                                Position end = offsetToPosition(content, nameEnd);
+                                PositionUtils.LineIndex lineIndex = lineIndexFor(uri, content, lineIndexCache);
+                                Position start = lineIndex.offsetToPosition(nameStart);
+                                Position end = lineIndex.offsetToPosition(nameEnd);
 
                                 List<TextEdit> existingEdits = editsByUri.get(uri);
                                 if (!hasEditAt(existingEdits, start.getLine(), start.getCharacter())) {
@@ -398,7 +424,8 @@ public class RenameProvider {
      */
     private void addConstructorRenameEdits(IType type, String newName,
                                             Map<String, List<TextEdit>> editsByUri,
-                                            Map<String, String> contentCache) {
+                                            Map<String, String> contentCache,
+                                            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             for (IMethod method : type.getMethods()) {
                 if (method.isConstructor()) {
@@ -419,7 +446,7 @@ public class RenameProvider {
                                 new SearchRequestor() {
                                     @Override
                                     public void acceptSearchMatch(SearchMatch match) {
-                                        addRenameEdit(match, newName, editsByUri, contentCache);
+                                        addRenameEdit(match, newName, editsByUri, contentCache, lineIndexCache);
                                     }
                                 },
                                 null);
@@ -440,7 +467,8 @@ public class RenameProvider {
      */
     private void addAccessorRenameEdits(IField field, String newName,
                                          Map<String, List<TextEdit>> editsByUri,
-                                         Map<String, String> contentCache) {
+                                         Map<String, String> contentCache,
+                                         Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             IType declaringType = field.getDeclaringType();
             if (declaringType == null) return;
@@ -450,9 +478,12 @@ public class RenameProvider {
             String newCapName = capitalize(newName);
 
             // Look for getOldName, setOldName, isOldName
-            renameAccessorIfExists(declaringType, "get" + oldCapName, "get" + newCapName, editsByUri, contentCache);
-            renameAccessorIfExists(declaringType, "set" + oldCapName, "set" + newCapName, editsByUri, contentCache);
-            renameAccessorIfExists(declaringType, "is" + oldCapName, "is" + newCapName, editsByUri, contentCache);
+            renameAccessorIfExists(declaringType, "get" + oldCapName, "get" + newCapName,
+                    editsByUri, contentCache, lineIndexCache);
+            renameAccessorIfExists(declaringType, "set" + oldCapName, "set" + newCapName,
+                    editsByUri, contentCache, lineIndexCache);
+            renameAccessorIfExists(declaringType, "is" + oldCapName, "is" + newCapName,
+                    editsByUri, contentCache, lineIndexCache);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Accessor rename failed", e);
         }
@@ -460,7 +491,8 @@ public class RenameProvider {
 
     private void renameAccessorIfExists(IType type, String oldAccessorName, String newAccessorName,
                                          Map<String, List<TextEdit>> editsByUri,
-                                         Map<String, String> contentCache) throws Exception {
+                                         Map<String, String> contentCache,
+                                         Map<String, PositionUtils.LineIndex> lineIndexCache) throws Exception {
         for (IMethod method : type.getMethods()) {
             if (method.getElementName().equals(oldAccessorName)) {
                 SearchPattern pattern = SearchPattern.createPattern(
@@ -480,7 +512,7 @@ public class RenameProvider {
                             new SearchRequestor() {
                                 @Override
                                 public void acceptSearchMatch(SearchMatch match) {
-                                    addRenameEdit(match, newAccessorName, editsByUri, contentCache);
+                                    addRenameEdit(match, newAccessorName, editsByUri, contentCache, lineIndexCache);
                                 }
                             },
                             null);
@@ -519,11 +551,12 @@ public class RenameProvider {
         List<TextEdit> edits = new ArrayList<>();
         Pattern pattern = Pattern.compile("\\b" + Pattern.quote(word) + "\\b");
         Matcher matcher = pattern.matcher(content);
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
         while (matcher.find()) {
             int matchStart = matcher.start();
             int matchEnd = matcher.end();
-            Position start = offsetToPosition(content, matchStart);
-            Position end = offsetToPosition(content, matchEnd);
+            Position start = lineIndex.offsetToPosition(matchStart);
+            Position end = lineIndex.offsetToPosition(matchEnd);
             edits.add(new TextEdit(new Range(start, end), newName));
         }
 

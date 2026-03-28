@@ -72,10 +72,11 @@ public class DocumentSymbolProvider {
         }
 
         try {
+            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
             // Walk all types declared in this compilation unit
             IType[] types = workingCopy.getTypes();
             for (IType type : types) {
-                DocumentSymbol typeSymbol = toDocumentSymbol(type, content);
+                DocumentSymbol typeSymbol = toDocumentSymbol(type, content, lineIndex);
                 if (typeSymbol != null) {
                     result.add(Either.forRight(typeSymbol));
                 }
@@ -91,9 +92,15 @@ public class DocumentSymbolProvider {
      * Convert an {@link IType} to a {@link DocumentSymbol} with nested children.
      */
     private DocumentSymbol toDocumentSymbol(IType type, String content) {
+        return toDocumentSymbol(type, content, PositionUtils.buildLineIndex(content));
+    }
+
+    private DocumentSymbol toDocumentSymbol(IType type,
+            String content,
+            PositionUtils.LineIndex lineIndex) {
         try {
-            DocumentSymbol symbol = createTypeSymbol(type, content);
-            symbol.setChildren(createTypeChildren(type, content));
+            DocumentSymbol symbol = createTypeSymbol(type, content, lineIndex);
+            symbol.setChildren(createTypeChildren(type, content, lineIndex));
             return symbol;
 
         } catch (Exception e) {
@@ -102,7 +109,9 @@ public class DocumentSymbolProvider {
         }
     }
 
-    private DocumentSymbol createTypeSymbol(IType type, String content) throws JavaModelException {
+    private DocumentSymbol createTypeSymbol(IType type,
+            String content,
+            PositionUtils.LineIndex lineIndex) throws JavaModelException {
         DocumentSymbol symbol = new DocumentSymbol();
         symbol.setName(type.getElementName());
         symbol.setKind(getTypeKind(type));
@@ -112,19 +121,24 @@ public class DocumentSymbolProvider {
             symbol.setDetail("extends " + superclass);
         }
 
-        setRanges(symbol, type, content);
+        setRanges(symbol, type, content, lineIndex);
         return symbol;
     }
 
-    private List<DocumentSymbol> createTypeChildren(IType type, String content) throws JavaModelException {
+    private List<DocumentSymbol> createTypeChildren(IType type,
+            String content,
+            PositionUtils.LineIndex lineIndex) throws JavaModelException {
         List<DocumentSymbol> children = new ArrayList<>();
-        addFieldSymbols(type, content, children);
-        addMethodSymbols(type, content, children);
-        addInnerTypeSymbols(type, content, children);
+        addFieldSymbols(type, content, lineIndex, children);
+        addMethodSymbols(type, content, lineIndex, children);
+        addInnerTypeSymbols(type, content, lineIndex, children);
         return children;
     }
 
-        private void addFieldSymbols(IType type, String content, List<DocumentSymbol> children)
+    private void addFieldSymbols(IType type,
+            String content,
+            PositionUtils.LineIndex lineIndex,
+            List<DocumentSymbol> children)
             throws JavaModelException {
         for (IField field : type.getFields()) {
             DocumentSymbol fieldSymbol = new DocumentSymbol();
@@ -132,7 +146,7 @@ public class DocumentSymbolProvider {
             fieldSymbol.setKind(org.eclipse.jdt.core.Flags.isEnum(field.getFlags())
                     ? SymbolKind.EnumMember : SymbolKind.Field);
             fieldSymbol.setDetail(resolveFieldDetail(field));
-            setRanges(fieldSymbol, field, content);
+            setRanges(fieldSymbol, field, content, lineIndex);
             children.add(fieldSymbol);
         }
     }
@@ -145,14 +159,17 @@ public class DocumentSymbolProvider {
         }
     }
 
-        private void addMethodSymbols(IType type, String content, List<DocumentSymbol> children)
+    private void addMethodSymbols(IType type,
+            String content,
+            PositionUtils.LineIndex lineIndex,
+            List<DocumentSymbol> children)
             throws JavaModelException {
         for (IMethod method : type.getMethods()) {
             DocumentSymbol methodSymbol = new DocumentSymbol();
             methodSymbol.setName(method.getElementName());
             methodSymbol.setKind(method.isConstructor() ? SymbolKind.Constructor : SymbolKind.Method);
             methodSymbol.setDetail(resolveMethodDetail(method));
-            setRanges(methodSymbol, method, content);
+            setRanges(methodSymbol, method, content, lineIndex);
             children.add(methodSymbol);
         }
     }
@@ -179,10 +196,13 @@ public class DocumentSymbolProvider {
         return detail.toString();
     }
 
-    private void addInnerTypeSymbols(IType type, String content, List<DocumentSymbol> children)
+    private void addInnerTypeSymbols(IType type,
+            String content,
+            PositionUtils.LineIndex lineIndex,
+            List<DocumentSymbol> children)
             throws JavaModelException {
         for (IType innerType : type.getTypes()) {
-            DocumentSymbol innerSymbol = toDocumentSymbol(innerType, content);
+            DocumentSymbol innerSymbol = toDocumentSymbol(innerType, content, lineIndex);
             if (innerSymbol != null) {
                 children.add(innerSymbol);
             }
@@ -193,6 +213,13 @@ public class DocumentSymbolProvider {
      * Set the range and selectionRange on a DocumentSymbol from a JDT source element.
      */
     private void setRanges(DocumentSymbol symbol, org.eclipse.jdt.core.IJavaElement element, String content) {
+        setRanges(symbol, element, content, PositionUtils.buildLineIndex(content));
+    }
+
+    private void setRanges(DocumentSymbol symbol,
+            org.eclipse.jdt.core.IJavaElement element,
+            String content,
+            PositionUtils.LineIndex lineIndex) {
         try {
             if (element instanceof ISourceReference sourceRef) {
 
@@ -201,7 +228,7 @@ public class DocumentSymbolProvider {
                 Range fullRange;
                 if (sourceRange != null && sourceRange.getOffset() >= 0
                         && sourceRange.getLength() >= 0) {
-                    fullRange = normalizeRange(toRange(content, sourceRange));
+                    fullRange = normalizeRange(toRange(lineIndex, sourceRange));
                 } else {
                     fullRange = new Range(new Position(0, 0), new Position(0, 0));
                 }
@@ -211,7 +238,7 @@ public class DocumentSymbolProvider {
                 ISourceRange nameRange = sourceRef.getNameRange();
                 if (nameRange != null && nameRange.getOffset() >= 0) {
                     symbol.setSelectionRange(clampSelectionRange(
-                            normalizeRange(toRange(content, nameRange)), fullRange));
+                            normalizeRange(toRange(lineIndex, nameRange)), fullRange));
                 } else {
                     symbol.setSelectionRange(fullRange);
                 }
@@ -231,11 +258,15 @@ public class DocumentSymbolProvider {
      * Convert a JDT source range to an LSP range.
      */
     private Range toRange(String content, ISourceRange sourceRange) {
+        return toRange(PositionUtils.buildLineIndex(content), sourceRange);
+    }
+
+    private Range toRange(PositionUtils.LineIndex lineIndex, ISourceRange sourceRange) {
         int startOffset = sourceRange.getOffset();
         int endOffset = startOffset + sourceRange.getLength();
 
-        Position start = offsetToPosition(content, startOffset);
-        Position end = offsetToPosition(content, endOffset);
+        Position start = lineIndex.offsetToPosition(startOffset);
+        Position end = lineIndex.offsetToPosition(endOffset);
 
         return new Range(start, end);
     }

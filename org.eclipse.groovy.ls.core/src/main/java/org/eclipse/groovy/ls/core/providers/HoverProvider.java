@@ -113,7 +113,8 @@ public class HoverProvider {
                 return null;
             }
 
-            int offset = positionToOffset(content, position);
+            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
+            int offset = lineIndex.positionToOffset(position);
             String cacheKey = uri + "#" + offset;
             Hover cached = hoverCache.get(cacheKey);
             if (cached != null) {
@@ -126,7 +127,7 @@ public class HoverProvider {
 
             Hover hover = computeHoverForOffset(workingCopy, offset);
             if (hover == null) {
-                hover = computeGeneratedAccessorHover(uri, content, workingCopy, offset);
+                hover = computeGeneratedAccessorHover(uri, content, lineIndex, workingCopy, offset);
             }
             if (hover != null) {
                 hoverCache.put(cacheKey, hover);
@@ -160,6 +161,15 @@ public class HoverProvider {
 
     private Hover computeGeneratedAccessorHover(String uri, String content,
             ICompilationUnit workingCopy, int offset) throws JavaModelException {
+        return computeGeneratedAccessorHover(
+                uri, content, PositionUtils.buildLineIndex(content), workingCopy, offset);
+    }
+
+    private Hover computeGeneratedAccessorHover(String uri,
+            String content,
+            PositionUtils.LineIndex lineIndex,
+            ICompilationUnit workingCopy,
+            int offset) throws JavaModelException {
         String word = extractWordAt(content, offset);
         if (word == null || word.isBlank() || !isMemberReferenceAfterDot(content, offset)) {
             return null;
@@ -175,7 +185,7 @@ public class HoverProvider {
             return null;
         }
 
-        IType receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content);
+        IType receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content, lineIndex);
         if (receiverType == null) {
             return null;
         }
@@ -523,15 +533,7 @@ public class HoverProvider {
     }
 
     private int positionToOffset(String content, Position position) {
-        int line = 0;
-        int offset = 0;
-        while (offset < content.length() && line < position.getLine()) {
-            if (content.charAt(offset) == '\n') {
-                line++;
-            }
-            offset++;
-        }
-        return Math.min(offset + position.getCharacter(), content.length());
+        return PositionUtils.positionToOffset(content, position);
     }
 
     /**
@@ -596,7 +598,8 @@ public class HoverProvider {
         int targetLine = position.getLine() + 1;
 
         // Extract the word under cursor for matching
-        int offset = positionToOffset(content, position);
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
+        int offset = lineIndex.positionToOffset(position);
         String word = extractWordAt(content, offset);
         if (word == null || word.isEmpty()) {
             return null;
@@ -885,7 +888,17 @@ public class HoverProvider {
 
     private IType resolveReceiverTypeFromAst(ModuleNode ast, IJavaProject project,
             int offset, String methodName, String content) {
-        MethodCallExpression found = findMethodCallAtOffset(ast, offset, methodName, content);
+        return resolveReceiverTypeFromAst(
+                ast, project, offset, methodName, content, PositionUtils.buildLineIndex(content));
+    }
+
+    private IType resolveReceiverTypeFromAst(ModuleNode ast,
+            IJavaProject project,
+            int offset,
+            String methodName,
+            String content,
+            PositionUtils.LineIndex lineIndex) {
+        MethodCallExpression found = findMethodCallAtOffset(ast, offset, methodName, content, lineIndex);
         if (found == null) {
             return null;
         }
@@ -901,7 +914,16 @@ public class HoverProvider {
 
     private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
             String methodName, String content) {
-        Position pos = offsetToPosition(content, offset);
+        return findMethodCallAtOffset(
+                module, offset, methodName, content, PositionUtils.buildLineIndex(content));
+    }
+
+    private MethodCallExpression findMethodCallAtOffset(ModuleNode module,
+            int offset,
+            String methodName,
+            String content,
+            PositionUtils.LineIndex lineIndex) {
+        Position pos = lineIndex.offsetToPosition(offset);
         int targetLine = pos.getLine() + 1;
         int targetCol = pos.getCharacter() + 1;
 
@@ -1142,16 +1164,6 @@ public class HoverProvider {
     }
 
     private Position offsetToPosition(String content, int offset) {
-        int line = 0;
-        int character = 0;
-        for (int index = 0; index < Math.min(offset, content.length()); index++) {
-            if (content.charAt(index) == '\n') {
-                line++;
-                character = 0;
-            } else {
-                character++;
-            }
-        }
-        return new Position(line, character);
+        return PositionUtils.offsetToPosition(content, offset);
     }
 }

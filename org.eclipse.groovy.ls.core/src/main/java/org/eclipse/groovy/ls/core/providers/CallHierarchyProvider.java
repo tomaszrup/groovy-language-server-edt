@@ -136,6 +136,8 @@ public class CallHierarchyProvider {
 
             // Group search matches by enclosing method
             Map<String, IncomingCallData> callerMap = new HashMap<>();
+            Map<String, String> contentCache = new HashMap<>();
+            Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
             IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
 
             JdtSearchSupport.search(pattern,
@@ -143,7 +145,7 @@ public class CallHierarchyProvider {
                     new SearchRequestor() {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
-                            processIncomingMatch(match, callerMap);
+                            processIncomingMatch(match, callerMap, contentCache, lineIndexCache);
                         }
                     },
                     null);
@@ -190,13 +192,14 @@ public class CallHierarchyProvider {
         if (content == null) {
             return result;
         }
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
 
         try {
             Range selectionRange = item.getSelectionRange();
-            int targetOffset = positionToOffset(content, selectionRange.getStart());
+            int targetOffset = lineIndex.positionToOffset(selectionRange.getStart());
 
             // Find the method node that contains this offset
-            MethodNode targetMethod = findMethodNodeAt(ast, targetOffset, content);
+            MethodNode targetMethod = findMethodNodeAt(ast, targetOffset, lineIndex);
             if (targetMethod == null) {
                 return result;
             }
@@ -240,7 +243,7 @@ public class CallHierarchyProvider {
 
             // Try to resolve each outgoing call to a JDT element
             ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-            resolveOutgoingCalls(callMap, workingCopy, content, uri, result);
+            resolveOutgoingCalls(callMap, workingCopy, uri, result, lineIndex);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("getOutgoingCalls failed for " + uri, e);
         }
@@ -251,11 +254,13 @@ public class CallHierarchyProvider {
     // ---- Outgoing call resolution helpers ----
 
     private void resolveOutgoingCalls(Map<String, OutgoingCallData> callMap,
-                                       ICompilationUnit workingCopy, String content,
-                                       String uri, List<CallHierarchyOutgoingCall> result) {
+                                       ICompilationUnit workingCopy,
+                                       String uri,
+                                       List<CallHierarchyOutgoingCall> result,
+                                       PositionUtils.LineIndex lineIndex) {
         for (OutgoingCallData data : callMap.values()) {
             CallHierarchyOutgoingCall outgoing = new CallHierarchyOutgoingCall();
-            CallHierarchyItem toItem = resolveCallTarget(workingCopy, content, data);
+            CallHierarchyItem toItem = resolveCallTarget(workingCopy, data, lineIndex);
 
             if (toItem == null) {
                 toItem = buildStubCallItem(data, uri);
@@ -268,12 +273,13 @@ public class CallHierarchyProvider {
     }
 
     private CallHierarchyItem resolveCallTarget(ICompilationUnit workingCopy,
-                                                 String content, OutgoingCallData data) {
+                                                 OutgoingCallData data,
+                                                 PositionUtils.LineIndex lineIndex) {
         if (workingCopy == null || data.ranges.isEmpty()) {
             return null;
         }
         Range firstRange = data.ranges.get(0);
-        int callOffset = positionToOffset(content, firstRange.getStart());
+        int callOffset = lineIndex.positionToOffset(firstRange.getStart());
         try {
             IJavaElement[] resolved = workingCopy.codeSelect(callOffset, 0);
             if (resolved != null && resolved.length > 0) {
@@ -317,6 +323,13 @@ public class CallHierarchyProvider {
     // ---- Helpers ----
 
     private void processIncomingMatch(SearchMatch match, Map<String, IncomingCallData> callerMap) {
+        processIncomingMatch(match, callerMap, new HashMap<>(), new HashMap<>());
+    }
+
+    private void processIncomingMatch(SearchMatch match,
+            Map<String, IncomingCallData> callerMap,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             Object matchElement = match.getElement();
             if (!(matchElement instanceof IJavaElement javaElement)) {
@@ -344,7 +357,7 @@ public class CallHierarchyProvider {
             }
 
             // Add the call site range
-            Range callRange = matchToRange(match);
+            Range callRange = matchToRange(match, contentCache, lineIndexCache);
             if (callRange != null) {
                 data.ranges.add(callRange);
             }
@@ -354,6 +367,12 @@ public class CallHierarchyProvider {
     }
 
     private Range matchToRange(SearchMatch match) {
+        return matchToRange(match, new HashMap<>(), new HashMap<>());
+    }
+
+    private Range matchToRange(SearchMatch match,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -361,16 +380,17 @@ public class CallHierarchyProvider {
             }
 
             String targetUri = resource.getLocationURI().toString();
-            String content = getContent(targetUri, resource);
+            String content = getContent(targetUri, resource, contentCache);
             if (content == null) {
                 return null;
             }
 
             int startOffset = match.getOffset();
             int endOffset = startOffset + match.getLength();
+            PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
             return new Range(
-                    offsetToPosition(content, startOffset),
-                    offsetToPosition(content, endOffset));
+                    lineIndex.offsetToPosition(startOffset),
+                    lineIndex.offsetToPosition(endOffset));
         } catch (Exception e) {
             return null;
         }
@@ -392,10 +412,14 @@ public class CallHierarchyProvider {
     }
 
     private MethodNode findMethodNodeAt(ModuleNode ast, int offset, String content) {
+        return findMethodNodeAt(ast, offset, PositionUtils.buildLineIndex(content));
+    }
+
+    private MethodNode findMethodNodeAt(ModuleNode ast, int offset, PositionUtils.LineIndex lineIndex) {
         for (ClassNode classNode : ast.getClasses()) {
             for (MethodNode method : classNode.getMethods()) {
-                int methodStart = lineColToOffset(content, method.getLineNumber(), method.getColumnNumber());
-                int methodEnd = lineColToOffset(content, method.getLastLineNumber(), method.getLastColumnNumber());
+                int methodStart = lineColToOffset(lineIndex, method.getLineNumber(), method.getColumnNumber());
+                int methodEnd = lineColToOffset(lineIndex, method.getLastLineNumber(), method.getLastColumnNumber());
                 if (offset >= methodStart && offset <= methodEnd) {
                     return method;
                 }
@@ -405,16 +429,15 @@ public class CallHierarchyProvider {
     }
 
     private int lineColToOffset(String content, int line, int col) {
-        if (line <= 0) return 0;
-        int currentLine = 1;
-        int offset = 0;
-        while (offset < content.length() && currentLine < line) {
-            if (content.charAt(offset) == '\n') {
-                currentLine++;
-            }
-            offset++;
+        return lineColToOffset(PositionUtils.buildLineIndex(content), line, col);
+    }
+
+    private int lineColToOffset(PositionUtils.LineIndex lineIndex, int line, int col) {
+        if (line <= 0) {
+            return 0;
         }
-        return Math.min(offset + Math.max(0, col - 1), content.length());
+        return lineIndex.positionToOffset(
+                new Position(Math.max(0, line - 1), Math.max(0, col - 1)));
     }
 
     /**
@@ -520,7 +543,7 @@ public class CallHierarchyProvider {
                 if (sourceRange != null && sourceRange.getOffset() >= 0) {
                     String content = getContent(uri, element.getResource());
                     if (content != null) {
-                        return toRange(content, sourceRange);
+                        return toRange(PositionUtils.buildLineIndex(content), sourceRange);
                     }
                 }
             }
@@ -537,7 +560,7 @@ public class CallHierarchyProvider {
                 if (nameRange != null && nameRange.getOffset() >= 0) {
                     String content = getContent(uri, element.getResource());
                     if (content != null) {
-                        return toRange(content, nameRange);
+                        return toRange(PositionUtils.buildLineIndex(content), nameRange);
                     }
                 }
             }
@@ -548,13 +571,29 @@ public class CallHierarchyProvider {
     }
 
     private String getContent(String uri, org.eclipse.core.resources.IResource resource) {
+        return getContent(uri, resource, null);
+    }
+
+    private String getContent(String uri,
+            org.eclipse.core.resources.IResource resource,
+            Map<String, String> contentCache) {
+        if (contentCache != null && contentCache.containsKey(uri)) {
+            return contentCache.get(uri);
+        }
         String content = documentManager.getContent(uri);
         if (content != null) {
+            if (contentCache != null) {
+                contentCache.put(uri, content);
+            }
             return content;
         }
         if (resource instanceof org.eclipse.core.resources.IFile file) {
             try (java.io.InputStream is = file.getContents()) {
-                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                if (contentCache != null) {
+                    contentCache.put(uri, content);
+                }
+                return content;
             } catch (Exception e) {
                 return null;
             }
@@ -563,11 +602,27 @@ public class CallHierarchyProvider {
     }
 
     private Range toRange(String content, ISourceRange sourceRange) {
+        return toRange(PositionUtils.buildLineIndex(content), sourceRange);
+    }
+
+    private Range toRange(PositionUtils.LineIndex lineIndex, ISourceRange sourceRange) {
         int startOffset = sourceRange.getOffset();
         int endOffset = startOffset + sourceRange.getLength();
         return new Range(
-                offsetToPosition(content, startOffset),
-                offsetToPosition(content, endOffset));
+                lineIndex.offsetToPosition(startOffset),
+                lineIndex.offsetToPosition(endOffset));
+    }
+
+    private PositionUtils.LineIndex lineIndexFor(String targetUri,
+            String content,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        PositionUtils.LineIndex cached = lineIndexCache.get(targetUri);
+        if (cached != null) {
+            return cached;
+        }
+        PositionUtils.LineIndex built = PositionUtils.buildLineIndex(content);
+        lineIndexCache.put(targetUri, built);
+        return built;
     }
 
     Position offsetToPosition(String content, int offset) {

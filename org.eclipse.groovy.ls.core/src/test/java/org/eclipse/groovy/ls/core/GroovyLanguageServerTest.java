@@ -325,6 +325,12 @@ class GroovyLanguageServerTest {
         return field.get(server);
     }
 
+    private Object getDeclaredFieldValue(Object target, String fieldName) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(target);
+    }
+
     // ================================================================
     // normalizePath tests
     // ================================================================
@@ -435,6 +441,39 @@ class GroovyLanguageServerTest {
         Object result = invokePrivate(server, "parseClasspathUpdateRequest",
                 new Class<?>[] {JsonObject.class}, new Object[] {obj});
         assertNull(result);
+    }
+
+    @Test
+    void parseClasspathUpdateRequestPreservesExplicitHasJarEntriesFlag() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        JsonObject obj = new JsonObject();
+        obj.addProperty("projectPath", "/home/user/project");
+        obj.addProperty("hasJarEntries", false);
+        JsonArray entries = new JsonArray();
+        entries.add("/libs/foo.jar");
+        obj.add("entries", entries);
+
+        Object result = invokePrivate(server, "parseClasspathUpdateRequest",
+                new Class<?>[] {JsonObject.class}, new Object[] {obj});
+
+        assertNotNull(result);
+        assertFalse((Boolean) getDeclaredFieldValue(result, "hasJarEntries"));
+    }
+
+    @Test
+    void parseClasspathUpdateRequestInfersHasJarEntriesFromEntriesWhenMissing() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        JsonObject obj = new JsonObject();
+        obj.addProperty("projectPath", "/home/user/project");
+        JsonArray entries = new JsonArray();
+        entries.add("/libs/foo.jar");
+        obj.add("entries", entries);
+
+        Object result = invokePrivate(server, "parseClasspathUpdateRequest",
+                new Class<?>[] {JsonObject.class}, new Object[] {obj});
+
+        assertNotNull(result);
+        assertTrue((Boolean) getDeclaredFieldValue(result, "hasJarEntries"));
     }
 
     // ================================================================

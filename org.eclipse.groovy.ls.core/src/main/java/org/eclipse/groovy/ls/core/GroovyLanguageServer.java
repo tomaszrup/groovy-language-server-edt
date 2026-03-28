@@ -150,9 +150,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     /**
      * Tracks which Eclipse project names have received at least one successful
-     * classpath update. Projects not in this set are considered to have no
-     * classpath configured — diagnostics for their files are limited to
-     * syntax-only errors and a warning is shown at the package declaration.
+     * classpath update that is complete enough for full diagnostics. Projects
+     * not in this set are considered to have no ready classpath configured yet
+     * — diagnostics for their files are limited to syntax-only errors and a
+     * warning is shown at the package declaration.
      */
     private final java.util.Set<String> projectsWithClasspath =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -545,8 +546,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * resolved classpath entries for a specific project. Each subproject sends
      * its own classpath to prevent version conflicts across projects.
      *
-     * @param params JSON object with "projectUri" (optional), "projectPath" (optional)
-     *               and "entries" array
+     * @param params JSON object with "projectUri" (optional), "projectPath" (optional),
+     *               "hasJarEntries" (optional) and "entries" array
      */
     @JsonNotification("groovy/classpathUpdate")
     public void classpathUpdate(JsonObject params) {
@@ -561,7 +562,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 "[classpathUpdate] Received " + request.entries.size() + " entries"
                     + (request.projectUri != null
                         ? " for projectUri: " + request.projectUri : " (no project URI)")
-                    + (request.projectPath != null ? ", projectPath: " + request.projectPath : ""));
+                    + (request.projectPath != null ? ", projectPath: " + request.projectPath : "")
+                    + ", hasJarEntries=" + request.hasJarEntries);
             if (firstClasspathReceived.compareAndSet(false, true)) {
                 startupTracker.mark(
                         "classpath.first-update",
@@ -630,16 +632,25 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                             + newEntries.size() + " entries.");
 
             diagnosticsEnabled = true;
-            projectsWithClasspath.add(projName);
-            GroovyLanguageServerPlugin.logInfo(
-                    "[classpath-check] Added '" + projName + "' to projectsWithClasspath. "
-                    + "All projects with classpath: " + projectsWithClasspath);
+            boolean classpathReady = request.hasJarEntries
+                    || classpathComputation.appliedLibraries > 0
+                    || projectsWithClasspath.contains(projName);
+            if (classpathReady) {
+                projectsWithClasspath.add(projName);
+                GroovyLanguageServerPlugin.logInfo(
+                        "[classpath-check] Added '" + projName + "' to projectsWithClasspath. "
+                        + "All projects with classpath: " + projectsWithClasspath);
 
-            // Eagerly publish diagnostics for any currently-open files that
-            // belong to this project. This gives near-instant feedback for the
-            // files the user is looking at, rather than waiting for all 50
-            // projects' classpaths to arrive + a full workspace build.
-            publishDiagnosticsForProjectFiles(projName);
+                // Eagerly publish diagnostics for any currently-open files that
+                // belong to this project. This gives near-instant feedback for the
+                // files the user is looking at, rather than waiting for all 50
+                // projects' classpaths to arrive + a full workspace build.
+                publishDiagnosticsForProjectFiles(projName);
+            } else {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[classpath-check] Deferred full diagnostics for '" + projName
+                        + "' because the update contains output directories only.");
+            }
 
             // Retry or re-reconcile working copies for open files in the
             // project whose classpath just became available so semantic tokens
@@ -667,7 +678,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         for (int i = 0; i < entriesArray.size(); i++) {
             entries.add(entriesArray.get(i).getAsString());
         }
-        return new ClasspathUpdateRequest(projectUri, projectPath, entries);
+        boolean hasJarEntries = getOptionalJsonBoolean(
+                params,
+                "hasJarEntries",
+                entries.stream().anyMatch(entry -> entry != null
+                        && entry.toLowerCase(java.util.Locale.ROOT).endsWith(".jar")));
+        return new ClasspathUpdateRequest(projectUri, projectPath, entries, hasJarEntries);
     }
 
     private String getOptionalJsonString(JsonObject params, String key) {
@@ -675,6 +691,17 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             return null;
         }
         return params.get(key).getAsString();
+    }
+
+    private boolean getOptionalJsonBoolean(JsonObject params, String key, boolean defaultValue) {
+        if (!params.has(key)) {
+            return defaultValue;
+        }
+        try {
+            return params.get(key).getAsBoolean();
+        } catch (Exception e) {
+            return defaultValue;
+        }
     }
 
     private ClasspathComputation buildUpdatedClasspath(
@@ -891,11 +918,17 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         private final String projectUri;
         private final String projectPath;
         private final List<String> entries;
+        private final boolean hasJarEntries;
 
-        private ClasspathUpdateRequest(String projectUri, String projectPath, List<String> entries) {
+        private ClasspathUpdateRequest(
+                String projectUri,
+                String projectPath,
+                List<String> entries,
+                boolean hasJarEntries) {
             this.projectUri = projectUri;
             this.projectPath = projectPath;
             this.entries = entries;
+            this.hasJarEntries = hasJarEntries;
         }
     }
 

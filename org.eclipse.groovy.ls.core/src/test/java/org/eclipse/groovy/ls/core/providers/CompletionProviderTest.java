@@ -15,7 +15,13 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyInt;
+import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
@@ -195,6 +201,108 @@ class CompletionProviderTest {
         params.setPosition(new Position(0, 0));
 
         assertTrue(provider.getCompletions(params).isEmpty());
+    }
+
+    @Test
+    void getCompletionsReturnsEmptyWhenInterrupted() {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///InterruptedCompletion.groovy";
+        manager.didOpen(uri, "class Sample {}\nSam");
+
+        CompletionProvider provider = new CompletionProvider(manager);
+        CompletionParams params = new CompletionParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(1, 3));
+
+        Thread.currentThread().interrupt();
+        try {
+            assertTrue(provider.getCompletions(params).isEmpty());
+        } finally {
+            Thread.interrupted();
+            manager.didClose(uri);
+        }
+    }
+
+    @Test
+    void getCompletionsUsesCheapDotLookupBeforeReconcile() throws Exception {
+        String uri = "file:///CheapDotLookup.groovy";
+        DocumentManager manager = mock(DocumentManager.class);
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IJavaProject project = mock(IJavaProject.class);
+        IType ownerType = mock(IType.class);
+        IField receiverField = mock(IField.class);
+        IType receiverType = mock(IType.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+        IField memberField = mock(IField.class);
+
+        when(manager.getContent(uri)).thenReturn("sample.");
+        when(manager.getWorkingCopy(uri)).thenReturn(workingCopy);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+        when(project.exists()).thenReturn(true);
+        when(workingCopy.getTypes()).thenReturn(new IType[]{ ownerType });
+
+        when(ownerType.getField("sample")).thenReturn(receiverField);
+        when(ownerType.getMethods()).thenReturn(new IMethod[0]);
+        when(receiverField.exists()).thenReturn(true);
+        when(receiverField.getTypeSignature()).thenReturn("QString;");
+
+        when(project.findType("String")).thenReturn(receiverType);
+        when(receiverType.getFullyQualifiedName()).thenReturn("java.lang.String");
+        when(receiverType.getElementName()).thenReturn("String");
+        when(receiverType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(receiverType)).thenReturn(new IType[0]);
+        when(receiverType.getMethods()).thenReturn(new IMethod[0]);
+        when(receiverType.getFields()).thenReturn(new IField[]{ memberField });
+
+        when(memberField.getElementName()).thenReturn("value");
+        when(memberField.getFlags()).thenReturn(0);
+        when(memberField.getTypeSignature()).thenReturn("QString;");
+
+        CompletionProvider provider = new CompletionProvider(manager);
+        CompletionParams params = new CompletionParams();
+        params.setTextDocument(new TextDocumentIdentifier(uri));
+        params.setPosition(new Position(0, 7));
+
+        List<CompletionItem> items = provider.getCompletions(params);
+
+        assertTrue(items.stream().anyMatch(item -> "value".equals(item.getLabel())));
+        verify(manager, never()).reconcileWithContent(any(), anyString());
+        verify(workingCopy, never()).codeSelect(anyInt(), anyInt());
+    }
+
+    @Test
+    void getCompletionsSkipsRepeatedPatchedReconcileForSameUnresolvedDotState() throws Exception {
+        String uri = "file:///RepeatedPatchedDotMiss.groovy";
+        DocumentManager manager = mock(DocumentManager.class);
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IJavaProject project = mock(IJavaProject.class);
+
+        when(manager.getContent(uri)).thenReturn("sample.", "sample.", "sampleX.");
+        when(manager.getWorkingCopy(uri)).thenReturn(workingCopy);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+        when(project.exists()).thenReturn(true);
+        when(workingCopy.getTypes()).thenReturn(new IType[0]);
+        when(workingCopy.codeSelect(anyInt(), anyInt())).thenReturn(new IJavaElement[0]);
+
+        CompletionProvider provider = new CompletionProvider(manager);
+
+        CompletionParams first = new CompletionParams();
+        first.setTextDocument(new TextDocumentIdentifier(uri));
+        first.setPosition(new Position(0, 7));
+
+        CompletionParams second = new CompletionParams();
+        second.setTextDocument(new TextDocumentIdentifier(uri));
+        second.setPosition(new Position(0, 7));
+
+        CompletionParams third = new CompletionParams();
+        third.setTextDocument(new TextDocumentIdentifier(uri));
+        third.setPosition(new Position(0, 8));
+
+        provider.getCompletions(first);
+        provider.getCompletions(second);
+        provider.getCompletions(third);
+
+        verify(manager, times(2)).reconcileWithContent(any(), anyString());
     }
 
     // ---- addClassCompletions: class name, methods, fields, properties ----
@@ -1222,6 +1330,44 @@ class CompletionProviderTest {
         assertNull(result);
     }
 
+    @Test
+    void resolveTypeNameFromASTCachesProjectLookupWithinRequest() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IJavaProject project = mock(IJavaProject.class);
+        IType resolvedType = mock(IType.class);
+        when(project.findType("java.time.LocalDate")).thenReturn(resolvedType);
+
+        ModuleNode module = parseModule(
+                "import java.time.LocalDate\nclass A {}", "file:///ResolveASTCache.groovy");
+        Object context = newTypeResolutionContext();
+
+        assertSame(resolvedType,
+                invokeResolveTypeNameFromAST(provider, "LocalDate", module, project, context));
+        assertSame(resolvedType,
+                invokeResolveTypeNameFromAST(provider, "LocalDate", module, project, context));
+
+        verify(project, times(1)).findType("java.time.LocalDate");
+    }
+
+    @Test
+    void resolveTraitTypeByImportsCachesProjectLookupWithinRequest() throws Exception {
+        CompletionProvider provider = new CompletionProvider(new DocumentManager());
+        IJavaProject project = mock(IJavaProject.class);
+        IType resolvedType = mock(IType.class);
+        when(project.findType("groovy.transform.ToString")).thenReturn(resolvedType);
+
+        ModuleNode module = parseModule(
+                "import groovy.transform.ToString\nclass A {}", "file:///ResolveTraitCache.groovy");
+        Object context = newTypeResolutionContext();
+
+        assertSame(resolvedType,
+                invokeResolveTraitTypeByImports(provider, "ToString", module, project, context));
+        assertSame(resolvedType,
+                invokeResolveTraitTypeByImports(provider, "ToString", module, project, context));
+
+        verify(project, times(1)).findType("groovy.transform.ToString");
+    }
+
     // ---- reflection helpers for new tests ----
 
     private boolean invokeMatchesPrefix(CompletionProvider provider, String name, String prefix) throws Exception {
@@ -1889,6 +2035,35 @@ class CompletionProviderTest {
                 "resolveTypeName", String.class, IType.class, IJavaProject.class);
         m.setAccessible(true);
         return (IType) m.invoke(provider, typeName, declaringType, project);
+    }
+
+    private Object newTypeResolutionContext() throws Exception {
+        for (Class<?> innerClass : CompletionProvider.class.getDeclaredClasses()) {
+            if ("TypeResolutionContext".equals(innerClass.getSimpleName())) {
+                var ctor = innerClass.getDeclaredConstructor();
+                ctor.setAccessible(true);
+                return ctor.newInstance();
+            }
+        }
+        throw new IllegalStateException("TypeResolutionContext not found");
+    }
+
+    private IType invokeResolveTypeNameFromAST(CompletionProvider provider, String typeName,
+            ModuleNode module, IJavaProject project, Object context) throws Exception {
+        Method m = CompletionProvider.class.getDeclaredMethod(
+                "resolveTypeNameFromAST", String.class, ModuleNode.class, IJavaProject.class,
+                context.getClass());
+        m.setAccessible(true);
+        return (IType) m.invoke(provider, typeName, module, project, context);
+    }
+
+    private IType invokeResolveTraitTypeByImports(CompletionProvider provider, String traitName,
+            ModuleNode module, IJavaProject project, Object context) throws Exception {
+        Method m = CompletionProvider.class.getDeclaredMethod(
+                "resolveTraitTypeByImports", String.class, ModuleNode.class, IJavaProject.class,
+                context.getClass());
+        m.setAccessible(true);
+        return (IType) m.invoke(provider, traitName, module, project, context);
     }
 
     private CompletionItem invokeMethodToCompletionItem(CompletionProvider provider,

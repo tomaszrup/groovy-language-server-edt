@@ -73,7 +73,10 @@ public class SignatureHelpProvider {
 
         try {
             String content = documentManager.getContent(uri);
-            SignatureContext context = resolveSignatureContext(content, position);
+            PositionUtils.LineIndex lineIndex = content != null
+                    ? PositionUtils.buildLineIndex(content)
+                    : null;
+            SignatureContext context = resolveSignatureContext(content, position, lineIndex);
             if (context == null) {
                 return null;
             }
@@ -88,11 +91,22 @@ public class SignatureHelpProvider {
     }
 
     private SignatureContext resolveSignatureContext(String content, Position position) {
+        return resolveSignatureContext(
+                content,
+                position,
+                content != null ? PositionUtils.buildLineIndex(content) : null);
+    }
+
+    private SignatureContext resolveSignatureContext(String content,
+            Position position,
+            PositionUtils.LineIndex lineIndex) {
         if (content == null || position == null) {
             return null;
         }
 
-        int offset = positionToOffset(content, position);
+        int offset = lineIndex != null
+                ? lineIndex.positionToOffset(position)
+                : positionToOffset(content, position);
         int openingParenOffset = findInvocationStart(content, offset);
         if (openingParenOffset < 0) {
             return null;
@@ -302,7 +316,10 @@ public class SignatureHelpProvider {
     private SignatureHelp getSignatureHelpFromGroovyAST(String uri, Position position) {
         String content = documentManager.getContent(uri);
         ModuleNode ast = documentManager.getGroovyAST(uri);
-        SignatureContext context = resolveSignatureContext(content, position);
+        PositionUtils.LineIndex lineIndex = content != null
+                ? PositionUtils.buildLineIndex(content)
+                : null;
+        SignatureContext context = resolveSignatureContext(content, position, lineIndex);
         if (ast == null || context == null) {
             return null;
         }
@@ -432,14 +449,6 @@ public class SignatureHelpProvider {
     }
 
     private int positionToOffset(String content, Position position) {
-        int line = 0;
-        int offset = 0;
-        while (offset < content.length() && line < position.getLine()) {
-            if (content.charAt(offset) == '\n') {
-                line++;
-            }
-            offset++;
-        }
-        return Math.min(offset + position.getCharacter(), content.length());
+        return PositionUtils.positionToOffset(content, position);
     }
 }

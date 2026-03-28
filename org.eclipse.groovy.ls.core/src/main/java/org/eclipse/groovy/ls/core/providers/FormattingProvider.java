@@ -119,8 +119,9 @@ public class FormattingProvider {
         }
 
         Range range = params.getRange();
-        int offset = positionToOffset(source, range.getStart());
-        int endOffset = positionToOffset(source, range.getEnd());
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(source);
+        int offset = lineIndex.positionToOffset(range.getStart());
+        int endOffset = lineIndex.positionToOffset(range.getEnd());
         int length = endOffset - offset;
 
         if (offset < 0 || length <= 0 || offset + length > source.length()) {
@@ -150,7 +151,8 @@ public class FormattingProvider {
 
         Position triggerPos = params.getPosition();
         String triggerChar = params.getCh();
-        int triggerOffset = positionToOffset(source, triggerPos);
+        PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(source);
+        int triggerOffset = lineIndex.positionToOffset(triggerPos);
 
         int formatStart;
         int formatEnd;
@@ -727,12 +729,18 @@ public class FormattingProvider {
      */
     private List<TextEdit> convertEdits(org.eclipse.text.edits.TextEdit eclipseEdit,
                                          String source) {
+        return convertEdits(eclipseEdit, source, PositionUtils.buildLineIndex(source));
+    }
+
+    private List<TextEdit> convertEdits(org.eclipse.text.edits.TextEdit eclipseEdit,
+                                         String source,
+                                         PositionUtils.LineIndex lineIndex) {
         List<TextEdit> lspEdits = new ArrayList<>();
 
         if (eclipseEdit instanceof MultiTextEdit) {
             // Recurse into children
             for (org.eclipse.text.edits.TextEdit child : eclipseEdit.getChildren()) {
-                lspEdits.addAll(convertEdits(child, source));
+                lspEdits.addAll(convertEdits(child, source, lineIndex));
             }
         } else if (eclipseEdit instanceof ReplaceEdit replace) {
             int offset = replace.getOffset();
@@ -750,8 +758,8 @@ public class FormattingProvider {
                 return lspEdits;
             }
 
-            Position start = offsetToPosition(source, offset);
-            Position end = offsetToPosition(source, offset + length);
+            Position start = lineIndex.offsetToPosition(offset);
+            Position end = lineIndex.offsetToPosition(offset + length);
             lspEdits.add(new TextEdit(new Range(start, end), newText));
         }
 
@@ -828,35 +836,13 @@ public class FormattingProvider {
      * Convert a character offset to an LSP Position (line, character).
      */
     private Position offsetToPosition(String source, int offset) {
-        int line = 0;
-        int col = 0;
-
-        for (int i = 0; i < offset && i < source.length(); i++) {
-            if (source.charAt(i) == '\n') {
-                line++;
-                col = 0;
-            } else {
-                col++;
-            }
-        }
-
-        return new Position(line, col);
+        return PositionUtils.offsetToPosition(source, offset);
     }
 
     /**
      * Convert an LSP Position to a character offset.
      */
     private int positionToOffset(String source, Position position) {
-        int line = 0;
-        int offset = 0;
-
-        while (offset < source.length() && line < position.getLine()) {
-            if (source.charAt(offset) == '\n') {
-                line++;
-            }
-            offset++;
-        }
-
-        return Math.min(offset + position.getCharacter(), source.length());
+        return PositionUtils.positionToOffset(source, position);
     }
 }

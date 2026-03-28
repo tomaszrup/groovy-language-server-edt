@@ -165,6 +165,10 @@ public class SemanticTokensProvider {
      * @param range optional LSP range to restrict tokens to (null = full document)
      */
     private SemanticTokens computeTokens(String uri, org.eclipse.lsp4j.Range range, boolean allowWorkingCopy) {
+        if (Thread.currentThread().isInterrupted()) {
+            return new SemanticTokens(Collections.emptyList());
+        }
+
         String content = documentManager.getContent(uri);
         if (content == null) {
             return new SemanticTokens(Collections.emptyList());
@@ -187,6 +191,9 @@ public class SemanticTokensProvider {
         // First attempt: try to produce tokens from the JDT/cached module
         List<Integer> tokens = tryVisitModule(moduleNode, content, range, uri);
         if (tokens != null && !tokens.isEmpty()) {
+            if (Thread.currentThread().isInterrupted()) {
+                return new SemanticTokens(Collections.emptyList());
+            }
             if (workingCopy != null && shouldSupplementTraitTokens(content)) {
                 ModuleNode fallback = getStandaloneAST(uri, content);
                 List<Integer> supplemental = tryVisitModule(fallback, content, range, uri + " [standalone]");
@@ -202,6 +209,9 @@ public class SemanticTokensProvider {
         GroovyLanguageServerPlugin.logInfo(
                 "[semantic] AST produced no tokens for " + uri
                         + ", trying standalone compiler fallback");
+        if (Thread.currentThread().isInterrupted()) {
+            return new SemanticTokens(Collections.emptyList());
+        }
         ModuleNode fallback = getStandaloneAST(uri, content);
         tokens = tryVisitModule(fallback, content, range, uri);
         if (tokens != null && !tokens.isEmpty()) {
@@ -311,6 +321,8 @@ public class SemanticTokensProvider {
             SemanticTokensVisitor visitor = new SemanticTokensVisitor(content, range, documentManager);
             visitor.visitModule(moduleNode);
             return visitor.getEncodedTokens();
+        } catch (SemanticTokensVisitor.VisitorCancelled ignored) {
+            return Collections.emptyList();
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Semantic tokens visitor failed for " + uri, e);

@@ -77,6 +77,14 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     private static final String VOID_TYPE = "void";
     private static final int[] NO_POSITION = new int[0];
 
+    static final class VisitorCancelled extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        private VisitorCancelled() {
+            super(null, null, false, false);
+        }
+    }
+
     /** Spock framework block labels that should be highlighted as keywords. */
     private static final Set<String> SPOCK_LABELS = new HashSet<>(Arrays.asList(
             "given", "when", "then", "expect", "where", "and"));
@@ -133,6 +141,12 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         return sourceUnit;
     }
 
+    private void ensureNotCancelled() {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new VisitorCancelled();
+        }
+    }
+
     // ================================================================
     // Entry point
     // ================================================================
@@ -141,6 +155,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
      * Visit the entire module (compilation unit). This is the main entry point.
      */
     public void visitModule(ModuleNode module) {
+        ensureNotCancelled();
         this.currentModule = module;
         this.sourceUnit = module.getContext();
         visitPackage(module);
@@ -151,6 +166,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     private void visitModuleClasses(ModuleNode module) {
         for (ClassNode classNode : module.getClasses()) {
+            ensureNotCancelled();
             if (isSyntheticScriptClass(classNode)) {
                 visitSyntheticScriptClass(classNode);
             } else {
@@ -164,11 +180,13 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     }
 
     private void visitSyntheticScriptClass(ClassNode classNode) {
+        ensureNotCancelled();
         MethodNode runMethod = classNode.getMethod("run", Parameter.EMPTY_ARRAY);
         if (runMethod != null && runMethod.getCode() != null) {
             runMethod.getCode().visit(this);
         }
         for (MethodNode method : classNode.getMethods()) {
+            ensureNotCancelled();
             if (!"run".equals(method.getName()) && !"main".equals(method.getName())
                     && method.getLineNumber() > 0) {
                 visitMethod(method);
@@ -182,7 +200,9 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitBlockStatement(BlockStatement block) {
+        ensureNotCancelled();
         for (Statement stmt : block.getStatements()) {
+            ensureNotCancelled();
             List<String> labels = stmt.getStatementLabels();
             if (labels != null) {
                 for (String label : labels) {
@@ -238,6 +258,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     }
 
     private void visitModuleStatements(ModuleNode module) {
+        ensureNotCancelled();
         BlockStatement statementBlock = module.getStatementBlock();
         if (statementBlock != null) {
             statementBlock.visit(this);
@@ -415,6 +436,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitClass(ClassNode node) {
+        ensureNotCancelled();
         if (node.getLineNumber() < 1) return;
         classStack.push(node);
         int tokenType = getClassTokenType(node);
@@ -540,6 +562,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitMethod(MethodNode node) {
+        ensureNotCancelled();
         if (node.getLineNumber() < 1) return;
         if (node.isSynthetic()) return;
         collectAnnotationTokens(node);
@@ -640,6 +663,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitField(FieldNode node) {
+        ensureNotCancelled();
         if (node.getLineNumber() < 1) return;
         if (node.isSynthetic()) return;
         collectAnnotationTokens(node);
@@ -693,6 +717,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitProperty(PropertyNode node) {
+        ensureNotCancelled();
         FieldNode field = node.getField();
         if (field != null && !field.isSynthetic() && field.getLineNumber() > 0) {
             visitField(field);
@@ -735,6 +760,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitMethodCallExpression(MethodCallExpression call) {
+        ensureNotCancelled();
         // Visit the object expression (receiver)
         call.getObjectExpression().visit(this);
 
@@ -757,6 +783,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitStaticMethodCallExpression(StaticMethodCallExpression call) {
+        ensureNotCancelled();
         // Emit the method name with static modifier
         if (call.getLineNumber() > 0) {
             String name = call.getMethod();
@@ -775,6 +802,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitConstructorCallExpression(ConstructorCallExpression call) {
+        ensureNotCancelled();
         // Emit the type being constructed
         ClassNode constructedType = call.getType();
         if (constructedType != null && call.getLineNumber() > 0) {
@@ -787,6 +815,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitVariableExpression(VariableExpression expr) {
+        ensureNotCancelled();
         if (expr.getLineNumber() < 1) return;
 
         String name = expr.getName();
@@ -892,6 +921,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitDeclarationExpression(DeclarationExpression expr) {
+        ensureNotCancelled();
         if (expr.getLineNumber() < 1) return;
         Expression leftExpr = expr.getLeftExpression();
         if (leftExpr instanceof VariableExpression varExpr) {
@@ -928,6 +958,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitClosureExpression(ClosureExpression expr) {
+        ensureNotCancelled();
         if (expr.getLineNumber() < 1) return;
 
         // Visit closure parameters
@@ -948,12 +979,14 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitClassExpression(ClassExpression expr) {
+        ensureNotCancelled();
         if (expr.getLineNumber() < 1) return;
         emitTypeReference(expr.getType());
     }
 
     @Override
     public void visitPropertyExpression(PropertyExpression expr) {
+        ensureNotCancelled();
         // Visit the object expression
         expr.getObjectExpression().visit(this);
 
@@ -972,8 +1005,10 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitArgumentlistExpression(ArgumentListExpression ale) {
+        ensureNotCancelled();
         // Visit each argument — check for named arguments (MapEntryExpression)
         for (Expression expr : ale.getExpressions()) {
+            ensureNotCancelled();
             if (expr instanceof MapEntryExpression mapEntry) {
                 // Named argument key
                 Expression key = mapEntry.getKeyExpression();
@@ -1000,6 +1035,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
 
     @Override
     public void visitAnnotations(AnnotatedNode node) {
+        ensureNotCancelled();
         // Annotation decorator tokens are handled explicitly in collectAnnotationTokens.
         // Keep visiting annotation member values so nested expressions are still tokenized,
         // but avoid default traversal classifying annotation names as TYPE tokens.
@@ -1016,6 +1052,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             return;
         }
         for (Expression memberValue : ann.getMembers().values()) {
+            ensureNotCancelled();
             if (memberValue != null) {
                 memberValue.visit(this);
             }
@@ -1329,6 +1366,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
      * Record a token at the given absolute position.
      */
     private void addToken(int line, int column, int length, int tokenType, int modifiers) {
+        ensureNotCancelled();
         if (line < 0 || column < 0 || length <= 0) return;
 
         // Range filter — skip tokens outside the requested range
@@ -1354,6 +1392,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
      * the previous token (or 0,0 for the first token).
      */
     public List<Integer> getEncodedTokens() {
+        ensureNotCancelled();
         if (tokens.isEmpty()) {
             return Collections.emptyList();
         }

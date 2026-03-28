@@ -10,6 +10,7 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -18,12 +19,16 @@ import static org.mockito.Mockito.when;
 
 import java.util.List;
 
+import org.codehaus.groovy.ast.ModuleNode;
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.lsp4j.CodeLens;
-import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.CodeLensParams;
+import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
@@ -39,6 +44,8 @@ import com.google.gson.JsonObject;
 class CodeLensProviderTest {
 
     private static final String REFERENCES_UNAVAILABLE_TITLE = "References unavailable";
+    private static final String ZERO_REFERENCES_TITLE = "0 references";
+    private static final String ZERO_REFERENCES_COMMAND = "groovy.codeLensNoop";
 
     private CodeLensProvider provider;
     private DocumentManager documentManager;
@@ -129,7 +136,7 @@ class CodeLensProviderTest {
     }
 
     @Test
-    void resolveCodeLensLeavesUnusedDeclarationHidden() {
+    void resolveCodeLensShowsZeroReferencesWhenUnused() {
         String uri = "file:///Foo.groovy";
         String handleId = "=Proj/src<pkg{File.groovy[Foo~unused";
         IJavaElement element = mock(IJavaElement.class);
@@ -152,7 +159,10 @@ class CodeLensProviderTest {
             CodeLens result = provider.resolveCodeLens(lens);
 
             assertNotNull(result);
-            assertNull(result.getCommand());
+            assertNotNull(result.getCommand());
+            assertEquals(ZERO_REFERENCES_TITLE, result.getCommand().getTitle());
+            assertEquals(ZERO_REFERENCES_COMMAND, result.getCommand().getCommand());
+            assertNull(result.getCommand().getArguments());
         }
     }
 
@@ -370,7 +380,7 @@ class CodeLensProviderTest {
     }
 
     @Test
-    void addCodeLensesForTypeSkipsDeclarationsWithoutReferences() throws Exception {
+    void addCodeLensesForTypeIncludesDeclarationsWithoutEagerReferenceSearch() throws Exception {
         RecordingCodeLensProvider localProvider = new RecordingCodeLensProvider(documentManager);
         org.eclipse.jdt.core.IType mockType = mock(org.eclipse.jdt.core.IType.class);
         org.eclipse.jdt.core.ISourceRange typeNameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
@@ -395,8 +405,6 @@ class CodeLensProviderTest {
 
         when(mockType.getMethods()).thenReturn(new org.eclipse.jdt.core.IMethod[]{referencedMethod, unusedMethod});
         when(mockType.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[0]);
-        localProvider.referencedElements.add(mockType);
-        localProvider.referencedElements.add(referencedMethod);
 
         java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
         java.lang.reflect.Method m = CodeLensProvider.class.getDeclaredMethod(
@@ -404,15 +412,191 @@ class CodeLensProviderTest {
         m.setAccessible(true);
         m.invoke(localProvider, mockType, "class Foo {\n    void bar() {}\n    void baz() {}\n}", "file:///Foo.groovy", lenses);
 
-        assertEquals(2, lenses.size());
+        assertEquals(3, lenses.size());
         JsonObject typeData = (JsonObject) lenses.get(0).getData();
         JsonObject firstMethodData = (JsonObject) lenses.get(1).getData();
+        JsonObject secondMethodData = (JsonObject) lenses.get(2).getData();
         assertEquals("=Proj/src<pkg{File.groovy[Foo", typeData.get("handleId").getAsString());
         assertEquals("=Proj/src<pkg{File.groovy[Foo~bar", firstMethodData.get("handleId").getAsString());
-        assertTrue(lenses.stream().noneMatch(lens -> {
-            JsonObject lensData = (JsonObject) lens.getData();
-            return "=Proj/src<pkg{File.groovy[Foo~baz".equals(lensData.get("handleId").getAsString());
-        }));
+        assertEquals("=Proj/src<pkg{File.groovy[Foo~baz", secondMethodData.get("handleId").getAsString());
+    }
+
+    @Test
+    void addCodeLensesForTypeSkipsStringNamedSpockFeatureMethod() throws Exception {
+        String uri = "file:///SpecStringFeature.groovy";
+        String content = """
+                import spock.lang.Specification
+
+                class MySpec extends Specification {
+                    def "value returns epsilon"() {
+                        expect:
+                        true
+                    }
+                }
+                """;
+
+        CodeLensProvider localProvider = new CodeLensProvider(documentManager);
+        IType specType = mockType("MySpec", "MySpec", "Specification",
+                content.indexOf("MySpec"), "=Proj/src{SpecStringFeature.groovy[MySpec");
+        IMethod featureMethod = mockMethod("value returns epsilon",
+                content.indexOf("\"value returns epsilon\"") + 1,
+                "=Proj/src{SpecStringFeature.groovy[MySpec~value returns epsilon",
+                specType);
+        when(specType.getMethods()).thenReturn(new IMethod[]{featureMethod});
+        when(specType.getTypes()).thenReturn(new IType[0]);
+
+        List<CodeLens> lenses = invokeAddCodeLensesForType(localProvider, specType, content, uri);
+
+        assertEquals(1, lenses.size());
+        JsonObject typeData = (JsonObject) lenses.get(0).getData();
+        assertEquals("=Proj/src{SpecStringFeature.groovy[MySpec", typeData.get("handleId").getAsString());
+    }
+
+    @Test
+    void addCodeLensesForTypeSkipsSpockLifecycleMethods() throws Exception {
+        String uri = "file:///SpecLifecycle.groovy";
+        String content = """
+                import spock.lang.Specification
+
+                class MySpec extends Specification {
+                    void setup() {}
+                    void cleanup() {}
+                    void setupSpec() {}
+                    void cleanupSpec() {}
+                }
+                """;
+
+        CodeLensProvider localProvider = new CodeLensProvider(documentManager);
+        IType specType = mockType("MySpec", "MySpec", "Specification",
+                content.indexOf("MySpec"), "=Proj/src{SpecLifecycle.groovy[MySpec");
+        IMethod setup = mockMethod("setup", content.indexOf("setup()"),
+                "=Proj/src{SpecLifecycle.groovy[MySpec~setup", specType);
+        IMethod cleanup = mockMethod("cleanup", content.indexOf("cleanup()"),
+                "=Proj/src{SpecLifecycle.groovy[MySpec~cleanup", specType);
+        IMethod setupSpec = mockMethod("setupSpec", content.indexOf("setupSpec()"),
+                "=Proj/src{SpecLifecycle.groovy[MySpec~setupSpec", specType);
+        IMethod cleanupSpec = mockMethod("cleanupSpec", content.indexOf("cleanupSpec()"),
+                "=Proj/src{SpecLifecycle.groovy[MySpec~cleanupSpec", specType);
+        when(specType.getMethods()).thenReturn(new IMethod[]{setup, cleanup, setupSpec, cleanupSpec});
+        when(specType.getTypes()).thenReturn(new IType[0]);
+
+        List<CodeLens> lenses = invokeAddCodeLensesForType(localProvider, specType, content, uri);
+
+        assertEquals(1, lenses.size());
+        JsonObject typeData = (JsonObject) lenses.get(0).getData();
+        assertEquals("=Proj/src{SpecLifecycle.groovy[MySpec", typeData.get("handleId").getAsString());
+    }
+
+    @Test
+    void addCodeLensesForTypeKeepsHelperMethodInSpecification() throws Exception {
+        String uri = "file:///SpecHelper.groovy";
+        String content = """
+                import spock.lang.Specification
+
+                class MySpec extends Specification {
+                    void helperMethod() {
+                        println "hi"
+                    }
+                }
+                """;
+
+        CodeLensProvider localProvider = new CodeLensProvider(new AstBackedDocumentManager(uri, content));
+        IType specType = mockType("MySpec", "MySpec", "Specification",
+                content.indexOf("MySpec"), "=Proj/src{SpecHelper.groovy[MySpec");
+        IMethod helperMethod = mockMethod("helperMethod", content.indexOf("helperMethod()"),
+                "=Proj/src{SpecHelper.groovy[MySpec~helperMethod", specType);
+        when(specType.getMethods()).thenReturn(new IMethod[]{helperMethod});
+        when(specType.getTypes()).thenReturn(new IType[0]);
+
+        List<CodeLens> lenses = invokeAddCodeLensesForType(localProvider, specType, content, uri);
+
+        assertEquals(2, lenses.size());
+        JsonObject typeData = (JsonObject) lenses.get(0).getData();
+        JsonObject methodData = (JsonObject) lenses.get(1).getData();
+        assertEquals("=Proj/src{SpecHelper.groovy[MySpec", typeData.get("handleId").getAsString());
+        assertEquals("=Proj/src{SpecHelper.groovy[MySpec~helperMethod", methodData.get("handleId").getAsString());
+    }
+
+    @Test
+    void addCodeLensesForTypeSkipsIdentifierNamedSpockFeatureMethodWhenCachedAstHasLabels() throws Exception {
+        String uri = "file:///SpecCachedAst.groovy";
+        String content = """
+                import spock.lang.Specification
+
+                class MySpec extends Specification {
+                    void namedFeature() {
+                        expect:
+                        true
+                    }
+                }
+                """;
+
+        CodeLensProvider localProvider = new CodeLensProvider(new AstBackedDocumentManager(uri, content));
+        IType specType = mockType("MySpec", "MySpec", "Specification",
+                content.indexOf("MySpec"), "=Proj/src{SpecCachedAst.groovy[MySpec");
+        IMethod namedFeature = mockMethod("namedFeature", content.indexOf("namedFeature()"),
+                "=Proj/src{SpecCachedAst.groovy[MySpec~namedFeature", specType);
+        when(specType.getMethods()).thenReturn(new IMethod[]{namedFeature});
+        when(specType.getTypes()).thenReturn(new IType[0]);
+
+        List<CodeLens> lenses = invokeAddCodeLensesForType(localProvider, specType, content, uri);
+
+        assertEquals(1, lenses.size());
+        JsonObject typeData = (JsonObject) lenses.get(0).getData();
+        assertEquals("=Proj/src{SpecCachedAst.groovy[MySpec", typeData.get("handleId").getAsString());
+    }
+
+    @Test
+    void addCodeLensesForTypeKeepsIdentifierNamedMethodWhenCachedAstUnavailable() throws Exception {
+        String uri = "file:///SpecNoCachedAst.groovy";
+        String content = """
+                import spock.lang.Specification
+
+                class MySpec extends Specification {
+                    void namedFeature() {
+                        expect:
+                        true
+                    }
+                }
+                """;
+
+        CodeLensProvider localProvider = new CodeLensProvider(documentManager);
+        IType specType = mockType("MySpec", "MySpec", "Specification",
+                content.indexOf("MySpec"), "=Proj/src{SpecNoCachedAst.groovy[MySpec");
+        IMethod namedFeature = mockMethod("namedFeature", content.indexOf("namedFeature()"),
+                "=Proj/src{SpecNoCachedAst.groovy[MySpec~namedFeature", specType);
+        when(specType.getMethods()).thenReturn(new IMethod[]{namedFeature});
+        when(specType.getTypes()).thenReturn(new IType[0]);
+
+        List<CodeLens> lenses = invokeAddCodeLensesForType(localProvider, specType, content, uri);
+
+        assertEquals(2, lenses.size());
+        JsonObject typeData = (JsonObject) lenses.get(0).getData();
+        JsonObject methodData = (JsonObject) lenses.get(1).getData();
+        assertEquals("=Proj/src{SpecNoCachedAst.groovy[MySpec", typeData.get("handleId").getAsString());
+        assertEquals("=Proj/src{SpecNoCachedAst.groovy[MySpec~namedFeature", methodData.get("handleId").getAsString());
+    }
+
+    @Test
+    void shouldSkipMethodCodeLensKeepsHelperMethodWithoutSpockLabels() throws Exception {
+        String uri = "file:///SpecShouldSkip.groovy";
+        String content = """
+                import spock.lang.Specification
+
+                class MySpec extends Specification {
+                    void helperMethod() {
+                        println "hi"
+                    }
+                }
+                """;
+
+        CodeLensProvider localProvider = new CodeLensProvider(new AstBackedDocumentManager(uri, content));
+        IType specType = mockType("MySpec", "MySpec", "Specification",
+                content.indexOf("MySpec"), "=Proj/src{SpecShouldSkip.groovy[MySpec");
+        IMethod helperMethod = mockMethod("helperMethod", content.indexOf("helperMethod()"),
+                "=Proj/src{SpecShouldSkip.groovy[MySpec~helperMethod", specType);
+
+        assertFalse(localProvider.shouldSkipMethodCodeLens(helperMethod, uri));
     }
 
     @Test
@@ -442,6 +626,42 @@ class CodeLensProviderTest {
         assertEquals(6, lens.getRange().getStart().getCharacter());
     }
 
+    private List<CodeLens> invokeAddCodeLensesForType(
+            CodeLensProvider provider, IType type, String content, String uri) throws Exception {
+        java.lang.reflect.Method m = CodeLensProvider.class.getDeclaredMethod(
+                "addCodeLensesForType", IType.class, String.class, String.class, java.util.List.class);
+        m.setAccessible(true);
+        java.util.List<CodeLens> lenses = new java.util.ArrayList<>();
+        m.invoke(provider, type, content, uri, lenses);
+        return lenses;
+    }
+
+    private IType mockType(
+            String elementName, String fullyQualifiedName, String superclassName,
+            int nameOffset, String handleIdentifier) throws Exception {
+        IType type = mock(IType.class);
+        org.eclipse.jdt.core.ISourceRange nameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
+        when(nameRange.getOffset()).thenReturn(nameOffset);
+        when(type.getNameRange()).thenReturn(nameRange);
+        when(type.getHandleIdentifier()).thenReturn(handleIdentifier);
+        when(type.getElementName()).thenReturn(elementName);
+        when(type.getFullyQualifiedName('$')).thenReturn(fullyQualifiedName);
+        when(type.getSuperclassName()).thenReturn(superclassName);
+        return type;
+    }
+
+    private IMethod mockMethod(
+            String elementName, int nameOffset, String handleIdentifier, IType declaringType) throws Exception {
+        IMethod method = mock(IMethod.class);
+        org.eclipse.jdt.core.ISourceRange nameRange = mock(org.eclipse.jdt.core.ISourceRange.class);
+        when(nameRange.getOffset()).thenReturn(nameOffset);
+        when(method.getNameRange()).thenReturn(nameRange);
+        when(method.getHandleIdentifier()).thenReturn(handleIdentifier);
+        when(method.getElementName()).thenReturn(elementName);
+        when(method.getDeclaringType()).thenReturn(declaringType);
+        return method;
+    }
+
     private static final class RecordingCodeLensProvider extends CodeLensProvider {
         private final java.util.Set<org.eclipse.jdt.core.IJavaElement> referencedElements =
                 java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
@@ -453,6 +673,23 @@ class CodeLensProviderTest {
         @Override
         boolean hasReferences(org.eclipse.jdt.core.IJavaElement element, String uri) {
             return referencedElements.contains(element);
+        }
+    }
+
+    private static final class AstBackedDocumentManager extends DocumentManager {
+        private final String targetUri;
+        private final ModuleNode cachedAst;
+
+        private AstBackedDocumentManager(String uri, String content) {
+            this.targetUri = DocumentManager.normalizeUri(uri);
+            didOpen(this.targetUri, content);
+            this.cachedAst = new GroovyCompilerService().parse(uri, content).getModuleNode();
+        }
+
+        @Override
+        public ModuleNode getCachedGroovyAST(String uri) {
+            String normalized = DocumentManager.normalizeUri(uri);
+            return targetUri.equals(normalized) ? cachedAst : null;
         }
     }
 }

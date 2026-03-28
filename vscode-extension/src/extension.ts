@@ -10,12 +10,13 @@ import { execFile, ExecFileSyncOptionsWithStringEncoding } from 'node:child_proc
 import * as vscode from 'vscode';
 import { workspace, ExtensionContext, window, commands, OutputChannel, StatusBarItem, StatusBarAlignment, ThemeColor } from 'vscode';
 import {
-    getConfigNameForPlatform,
     inferProjectPathFromEntries,
     isJdtWorkspaceUri,
     normalizeFsPath,
     pathStartsWith,
 } from './utils';
+import { prepareWritableConfigDir } from './serverConfig';
+import { detectWorkspaceRestoreCorruption } from './workspaceRecovery';
 import {
     LanguageClient,
     LanguageClientOptions,
@@ -34,6 +35,7 @@ interface ClasspathNotificationPayload {
     projectUri: string;
     projectPath?: string;
     entries: string[];
+    hasJarEntries: boolean;
 }
 
 interface JavaClasspathTarget {
@@ -152,6 +154,7 @@ let startupTrace: StartupTrace | undefined;
 const GROOVY_SOURCE_SCHEME = 'groovy-source';
 const GRADLE_CLASSPATH_LINE_PREFIX = 'GROOVY_LS_CP::';
 const REPRESENTATIVE_SOURCE_GLOB = '{src/main/java/**/*.java,src/main/groovy/**/*.groovy,src/test/java/**/*.java,src/test/groovy/**/*.groovy}';
+const BUILD_DESCRIPTOR_GLOB = '{**/build.gradle,**/build.gradle.kts,**/settings.gradle,**/settings.gradle.kts,**/pom.xml}';
 const MINIMUM_JAVA_MAJOR = 21;
 const WORKSPACE_DATA_VERSION = 2;
 const WORKSPACE_DATA_STATE_FILE = 'groovy_ws_state.json';
@@ -238,7 +241,7 @@ async function collectProjectRootMap(): Promise<Map<string, string>> {
 
     const rootMap = new Map<string, string>();
     const buildFiles = await vscode.workspace.findFiles(
-        '{**/build.gradle,**/pom.xml}',
+        BUILD_DESCRIPTOR_GLOB,
         '{**/node_modules/**,**/build/**,**/.gradle/**}'
     );
 
@@ -555,6 +558,9 @@ export async function activate(context: ExtensionContext): Promise<void> {
         commands.registerCommand('groovy.showOutputChannel', () => {
             outputChannel.show(true);
         }),
+        commands.registerCommand('groovy.codeLensNoop', () => {
+            return undefined;
+        }),
         commands.registerCommand('groovy.showReferences', async (uri: string, position: { line: number; character: number }, locations: Array<{ uri: string; range: { start: { line: number; character: number }; end: { line: number; character: number } } }>) => {
             const vsUri = vscode.Uri.parse(uri);
             const vsPos = new vscode.Position(position.line, position.character);
@@ -688,9 +694,26 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         return;
     }
 
-    // 4. Determine platform-specific config directory
-    const configDir = getConfigDir(serverDir);
+    // 4. Copy the bundled Equinox config into VS Code's writable storage.
+    // The extension install directory may be read-only, and Equinox needs to
+    // write framework metadata into the configuration area on startup.
+    const storagePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
+    const configPreparation = prepareWritableConfigDir({
+        serverDir,
+        storagePath,
+        platform: process.platform,
+        extensionVersion: String(context.extension.packageJSON.version ?? 'unknown'),
+    });
+    const configDir = configPreparation.configDir;
+    outputChannel.appendLine(`Bundled config directory: ${configPreparation.bundledConfigDir}`);
     outputChannel.appendLine(`Config directory: ${configDir}`);
+    if (configPreparation.resetConfig) {
+        outputChannel.appendLine(`Reset writable Equinox config: ${configDir} (${configPreparation.reason})`);
+        markStartupPhase('server.config-reset', configPreparation.reason);
+    } else {
+        outputChannel.appendLine(`Reusing writable Equinox config: ${configDir}`);
+        markStartupPhase('server.config-reused', configDir);
+    }
 
     // 5. Build the workspace data directory.
     // Preserve the Eclipse workspace across healthy restarts so JDT and OSGi
@@ -747,7 +770,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     activeServerSession = session;
     const groovyWatcher = workspace.createFileSystemWatcher('**/*.groovy');
     const javaWatcher = workspace.createFileSystemWatcher('**/*.java');
-    const buildDescriptorWatcher = workspace.createFileSystemWatcher('{**/build.gradle,**/pom.xml}');
+    const buildDescriptorWatcher = workspace.createFileSystemWatcher(BUILD_DESCRIPTOR_GLOB);
     addSessionDisposables(session, groovyWatcher, javaWatcher, buildDescriptorWatcher);
 
     // Build initializationOptions from user settings
@@ -769,7 +792,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         middleware: {
             executeCommand: async (command, args, next) => {
                 // Handle client-side commands directly instead of forwarding to server
-                if (command === 'groovy.showReferences') {
+                if (command === 'groovy.showReferences' || command === 'groovy.codeLensNoop') {
                     return vscode.commands.executeCommand(command, ...(args || []));
                 }
                 return next(command, args);
@@ -926,6 +949,14 @@ function prepareWorkspaceDataDir(context: ExtensionContext): WorkspaceDataPrepar
     } else {
         resetWorkspace = fs.existsSync(dataDir);
         resetReason = 'missing workspace data marker';
+    }
+
+    if (!resetWorkspace) {
+        const corruptionReason = detectWorkspaceRestoreCorruption(dataDir);
+        if (corruptionReason) {
+            resetWorkspace = true;
+            resetReason = corruptionReason;
+        }
     }
 
     if (resetWorkspace && fs.existsSync(dataDir)) {
@@ -1107,6 +1138,7 @@ async function initJavaExtensionClasspath(
             projectUri: target.projectUri,
             projectPath: resolvedProjectPath,
             entries: filteredEntries,
+            hasJarEntries: finalHasJars,
         });
         outputChannel.appendLine(
             `[java-ext]   ${sent ? 'Sent' : 'Skipped duplicate'} ${filteredEntries.length} classpath entries` +
@@ -1706,6 +1738,7 @@ function sendClasspathUpdateNotification(
     const fingerprint = JSON.stringify({
         projectPath: payload.projectPath ?? '',
         entries: [...payload.entries].sort(),
+        hasJarEntries: payload.hasJarEntries,
     });
 
     if (sentClasspathFingerprints.get(projectKey) === fingerprint) {
@@ -1797,11 +1830,4 @@ function findLauncherJar(serverDir: string): string | undefined {
     const entries = fs.readdirSync(pluginsDir);
     const launcher = entries.find(name => name.startsWith('org.eclipse.equinox.launcher_') && name.endsWith('.jar'));
     return launcher ? path.join(pluginsDir, launcher) : undefined;
-}
-
-/**
- * Get the platform-specific Equinox configuration directory.
- */
-function getConfigDir(serverDir: string): string {
-    return path.join(serverDir, getConfigNameForPlatform(process.platform));
 }

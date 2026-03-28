@@ -117,13 +117,14 @@ public class ImplementationProvider {
     private void search(SearchPattern pattern, List<Location> locations) throws org.eclipse.core.runtime.CoreException {
         IJavaSearchScope scope = SearchEngine.createWorkspaceScope();
         Map<String, String> contentCache = new HashMap<>();
+        Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
 
         JdtSearchSupport.search(pattern,
                 scope,
                 new SearchRequestor() {
                     @Override
                     public void acceptSearchMatch(SearchMatch match) {
-                        Location location = toLocation(match, contentCache);
+                        Location location = toLocation(match, contentCache, lineIndexCache);
                         if (location != null) {
                             locations.add(location);
                         }
@@ -137,10 +138,16 @@ public class ImplementationProvider {
      */
     @SuppressWarnings("unused")
     private Location toLocation(SearchMatch match) {
-        return toLocation(match, new HashMap<>());
+        return toLocation(match, new HashMap<>(), new HashMap<>());
     }
 
     private Location toLocation(SearchMatch match, Map<String, String> contentCache) {
+        return toLocation(match, contentCache, new HashMap<>());
+    }
+
+    private Location toLocation(SearchMatch match,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
             if (resource == null || resource.getLocationURI() == null) {
@@ -155,8 +162,9 @@ public class ImplementationProvider {
 
             Range range;
             if (content != null) {
-                Position start = offsetToPosition(content, startOffset);
-                Position end = offsetToPosition(content, endOffset);
+                PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
+                Position start = lineIndex.offsetToPosition(startOffset);
+                Position end = lineIndex.offsetToPosition(endOffset);
                 range = new Range(start, end);
             } else {
                 range = new Range(new Position(0, 0), new Position(0, 0));
@@ -178,6 +186,14 @@ public class ImplementationProvider {
             org.eclipse.core.resources.IResource resource,
             Map<String, String> contentCache) {
         return JdtSearchSupport.readContent(documentManager, targetUri, resource, contentCache);
+    }
+
+    private PositionUtils.LineIndex lineIndexFor(String targetUri,
+            String content,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        return lineIndexCache.computeIfAbsent(
+                targetUri,
+                ignored -> PositionUtils.buildLineIndex(content));
     }
 
     // ---- Helpers ----

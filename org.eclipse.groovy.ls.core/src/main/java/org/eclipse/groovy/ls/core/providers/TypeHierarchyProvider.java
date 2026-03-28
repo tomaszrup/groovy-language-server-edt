@@ -10,7 +10,11 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -47,6 +51,8 @@ import org.eclipse.lsp4j.TypeHierarchySupertypesParams;
 public class TypeHierarchyProvider {
 
     private final DocumentManager documentManager;
+    private final Map<String, IType> resolvedTypesByFqn = new ConcurrentHashMap<>();
+    private final Set<String> missingTypesByFqn = ConcurrentHashMap.newKeySet();
 
     public TypeHierarchyProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -54,6 +60,8 @@ public class TypeHierarchyProvider {
 
     public void invalidateCache() {
         TypeHierarchyCache.clear();
+        resolvedTypesByFqn.clear();
+        missingTypesByFqn.clear();
     }
 
     /**
@@ -86,7 +94,7 @@ public class TypeHierarchyProvider {
                 return result;
             }
 
-            TypeHierarchyItem item = buildTypeHierarchyItem(type);
+            TypeHierarchyItem item = buildTypeHierarchyItem(type, new HashMap<>(), new HashMap<>());
             if (item != null) {
                 result.add(item);
             }
@@ -113,9 +121,11 @@ public class TypeHierarchyProvider {
             if (hierarchy == null) {
                 return result;
             }
+            Map<String, String> contentCache = new HashMap<>();
+            Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
             IType[] supertypes = hierarchy.getSupertypes(type);
             for (IType supertype : supertypes) {
-                TypeHierarchyItem item = buildTypeHierarchyItem(supertype);
+                TypeHierarchyItem item = buildTypeHierarchyItem(supertype, contentCache, lineIndexCache);
                 if (item != null) {
                     result.add(item);
                 }
@@ -143,9 +153,11 @@ public class TypeHierarchyProvider {
             if (hierarchy == null) {
                 return result;
             }
+            Map<String, String> contentCache = new HashMap<>();
+            Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
             IType[] subtypes = hierarchy.getSubtypes(type);
             for (IType subtype : subtypes) {
-                TypeHierarchyItem item = buildTypeHierarchyItem(subtype);
+                TypeHierarchyItem item = buildTypeHierarchyItem(subtype, contentCache, lineIndexCache);
                 if (item != null) {
                     result.add(item);
                 }
@@ -213,16 +225,27 @@ public class TypeHierarchyProvider {
     }
 
     private IType findTypeInWorkspace(String fqn) throws org.eclipse.core.runtime.CoreException {
+        IType cachedType = resolvedTypesByFqn.get(fqn);
+        if (cachedType != null && cachedType.exists()) {
+            return cachedType;
+        }
+        if (missingTypesByFqn.contains(fqn)) {
+            return null;
+        }
+
         for (org.eclipse.core.resources.IProject project :
                 org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
             if (project.isOpen() && project.hasNature(org.eclipse.jdt.core.JavaCore.NATURE_ID)) {
                 IJavaProject javaProject = org.eclipse.jdt.core.JavaCore.create(project);
                 IType type = javaProject.findType(fqn);
                 if (type != null && type.exists()) {
+                    resolvedTypesByFqn.put(fqn, type);
+                    missingTypesByFqn.remove(fqn);
                     return type;
                 }
             }
         }
+        missingTypesByFqn.add(fqn);
         return null;
     }
 
@@ -230,6 +253,12 @@ public class TypeHierarchyProvider {
      * Build a TypeHierarchyItem from an IType.
      */
     private TypeHierarchyItem buildTypeHierarchyItem(IType type) {
+        return buildTypeHierarchyItem(type, new HashMap<>(), new HashMap<>());
+    }
+
+    private TypeHierarchyItem buildTypeHierarchyItem(IType type,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             // Determine the URI first — skip if not resolvable
             String uri = resolveTypeUri(type);
@@ -237,9 +266,12 @@ public class TypeHierarchyProvider {
                 return null;
             }
 
-            // Compute ranges
-            Range range = getTypeRange(type, uri);
-            Range selectionRange = getTypeSelectionRange(type, uri, range);
+            String content = getContent(type, uri, contentCache);
+            PositionUtils.LineIndex lineIndex = content != null
+                    ? lineIndexFor(uri, content, lineIndexCache)
+                    : null;
+            Range range = getTypeRange(type, uri, content, lineIndex);
+            Range selectionRange = getTypeSelectionRange(type, uri, range, content, lineIndex);
 
             // Use the required 5-arg constructor
             TypeHierarchyItem item = new TypeHierarchyItem(
@@ -305,12 +337,19 @@ public class TypeHierarchyProvider {
     }
 
     private Range getTypeRange(IType type, String uri) {
+        return getTypeRange(type, uri, getContent(type, uri), null);
+    }
+
+    private Range getTypeRange(IType type,
+            String uri,
+            String content,
+            PositionUtils.LineIndex lineIndex) {
         try {
             ISourceRange sourceRange = type.getSourceRange();
             if (sourceRange != null && sourceRange.getOffset() >= 0) {
-                String content = getContent(type, uri);
                 if (content != null) {
-                    return toRange(content, sourceRange);
+                    return toRange(lineIndex != null ? lineIndex : PositionUtils.buildLineIndex(content),
+                            sourceRange);
                 }
             }
         } catch (Exception e) {
@@ -320,12 +359,20 @@ public class TypeHierarchyProvider {
     }
 
     private Range getTypeSelectionRange(IType type, String uri, Range fallback) {
+        return getTypeSelectionRange(type, uri, fallback, getContent(type, uri), null);
+    }
+
+    private Range getTypeSelectionRange(IType type,
+            String uri,
+            Range fallback,
+            String content,
+            PositionUtils.LineIndex lineIndex) {
         try {
             ISourceRange nameRange = type.getNameRange();
             if (nameRange != null && nameRange.getOffset() >= 0) {
-                String content = getContent(type, uri);
                 if (content != null) {
-                    return toRange(content, nameRange);
+                    return toRange(lineIndex != null ? lineIndex : PositionUtils.buildLineIndex(content),
+                            nameRange);
                 }
             }
         } catch (Exception e) {
@@ -335,29 +382,54 @@ public class TypeHierarchyProvider {
     }
 
     private String getContent(IType type, String uri) {
+        return getContent(type, uri, new HashMap<>());
+    }
+
+    private String getContent(IType type, String uri, Map<String, String> contentCache) {
+        if (contentCache.containsKey(uri)) {
+            return contentCache.get(uri);
+        }
+
         String content = documentManager.getContent(uri);
         if (content != null) {
+            contentCache.put(uri, content);
             return content;
         }
         try {
             org.eclipse.core.resources.IResource resource = type.getResource();
             if (resource instanceof org.eclipse.core.resources.IFile file) {
                 try (java.io.InputStream is = file.getContents()) {
-                    return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                    content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                    contentCache.put(uri, content);
+                    return content;
                 }
             }
         } catch (Exception e) {
             // ignore
         }
+        contentCache.put(uri, null);
         return null;
     }
 
     private Range toRange(String content, ISourceRange sourceRange) {
+        return toRange(PositionUtils.buildLineIndex(content), sourceRange);
+    }
+
+    private Range toRange(PositionUtils.LineIndex lineIndex, ISourceRange sourceRange) {
         int startOffset = sourceRange.getOffset();
         int endOffset = startOffset + sourceRange.getLength();
         return new Range(
-                offsetToPosition(content, startOffset),
-                offsetToPosition(content, endOffset));
+                lineIndex.offsetToPosition(startOffset),
+                lineIndex.offsetToPosition(endOffset));
+    }
+
+    private PositionUtils.LineIndex lineIndexFor(String uri,
+            String content,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) {
+        if (lineIndexCache == null) {
+            return PositionUtils.buildLineIndex(content);
+        }
+        return lineIndexCache.computeIfAbsent(uri, ignored -> PositionUtils.buildLineIndex(content));
     }
 
     Position offsetToPosition(String content, int offset) {

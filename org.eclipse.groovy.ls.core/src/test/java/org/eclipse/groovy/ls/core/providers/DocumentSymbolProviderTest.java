@@ -32,6 +32,7 @@ import org.eclipse.jdt.core.IType;
 import org.eclipse.lsp4j.DocumentSymbol;
 import org.eclipse.lsp4j.DocumentSymbolParams;
 import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.SymbolInformation;
 import org.eclipse.lsp4j.SymbolKind;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
@@ -75,6 +76,24 @@ class DocumentSymbolProviderTest {
         Position pos = invokeOffsetToPosition("hi", 99);
         assertEquals(0, pos.getLine());
         assertEquals(2, pos.getCharacter());
+    }
+
+    @Test
+    void toRangeConvertsOffsetsAcrossLines() throws Exception {
+        ISourceRange sourceRange = mock(ISourceRange.class);
+        when(sourceRange.getOffset()).thenReturn(6);
+        when(sourceRange.getLength()).thenReturn(5);
+
+        Method method = DocumentSymbolProvider.class.getDeclaredMethod(
+                "toRange", String.class, ISourceRange.class);
+        method.setAccessible(true);
+
+        Range range = (Range) method.invoke(provider, "hello\nworld\n!", sourceRange);
+
+        assertEquals(1, range.getStart().getLine());
+        assertEquals(0, range.getStart().getCharacter());
+        assertEquals(1, range.getEnd().getLine());
+        assertEquals(5, range.getEnd().getCharacter());
     }
 
     // ---- toDocumentSymbolFromAST ----
