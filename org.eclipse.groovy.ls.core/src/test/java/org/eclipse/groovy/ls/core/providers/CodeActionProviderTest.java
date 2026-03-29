@@ -19,6 +19,7 @@ import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -33,8 +34,13 @@ import org.eclipse.core.resources.IWorkspaceRoot;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
+import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.ISourceRange;
+import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
+import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.lsp4j.CodeAction;
 import org.eclipse.lsp4j.CodeActionContext;
 import org.eclipse.lsp4j.CodeActionKind;
@@ -156,10 +162,366 @@ class CodeActionProviderTest {
                                 List.of(CodeActionKind.QuickFix, CodeActionProvider.SOURCE_KIND_REMOVE_UNUSED_IMPORTS),
                                 List.of());
 
-                assertTrue(actions.stream().noneMatch(action -> "Remove all unused imports".equals(action.getTitle())));
+        assertTrue(actions.stream().noneMatch(action -> "Remove all unused imports".equals(action.getTitle())));
 
-                documentManager.didClose(uri);
-        }
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void removeUnusedImportIsPreferredOnlyWhenCursorIsOnImportSymbol() {
+        String uri = "file:///PreferredUnusedImport.groovy";
+        String content = """
+                import java.time.LocalDate
+                class Example {
+                    String name
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        Diagnostic diagnostic = new Diagnostic();
+        diagnostic.setCode(Either.forLeft(CodeActionProvider.DIAG_CODE_UNUSED_IMPORT));
+        diagnostic.setRange(new Range(new Position(0, 17), new Position(0, 26)));
+        diagnostic.setMessage("The import 'java.time.LocalDate' is never used");
+
+        CodeAction onSymbol = actionsAtRange(provider, uri, content,
+                new Range(new Position(0, 20), new Position(0, 20)),
+                List.of(CodeActionKind.QuickFix),
+                List.of(diagnostic)).stream()
+                .filter(action -> "Remove unused import".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(onSymbol);
+        assertEquals(Boolean.TRUE, onSymbol.getIsPreferred());
+
+        CodeAction awayFromSymbol = actionsAtRange(provider, uri, content,
+                new Range(new Position(2, 4), new Position(2, 4)),
+                List.of(CodeActionKind.QuickFix),
+                List.of(diagnostic)).stream()
+                .filter(action -> "Remove unused import".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(awayFromSymbol);
+        assertFalse(Boolean.TRUE.equals(awayFromSymbol.getIsPreferred()));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void deleteUnusedDeclarationQuickFixUsesDeclarationRangeAndPreferredCursor() throws Exception {
+        String uri = "file:///DeleteUnusedDeclaration.groovy";
+        String content = """
+                class Example {
+                    void helper() {
+                    }
+                }
+                """;
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IType type = mock(IType.class);
+        IMethod method = mock(IMethod.class);
+        ISourceRange methodNameRange = mockSourceRange(content.indexOf("helper"), "helper".length());
+        int methodStart = content.indexOf("    void helper()");
+        int methodEnd = content.indexOf("    }\n", methodStart) + "    }\n".length();
+        ISourceRange methodSourceRange = mockSourceRange(methodStart, methodEnd - methodStart);
+
+        when(method.getNameRange()).thenReturn(methodNameRange);
+        when(method.getSourceRange()).thenReturn(methodSourceRange);
+        ISourceRange typeNameRange = mockSourceRange(content.indexOf("Example"), "Example".length());
+        ISourceRange typeSourceRange = mockSourceRange(0, content.length());
+        when(type.getMethods()).thenReturn(new IMethod[] { method });
+        when(type.getTypes()).thenReturn(new IType[0]);
+        when(type.getNameRange()).thenReturn(typeNameRange);
+        when(type.getSourceRange()).thenReturn(typeSourceRange);
+        when(workingCopy.getTypes()).thenReturn(new IType[] { type });
+
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public ICompilationUnit getWorkingCopy(String requestedUri) {
+                return uri.equals(requestedUri) ? workingCopy : null;
+            }
+        };
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        Diagnostic diagnostic = new Diagnostic();
+        diagnostic.setCode(Either.forLeft(CodeActionProvider.DIAG_CODE_UNUSED_DECLARATION));
+        diagnostic.setRange(new Range(new Position(1, 9), new Position(1, 15)));
+        diagnostic.setMessage("The method 'helper' is never used");
+
+        CodeAction action = actionsAtRange(provider, uri, content,
+                new Range(new Position(1, 11), new Position(1, 11)),
+                List.of(CodeActionKind.QuickFix),
+                List.of(diagnostic)).stream()
+                .filter(candidate -> "Delete unused declaration".equals(candidate.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(action);
+        assertEquals(Boolean.TRUE, action.getIsPreferred());
+        List<TextEdit> edits = action.getEdit().getChanges().get(uri);
+        assertNotNull(edits);
+        assertEquals(1, edits.size());
+        assertEquals(1, edits.get(0).getRange().getStart().getLine());
+        assertEquals("", edits.get(0).getNewText());
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void deleteUnusedDeclarationQuickFixDeletesConstructorInsteadOfWholeType() throws Exception {
+        String uri = "file:///DeleteUnusedConstructor.groovy";
+        String content = """
+                class Example {
+                    Example() {
+                    }
+                }
+                """;
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IType type = mock(IType.class);
+        IMethod constructor = mock(IMethod.class);
+        ISourceRange sharedNameRange = mockSourceRange(content.indexOf("Example"), "Example".length());
+        int constructorStart = content.indexOf("    Example()");
+        int constructorEnd = content.indexOf("    }\n", constructorStart) + "    }\n".length();
+        ISourceRange constructorSourceRange = mockSourceRange(constructorStart, constructorEnd - constructorStart);
+        ISourceRange typeSourceRange = mockSourceRange(0, content.length());
+
+        when(constructor.getNameRange()).thenReturn(sharedNameRange);
+        when(constructor.getSourceRange()).thenReturn(constructorSourceRange);
+        when(type.getMethods()).thenReturn(new IMethod[] { constructor });
+        when(type.getTypes()).thenReturn(new IType[0]);
+        when(type.getNameRange()).thenReturn(sharedNameRange);
+        when(type.getSourceRange()).thenReturn(typeSourceRange);
+        when(workingCopy.getTypes()).thenReturn(new IType[] { type });
+
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public ICompilationUnit getWorkingCopy(String requestedUri) {
+                return uri.equals(requestedUri) ? workingCopy : null;
+            }
+        };
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        Diagnostic diagnostic = new Diagnostic();
+        diagnostic.setCode(Either.forLeft(CodeActionProvider.DIAG_CODE_UNUSED_DECLARATION));
+        diagnostic.setRange(new Range(new Position(0, 6), new Position(0, 13)));
+        diagnostic.setMessage("The method 'Example' is never used");
+
+        CodeAction action = actionsAtRange(provider, uri, content,
+                new Range(new Position(0, 8), new Position(0, 8)),
+                List.of(CodeActionKind.QuickFix),
+                List.of(diagnostic)).stream()
+                .filter(candidate -> "Delete unused declaration".equals(candidate.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(action);
+        List<TextEdit> edits = action.getEdit().getChanges().get(uri);
+        assertNotNull(edits);
+        assertEquals(1, edits.size());
+        assertEquals(1, edits.get(0).getRange().getStart().getLine());
+        assertEquals(3, edits.get(0).getRange().getEnd().getLine());
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void getCodeActionsOffersCreateTypeActionsForUnresolvedType() {
+        String uri = "file:///project/src/main/groovy/com/example/UsesFoo.groovy";
+        String content = """
+                package com.example
+
+                class UsesFoo {
+                    Foo value
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        Diagnostic diagnostic = new Diagnostic();
+        diagnostic.setCode(Either.forLeft(CodeActionProvider.DIAG_CODE_UNRESOLVED_TYPE));
+        diagnostic.setRange(new Range(new Position(3, 4), new Position(3, 7)));
+        diagnostic.setMessage("Groovy:unable to resolve class Foo");
+
+        List<CodeAction> actions = quickFixActions(provider, uri, content, List.of(diagnostic));
+        CodeAction createClass = actions.stream()
+                .filter(action -> "Create class 'Foo'".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(createClass);
+        assertNotNull(createClass.getEdit());
+        assertNotNull(createClass.getEdit().getDocumentChanges());
+        assertEquals(2, createClass.getEdit().getDocumentChanges().size());
+        assertTrue(createClass.getEdit().getDocumentChanges().get(0).isRight());
+        assertTrue(createClass.getEdit().getDocumentChanges().get(1).isLeft());
+        assertTrue(createClass.getEdit().getDocumentChanges().get(0).getRight().toString().contains("Foo.groovy"));
+        assertTrue(createClass.getEdit().getDocumentChanges().get(1).getLeft().toString().contains("package com.example"));
+        assertTrue(createClass.getEdit().getDocumentChanges().get(1).getLeft().toString().contains("class Foo"));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void organizeImportsRemovesUnusedAddsMissingAndSortsSimpleImports() throws Exception {
+        String uri = "file:///OrganizeImportsReal.groovy";
+        String content = """
+                package com.example
+
+                import z.last.TypeZ
+                import java.time.LocalDate
+
+                class Demo {
+                    List<String> values
+                    TypeZ last
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+        seedImportSearchCache(provider, "List", List.of("java.util.List"));
+
+        Diagnostic diagnostic = new Diagnostic();
+        diagnostic.setCode(Either.forLeft(CodeActionProvider.DIAG_CODE_UNRESOLVED_TYPE));
+        diagnostic.setRange(new Range(new Position(6, 4), new Position(6, 8)));
+        diagnostic.setMessage("Groovy:unable to resolve class List");
+
+        CodeAction organizeImports = actions(provider, uri, content,
+                List.of(CodeActionKind.SourceOrganizeImports), List.of(diagnostic)).stream()
+                .filter(action -> "Organize imports".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(organizeImports);
+        List<TextEdit> edits = organizeImports.getEdit().getChanges().get(uri);
+        assertNotNull(edits);
+        assertEquals(1, edits.size());
+        String organized = edits.get(0).getNewText();
+        assertTrue(organized.contains("import java.util.List"));
+        assertTrue(organized.contains("import z.last.TypeZ"));
+        assertFalse(organized.contains("LocalDate"));
+        assertTrue(organized.indexOf("import java.util.List") < organized.indexOf("import z.last.TypeZ"));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void organizeImportsRemovesUnusedStaticImports() {
+        String uri = "file:///OrganizeImportsStatic.groovy";
+        String content = """
+                import static java.util.Collections.emptyList
+                import java.time.LocalTime
+
+                class Demo {
+                    LocalTime value
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        CodeAction organizeImports = actions(provider, uri, content,
+                List.of(CodeActionKind.SourceOrganizeImports), List.of()).stream()
+                .filter(action -> "Organize imports".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(organizeImports);
+        String organized = organizeImports.getEdit().getChanges().get(uri).get(0).getNewText();
+        assertTrue(organized.contains("import java.time.LocalTime"));
+        assertFalse(organized.contains("import static java.util.Collections.emptyList"));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void organizeImportsPreservesCommentsInsideImportBlock() {
+        String uri = "file:///OrganizeImportsComments.groovy";
+        String content = """
+                package com.example
+
+                import java.time.LocalDate
+                // keep this comment
+                import java.time.LocalTime
+
+                class Demo {
+                    LocalTime value
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        CodeAction organizeImports = actions(provider, uri, content,
+                List.of(CodeActionKind.SourceOrganizeImports), List.of()).stream()
+                .filter(action -> "Organize imports".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(organizeImports);
+        String organized = organizeImports.getEdit().getChanges().get(uri).get(0).getNewText();
+        assertTrue(organized.contains("// keep this comment"));
+        assertTrue(organized.contains("import java.time.LocalTime"));
+        assertFalse(organized.contains("LocalDate"));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void getCodeActionsOffersSourceFixAll() {
+        String uri = "file:///FixAllImports.groovy";
+        String content = """
+                import java.time.LocalDate
+                class Example {
+                    String name
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        Diagnostic diagnostic = new Diagnostic();
+        diagnostic.setCode(Either.forLeft(CodeActionProvider.DIAG_CODE_UNUSED_IMPORT));
+        diagnostic.setRange(new Range(new Position(0, 17), new Position(0, 26)));
+        diagnostic.setMessage("The import 'java.time.LocalDate' is never used");
+
+        CodeAction fixAll = actions(provider, uri, content,
+                List.of(CodeActionKind.SourceFixAll), List.of(diagnostic)).stream()
+                .filter(action -> CodeActionKind.SourceFixAll.equals(action.getKind()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(fixAll);
+        assertEquals("Fix all auto-fixable issues", fixAll.getTitle());
+
+        documentManager.didClose(uri);
+    }
 
     @Test
     void getCodeActionsOffersImplementMissingInterfaceMemberQuickFix() {
@@ -183,7 +545,8 @@ class CodeActionProviderTest {
         List<CodeAction> actions = quickFixActions(provider, uri, content, List.of(diagnostic));
 
         CodeAction implementAction = actions.stream()
-                .filter(action -> "Implement missing interface member".equals(action.getTitle()))
+                .filter(action -> action.getTitle() != null
+                        && action.getTitle().startsWith("Implement inherited abstract member"))
                 .findFirst()
                 .orElse(null);
 
@@ -203,6 +566,38 @@ class CodeActionProviderTest {
         assertTrue(inserted.contains("@Override"));
         assertTrue(inserted.contains("String greet(String name)"));
         assertTrue(inserted.contains("UnsupportedOperationException"));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void getCodeActionsOffersImplementInheritedAbstractMemberQuickFix() {
+        String uri = "file:///CodeActionProviderAbstractBaseTest.groovy";
+        String content = """
+                abstract class GreeterBase {
+                    abstract String greet(String name)
+                }
+
+                class Impl extends GreeterBase {
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        Diagnostic diagnostic = missingInterfaceDiagnostic(4, "Impl");
+        List<CodeAction> actions = quickFixActions(provider, uri, content, List.of(diagnostic));
+
+        CodeAction implementAction = actions.stream()
+                .filter(action -> "Implement inherited abstract member".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(implementAction);
+        assertTrue(implementAction.getEdit().getChanges().get(uri).get(0).getNewText().contains("greet"));
 
         documentManager.didClose(uri);
     }
@@ -234,7 +629,7 @@ class CodeActionProviderTest {
 
         List<CodeAction> implementActions = actions.stream()
                 .filter(action -> action.getTitle() != null
-                        && action.getTitle().startsWith("Implement missing interface member"))
+                        && action.getTitle().startsWith("Implement inherited abstract member"))
                 .toList();
 
         assertTrue(implementActions.isEmpty());
@@ -865,7 +1260,7 @@ class CodeActionProviderTest {
 
         List<CodeAction> allActions = quickFixActions(provider, uri, content, List.of(diag));
         CodeAction implementAction = allActions.stream()
-                .filter(a -> a.getTitle() != null && a.getTitle().startsWith("Implement missing"))
+                .filter(a -> a.getTitle() != null && a.getTitle().startsWith("Implement inherited"))
                 .findFirst().orElse(null);
 
         assertNotNull(implementAction);
@@ -1261,6 +1656,28 @@ class CodeActionProviderTest {
                 return actions(provider, uri, content, List.of(CodeActionKind.QuickFix), diagnostics);
         }
 
+        private List<CodeAction> actionsAtRange(
+                        CodeActionProvider provider,
+                        String uri,
+                        String content,
+                        Range range,
+                        List<String> onlyKinds,
+                        List<Diagnostic> diagnostics) {
+        CodeActionContext context = new CodeActionContext();
+        context.setDiagnostics(diagnostics);
+                context.setOnly(onlyKinds);
+
+        CodeActionParams params = new CodeActionParams(
+                new TextDocumentIdentifier(uri),
+                range,
+                context);
+
+        return provider.getCodeActions(params).stream()
+                .filter(Either::isRight)
+                .map(Either::getRight)
+                .toList();
+    }
+
         private List<CodeAction> actions(
                         CodeActionProvider provider,
                         String uri,
@@ -1289,6 +1706,28 @@ class CodeActionProviderTest {
         diagnostic.setMessage("The class '" + className
                 + "' must be declared abstract or the method 'java.lang.String greet(java.lang.String)' must be implemented");
         return diagnostic;
+    }
+
+    private ISourceRange mockSourceRange(int offset, int length) throws JavaModelException {
+        ISourceRange range = mock(ISourceRange.class);
+        when(range.getOffset()).thenReturn(offset);
+        when(range.getLength()).thenReturn(length);
+        return range;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void seedImportSearchCache(CodeActionProvider provider, String key, List<String> results)
+            throws Exception {
+        Class<?> cachedClass = Class.forName(
+                "org.eclipse.groovy.ls.core.providers.CodeActionProvider$CachedSearchResult");
+        var ctor = cachedClass.getDeclaredConstructor(List.class);
+        ctor.setAccessible(true);
+        Object cached = ctor.newInstance(results);
+
+        var field = CodeActionProvider.class.getDeclaredField("importSearchCache");
+        field.setAccessible(true);
+        Map<String, Object> cache = (Map<String, Object>) field.get(provider);
+        cache.put(key, cached);
     }
 
     private Object invoke(Object target, String methodName, Class<?>[] types, Object[] args) throws Exception {
@@ -2082,8 +2521,8 @@ class CodeActionProviderTest {
         diag.setRange(new Range(new Position(0, 0), new Position(0, 27)));
 
         CodeAction action = (CodeAction) invoke(testProvider, "createRemoveImportAction",
-                new Class<?>[] {String.class, String.class, Diagnostic.class},
-                new Object[] {uri, content, diag});
+                new Class<?>[] {String.class, String.class, Diagnostic.class, boolean.class},
+                new Object[] {uri, content, diag, true});
         assertNotNull(action);
         assertEquals("Remove unused import", action.getTitle());
         assertEquals(CodeActionKind.QuickFix, action.getKind());
@@ -2105,8 +2544,8 @@ class CodeActionProviderTest {
         diag.setRange(new Range(new Position(99, 0), new Position(99, 5)));
 
         CodeAction action = (CodeAction) invoke(testProvider, "createRemoveImportAction",
-                new Class<?>[] {String.class, String.class, Diagnostic.class},
-                new Object[] {uri, content, diag});
+                new Class<?>[] {String.class, String.class, Diagnostic.class, boolean.class},
+                new Object[] {uri, content, diag, false});
         assertNull(action);
     }
 
@@ -2118,8 +2557,8 @@ class CodeActionProviderTest {
         diag.setRange(new Range(new Position(0, 0), new Position(0, 22)));
 
         CodeAction action = (CodeAction) invoke(testProvider, "createRemoveImportAction",
-                new Class<?>[] {String.class, String.class, Diagnostic.class},
-                new Object[] {uri, content, diag});
+                new Class<?>[] {String.class, String.class, Diagnostic.class, boolean.class},
+                new Object[] {uri, content, diag, false});
         assertNotNull(action);
         assertFalse(action.getEdit().getChanges().get(uri).isEmpty());
     }

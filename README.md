@@ -21,7 +21,7 @@ The following LSP capabilities are supported:
 - **Signature Help** — parameter hints when calling methods and constructors (triggers: `(`, `,`)
 - **Document Symbols** — outline view of classes, methods, and fields in a file
 - **Workspace Symbols** — search for symbols across the entire workspace
-- **Code Actions** — quick-fix suggestions, organize imports, add missing imports, remove unused imports
+- **Code Actions** — quick-fix suggestions including remove unused import, delete unused declaration, add missing imports, create unresolved types, implement inherited abstract members, real organize imports, and `source.fixAll`
 - **Code Lens** — reference counts on types, methods, and fields
 - **Diagnostics** — real-time syntax and compilation error/warning reporting, including unused import and unused declaration detection
 - **Inlay Hints** — inline type annotations for `def` variables, parameter name hints, closure parameter types, and method return types

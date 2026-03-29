@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import org.eclipse.lsp4j.CodeActionKind;
 import org.eclipse.lsp4j.InitializeParams;
 import org.eclipse.lsp4j.InitializeResult;
 import org.eclipse.lsp4j.ServerCapabilities;
@@ -128,6 +129,15 @@ class GroovyLanguageServerTest {
         GroovyLanguageServer server = new GroovyLanguageServer();
         ServerCapabilities caps = initAndGetCapabilities(server);
         assertNotNull(caps.getCodeActionProvider());
+    }
+
+    @Test
+    void initializeAdvertisesSourceFixAllCodeActionKind() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        ServerCapabilities caps = initAndGetCapabilities(server);
+        assertTrue(caps.getCodeActionProvider().isRight());
+        assertTrue(caps.getCodeActionProvider().getRight().getCodeActionKinds()
+                .contains(CodeActionKind.SourceFixAll));
     }
 
     @Test

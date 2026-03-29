@@ -306,7 +306,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             codeActionOptions.setCodeActionKinds(java.util.Arrays.asList(
                     CodeActionKind.QuickFix,
                     CodeActionKind.Source,
+                    CodeActionKind.SourceFixAll,
                     CodeActionKind.SourceOrganizeImports,
+                    org.eclipse.groovy.ls.core.providers.CodeActionProvider.SOURCE_KIND_FIX_ALL_GROOVY,
                     org.eclipse.groovy.ls.core.providers.CodeActionProvider.SOURCE_KIND_ADD_MISSING_IMPORTS,
                     org.eclipse.groovy.ls.core.providers.CodeActionProvider.SOURCE_KIND_REMOVE_UNUSED_IMPORTS));
             codeActionOptions.setResolveProvider(true);
