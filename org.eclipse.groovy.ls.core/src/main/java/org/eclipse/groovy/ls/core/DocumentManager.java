@@ -56,6 +56,7 @@ public class DocumentManager {
 
     private static final String CLASSES_LOG_SEGMENT = " classes=";
     private static final String EXTERNAL_PROJECT_PREFIX = "ExtGroovy_";
+    private static final String JRE_CONTAINER_ID = "org.eclipse.jdt.launching.JRE_CONTAINER";
     private static final String LINKED_FOLDER_NAME = "linked";
     private static final long STANDALONE_PARSE_DEBOUNCE_MS = 300;
 
@@ -1096,6 +1097,8 @@ public class DocumentManager {
             IProject existingProject = findExistingProjectForRoot(workspace, projectRoot);
             if (existingProject != null) {
                 refreshProjectLinkedRoot(existingProject);
+                configureExternalProjectClasspath(
+                        existingProject, existingProject.getFolder(LINKED_FOLDER_NAME));
                 GroovyLanguageServerPlugin.logInfo(
                         "Reusing existing Eclipse project '" + existingProject.getName()
                         + "' for " + projectRoot.getAbsolutePath());
@@ -1192,54 +1195,17 @@ public class DocumentManager {
      */
     private void configureExternalProjectClasspath(IProject project, IFolder linkedRoot) {
         try {
+            if (linkedRoot == null) {
+                return;
+            }
+
             IJavaProject javaProject = JavaCore.create(project);
             if (javaProject == null) {
                 return;
             }
 
-            String[] candidateSrcDirs = {
-                "src/main/java",
-                "src/main/groovy",
-                "src/test/java",
-                "src/test/groovy",
-                "src/main/resources",
-                "src/test/resources",
-                "src",
-            };
-
-            List<IClasspathEntry> entries = new ArrayList<>();
-            boolean foundAny = false;
-            Set<String> addedSrcDirs = new java.util.LinkedHashSet<>();
-
-            for (String srcDir : candidateSrcDirs) {
-                IFolder folder = linkedRoot.getFolder(srcDir);
-                boolean folderExists = existsOnFilesystem(folder);
-                if (folder == null || !folderExists || hasNestedConflict(srcDir, addedSrcDirs)) {
-                    if (folder != null && folderExists) {
-                        GroovyLanguageServerPlugin.logInfo(
-                                "[ext] Skipping nested source folder: " + srcDir);
-                    }
-                    continue;
-                }
-                entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
-                addedSrcDirs.add(srcDir);
-                foundAny = true;
-                GroovyLanguageServerPlugin.logInfo(
-                        "[ext] Added source folder: linked/" + srcDir);
-            }
-
-            if (!foundAny) {
-                entries.add(JavaCore.newSourceEntry(linkedRoot.getFullPath()));
-                GroovyLanguageServerPlugin.logInfo(
-                        "[ext] No standard source folders found; using linked root.");
-            }
-
-            // Add JRE system library
-            entries.add(JavaCore.newContainerEntry(
-                    new Path("org.eclipse.jdt.launching.JRE_CONTAINER")));
-
-            // NOTE: Library dependencies are added via groovy/classpathUpdate
-            // when the Red Hat Java extension provides resolved classpath entries.
+            List<IClasspathEntry> entries = createExternalProjectSourceEntries(linkedRoot);
+            preserveNonSourceClasspathEntries(javaProject, entries);
 
             javaProject.setRawClasspath(
                     entries.toArray(new IClasspathEntry[0]),
@@ -1248,12 +1214,78 @@ public class DocumentManager {
 
             GroovyLanguageServerPlugin.logInfo(
                     "[ext] Configured classpath with " + entries.size()
-                    + " entries (source folders + JRE).");
+                    + " entries (source folders + preserved dependencies).");
 
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to configure classpath for external project "
                     + project.getName() + " (non-fatal): " + e.getMessage(), e);
+        }
+    }
+
+    private List<IClasspathEntry> createExternalProjectSourceEntries(IFolder linkedRoot) {
+        List<IClasspathEntry> entries = new ArrayList<>();
+
+        String[] candidateSrcDirs = {
+            "src/main/java",
+            "src/main/groovy",
+            "src/test/java",
+            "src/test/groovy",
+            "src/main/resources",
+            "src/test/resources",
+            "src",
+        };
+
+        boolean foundAny = false;
+        Set<String> addedSrcDirs = new java.util.LinkedHashSet<>();
+
+        for (String srcDir : candidateSrcDirs) {
+            IFolder folder = linkedRoot.getFolder(srcDir);
+            boolean folderExists = existsOnFilesystem(folder);
+            if (folder == null || !folderExists || hasNestedConflict(srcDir, addedSrcDirs)) {
+                if (folder != null && folderExists) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[ext] Skipping nested source folder: " + srcDir);
+                }
+                continue;
+            }
+            entries.add(JavaCore.newSourceEntry(folder.getFullPath()));
+            addedSrcDirs.add(srcDir);
+            foundAny = true;
+            GroovyLanguageServerPlugin.logInfo(
+                    "[ext] Added source folder: linked/" + srcDir);
+        }
+
+        if (!foundAny) {
+            entries.add(JavaCore.newSourceEntry(linkedRoot.getFullPath()));
+            GroovyLanguageServerPlugin.logInfo(
+                    "[ext] No standard source folders found; using linked root.");
+        }
+
+        return entries;
+    }
+
+    private void preserveNonSourceClasspathEntries(
+            IJavaProject javaProject,
+            List<IClasspathEntry> entries) throws JavaModelException {
+        boolean hasJreContainer = false;
+
+        for (IClasspathEntry entry : javaProject.getRawClasspath()) {
+            if (entry == null || entry.getEntryKind() == IClasspathEntry.CPE_SOURCE) {
+                continue;
+            }
+            entries.add(entry);
+            if (entry.getEntryKind() == IClasspathEntry.CPE_CONTAINER
+                    && entry.getPath() != null
+                    && entry.getPath().toString().startsWith(JRE_CONTAINER_ID)) {
+                hasJreContainer = true;
+            }
+        }
+
+        // NOTE: Library dependencies are added via groovy/classpathUpdate
+        // when the Red Hat Java extension provides resolved classpath entries.
+        if (!hasJreContainer) {
+            entries.add(JavaCore.newContainerEntry(new Path(JRE_CONTAINER_ID)));
         }
     }
 

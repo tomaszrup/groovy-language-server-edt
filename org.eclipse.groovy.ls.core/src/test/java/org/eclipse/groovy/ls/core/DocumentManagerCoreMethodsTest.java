@@ -27,16 +27,23 @@ import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.codehaus.groovy.ast.ModuleNode;
+import org.eclipse.core.resources.IFolder;
+import org.eclipse.core.resources.IProject;
 import org.eclipse.jdt.core.IBuffer;
+import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.MockedStatic;
 
 /**
  * Tests for {@link DocumentManager} core methods not covered by the
@@ -847,6 +854,73 @@ class DocumentManagerCoreMethodsTest {
         assertFalse(invokeHasNestedConflict(dm, "src/main/java", existing));
     }
 
+    @Test
+    void configureExternalProjectClasspathRefreshesSourcesAndPreservesLibraries() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        IProject project = mock(IProject.class);
+        IFolder linkedRoot = mock(IFolder.class);
+        IJavaProject javaProject = mock(IJavaProject.class);
+
+        Path srcMainGroovy = tempDir.resolve("src/main/groovy");
+        Files.createDirectories(srcMainGroovy);
+
+        IClasspathEntry staleRootSource = mockClasspathEntry(
+                IClasspathEntry.CPE_SOURCE, "/ExtGroovy_project/linked");
+        IClasspathEntry libraryEntry = mockClasspathEntry(
+                IClasspathEntry.CPE_LIBRARY, "/libs/example.jar");
+        IClasspathEntry jreEntry = mockClasspathEntry(
+                IClasspathEntry.CPE_CONTAINER, "org.eclipse.jdt.launching.JRE_CONTAINER");
+
+        when(project.getFullPath()).thenReturn(new org.eclipse.core.runtime.Path("/ExtGroovy_project"));
+        when(javaProject.getRawClasspath()).thenReturn(new IClasspathEntry[] {
+                staleRootSource,
+                libraryEntry,
+                jreEntry
+        });
+        when(linkedRoot.getFolder(org.mockito.ArgumentMatchers.anyString())).thenAnswer(invocation -> {
+            String srcDir = invocation.getArgument(0, String.class);
+            IFolder folder = mock(IFolder.class);
+            when(folder.getLocation()).thenReturn(
+                    org.eclipse.core.runtime.Path.fromOSString(tempDir.resolve(srcDir).toString()));
+            when(folder.getFullPath()).thenReturn(
+                    new org.eclipse.core.runtime.Path("/ExtGroovy_project/linked/" + srcDir));
+            return folder;
+        });
+
+        try (MockedStatic<JavaCore> javaCoreMock = org.mockito.Mockito.mockStatic(JavaCore.class)) {
+            javaCoreMock.when(() -> JavaCore.create(project)).thenReturn(javaProject);
+            javaCoreMock.when(() -> JavaCore.newSourceEntry(org.mockito.ArgumentMatchers.any()))
+                    .thenAnswer(invocation -> mockClasspathEntry(
+                            IClasspathEntry.CPE_SOURCE,
+                            invocation.getArgument(0, org.eclipse.core.runtime.IPath.class).toString()));
+            javaCoreMock.when(() -> JavaCore.newContainerEntry(org.mockito.ArgumentMatchers.any()))
+                    .thenAnswer(invocation -> mockClasspathEntry(
+                            IClasspathEntry.CPE_CONTAINER,
+                            invocation.getArgument(0, org.eclipse.core.runtime.IPath.class).toString()));
+            invokeConfigureExternalProjectClasspath(dm, project, linkedRoot);
+        }
+
+        org.mockito.ArgumentCaptor<IClasspathEntry[]> entriesCaptor =
+                org.mockito.ArgumentCaptor.forClass(IClasspathEntry[].class);
+        verify(javaProject).setRawClasspath(
+                entriesCaptor.capture(),
+                org.mockito.ArgumentMatchers.eq(new org.eclipse.core.runtime.Path("/ExtGroovy_project/bin")),
+                org.mockito.ArgumentMatchers.any());
+
+        List<IClasspathEntry> appliedEntries = Arrays.asList(entriesCaptor.getValue());
+        assertTrue(appliedEntries.stream().anyMatch(entry ->
+                entry.getEntryKind() == IClasspathEntry.CPE_SOURCE
+                        && "/ExtGroovy_project/linked/src/main/groovy".equals(entry.getPath().toString())));
+        assertFalse(appliedEntries.stream().anyMatch(entry ->
+                entry.getEntryKind() == IClasspathEntry.CPE_SOURCE
+                        && "/ExtGroovy_project/linked".equals(entry.getPath().toString())));
+        assertTrue(appliedEntries.contains(libraryEntry));
+        assertEquals(1, appliedEntries.stream().filter(entry ->
+                entry.getEntryKind() == IClasspathEntry.CPE_CONTAINER
+                        && entry.getPath().toString().startsWith("org.eclipse.jdt.launching.JRE_CONTAINER"))
+                .count());
+    }
+
     // ================================================================
     // dispose tests
     // ================================================================
@@ -917,5 +991,22 @@ class DocumentManagerCoreMethodsTest {
             Thread.sleep(25);
         }
         assertTrue(condition.getAsBoolean(), "Condition was not satisfied within " + timeoutMs + " ms");
+    }
+
+    private void invokeConfigureExternalProjectClasspath(
+            DocumentManager manager,
+            IProject project,
+            IFolder linkedRoot) throws Exception {
+        Method method = DocumentManager.class.getDeclaredMethod(
+                "configureExternalProjectClasspath", IProject.class, IFolder.class);
+        method.setAccessible(true);
+        method.invoke(manager, project, linkedRoot);
+    }
+
+    private IClasspathEntry mockClasspathEntry(int entryKind, String path) {
+        IClasspathEntry entry = mock(IClasspathEntry.class);
+        when(entry.getEntryKind()).thenReturn(entryKind);
+        when(entry.getPath()).thenReturn(new org.eclipse.core.runtime.Path(path));
+        return entry;
     }
 }
