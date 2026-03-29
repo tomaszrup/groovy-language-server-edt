@@ -132,6 +132,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private volatile boolean firstFullBuildComplete = false;
     private volatile boolean initialBuildStarted = false;
     private volatile boolean initialBuildSettled = false;
+    private volatile boolean delegatedClasspathStartupExpected = false;
+    private volatile boolean initialClasspathBatchCompleteReceived = false;
     private volatile boolean buildInProgress = false;
     private volatile java.util.concurrent.ScheduledFuture<?> initialBuildTimer;
     private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<?>>
@@ -439,9 +441,6 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 sendStatus("Error", "Build failed: " + e.getMessage());
             } finally {
                 buildInProgress = false;
-                if (initialBuild && buildSucceeded) {
-                    initialBuildSettled = true;
-                }
             }
 
             // Now that the workspace lock is released, publish full JDT-based
@@ -463,10 +462,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 GroovyLanguageServerPlugin.logError("Post-build code lens refresh failed", e);
             }
 
-            // Mark as ready only after diagnostics have been scheduled
-            // for all open files, so the user doesn't see "Ready" while
-            // imports are still being resolved.
-            sendStatus(STATUS_READY, null);
+            if (buildSucceeded) {
+                settleInitialBuildIfReady();
+            }
+
+            // Mark as ready only once rooted startup has crossed the same
+            // classpath-safety gate used for full diagnostics.
+            sendPostBuildStartupStatus();
         });
     }
 
@@ -867,6 +869,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     private void handleClasspathBatchComplete() {
+        initialClasspathBatchCompleteReceived = true;
         GroovyLanguageServerPlugin.logInfo(
                 "[classpathBatchComplete] All initial classpaths received. Triggering build now.");
         java.util.concurrent.ScheduledFuture<?> prev = debouncedBuildFuture.getAndSet(null);
@@ -1183,6 +1186,10 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         return workspaceRoot != null && initialBuildSettled;
     }
 
+    boolean isDelegatedClasspathStartupExpected() {
+        return workspaceRoot != null && delegatedClasspathStartupExpected;
+    }
+
     /**
      * Read optional tuning parameters from the client's
      * {@code initializationOptions} JSON and reconfigure the LSP request
@@ -1246,10 +1253,35 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 int effectiveBgQueue = bgQueueSize > 0 ? bgQueueSize : 128;
                 textDocumentService.configureBackgroundPool(effectiveBgPool, effectiveBgQueue);
             }
+
+            if (opts.has("delegatedClasspathStartup")
+                    && opts.get("delegatedClasspathStartup").isJsonPrimitive()) {
+                delegatedClasspathStartupExpected = opts.get("delegatedClasspathStartup").getAsBoolean();
+            }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
-                    "Failed to parse initializationOptions for pool config", e);
+                    "Failed to parse initializationOptions", e);
         }
+    }
+
+    private void settleInitialBuildIfReady() {
+        if (initialBuildSettled || workspaceRoot == null || !firstFullBuildComplete) {
+            return;
+        }
+        if (delegatedClasspathStartupExpected && !initialClasspathBatchCompleteReceived) {
+            return;
+        }
+        initialBuildSettled = true;
+    }
+
+    private void sendPostBuildStartupStatus() {
+        if (workspaceRoot != null
+                && delegatedClasspathStartupExpected
+                && !initialBuildSettled) {
+            sendStatus(STATUS_IMPORTING, "Finalizing classpath...");
+            return;
+        }
+        sendStatus(STATUS_READY, null);
     }
 
     /**

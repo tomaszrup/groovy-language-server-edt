@@ -254,6 +254,80 @@ class GroovyTextDocumentServiceTest {
     }
 
     @Test
+    void publishDiagnosticsIfEnabledStaysSyntaxOnlyAfterFirstBuildUntilRootedStartupSettles()
+            throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        setField(server, "workspaceRoot", "file:///workspace");
+        setField(server, "firstFullBuildComplete", true);
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(diagnostics).publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishDiagnosticsDebounced("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledUsesFullDiagnosticsForRootedResolvedProjectBeforeStartupSettles()
+            throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public boolean areDiagnosticsEnabled() {
+                return true;
+            }
+
+            @Override
+            public String getWorkspaceRoot() {
+                return "file:///workspace";
+            }
+
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return "projA";
+            }
+
+            @Override
+            public boolean hasClasspathForProject(String projectName) {
+                return "projA".equals(projectName);
+            }
+
+            @Override
+            boolean isInitialBuildStarted() {
+                return true;
+            }
+
+            @Override
+            public boolean isBuildInProgress() {
+                return false;
+            }
+        };
+        setField(server, "firstFullBuildComplete", true);
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+    }
+
+    @Test
     void publishDiagnosticsIfEnabledUsesFullDiagnosticsForNoRootProjectOnceClasspathArrives() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer() {
             @Override

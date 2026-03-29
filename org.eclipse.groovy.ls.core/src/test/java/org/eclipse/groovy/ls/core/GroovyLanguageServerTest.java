@@ -864,6 +864,19 @@ class GroovyLanguageServerTest {
     }
 
     @Test
+    void initializeReadsDelegatedClasspathStartupOption() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        InitializeParams params = new InitializeParams();
+        JsonObject options = new JsonObject();
+        options.addProperty("delegatedClasspathStartup", true);
+        params.setInitializationOptions(options);
+
+        server.initialize(params).get();
+
+        assertTrue((Boolean) getField(server, "delegatedClasspathStartupExpected"));
+    }
+
+    @Test
     void classpathUpdateQueuesWhileWorkspaceProjectsAreInitializing() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
         ((AtomicBoolean) getField(server, "workspaceProjectsReady")).set(false);
@@ -932,6 +945,96 @@ class GroovyLanguageServerTest {
 
         assertTrue(server.eagerProjectDiagnosticsPublished);
         assertEquals("projA", server.lastEagerProjectName);
+    }
+
+    @Test
+    void triggerFullBuildWaitsForDelegatedClasspathBatchBeforeSettling() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+
+        Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        workspaceRootField.setAccessible(true);
+        workspaceRootField.set(server, "file:///workspace");
+
+        Field delegatedClasspathField = GroovyLanguageServer.class.getDeclaredField("delegatedClasspathStartupExpected");
+        delegatedClasspathField.setAccessible(true);
+        delegatedClasspathField.set(server, true);
+
+        Field firstBuildField = GroovyLanguageServer.class.getDeclaredField("firstFullBuildComplete");
+        firstBuildField.setAccessible(true);
+        firstBuildField.set(server, true);
+
+        Method settleMethod = GroovyLanguageServer.class.getDeclaredMethod("settleInitialBuildIfReady");
+        settleMethod.setAccessible(true);
+
+        settleMethod.invoke(server);
+        assertFalse((Boolean) getField(server, "initialBuildSettled"));
+
+        Field batchCompleteField = GroovyLanguageServer.class.getDeclaredField("initialClasspathBatchCompleteReceived");
+        batchCompleteField.setAccessible(true);
+        batchCompleteField.set(server, true);
+
+        settleMethod.invoke(server);
+        assertTrue((Boolean) getField(server, "initialBuildSettled"));
+    }
+
+    @Test
+    void sendPostBuildStartupStatusKeepsImportingWhileDelegatedClasspathStartupPending() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        Endpoint endpoint = mock(Endpoint.class);
+
+        Field endpointField = GroovyLanguageServer.class.getDeclaredField("remoteEndpoint");
+        endpointField.setAccessible(true);
+        endpointField.set(server, endpoint);
+
+        Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        workspaceRootField.setAccessible(true);
+        workspaceRootField.set(server, "file:///workspace");
+
+        Field delegatedClasspathField = GroovyLanguageServer.class.getDeclaredField("delegatedClasspathStartupExpected");
+        delegatedClasspathField.setAccessible(true);
+        delegatedClasspathField.set(server, true);
+
+        Method method = GroovyLanguageServer.class.getDeclaredMethod("sendPostBuildStartupStatus");
+        method.setAccessible(true);
+        method.invoke(server);
+
+        verify(endpoint).notify(
+                org.mockito.ArgumentMatchers.eq("groovy/status"),
+                org.mockito.ArgumentMatchers.argThat(arg -> {
+                    JsonObject params = (JsonObject) arg;
+                    return "Importing".equals(params.get("state").getAsString())
+                            && "Finalizing classpath...".equals(params.get("message").getAsString());
+                }));
+    }
+
+    @Test
+    void sendPostBuildStartupStatusSendsReadyAfterStartupSettles() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        Endpoint endpoint = mock(Endpoint.class);
+
+        Field endpointField = GroovyLanguageServer.class.getDeclaredField("remoteEndpoint");
+        endpointField.setAccessible(true);
+        endpointField.set(server, endpoint);
+
+        Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        workspaceRootField.setAccessible(true);
+        workspaceRootField.set(server, "file:///workspace");
+
+        Field settledField = GroovyLanguageServer.class.getDeclaredField("initialBuildSettled");
+        settledField.setAccessible(true);
+        settledField.set(server, true);
+
+        Method method = GroovyLanguageServer.class.getDeclaredMethod("sendPostBuildStartupStatus");
+        method.setAccessible(true);
+        method.invoke(server);
+
+        verify(endpoint).notify(
+                org.mockito.ArgumentMatchers.eq("groovy/status"),
+                org.mockito.ArgumentMatchers.argThat(arg -> {
+                    JsonObject params = (JsonObject) arg;
+                    return "Ready".equals(params.get("state").getAsString())
+                            && !params.has("message");
+                }));
     }
 
     @Test

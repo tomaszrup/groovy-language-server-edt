@@ -250,11 +250,12 @@ public class GroovyTextDocumentService implements TextDocumentService {
         this.formattingProvider = new FormattingProvider(documentManager);
         this.diagnosticsProvider = new DiagnosticsProvider(documentManager);
         this.diagnosticsProvider.setClasspathChecker(uri -> {
-            // After the first full build, all classpaths have been received
-            // and applied.  The per-project mapping may not cover every file
-            // (e.g. deeply nested subprojects), so treat all files as having
-            // a classpath once the build is done.
-            if (server.isFirstBuildComplete()) return true;
+            if (server.getWorkspaceRoot() == null && server.isFirstBuildComplete()) return true;
+            // Once rooted startup fully settles, the initial delegated
+            // classpath handoff is complete and open documents can use the
+            // normal post-build diagnostics path even if the per-project
+            // mapping is still catching up.
+            if (server.isInitialBuildSettled()) return true;
             boolean allowWorkingCopyFallback = allowWorkingCopyClasspathFallback();
             if (server.getWorkspaceRoot() != null && !allowWorkingCopyFallback) {
                 return false;
@@ -1364,7 +1365,10 @@ public class GroovyTextDocumentService implements TextDocumentService {
     }
 
     private boolean canPublishFullDiagnostics(String uri) {
-        if (server.isFirstBuildComplete()) {
+        if (server.getWorkspaceRoot() == null && server.isFirstBuildComplete()) {
+            return true;
+        }
+        if (server.isInitialBuildSettled()) {
             return true;
         }
         boolean allowWorkingCopyFallback = allowWorkingCopyClasspathFallback();
@@ -1382,17 +1386,9 @@ public class GroovyTextDocumentService implements TextDocumentService {
         return server.isInitialBuildStarted() && !server.isBuildInProgress();
     }
 
-    private boolean hasResolvedClasspathForUri(String uri) {
-        return hasResolvedClasspathForUri(uri, true);
-    }
-
     private boolean hasResolvedClasspathForUri(String uri, boolean allowWorkingCopyFallback) {
         String projectName = resolveProjectNameForDiagnostics(uri, allowWorkingCopyFallback);
         return projectName != null && server.hasClasspathForProject(projectName);
-    }
-
-    private String resolveProjectNameForDiagnostics(String uri) {
-        return resolveProjectNameForDiagnostics(uri, true);
     }
 
     private String resolveProjectNameForDiagnostics(String uri, boolean allowWorkingCopyFallback) {

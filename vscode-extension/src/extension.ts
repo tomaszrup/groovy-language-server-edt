@@ -1813,7 +1813,9 @@ function validateCriticalPluginJars(serverDir: string): boolean {
 
 function buildInitializationOptions(): Record<string, unknown> | undefined {
     const config = workspace.getConfiguration('groovy');
-    const initOptions: Record<string, unknown> = {};
+    const initOptions: Record<string, unknown> = {
+        delegatedClasspathStartup: cachedJavaApi !== null,
+    };
     const requestPoolSize = config.get<number>('ls.requestPoolSize', 0);
     const requestQueueSize = config.get<number>('ls.requestQueueSize', 64);
     const backgroundPoolSize = config.get<number>('ls.backgroundPoolSize', 0);
