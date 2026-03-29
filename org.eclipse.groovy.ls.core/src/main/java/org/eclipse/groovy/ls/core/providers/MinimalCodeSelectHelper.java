@@ -1034,23 +1034,13 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
                 return null; // Not a dot-expression
             }
 
-            // Extract the receiver identifier before the dot
-            int dotPos = wordStart - 1;
-            int receiverEnd = dotPos;
-            int receiverStart = receiverEnd - 1;
-            while (receiverStart >= 0 && Character.isJavaIdentifierPart(source.charAt(receiverStart))) {
-                receiverStart--;
-            }
-            receiverStart++;
-
             IType receiverType = null;
 
-            if (receiverStart < receiverEnd) {
-                // Simple identifier receiver (e.g., "foo.value()")
-                String receiverName = source.substring(receiverStart, receiverEnd);
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] Dot call: receiver='" + receiverName
-                        + "' method='" + word + "'");
-                receiverType = resolveExpressionType(module, project, receiverName);
+            String receiverChain = extractQualifiedReceiverChain(source, wordStart);
+            if (receiverChain != null && !receiverChain.isBlank()) {
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Dot call: receiver='" + receiverChain
+                        + "' member='" + word + "'");
+                receiverType = resolveQualifiedReceiverType(module, project, receiverChain);
             }
 
             // Fallback: AST-based resolution for complex receivers like "new Foo().method()"
@@ -1063,6 +1053,13 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
 
             GroovyLanguageServerPlugin.logInfo("[codeSelect] Receiver type: " + receiverType.getFullyQualifiedName());
+
+            IType nestedType = findNestedType(receiverType, word, project);
+            if (nestedType != null) {
+                GroovyLanguageServerPlugin.logInfo("[codeSelect] Found nested type '" + word
+                        + "' in " + receiverType.getFullyQualifiedName());
+                return nestedType;
+            }
 
             // Find the method in the receiver type
             IMethod method = findMethodByNameInHierarchy(receiverType, word, project);
@@ -1080,6 +1077,140 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[codeSelect] resolveDotMethodCall failed", e);
         }
+        return null;
+    }
+
+    private String extractQualifiedReceiverChain(String source, int wordStart) {
+        int dotPos = wordStart - 1;
+        int receiverStart = dotPos - 1;
+        while (receiverStart >= 0) {
+            char current = source.charAt(receiverStart);
+            if (!Character.isJavaIdentifierPart(current) && current != '.') {
+                break;
+            }
+            receiverStart--;
+        }
+        receiverStart++;
+
+        if (receiverStart >= dotPos) {
+            return null;
+        }
+
+        String chain = source.substring(receiverStart, dotPos);
+        return chain.isBlank() ? null : chain;
+    }
+
+    private IType resolveQualifiedReceiverType(ModuleNode module, IJavaProject project, String receiverChain) {
+        if (receiverChain == null || receiverChain.isBlank()) {
+            return null;
+        }
+
+        String[] segments = receiverChain.split("\\.");
+        if (segments.length == 0) {
+            return null;
+        }
+
+        IType currentType = resolveExpressionType(module, project, segments[0]);
+        for (int index = 1; currentType != null && index < segments.length; index++) {
+            currentType = resolveQualifiedMemberType(currentType, segments[index], project);
+        }
+        return currentType;
+    }
+
+    private IType resolveQualifiedMemberType(IType receiverType, String memberName, IJavaProject project) {
+        if (receiverType == null || memberName == null || memberName.isBlank()) {
+            return null;
+        }
+
+        try {
+            IType nestedType = findNestedType(receiverType, memberName, project);
+            if (nestedType != null) {
+                return nestedType;
+            }
+
+            IField field = findFieldByName(receiverType, memberName);
+            if (field != null) {
+                return resolveMemberSignatureType(field.getTypeSignature(), receiverType);
+            }
+
+            IMethod method = findMethodByNameInHierarchy(receiverType, memberName,
+                    receiverType.getJavaProject() != null ? receiverType.getJavaProject() : project);
+            if (method != null) {
+                return resolveMemberSignatureType(method.getReturnType(), receiverType);
+            }
+        } catch (JavaModelException e) {
+            return null;
+        }
+
+        return null;
+    }
+
+    private IType resolveMemberSignatureType(String typeSignature, IType declaringType)
+            throws JavaModelException {
+        if (typeSignature == null || declaringType == null) {
+            return null;
+        }
+
+        String typeName = Signature.toString(typeSignature);
+        int genericStart = typeName.indexOf('<');
+        if (genericStart >= 0) {
+            typeName = typeName.substring(0, genericStart);
+        }
+        int arrayStart = typeName.indexOf('[');
+        if (arrayStart >= 0) {
+            typeName = typeName.substring(0, arrayStart);
+        }
+        typeName = typeName.trim();
+
+        String[][] resolvedNames = declaringType.resolveType(typeName);
+        if (resolvedNames != null && resolvedNames.length > 0) {
+            String fqn = resolvedNames[0][0].isEmpty()
+                    ? resolvedNames[0][1]
+                    : resolvedNames[0][0] + "." + resolvedNames[0][1];
+            return declaringType.getJavaProject().findType(fqn);
+        }
+
+        return declaringType.getJavaProject().findType(typeName);
+    }
+
+    private IType findNestedType(IType receiverType, String simpleName, IJavaProject project)
+            throws JavaModelException {
+        if (receiverType == null || simpleName == null || simpleName.isBlank()) {
+            return null;
+        }
+
+        IType[] memberTypes = receiverType.getTypes();
+        if (memberTypes != null) {
+            for (IType memberType : memberTypes) {
+                if (simpleName.equals(memberType.getElementName())) {
+                    return memberType;
+                }
+            }
+        }
+
+        IType direct = receiverType.getType(simpleName);
+        if (direct != null && direct.exists()) {
+            return direct;
+        }
+
+        IJavaProject javaProject = receiverType.getJavaProject() != null ? receiverType.getJavaProject() : project;
+        if (javaProject == null) {
+            return null;
+        }
+
+        String binaryFqn = receiverType.getFullyQualifiedName('$');
+        if (binaryFqn != null && !binaryFqn.isBlank()) {
+            IType found = javaProject.findType(binaryFqn + "$" + simpleName);
+            if (found != null) {
+                return found;
+            }
+        }
+
+        String dottedFqn = receiverType.getFullyQualifiedName();
+        if (dottedFqn != null && !dottedFqn.isBlank()) {
+            return javaProject.findType(dottedFqn + "." + simpleName);
+        }
+
         return null;
     }
 

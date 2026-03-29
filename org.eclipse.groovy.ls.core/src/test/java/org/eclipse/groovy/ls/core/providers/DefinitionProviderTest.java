@@ -449,7 +449,8 @@ class DefinitionProviderTest {
             source);
 
         IType type = mock(IType.class);
-        when(type.getFullyQualifiedName()).thenReturn("test.binary.AttachedOuter$Inner");
+        when(type.getFullyQualifiedName()).thenReturn("test.binary.AttachedOuter.Inner");
+        when(type.getFullyQualifiedName('$')).thenReturn("test.binary.AttachedOuter$Inner");
         when(type.getElementName()).thenReturn("Inner");
 
         IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
@@ -461,12 +462,81 @@ class DefinitionProviderTest {
         String resolvedSource = SourceJarHelper.resolveSourceContent(loc.getUri());
 
         assertNotNull(loc);
-        assertEquals("groovy-source:///test/binary/AttachedOuter$Inner.java", loc.getUri());
+        assertEquals("groovy-source:///test/binary/AttachedOuter.java", loc.getUri());
         assertEquals(source, resolvedSource);
         assertEquals(resolvedSource,
             SourceJarHelper.getCachedContent("test.binary.AttachedOuter$Inner"));
         assertTrue(resolvedSource.contains("enum Inner"));
         assertTrue(loc.getRange().getStart().getLine() > 0);
+    }
+
+    @Test
+    void toLocationUsesAttachedBinarySourceRangeForEnumConstant() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getFullyQualifiedName()).thenReturn("test.binary.AttachedOuter.Inner");
+        when(type.getFullyQualifiedName('$')).thenReturn("test.binary.AttachedOuter$Inner");
+        when(type.getElementName()).thenReturn("Inner");
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(null);
+
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        when(type.getClassFile()).thenReturn(classFile);
+        String source = "package test.binary;\n"
+            + "public class AttachedOuter {\n"
+            + "    public enum Inner {\n"
+            + "        VALUE;\n"
+            + "    }\n"
+            + "}\n";
+        when(classFile.getSource()).thenReturn(source);
+
+        IField field = mock(IField.class);
+        when(field.getElementName()).thenReturn("VALUE");
+        when(field.getResource()).thenReturn(null);
+        when(field.getAncestor(IJavaElement.TYPE)).thenReturn(type);
+        ISourceRange nameRange = mock(ISourceRange.class);
+        when(nameRange.getOffset()).thenReturn(source.indexOf("VALUE"));
+        when(nameRange.getLength()).thenReturn("VALUE".length());
+        when(field.getNameRange()).thenReturn(nameRange);
+
+        Location loc = invokeToLocation(field);
+
+        assertNotNull(loc);
+        assertEquals("groovy-source:///test/binary/AttachedOuter.java", loc.getUri());
+        assertEquals(3, loc.getRange().getStart().getLine());
+    }
+
+    @Test
+    void toLocationSkipsBinaryMethodCallSitesWhenNameRangeIsUnavailable() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getFullyQualifiedName()).thenReturn("test.binary.AttachedOuter.Inner");
+        when(type.getFullyQualifiedName('$')).thenReturn("test.binary.AttachedOuter$Inner");
+        when(type.getElementName()).thenReturn("Inner");
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(null);
+
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        when(type.getClassFile()).thenReturn(classFile);
+        String source = "package test.binary;\n"
+            + "public class AttachedOuter {\n"
+            + "    public static class Inner {\n"
+            + "        void use() {\n"
+            + "            value();\n"
+            + "        }\n"
+            + "\n"
+            + "        void value() {}\n"
+            + "    }\n"
+            + "}\n";
+        when(classFile.getSource()).thenReturn(source);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("value");
+        when(method.getResource()).thenReturn(null);
+        when(method.getAncestor(IJavaElement.TYPE)).thenReturn(type);
+        when(method.getNameRange()).thenReturn(null);
+
+        Location loc = invokeToLocation(method);
+
+        assertNotNull(loc);
+        assertEquals("groovy-source:///test/binary/AttachedOuter.java", loc.getUri());
+        assertEquals(7, loc.getRange().getStart().getLine());
     }
 
     @Test
@@ -796,6 +866,19 @@ class DefinitionProviderTest {
         return (Location) m.invoke(provider, type);
     }
 
+    private Location invokeToLocation(IJavaElement element) throws Exception {
+        Method m = DefinitionProvider.class.getDeclaredMethod("toLocation", IJavaElement.class);
+        m.setAccessible(true);
+        return (Location) m.invoke(provider, element);
+    }
+
+    private IType invokeFindTypeCached(org.eclipse.jdt.core.IJavaProject project, String fqn) throws Exception {
+        Method m = DefinitionProvider.class.getDeclaredMethod(
+                "findTypeCached", org.eclipse.jdt.core.IJavaProject.class, String.class, Class.forName("org.eclipse.groovy.ls.core.providers.DefinitionProvider$SourceLookupContext"));
+        m.setAccessible(true);
+        return (IType) m.invoke(provider, project, fqn, null);
+    }
+
     // ================================================================
     // JDT Mock Tests — offsetToPosition
     // ================================================================
@@ -805,6 +888,32 @@ class DefinitionProviderTest {
         Position pos = invokeOffsetToPosition("hello world", 5);
         assertEquals(0, pos.getLine());
         assertEquals(5, pos.getCharacter());
+    }
+
+    @Test
+    void findTypeCachedFallsBackToBinaryNestedFqn() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        IType type = mock(IType.class);
+
+        when(project.findType("test.binary.AttachedOuter.Inner")).thenReturn(null);
+        when(project.findType("test.binary.AttachedOuter$Inner")).thenReturn(type);
+
+        IType result = invokeFindTypeCached(project, "test.binary.AttachedOuter.Inner");
+
+        assertEquals(type, result);
+    }
+
+    @Test
+    void findTypeCachedDoesNotRewriteUppercasePackageSegments() throws Exception {
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        IType type = mock(IType.class);
+
+        when(project.findType("com.Acme.tools.Widget.Inner")).thenReturn(type);
+
+        IType result = invokeFindTypeCached(project, "com.Acme.tools.Widget.Inner");
+
+        assertEquals(type, result);
+        verify(project, times(1)).findType("com.Acme.tools.Widget.Inner");
     }
 
     @Test

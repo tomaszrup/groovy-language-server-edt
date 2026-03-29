@@ -460,7 +460,7 @@ public class HoverProvider {
             return workspaceSource;
         }
 
-        String fqn = type.getFullyQualifiedName();
+        String fqn = SourceJarHelper.binaryTypeFqn(type);
         if (type.getClassFile() == null) {
             return SourceJarHelper.readSourceFromJdkSrcZip(fqn);
         }

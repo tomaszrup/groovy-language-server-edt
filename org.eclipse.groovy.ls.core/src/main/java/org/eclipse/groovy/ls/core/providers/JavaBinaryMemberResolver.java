@@ -42,7 +42,7 @@ final class JavaBinaryMemberResolver {
             return type;
         }
 
-        String fullyQualifiedName = type.getFullyQualifiedName();
+        String fullyQualifiedName = SourceJarHelper.binaryTypeFqn(type);
         if (fullyQualifiedName == null || fullyQualifiedName.isBlank()) {
             return type;
         }

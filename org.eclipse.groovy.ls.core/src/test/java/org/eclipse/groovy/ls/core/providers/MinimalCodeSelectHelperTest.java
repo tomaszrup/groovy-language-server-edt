@@ -1197,6 +1197,14 @@ class MinimalCodeSelectHelperTest {
         return (MethodCallExpression) m.invoke(helper, module, offset, methodName, source);
     }
 
+    private IJavaElement invokeResolveDotMethodCall(ModuleNode module, IJavaProject project,
+            String source, int offset, String word) throws Exception {
+        Method m = MinimalCodeSelectHelper.class.getDeclaredMethod(
+                "resolveDotMethodCall", ModuleNode.class, IJavaProject.class, String.class, int.class, String.class);
+        m.setAccessible(true);
+        return (IJavaElement) m.invoke(helper, module, project, source, offset, word);
+    }
+
     @Test
     void findMethodCallAtOffsetFindsCall() throws Exception {
         String source = "class A { void foo() { 'hello'.toUpperCase() } }";
@@ -1213,6 +1221,57 @@ class MinimalCodeSelectHelperTest {
         ModuleNode module = parseModule(source);
         MethodCallExpression result = invokeFindMethodCallAtOffset(module, 0, "nonexistent", source);
         assertNull(result);
+    }
+
+    @Test
+    void resolveDotMethodCallFindsNestedTypeInQualifiedStaticChain() throws Exception {
+        String source = "import org.springframework.test.annotation.DirtiesContext\n"
+                + "class A { def x = DirtiesContext.ClassMode }";
+        ModuleNode module = parseModule(source);
+        IJavaProject project = mock(IJavaProject.class);
+        IType outerType = mock(IType.class);
+        IType innerType = mock(IType.class);
+
+        when(project.findType("org.springframework.test.annotation.DirtiesContext")).thenReturn(outerType);
+        when(outerType.getElementName()).thenReturn("DirtiesContext");
+        when(outerType.getFields()).thenReturn(new IField[0]);
+        when(outerType.getMethods()).thenReturn(new IMethod[0]);
+        when(outerType.getTypes()).thenReturn(new IType[] { innerType });
+        when(outerType.getJavaProject()).thenReturn(project);
+        when(innerType.getElementName()).thenReturn("ClassMode");
+
+        int offset = source.indexOf("ClassMode");
+        IJavaElement result = invokeResolveDotMethodCall(module, project, source, offset, "ClassMode");
+
+        assertEquals(innerType, result);
+    }
+
+    @Test
+    void resolveDotMethodCallFindsEnumConstantInNestedTypeChain() throws Exception {
+        String source = "import org.springframework.test.annotation.DirtiesContext\n"
+                + "class A { def x = DirtiesContext.ClassMode.BEFORE_EACH_TEST_METHOD }";
+        ModuleNode module = parseModule(source);
+        IJavaProject project = mock(IJavaProject.class);
+        IType outerType = mock(IType.class);
+        IType innerType = mock(IType.class);
+        IField enumConstant = mock(IField.class);
+
+        when(project.findType("org.springframework.test.annotation.DirtiesContext")).thenReturn(outerType);
+        when(outerType.getElementName()).thenReturn("DirtiesContext");
+        when(outerType.getFields()).thenReturn(new IField[0]);
+        when(outerType.getMethods()).thenReturn(new IMethod[0]);
+        when(outerType.getTypes()).thenReturn(new IType[] { innerType });
+        when(outerType.getJavaProject()).thenReturn(project);
+        when(innerType.getElementName()).thenReturn("ClassMode");
+        when(innerType.getFields()).thenReturn(new IField[] { enumConstant });
+        when(innerType.getMethods()).thenReturn(new IMethod[0]);
+        when(enumConstant.getElementName()).thenReturn("BEFORE_EACH_TEST_METHOD");
+
+        int offset = source.indexOf("BEFORE_EACH_TEST_METHOD");
+        IJavaElement result = invokeResolveDotMethodCall(module, project, source, offset,
+                "BEFORE_EACH_TEST_METHOD");
+
+        assertEquals(enumConstant, result);
     }
 
     // ================================================================

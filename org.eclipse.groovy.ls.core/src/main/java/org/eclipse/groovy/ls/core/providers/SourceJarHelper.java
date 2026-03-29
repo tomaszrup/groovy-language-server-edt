@@ -11,6 +11,7 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.io.File;
 import java.io.InputStream;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Enumeration;
@@ -80,13 +81,14 @@ public class SourceJarHelper {
      */
     public static String buildGroovySourceUri(String fqn, String ext, String sourcesJarPath,
                                                boolean isJdk, String content) {
-        String pathPart = fqn.replace('.', '/') + ext;
+        String uriFqn = binaryTypeFqn(fqn);
+        String pathPart = sourceFileFqn(uriFqn).replace('.', '/') + ext;
         String uriStr = "groovy-source:///" + pathPart;
         if (content != null) {
-            contentCache.put(fqn, new CacheEntry(content));
+            cacheContent(uriFqn, content);
         }
         GroovyLanguageServerPlugin.logInfo("[source] Built virtual URI: " + uriStr
-                + " (cached FQN=" + fqn + ", sourceJar=" + sourcesJarPath
+                + " (cached FQN=" + uriFqn + ", sourceJar=" + sourcesJarPath
                 + ", isJdk=" + isJdk + ")");
         return uriStr;
     }
@@ -102,7 +104,21 @@ public class SourceJarHelper {
      */
     public static String extractFqnFromUri(String uriStr) {
         if (uriStr == null || !uriStr.startsWith(GROOVY_SOURCE_SCHEME)) return null;
-        String rest = uriStr.substring(GROOVY_SOURCE_SCHEME.length());
+        String rest;
+        try {
+            URI uri = URI.create(uriStr);
+            rest = uri.getPath();
+            if (rest == null || rest.isBlank()) {
+                rest = uri.getSchemeSpecificPart();
+            }
+        } catch (IllegalArgumentException e) {
+            rest = uriStr.substring(GROOVY_SOURCE_SCHEME.length());
+        }
+
+        if (rest == null || rest.isBlank()) {
+            return null;
+        }
+
         // Strip leading slashes (could be /// or /)
         while (rest.startsWith("/")) rest = rest.substring(1);
         // Strip query/fragment if present (shouldn't be, but be safe)
@@ -124,11 +140,67 @@ public class SourceJarHelper {
      * Example: {@code a.b.Outer$Inner$Leaf -> a.b.Outer}.
      */
     static String sourceFileFqn(String fqn) {
-        if (fqn == null || fqn.isBlank()) {
-            return fqn;
+        String binaryFqn = binaryTypeFqn(fqn);
+        if (binaryFqn == null || binaryFqn.isBlank()) {
+            return binaryFqn;
         }
-        int dollar = fqn.indexOf('$');
-        return dollar >= 0 ? fqn.substring(0, dollar) : fqn;
+        int dollar = binaryFqn.indexOf('$');
+        return dollar >= 0 ? binaryFqn.substring(0, dollar) : binaryFqn;
+    }
+
+    static String binaryTypeFqn(IType type) {
+        if (type == null) {
+            return null;
+        }
+        return binaryTypeFqn(type.getFullyQualifiedName('$'), type.getFullyQualifiedName());
+    }
+
+    static String binaryTypeFqn(String fqn) {
+        return binaryTypeFqn(fqn, fqn);
+    }
+
+    private static String binaryTypeFqn(String preferred, String fallback) {
+        if (preferred != null && !preferred.isBlank()) {
+            if (preferred.indexOf('$') >= 0) {
+                return preferred;
+            }
+
+            String[] segments = preferred.split("\\.");
+            int typeStart = -1;
+            for (int index = 0; index < segments.length; index++) {
+                String segment = segments[index];
+                if (!segment.isEmpty() && Character.isUpperCase(segment.charAt(0))) {
+                    typeStart = index;
+                    break;
+                }
+            }
+
+            if (typeStart >= 0 && typeStart < segments.length - 1
+                    && allTypeSegmentsLookLikeTypes(segments, typeStart)) {
+                StringBuilder builder = new StringBuilder(preferred.length());
+                for (int index = 0; index < segments.length; index++) {
+                    if (index > 0) {
+                        builder.append(index > typeStart ? '$' : '.');
+                    }
+                    builder.append(segments[index]);
+                }
+                return builder.toString();
+            }
+
+            return preferred;
+        }
+
+        return fallback;
+    }
+
+    private static boolean allTypeSegmentsLookLikeTypes(String[] segments, int typeStart) {
+        for (int index = typeStart; index < segments.length; index++) {
+            String segment = segments[index];
+            if (segment.isEmpty() || !Character.isUpperCase(segment.charAt(0))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -148,7 +220,7 @@ public class SourceJarHelper {
         GroovyLanguageServerPlugin.logInfo("[source] Resolving FQN=" + fqn + " from URI: " + uriStr);
 
         // 1. Check in-memory cache by FQN
-        CacheEntry entry = contentCache.get(fqn);
+        CacheEntry entry = getCachedEntry(fqn);
         if (entry != null) {
             GroovyLanguageServerPlugin.logInfo("[source] Cache hit for FQN: " + fqn);
             return entry.content;
@@ -157,7 +229,7 @@ public class SourceJarHelper {
         // 2. Try JDK src.zip
         String jdkSource = readSourceFromJdkSrcZip(fqn);
         if (jdkSource != null) {
-            contentCache.put(fqn, new CacheEntry(jdkSource));
+            cacheContent(fqn, jdkSource);
             return jdkSource;
         }
 
@@ -169,8 +241,51 @@ public class SourceJarHelper {
      * Get cached content for a FQN directly (used by navigation within virtual docs).
      */
     public static String getCachedContent(String fqn) {
-        CacheEntry entry = contentCache.get(fqn);
+        CacheEntry entry = getCachedEntry(fqn);
         return entry != null ? entry.content : null;
+    }
+
+    private static CacheEntry getCachedEntry(String fqn) {
+        if (fqn == null || fqn.isBlank()) {
+            return null;
+        }
+
+        CacheEntry direct = contentCache.get(fqn);
+        if (direct != null) {
+            return direct;
+        }
+
+        String binaryFqn = binaryTypeFqn(fqn);
+        if (binaryFqn != null && !binaryFqn.equals(fqn)) {
+            CacheEntry binary = contentCache.get(binaryFqn);
+            if (binary != null) {
+                return binary;
+            }
+        }
+
+        if (fqn.indexOf('$') >= 0) {
+            return contentCache.get(fqn.replace('$', '.'));
+        }
+
+        return null;
+    }
+
+    private static void cacheContent(String fqn, String content) {
+        if (fqn == null || fqn.isBlank() || content == null) {
+            return;
+        }
+
+        String binaryFqn = binaryTypeFqn(fqn);
+        String sourceFileFqn = sourceFileFqn(binaryFqn);
+        CacheEntry entry = new CacheEntry(content);
+        contentCache.put(binaryFqn, entry);
+
+        if (binaryFqn.indexOf('$') >= 0) {
+            contentCache.put(binaryFqn.replace('$', '.'), entry);
+        }
+
+        contentCache.put(sourceFileFqn, entry);
+        contentCache.put(fqn, entry);
     }
 
     /**

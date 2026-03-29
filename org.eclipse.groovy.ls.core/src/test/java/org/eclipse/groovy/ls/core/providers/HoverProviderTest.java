@@ -731,7 +731,9 @@ class HoverProviderTest {
         when(type.getSuperclassName()).thenReturn(null);
         when(type.getSuperInterfaceNames()).thenReturn(new String[0]);
         when(type.getFullyQualifiedName()).thenReturn(
-                "org.springframework.test.annotation.DirtiesContext$ClassMode");
+            "org.springframework.test.annotation.DirtiesContext.ClassMode");
+        when(type.getFullyQualifiedName('$')).thenReturn(
+            "org.springframework.test.annotation.DirtiesContext$ClassMode");
         when(type.getClassFile()).thenReturn(mock(IOrdinaryClassFile.class));
         when(type.getCompilationUnit()).thenReturn(null);
         when(type.getResource()).thenReturn(null);

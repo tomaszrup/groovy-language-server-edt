@@ -62,9 +62,35 @@ class SourceJarHelperTest {
     }
 
     @Test
+    void extractFqnFromUriDecodesEncodedInnerClassMarker() {
+        assertEquals("a.b.Outer$Inner",
+                SourceJarHelper.extractFqnFromUri("groovy-source:///a/b/Outer%24Inner.java"));
+    }
+
+    @Test
     void sourceFileFqnReturnsTopLevelOwnerForNestedType() {
         assertEquals("a.b.Outer", SourceJarHelper.sourceFileFqn("a.b.Outer$Inner$Leaf"));
+        assertEquals("a.b.Outer", SourceJarHelper.sourceFileFqn("a.b.Outer.Inner.Leaf"));
         assertEquals("a.b.Outer", SourceJarHelper.sourceFileFqn("a.b.Outer"));
+    }
+
+    @Test
+    void buildUriNormalizesDottedNestedTypeToOuterSourcePath() {
+        String content = "class Outer { enum Inner { VALUE } }\n";
+
+        String uri = SourceJarHelper.buildGroovySourceUri("a.b.Outer.Inner", ".java", null, false, content);
+
+        assertEquals("groovy-source:///a/b/Outer.java", uri);
+        assertEquals(content, SourceJarHelper.resolveSourceContent(uri));
+        assertEquals(content, SourceJarHelper.getCachedContent("a.b.Outer"));
+        assertEquals(content, SourceJarHelper.getCachedContent("a.b.Outer.Inner"));
+        assertEquals(content, SourceJarHelper.getCachedContent("a.b.Outer$Inner"));
+    }
+
+    @Test
+    void binaryTypeFqnDoesNotTreatUppercasePackageSegmentAsNestedType() {
+        assertEquals("com.Acme.tools.Widget.Inner",
+                SourceJarHelper.binaryTypeFqn("com.Acme.tools.Widget.Inner"));
     }
 
     @Test

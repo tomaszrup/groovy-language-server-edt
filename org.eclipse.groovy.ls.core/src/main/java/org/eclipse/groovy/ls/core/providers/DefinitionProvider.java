@@ -119,6 +119,12 @@ public class DefinitionProvider {
         }
 
         IType resolved = project.findType(fqn);
+        if (resolved == null) {
+            String binaryFqn = SourceJarHelper.binaryTypeFqn(fqn);
+            if (binaryFqn != null && !binaryFqn.equals(fqn)) {
+                resolved = project.findType(binaryFqn);
+            }
+        }
         if (context != null) {
             context.resolvedTypes.remove(cacheKey);
             context.missingTypes.remove(cacheKey);
@@ -278,7 +284,22 @@ public class DefinitionProvider {
                 return null;
             }
 
-            return resolveLocationForType(type, sourceLookupContext);
+            Location typeLocation = resolveLocationForType(type, sourceLookupContext);
+            if (typeLocation == null) {
+                return null;
+            }
+
+            if (!(element instanceof IType) && typeLocation.getUri() != null
+                    && typeLocation.getUri().startsWith("groovy-source:")) {
+                String source = SourceJarHelper.resolveSourceContent(typeLocation.getUri());
+                if (source != null && !source.isEmpty()) {
+                    Range memberRange = BinaryTypeLocationResolver.findDeclarationRange(
+                            source, element, element.getElementName());
+                    return new Location(typeLocation.getUri(), memberRange);
+                }
+            }
+
+            return typeLocation;
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to resolve location for " + element.getElementName(), e);
             return null;
@@ -348,7 +369,7 @@ public class DefinitionProvider {
     }
 
     private Location resolveLocationForType(IType type, SourceLookupContext sourceLookupContext) {
-        String fqn = type.getFullyQualifiedName();
+        String fqn = SourceJarHelper.binaryTypeFqn(type);
         GroovyLanguageServerPlugin.logInfo("[definition] Binary type: " + fqn
                 + " — searching for source");
 

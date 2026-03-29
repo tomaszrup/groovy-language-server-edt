@@ -375,6 +375,35 @@ class TypeDefinitionProviderTest {
     }
 
     @Test
+    void toLocationUsesAttachedBinarySourceForNestedTypeWithDottedFqn() throws Exception {
+        org.eclipse.jdt.core.IType type = mock(org.eclipse.jdt.core.IType.class);
+        when(type.getResource()).thenReturn(null);
+        when(type.getCompilationUnit()).thenReturn(null);
+        when(type.getFullyQualifiedName()).thenReturn("type.definition.AttachedOuter.Inner");
+        when(type.getFullyQualifiedName('$')).thenReturn("type.definition.AttachedOuter$Inner");
+        when(type.getElementName()).thenReturn("Inner");
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(null);
+
+        IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
+        when(type.getClassFile()).thenReturn(classFile);
+        String source = """
+                package type.definition;
+                public class AttachedOuter {
+                    public enum Inner {
+                        VALUE;
+                    }
+                }
+                """;
+        when(classFile.getSource()).thenReturn(source);
+
+        Location loc = invokeToLocation(type);
+
+        assertNotNull(loc);
+        assertEquals("groovy-source:///type/definition/AttachedOuter.java", loc.getUri());
+        assertEquals(source, SourceJarHelper.resolveSourceContent(loc.getUri()));
+    }
+
+    @Test
     void toLocationReturnsNullWhenBinaryTypeHasNoSource() throws Exception {
         org.eclipse.jdt.core.IType type = mock(org.eclipse.jdt.core.IType.class);
         when(type.getResource()).thenReturn(null);
