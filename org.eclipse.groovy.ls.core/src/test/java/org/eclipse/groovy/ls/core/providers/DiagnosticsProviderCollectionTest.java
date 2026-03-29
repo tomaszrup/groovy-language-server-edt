@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
+import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticSeverity;
@@ -72,6 +73,278 @@ class DiagnosticsProviderCollectionTest {
 
         assertFalse(diagnostics.isEmpty(), "Should reuse cached syntax diagnostics");
         verifyNoInteractions(workingCopy);
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsSuppressesUnresolvedClassFailuresDuringStartupSyntaxOnlyMode() throws Exception {
+        DocumentManager documentManager = new DocumentManager();
+        String uri = "file:///StartupUnresolved.groovy";
+        documentManager.didOpen(uri, "import foo.Bar\nclass StartupUnresolved { Bar field }\n");
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> false);
+        provider.setInitializationCompleteSupplier(() -> false);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertTrue(diagnostics.isEmpty(), "Startup syntax-only diagnostics should suppress unresolved classes");
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsStillReportsParserErrorsDuringStartupSyntaxOnlyMode() throws Exception {
+        DocumentManager documentManager = new DocumentManager();
+        String uri = "file:///StartupSyntaxError.groovy";
+        documentManager.didOpen(uri, "class StartupSyntaxError {\n");
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> false);
+        provider.setInitializationCompleteSupplier(() -> false);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertFalse(diagnostics.isEmpty(), "Startup syntax-only diagnostics should still report parser errors");
+        assertTrue(diagnostics.stream()
+                .noneMatch(d -> {
+                    String message = messageText(d);
+                    return message != null
+                            && (message.contains("unable to resolve class")
+                                || message.contains("No such class"));
+                }));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsSuppressesQuotedUnresolvedClassFailuresDuringStartupSyntaxOnlyMode()
+            throws Exception {
+        SeededParseDocumentManager documentManager = new SeededParseDocumentManager();
+        String uri = "file:///StartupQuotedUnresolved.groovy";
+        documentManager.didOpen(uri, "class StartupQuotedUnresolved {}\n");
+        documentManager.seedCachedParseResult(
+                uri,
+                new GroovyCompilerService.ParseResult(
+                        null,
+                        List.of(new org.codehaus.groovy.syntax.SyntaxException(
+                                "unable to resolve class 'foo.Bar'",
+                                1,
+                                1,
+                                1,
+                                10))));
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> false);
+        provider.setInitializationCompleteSupplier(() -> false);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertTrue(
+                diagnostics.isEmpty(),
+                "Startup syntax-only diagnostics should suppress quoted unresolved classes");
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsSuppressesWrappedClasspathFailuresDuringStartupSyntaxOnlyMode()
+        throws Exception {
+    SeededParseDocumentManager documentManager = new SeededParseDocumentManager();
+    String uri = "file:///StartupWrappedClasspathFailure.groovy";
+    documentManager.didOpen(uri, "class StartupWrappedClasspathFailure {}\n");
+    documentManager.seedCachedParseResult(
+        uri,
+        new GroovyCompilerService.ParseResult(
+            null,
+            List.of(
+                new org.codehaus.groovy.syntax.SyntaxException(
+                    "Parse error: No such class: foo.Bar -- while compiling",
+                    1,
+                    1,
+                    1,
+                    10),
+                new org.codehaus.groovy.syntax.SyntaxException(
+                    "Parse error: Groovy:General error during conversion: startup wrapper",
+                    1,
+                    1,
+                    1,
+                    10),
+                new org.codehaus.groovy.syntax.SyntaxException(
+                    "Internal parse error: unable to resolve class 'foo.Bar'",
+                    1,
+                    1,
+                    1,
+                    10))));
+
+    DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+    provider.setClasspathChecker(ignored -> false);
+    provider.setInitializationCompleteSupplier(() -> false);
+    provider.setBuildInProgressSupplier(() -> false);
+
+    List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+    assertTrue(
+        diagnostics.isEmpty(),
+        "Startup syntax-only diagnostics should suppress wrapped classpath failures");
+
+    documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsReportsUnresolvedClassFailuresAfterStartupWithoutWorkingCopy() throws Exception {
+        SeededParseDocumentManager documentManager = new SeededParseDocumentManager();
+        String uri = "file:///StandaloneAfterStartup.groovy";
+        documentManager.didOpen(uri, "import foo.Bar\nclass StandaloneAfterStartup { Bar field }\n");
+        documentManager.seedCachedParseResult(
+                uri,
+                new GroovyCompilerService.ParseResult(
+                        null,
+                        List.of(new org.codehaus.groovy.syntax.SyntaxException(
+                                "No such class: foo.Bar -- while compiling",
+                                1,
+                                8,
+                                1,
+                                15))));
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> true);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertNull(documentManager.getWorkingCopy(uri), "Test should stay on the standalone fallback path");
+        assertTrue(diagnostics.stream()
+                .map(DiagnosticsProviderCollectionTest::messageText)
+                .anyMatch(message -> message != null
+                        && (message.contains("unable to resolve class")
+                            || message.contains("No such class"))),
+                diagnosticMessages(diagnostics));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsReportsWrappedClasspathFailuresAfterStartupWithoutWorkingCopy()
+            throws Exception {
+        SeededParseDocumentManager documentManager = new SeededParseDocumentManager();
+        String uri = "file:///StandaloneWrappedAfterStartup.groovy";
+        documentManager.didOpen(uri, "import foo.Bar\nclass StandaloneWrappedAfterStartup { Bar field }\n");
+        documentManager.seedCachedParseResult(
+                uri,
+                new GroovyCompilerService.ParseResult(
+                        null,
+                        List.of(new org.codehaus.groovy.syntax.SyntaxException(
+                                "Parse error: No such class: foo.Bar -- while compiling",
+                                1,
+                                8,
+                                1,
+                                15))));
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> true);
+        provider.setInitializationCompleteSupplier(() -> true);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertNull(documentManager.getWorkingCopy(uri), "Test should stay on the standalone fallback path");
+        assertTrue(diagnostics.stream()
+                .map(DiagnosticsProviderCollectionTest::messageText)
+                .anyMatch(message -> message != null && message.contains("No such class")),
+                diagnosticMessages(diagnostics));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsReportsUnresolvedClassFailuresForNoRootProjectOnceClasspathArrives() throws Exception {
+        SeededParseDocumentManager documentManager = new SeededParseDocumentManager();
+        String uri = "file:///NoRootStandaloneAfterClasspath.groovy";
+        documentManager.didOpen(uri, "import foo.Bar\nclass NoRootStandaloneAfterClasspath { Bar field }\n");
+        documentManager.seedCachedParseResult(
+                uri,
+                new GroovyCompilerService.ParseResult(
+                        null,
+                        List.of(new org.codehaus.groovy.syntax.SyntaxException(
+                                "No such class: foo.Bar -- while compiling",
+                                1,
+                                8,
+                                1,
+                                15))));
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> true);
+        provider.setInitializationCompleteSupplier(() -> false);
+        provider.setStandaloneFallbackReadyChecker(uri::equals);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertNull(documentManager.getWorkingCopy(uri), "Test should stay on the standalone fallback path");
+        assertTrue(diagnostics.stream()
+                .map(DiagnosticsProviderCollectionTest::messageText)
+                .anyMatch(message -> message != null
+                        && (message.contains("unable to resolve class")
+                            || message.contains("No such class"))),
+                diagnosticMessages(diagnostics));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectSyntaxDiagnosticsReportsUnresolvedClassFailuresAfterStartup() throws Exception {
+        SeededParseDocumentManager documentManager = new SeededParseDocumentManager();
+        String uri = "file:///SyntaxPreviewAfterStartup.groovy";
+        documentManager.didOpen(uri, "import foo.Bar\nclass SyntaxPreviewAfterStartup { Bar field }\n");
+        documentManager.seedCachedParseResult(
+                uri,
+                new GroovyCompilerService.ParseResult(
+                        null,
+                        List.of(new org.codehaus.groovy.syntax.SyntaxException(
+                                "No such class: foo.Bar -- while compiling",
+                                1,
+                                8,
+                                1,
+                                15))));
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> true);
+        provider.setInitializationCompleteSupplier(() -> true);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectSyntaxDiagnostics(provider, uri);
+
+        assertTrue(diagnostics.stream()
+                .map(DiagnosticsProviderCollectionTest::messageText)
+                .anyMatch(message -> message != null
+                        && (message.contains("unable to resolve class")
+                            || message.contains("No such class"))),
+                diagnosticMessages(diagnostics));
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void collectDiagnosticsReusesCachedStartupParseWithoutReparsing() throws Exception {
+        TrackingDocumentManager documentManager = new TrackingDocumentManager();
+        String uri = "file:///StartupCachedStandalone.groovy";
+        documentManager.didOpen(uri, "import foo.Bar\nclass StartupCachedStandalone { Bar field }\n");
+
+        DiagnosticsProvider provider = new DiagnosticsProvider(documentManager);
+        provider.setClasspathChecker(ignored -> false);
+        provider.setInitializationCompleteSupplier(() -> false);
+        provider.setBuildInProgressSupplier(() -> false);
+
+        List<Diagnostic> diagnostics = invokeCollectDiagnostics(provider, uri);
+
+        assertTrue(diagnostics.isEmpty(), "Startup syntax-only diagnostics should still suppress unresolved classes");
+        assertEquals(1, documentManager.trackingCompilerService.parseCalls);
+        assertEquals(0, documentManager.trackingCompilerService.collectSyntaxErrorsCalls);
 
         documentManager.didClose(uri);
     }
@@ -251,6 +524,13 @@ class DiagnosticsProviderCollectionTest {
         method.invoke(provider, uri, diagnostics);
     }
 
+    @SuppressWarnings("unchecked")
+    private List<Diagnostic> invokeCollectSyntaxDiagnostics(DiagnosticsProvider provider, String uri) throws Exception {
+        Method method = DiagnosticsProvider.class.getDeclaredMethod("collectSyntaxDiagnostics", String.class);
+        method.setAccessible(true);
+        return (List<Diagnostic>) method.invoke(provider, uri);
+    }
+
     /**
      * Extract the plain-text message from a Diagnostic, handling the
      * {@code Either<String, MarkupContent>} return type in LSP4j 1.0.
@@ -271,5 +551,100 @@ class DiagnosticsProviderCollectionTest {
             }
         }
         return msg.toString();
+    }
+
+    private static String diagnosticMessages(List<Diagnostic> diagnostics) {
+        List<String> messages = diagnostics.stream()
+                .map(DiagnosticsProviderCollectionTest::messageText)
+                .toList();
+        return "messages=" + messages;
+    }
+
+    private static final class TrackingDocumentManager extends DocumentManager {
+        private final TrackingGroovyCompilerService trackingCompilerService =
+                new TrackingGroovyCompilerService();
+
+        @Override
+        public void didOpen(String uri, String text) {
+            super.didOpen(uri, text);
+            trackingCompilerService.parse(uri, text);
+        }
+
+        @Override
+        public void didClose(String uri) {
+            super.didClose(uri);
+            trackingCompilerService.invalidateDocumentFamily(uri);
+        }
+
+        @Override
+        public GroovyCompilerService getCompilerService() {
+            return trackingCompilerService;
+        }
+    }
+
+    private static final class SeededParseDocumentManager extends DocumentManager {
+        private final SeededGroovyCompilerService seededGroovyCompilerService =
+                new SeededGroovyCompilerService();
+
+        void seedCachedParseResult(String uri, GroovyCompilerService.ParseResult result) {
+            seededGroovyCompilerService.seedParseResult(uri, result);
+        }
+
+        @Override
+        public void didClose(String uri) {
+            super.didClose(uri);
+            seededGroovyCompilerService.invalidateDocumentFamily(uri);
+        }
+
+        @Override
+        public GroovyCompilerService getCompilerService() {
+            return seededGroovyCompilerService;
+        }
+    }
+
+    private static final class TrackingGroovyCompilerService extends GroovyCompilerService {
+        private int parseCalls;
+        private int collectSyntaxErrorsCalls;
+
+        @Override
+        public ParseResult parse(String uri, String source) {
+            parseCalls++;
+            return super.parse(uri, source);
+        }
+
+        @Override
+        public List<org.codehaus.groovy.syntax.SyntaxException> collectSyntaxErrors(
+                String uri,
+                String source) {
+            collectSyntaxErrorsCalls++;
+            return super.collectSyntaxErrors(uri, source);
+        }
+    }
+
+    private static final class SeededGroovyCompilerService extends GroovyCompilerService {
+        private final java.util.Map<String, ParseResult> seededResults =
+                new java.util.concurrent.ConcurrentHashMap<>();
+
+        void seedParseResult(String uri, ParseResult result) {
+            seededResults.put(DocumentManager.normalizeUri(uri), result);
+        }
+
+        @Override
+        public ParseResult getCachedResult(String uri) {
+            ParseResult seeded = seededResults.get(DocumentManager.normalizeUri(uri));
+            return seeded != null ? seeded : super.getCachedResult(uri);
+        }
+
+        @Override
+        public ParseResult parse(String uri, String source) {
+            ParseResult seeded = seededResults.get(DocumentManager.normalizeUri(uri));
+            return seeded != null ? seeded : super.parse(uri, source);
+        }
+
+        @Override
+        public void invalidateDocumentFamily(String uri) {
+            seededResults.remove(DocumentManager.normalizeUri(uri));
+            super.invalidateDocumentFamily(uri);
+        }
     }
 }

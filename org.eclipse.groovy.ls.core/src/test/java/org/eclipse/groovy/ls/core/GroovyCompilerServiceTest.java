@@ -16,8 +16,10 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -50,6 +52,62 @@ class GroovyCompilerServiceTest {
 
         assertNotNull(result);
         assertFalse(result.getErrors().isEmpty());
+    }
+
+    @Test
+    void collectSyntaxErrorsDoesNotCacheConversionResult() throws IOException {
+        GroovyCompilerService service = new GroovyCompilerService();
+        String uri = createSourceUri("SyntaxOnly.groovy");
+
+        List<org.codehaus.groovy.syntax.SyntaxException> errors =
+                service.collectSyntaxErrors(uri, "class Broken {\n");
+
+        assertFalse(errors.isEmpty());
+        assertNull(service.getCachedResult(uri));
+    }
+
+    @Test
+    void collectSyntaxErrorsDoesNotReportUnresolvedTypes() throws IOException {
+        GroovyCompilerService service = new GroovyCompilerService();
+        String uri = createSourceUri("UnresolvedType.groovy");
+
+        List<org.codehaus.groovy.syntax.SyntaxException> errors =
+                service.collectSyntaxErrors(uri, "import foo.Bar\nclass A { Bar field }\n");
+
+        assertTrue(errors.isEmpty());
+        assertNull(service.getCachedResult(uri));
+    }
+
+    @Test
+    void classpathFailureDetectionTreatsQuotedUnresolvedClassAsClasspathDependent() throws Exception {
+        GroovyCompilerService service = new GroovyCompilerService();
+        Method method = GroovyCompilerService.class
+                .getDeclaredMethod("isClasspathDependentFailure", String.class);
+        method.setAccessible(true);
+
+        boolean classpathDependent = (boolean) method.invoke(
+                service,
+                "unable to resolve class 'foo.Bar'");
+
+        assertTrue(classpathDependent);
+    }
+
+    @Test
+    void classpathFailureDetectionTreatsWrappedClasspathFailuresAsClasspathDependent() throws Exception {
+    GroovyCompilerService service = new GroovyCompilerService();
+    Method method = GroovyCompilerService.class
+        .getDeclaredMethod("isClasspathDependentFailure", String.class);
+    method.setAccessible(true);
+
+    assertTrue((boolean) method.invoke(
+        service,
+        "Parse error: No such class: foo.Bar -- while compiling"));
+    assertTrue((boolean) method.invoke(
+        service,
+        "Parse error: Groovy:General error during conversion: startup wrapper"));
+    assertTrue((boolean) method.invoke(
+        service,
+        "Internal parse error: unable to resolve class 'foo.Bar'"));
     }
 
     @Test

@@ -255,10 +255,14 @@ public class GroovyTextDocumentService implements TextDocumentService {
             // (e.g. deeply nested subprojects), so treat all files as having
             // a classpath once the build is done.
             if (server.isFirstBuildComplete()) return true;
-            String projectName = server.getProjectNameForUri(uri);
-            return projectName != null && server.hasClasspathForProject(projectName);
+            boolean allowWorkingCopyFallback = allowWorkingCopyClasspathFallback();
+            if (server.getWorkspaceRoot() != null && !allowWorkingCopyFallback) {
+                return false;
+            }
+            return hasResolvedClasspathForUri(uri, allowWorkingCopyFallback);
         });
-        this.diagnosticsProvider.setInitializationCompleteSupplier(server::isFirstBuildComplete);
+        this.diagnosticsProvider.setInitializationCompleteSupplier(server::isInitialBuildSettled);
+        this.diagnosticsProvider.setStandaloneFallbackReadyChecker(this::canPublishFullDiagnostics);
         this.diagnosticsProvider.setBuildInProgressSupplier(server::isBuildInProgress);
         this.codeActionProvider = new CodeActionProvider(documentManager, diagnosticsProvider);
         this.inlayHintProvider = new InlayHintProvider(documentManager);
@@ -288,10 +292,12 @@ public class GroovyTextDocumentService implements TextDocumentService {
         documentManager.didOpen(uri, text);
         TraitMemberResolver.invalidateCache();
 
-        // A newly opened document may still be waiting for its background JDT
-        // working-copy refresh. Publish syntax-only diagnostics during that
-        // gap, then let the readiness callback trigger the full pass.
-        if (documentManager.isReadyForDiagnostics(uri)) {
+        // During workspace bootstrap, stay in syntax-only mode until the initial
+        // classpath batch and first build have completed. In no-root sessions,
+        // there is no workspace build, so a file can upgrade as soon as its
+        // imported project has received a concrete classpath update.
+        if (canPublishFullDiagnostics(uri) && documentManager.isReadyForDiagnostics(uri)) {
+            clearStandaloneFallbackCacheIfNeeded(uri);
             diagnosticsProvider.publishDiagnosticsImmediate(uri);
         } else {
             diagnosticsProvider.publishSyntaxDiagnosticsImmediate(uri);
@@ -344,7 +350,12 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
         // Re-publish diagnostics after changes
         if (server.areDiagnosticsEnabled()) {
-            diagnosticsProvider.publishDiagnosticsAfterChange(uri);
+            if (canPublishFullDiagnostics(uri)) {
+                clearStandaloneFallbackCacheIfNeeded(uri);
+                diagnosticsProvider.publishDiagnosticsAfterChange(uri);
+            } else {
+                diagnosticsProvider.publishSyntaxDiagnosticsImmediate(uri);
+            }
         }
     }
 
@@ -1343,8 +1354,91 @@ public class GroovyTextDocumentService implements TextDocumentService {
         if (server.areDiagnosticsEnabled()) {
             String clientUri = documentManager.getClientUri(uri);
             GroovyLanguageServerPlugin.logInfo("[diag-trace] publishDiagnosticsIfEnabled uri=" + clientUri);
-            diagnosticsProvider.publishDiagnosticsDebounced(clientUri);
+            if (canPublishFullDiagnostics(uri)) {
+                clearStandaloneFallbackCacheIfNeeded(uri);
+                diagnosticsProvider.publishDiagnosticsDebounced(clientUri);
+            } else {
+                diagnosticsProvider.publishSyntaxDiagnosticsImmediate(clientUri);
+            }
         }
+    }
+
+    private boolean canPublishFullDiagnostics(String uri) {
+        if (server.isFirstBuildComplete()) {
+            return true;
+        }
+        boolean allowWorkingCopyFallback = allowWorkingCopyClasspathFallback();
+        if (server.getWorkspaceRoot() != null && !allowWorkingCopyFallback) {
+            return false;
+        }
+
+        return hasResolvedClasspathForUri(uri, allowWorkingCopyFallback);
+    }
+
+    private boolean allowWorkingCopyClasspathFallback() {
+        if (server.getWorkspaceRoot() == null) {
+            return true;
+        }
+        return server.isInitialBuildStarted() && !server.isBuildInProgress();
+    }
+
+    private boolean hasResolvedClasspathForUri(String uri) {
+        return hasResolvedClasspathForUri(uri, true);
+    }
+
+    private boolean hasResolvedClasspathForUri(String uri, boolean allowWorkingCopyFallback) {
+        String projectName = resolveProjectNameForDiagnostics(uri, allowWorkingCopyFallback);
+        return projectName != null && server.hasClasspathForProject(projectName);
+    }
+
+    private String resolveProjectNameForDiagnostics(String uri) {
+        return resolveProjectNameForDiagnostics(uri, true);
+    }
+
+    private String resolveProjectNameForDiagnostics(String uri, boolean allowWorkingCopyFallback) {
+        String projectName = resolveProjectNameFromServer(uri);
+        if (projectName != null || !allowWorkingCopyFallback) {
+            return projectName;
+        }
+
+        // In no-root sessions the URI→project mapping can briefly lag behind
+        // the imported working copy. Use this document's concrete JDT project
+        // as a narrow fallback instead of treating any project as ready.
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        if (workingCopy == null) {
+            return null;
+        }
+
+        org.eclipse.jdt.core.IJavaProject javaProject = workingCopy.getJavaProject();
+        if (javaProject == null) {
+            return null;
+        }
+
+        String workingCopyProject = javaProject.getElementName();
+        return workingCopyProject == null || workingCopyProject.isBlank()
+                ? null
+                : workingCopyProject;
+    }
+
+    private String resolveProjectNameFromServer(String uri) {
+        String clientUri = documentManager.getClientUri(uri);
+        String uriForLookup = clientUri != null ? clientUri : uri;
+        return server.getProjectNameForUri(uriForLookup);
+    }
+
+    private void clearStandaloneFallbackCacheIfNeeded(String uri) {
+        if (!documentManager.hasJdtWorkingCopy(uri)) {
+            return;
+        }
+        if (!server.isFirstBuildComplete()) {
+            boolean allowWorkingCopyFallback = allowWorkingCopyClasspathFallback();
+            if (!hasResolvedClasspathForUri(uri, allowWorkingCopyFallback)) {
+                return;
+            }
+        }
+        // Once a usable JDT working copy is available, drop the startup
+        // standalone parse so cached fallback errors cannot mask reconcile.
+        documentManager.getCompilerService().invalidateDocumentFamily(uri);
     }
 
     /**
@@ -1383,7 +1477,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
                     "[diag-trace] publishDiagnosticsForOpenDocuments count="
                     + documentManager.getOpenDocumentUris().size());
             for (String uri : documentManager.getOpenDocumentUris()) {
-                diagnosticsProvider.publishDiagnosticsDebounced(documentManager.getClientUri(uri));
+                publishDiagnosticsIfEnabled(uri);
             }
         }
     }

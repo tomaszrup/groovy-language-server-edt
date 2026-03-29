@@ -44,6 +44,8 @@ import org.eclipse.lsp4j.services.LanguageClient;
  */
 public class DiagnosticsProvider {
 
+    private static final String INTERNAL_PARSE_ERROR_PREFIX = "Internal parse error: ";
+    private static final String PARSE_ERROR_PREFIX = "Parse error: ";
     private static final int TYPE_COLLISION_PROBLEM_ID = 16777539;
     private static final int GROOVY_RUN_SCRIPT_PROBLEM_ID = 67108964;
     /** IProblem.PackageIsNotExpectedPackage — false positive when AST has zero classes. */
@@ -92,7 +94,17 @@ public class DiagnosticsProvider {
         "groovy.util."
     };
     private static final Pattern UNABLE_TO_RESOLVE_CLASS_PATTERN =
-            Pattern.compile("(?i)unable to resolve class\\s+([\\w.$]+)");
+            Pattern.compile("(?i)unable to resolve class\\s+['\"]?([\\w.$]+)['\"]?");
+
+    /**
+     * Standalone-compiler diagnostics run in two modes:
+     * startup bootstrap suppresses temporary classpath-dependent failures,
+     * while the long-lived fallback path preserves all standalone errors.
+     */
+    private enum StandaloneCompilerMode {
+        STARTUP_FILTERED,
+        NORMAL_FALLBACK
+    }
 
     private final DocumentManager documentManager;
     private LanguageClient client;
@@ -109,6 +121,8 @@ public class DiagnosticsProvider {
      */
     private final java.util.concurrent.atomic.AtomicReference<java.util.function.BooleanSupplier> initializationCompleteSupplier =
             new java.util.concurrent.atomic.AtomicReference<>(() -> true);
+    private final java.util.concurrent.atomic.AtomicReference<java.util.function.Predicate<String>> standaloneFallbackReadyForUri =
+            new java.util.concurrent.atomic.AtomicReference<>();
     private final java.util.Map<String, List<Diagnostic>> latestDiagnosticsByUri =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -193,6 +207,16 @@ public class DiagnosticsProvider {
      */
     public void setInitializationCompleteSupplier(java.util.function.BooleanSupplier supplier) {
         this.initializationCompleteSupplier.set(supplier);
+    }
+
+    /**
+     * Set a predicate that returns {@code true} once the standalone fallback
+     * should stop using startup filtering for a given URI. This is used by
+     * no-root/external-project flows where a document can become "ready"
+     * as soon as its project classpath arrives, even without a workspace build.
+     */
+    public void setStandaloneFallbackReadyChecker(java.util.function.Predicate<String> checker) {
+        this.standaloneFallbackReadyForUri.set(checker);
     }
 
     public void setBuildInProgressSupplier(java.util.function.BooleanSupplier supplier) {
@@ -495,11 +519,14 @@ public class DiagnosticsProvider {
         // offset→position conversion from O(fileLength) to O(log lines).
         PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
 
-        // When no classpath is available for this project, report only syntax
-        // errors (from the standalone Groovy compiler) and append a warning at
-        // the top of the file so the user knows why full diagnostics are missing.
+        // When no classpath is available for this project, use the standalone
+        // compiler instead of JDT. During startup that path stays filtered to
+        // syntax-only issues; after initialization it can surface unresolved
+        // type failures as part of the long-lived fallback behavior.
         java.util.function.Predicate<String> checker = classpathAvailableForUri.get();
         boolean hasClasspath = checker == null || checker.test(uri);
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        StandaloneCompilerMode compilerMode = standaloneCompilerMode(uri, initComplete);
         GroovyLanguageServerPlugin.logInfo(
                 "[classpath-check] uri=" + uri
                 + " checkerPresent=" + (checker != null)
@@ -507,10 +534,8 @@ public class DiagnosticsProvider {
 
         GroovyCompilerService.ParseResult cachedParse =
                 documentManager.getCompilerService().getCachedResult(uri);
-        if (cachedParse != null && hasSyntaxErrors(cachedParse)) {
-            collectFromParseResult(cachedParse, diagnostics);
-
-            boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        if (cachedParse != null && hasSyntaxErrors(cachedParse, compilerMode)) {
+            collectFromParseResult(cachedParse, diagnostics, compilerMode);
             if (!hasClasspath && initComplete) {
                 diagnostics.add(createNoClasspathWarning(content));
             }
@@ -521,7 +546,7 @@ public class DiagnosticsProvider {
             GroovyLanguageServerPlugin.logInfo(
                     "[classpath-check] No classpath for " + uri + " → syntax-only mode");
             try {
-                collectFromGroovyCompiler(uri, diagnostics);
+                collectFromGroovyCompiler(uri, diagnostics, compilerMode);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError(
                     "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
@@ -531,7 +556,6 @@ public class DiagnosticsProvider {
             // missing classpath is expected and the warning would be a
             // false alarm for files that were already open when the server
             // started.
-            boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
             if (initComplete) {
                 diagnostics.add(createNoClasspathWarning(content));
             }
@@ -539,16 +563,16 @@ public class DiagnosticsProvider {
         }
 
         // When a build is in progress, the workspace lock is held and any
-        // JDT reconcile() call would block this thread indefinitely.  Use
-        // fast syntax-only diagnostics from the standalone Groovy compiler
-        // instead.  Full JDT diagnostics are published automatically after
-        // the build completes.
+        // JDT reconcile() call would block this thread indefinitely. Use the
+        // standalone compiler instead. During startup this remains filtered;
+        // after initialization it preserves the normal standalone fallback
+        // diagnostics until the post-build JDT pass runs.
         boolean buildRunning = buildInProgressSupplier.get().getAsBoolean();
         if (buildRunning) {
             GroovyLanguageServerPlugin.logInfo(
                     "[diag-trace] Build in progress → syntax-only diagnostics for " + uri);
             try {
-                collectFromGroovyCompiler(uri, diagnostics);
+                collectFromGroovyCompiler(uri, diagnostics, compilerMode);
             } catch (Exception e) {
                 GroovyLanguageServerPlugin.logError(
                     "Failed to collect syntax diagnostics (build in progress) for " + uri, e);
@@ -580,16 +604,18 @@ public class DiagnosticsProvider {
                         reconcileSemaphore.release();
                     }
                 } else {
-                    // All reconcile slots are busy — use fast syntax-only diagnostics.
-                    // This file will get full JDT diagnostics on the next change or
-                    // when publishDiagnosticsForOpenDocuments() runs after a build.
+                    // All reconcile slots are busy — fall back to standalone
+                    // diagnostics for now. This file will get full JDT
+                    // diagnostics on the next change or when
+                    // publishDiagnosticsForOpenDocuments() runs after a build.
                     GroovyLanguageServerPlugin.logInfo(
                             "[diag-trace] Reconcile slots busy, syntax-only for " + uri);
-                    collectFromGroovyCompiler(uri, diagnostics);
+                    collectFromGroovyCompiler(uri, diagnostics, compilerMode);
                 }
             } else {
-                // Fallback: use standalone Groovy compiler for syntax diagnostics
-                collectFromGroovyCompiler(uri, diagnostics);
+                // Fallback: use the standalone compiler for long-lived
+                // diagnostics when no JDT working copy is available.
+                collectFromGroovyCompiler(uri, diagnostics, compilerMode);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("Failed to collect diagnostics for " + uri, e);
@@ -622,8 +648,10 @@ public class DiagnosticsProvider {
             return diagnostics;
         }
 
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        StandaloneCompilerMode compilerMode = standaloneCompilerMode(uri, initComplete);
         try {
-            collectFromGroovyCompiler(uri, diagnostics);
+            collectFromGroovyCompiler(uri, diagnostics, compilerMode);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Failed to collect syntax-only diagnostics for " + uri, e);
@@ -631,12 +659,37 @@ public class DiagnosticsProvider {
 
         java.util.function.Predicate<String> checker = classpathAvailableForUri.get();
         boolean hasClasspath = checker == null || checker.test(uri);
-        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
         if (!hasClasspath && initComplete) {
             diagnostics.add(createNoClasspathWarning(content));
         }
 
         return diagnostics;
+    }
+
+    private StandaloneCompilerMode standaloneCompilerMode(boolean initComplete) {
+        return standaloneCompilerMode(null, initComplete);
+    }
+
+    private StandaloneCompilerMode standaloneCompilerMode(String uri, boolean initComplete) {
+        if (initComplete) {
+            return StandaloneCompilerMode.NORMAL_FALLBACK;
+        }
+
+        java.util.function.Predicate<String> checker = standaloneFallbackReadyForUri.get();
+        if (checker != null && uri != null) {
+            try {
+                if (checker.test(uri)) {
+                    return StandaloneCompilerMode.NORMAL_FALLBACK;
+                }
+            } catch (Exception e) {
+                GroovyLanguageServerPlugin.logError(
+                        "Failed to evaluate standalone fallback readiness for " + uri, e);
+            }
+        }
+
+        return initComplete
+                ? StandaloneCompilerMode.NORMAL_FALLBACK
+                : StandaloneCompilerMode.STARTUP_FILTERED;
     }
 
     /**
@@ -1055,36 +1108,94 @@ public class DiagnosticsProvider {
     }
 
     /**
-     * Collect diagnostics from the standalone Groovy compiler (fallback).
-     * Used when no JDT working copy is available.
+     * Collect diagnostics from the standalone Groovy compiler.
+     * During bootstrap this runs in a filtered mode that suppresses temporary
+     * classpath-dependent failures; after initialization it becomes the
+     * long-lived fallback for files without JDT diagnostics.
      */
     private void collectFromGroovyCompiler(String uri, List<Diagnostic> diagnostics) {
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        collectFromGroovyCompiler(uri, diagnostics, standaloneCompilerMode(uri, initComplete));
+    }
+
+    private void collectFromGroovyCompiler(
+            String uri,
+            List<Diagnostic> diagnostics,
+            StandaloneCompilerMode compilerMode) {
         String content = documentManager.getContent(uri);
         if (content == null) {
             return;
         }
 
         GroovyCompilerService compilerService = documentManager.getCompilerService();
-        GroovyCompilerService.ParseResult result = compilerService.getCachedResult(uri);
-        if (result == null) {
-            result = compilerService.parse(uri, content);
+        GroovyCompilerService.ParseResult cachedParse = compilerService.getCachedResult(uri);
+        if (cachedParse != null) {
+            collectFromParseResult(cachedParse, diagnostics, compilerMode);
+            return;
         }
 
-        collectFromParseResult(result, diagnostics);
+        if (compilerMode == StandaloneCompilerMode.STARTUP_FILTERED) {
+            collectFromSyntaxErrors(
+                    compilerService.collectSyntaxErrors(uri, content),
+                    diagnostics,
+                    compilerMode);
+            return;
+        }
+
+        collectFromParseResult(compilerService.parse(uri, content), diagnostics, compilerMode);
     }
 
     private boolean hasSyntaxErrors(GroovyCompilerService.ParseResult result) {
-        return result != null && result.getErrors() != null && !result.getErrors().isEmpty();
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        return hasSyntaxErrors(result, standaloneCompilerMode(initComplete));
+    }
+
+    private boolean hasSyntaxErrors(
+            GroovyCompilerService.ParseResult result,
+            StandaloneCompilerMode compilerMode) {
+        if (result == null || result.getErrors() == null) {
+            return false;
+        }
+        return result.getErrors().stream()
+                .anyMatch(error -> isReportableStandaloneCompilerError(error, compilerMode));
     }
 
     private void collectFromParseResult(
             GroovyCompilerService.ParseResult result,
             List<Diagnostic> diagnostics) {
-        if (result == null || result.getErrors() == null) {
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        collectFromParseResult(result, diagnostics, standaloneCompilerMode(initComplete));
+    }
+
+    private void collectFromParseResult(
+            GroovyCompilerService.ParseResult result,
+            List<Diagnostic> diagnostics,
+            StandaloneCompilerMode compilerMode) {
+        if (result == null) {
+            return;
+        }
+        collectFromSyntaxErrors(result.getErrors(), diagnostics, compilerMode);
+    }
+
+    private void collectFromSyntaxErrors(
+            List<org.codehaus.groovy.syntax.SyntaxException> errors,
+            List<Diagnostic> diagnostics) {
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        collectFromSyntaxErrors(errors, diagnostics, standaloneCompilerMode(initComplete));
+    }
+
+    private void collectFromSyntaxErrors(
+            List<org.codehaus.groovy.syntax.SyntaxException> errors,
+            List<Diagnostic> diagnostics,
+            StandaloneCompilerMode compilerMode) {
+        if (errors == null) {
             return;
         }
 
-        for (org.codehaus.groovy.syntax.SyntaxException error : result.getErrors()) {
+        for (org.codehaus.groovy.syntax.SyntaxException error : errors) {
+            if (!isReportableStandaloneCompilerError(error, compilerMode)) {
+                continue;
+            }
             Diagnostic diagnostic = new Diagnostic();
             diagnostic.setSeverity(DiagnosticSeverity.Error);
 
@@ -1097,10 +1208,54 @@ public class DiagnosticsProvider {
                     new Position(startLine, startCol),
                     new Position(endLine, endCol)));
             diagnostic.setMessage(error.getMessage());
-                diagnostic.setSource(DIAGNOSTIC_SOURCE_GROOVY);
+            diagnostic.setSource(DIAGNOSTIC_SOURCE_GROOVY);
 
             diagnostics.add(diagnostic);
         }
+    }
+
+    private boolean isReportableStandaloneCompilerError(org.codehaus.groovy.syntax.SyntaxException error) {
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        return isReportableStandaloneCompilerError(error, standaloneCompilerMode(initComplete));
+    }
+
+    private boolean isReportableStandaloneCompilerError(
+            org.codehaus.groovy.syntax.SyntaxException error,
+            StandaloneCompilerMode compilerMode) {
+        if (error == null) {
+            return false;
+        }
+        if (compilerMode == StandaloneCompilerMode.NORMAL_FALLBACK) {
+            return true;
+        }
+        return !isStandaloneCompilerClasspathFailure(error.getMessage());
+    }
+
+    private boolean isStandaloneCompilerClasspathFailure(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String normalizedMessage = unwrapParseErrorMessage(message);
+        if (normalizedMessage.startsWith(NO_SUCH_CLASS_PREFIX)) {
+            return true;
+        }
+        if (normalizedMessage.startsWith(GENERAL_CONVERSION_ERROR_PREFIX)) {
+            return true;
+        }
+        if (normalizedMessage.contains(TRANSFORM_LOADER_FRAGMENT)) {
+            return true;
+        }
+        return UNABLE_TO_RESOLVE_CLASS_PATTERN.matcher(normalizedMessage).find();
+    }
+
+    private String unwrapParseErrorMessage(String message) {
+        if (message.startsWith(PARSE_ERROR_PREFIX)) {
+            return message.substring(PARSE_ERROR_PREFIX.length());
+        }
+        if (message.startsWith(INTERNAL_PARSE_ERROR_PREFIX)) {
+            return message.substring(INTERNAL_PARSE_ERROR_PREFIX.length());
+        }
+        return message;
     }
 
     /**

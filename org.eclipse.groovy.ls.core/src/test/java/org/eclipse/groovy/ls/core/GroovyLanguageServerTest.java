@@ -21,10 +21,14 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import org.eclipse.core.resources.IWorkspace;
+import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.lsp4j.CodeActionKind;
 import org.eclipse.lsp4j.InitializeParams;
 import org.eclipse.lsp4j.InitializeResult;
@@ -33,6 +37,7 @@ import org.eclipse.lsp4j.jsonrpc.Endpoint;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.MockedStatic;
 
 /**
  * Tests for {@link GroovyLanguageServer} — initialization, capabilities,
@@ -890,6 +895,76 @@ class GroovyLanguageServerTest {
         assertTrue(pending.get());
     }
 
+    @Test
+    void publishDiagnosticsForProjectFilesIfStartupReadySkipsBeforeStartupSettles() throws Exception {
+        RecordingGroovyLanguageServer server = new RecordingGroovyLanguageServer();
+        Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        workspaceRootField.setAccessible(true);
+        workspaceRootField.set(server, "file:///workspace");
+
+        server.publishDiagnosticsForProjectFilesIfStartupReady("projA");
+
+        assertFalse(server.eagerProjectDiagnosticsPublished);
+    }
+
+    @Test
+    void publishDiagnosticsForProjectFilesIfStartupReadyPublishesImmediatelyWithoutWorkspaceRoot() {
+        RecordingGroovyLanguageServer server = new RecordingGroovyLanguageServer();
+
+        server.publishDiagnosticsForProjectFilesIfStartupReady("projA");
+
+        assertTrue(server.eagerProjectDiagnosticsPublished);
+        assertEquals("projA", server.lastEagerProjectName);
+    }
+
+    @Test
+    void publishDiagnosticsForProjectFilesIfStartupReadyPublishesAfterStartupSettles() throws Exception {
+        RecordingGroovyLanguageServer server = new RecordingGroovyLanguageServer();
+        Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        workspaceRootField.setAccessible(true);
+        workspaceRootField.set(server, "file:///workspace");
+
+        Field field = GroovyLanguageServer.class.getDeclaredField("initialBuildSettled");
+        field.setAccessible(true);
+        field.set(server, true);
+
+        server.publishDiagnosticsForProjectFilesIfStartupReady("projA");
+
+        assertTrue(server.eagerProjectDiagnosticsPublished);
+        assertEquals("projA", server.lastEagerProjectName);
+    }
+
+    @Test
+    void triggerFullBuildDoesNotSettleFailedInitialBuild() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+
+        Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        workspaceRootField.setAccessible(true);
+        workspaceRootField.set(server, "file:///workspace");
+
+        IWorkspace workspace = mock(IWorkspace.class);
+        org.mockito.Mockito.doThrow(new RuntimeException("boom"))
+                .when(workspace)
+                .build(org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.any());
+
+        try (MockedStatic<ResourcesPlugin> resourcesPlugin = org.mockito.Mockito.mockStatic(ResourcesPlugin.class)) {
+            resourcesPlugin.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+
+            server.triggerFullBuild();
+
+            ScheduledExecutorService scheduler =
+                    (ScheduledExecutorService) getField(server, "initialBuildScheduler");
+            scheduler.shutdown();
+            assertTrue(scheduler.awaitTermination(5, TimeUnit.SECONDS));
+        } finally {
+            server.shutdown().join();
+        }
+
+        assertTrue((Boolean) getField(server, "initialBuildStarted"));
+        assertFalse((Boolean) getField(server, "initialBuildSettled"));
+        assertFalse(server.isFirstBuildComplete());
+    }
+
     // ================================================================
     // getProjectNameForUri tests
     // ================================================================
@@ -916,6 +991,17 @@ class GroovyLanguageServerTest {
         // Try to look up a URI under that subproject
         String result = server.getProjectNameForUri("file:///workspace/projA/src/Foo.groovy");
         assertTrue(result == null || result.equals("ProjA"));
+    }
+
+    private static final class RecordingGroovyLanguageServer extends GroovyLanguageServer {
+        private boolean eagerProjectDiagnosticsPublished;
+        private String lastEagerProjectName;
+
+        @Override
+        void publishDiagnosticsForProjectFiles(String projectName) {
+            eagerProjectDiagnosticsPublished = true;
+            lastEagerProjectName = projectName;
+        }
     }
 
     @Test

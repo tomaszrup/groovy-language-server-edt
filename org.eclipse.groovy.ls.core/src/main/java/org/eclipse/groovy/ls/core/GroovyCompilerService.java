@@ -37,6 +37,16 @@ import org.codehaus.groovy.syntax.SyntaxException;
  */
 public class GroovyCompilerService {
 
+    private static final String INTERNAL_PARSE_ERROR_PREFIX = "Internal parse error: ";
+    private static final String PARSE_ERROR_PREFIX = "Parse error: ";
+    private static final String GENERAL_CONVERSION_ERROR_PREFIX =
+            "Groovy:General error during conversion:";
+    private static final String NO_SUCH_CLASS_PREFIX = "No such class: ";
+    private static final String TRANSFORM_LOADER_FRAGMENT =
+            "JDTClassNode.getTypeClass() cannot locate it using transform loader";
+    private static final java.util.regex.Pattern UNABLE_TO_RESOLVE_CLASS_PATTERN =
+            java.util.regex.Pattern.compile("(?i)unable to resolve class\\s+['\"]?([\\w.$]+)['\"]?");
+
     /**
      * Result of parsing a Groovy source file.
      */
@@ -124,7 +134,7 @@ public class GroovyCompilerService {
             String fileName = extractFileName(uri);
             compilationUnit.addSource(fileName, source);
 
-            compileThroughConversion(compilationUnit, errors);
+            compileThroughPhase(compilationUnit, errors, Phases.CONVERSION);
             moduleNode = extractFirstModuleNode(compilationUnit, uri);
 
         } catch (Exception e) {
@@ -140,9 +150,44 @@ public class GroovyCompilerService {
         return result;
     }
 
-    private void compileThroughConversion(CompilationUnit compilationUnit, List<SyntaxException> errors) {
+    /**
+     * Collect syntax-only parser errors without caching or producing a conversion-phase AST.
+     * <p>
+     * This is used by diagnostics during startup/bootstrap so unresolved types do
+     * not leak into the temporary syntax-only diagnostic pass. The long-lived
+     * standalone fallback should continue using cached/full {@link #parse}
+     * results after startup settles.
+     */
+    public List<SyntaxException> collectSyntaxErrors(String uri, String source) {
+        uri = DocumentManager.normalizeUri(uri);
+        List<SyntaxException> rawErrors = new ArrayList<>();
+
         try {
-            compilationUnit.compile(Phases.CONVERSION);
+            CompilationUnit compilationUnit = new CompilationUnit(sharedConfig);
+            compilationUnit.addSource(extractFileName(uri), source);
+            compileThroughPhase(compilationUnit, rawErrors, Phases.CONVERSION);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Groovy syntax-only parse failed for " + uri, e);
+            rawErrors.add(new SyntaxException(
+                    "Internal parse error: " + e.getMessage(), 1, 1));
+        }
+
+        List<SyntaxException> syntaxErrors = new ArrayList<>();
+        for (SyntaxException error : rawErrors) {
+            if (isReportableSyntaxError(error)) {
+                syntaxErrors.add(error);
+            }
+        }
+        return syntaxErrors;
+    }
+
+    private void compileThroughPhase(
+            CompilationUnit compilationUnit,
+            List<SyntaxException> errors,
+            int phase) {
+        try {
+            compilationUnit.compile(phase);
         } catch (MultipleCompilationErrorsException e) {
             collectErrors(e.getErrorCollector(), errors);
         } catch (Exception e) {
@@ -217,6 +262,37 @@ public class GroovyCompilerService {
                 }
             }
         }
+    }
+
+    private boolean isReportableSyntaxError(SyntaxException error) {
+        return error != null && !isClasspathDependentFailure(error.getMessage());
+    }
+
+    private boolean isClasspathDependentFailure(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        String normalizedMessage = unwrapParseErrorMessage(message);
+        if (normalizedMessage.startsWith(NO_SUCH_CLASS_PREFIX)) {
+            return true;
+        }
+        if (normalizedMessage.startsWith(GENERAL_CONVERSION_ERROR_PREFIX)) {
+            return true;
+        }
+        if (normalizedMessage.contains(TRANSFORM_LOADER_FRAGMENT)) {
+            return true;
+        }
+        return UNABLE_TO_RESOLVE_CLASS_PATTERN.matcher(normalizedMessage).find();
+    }
+
+    private String unwrapParseErrorMessage(String message) {
+        if (message.startsWith(PARSE_ERROR_PREFIX)) {
+            return message.substring(PARSE_ERROR_PREFIX.length());
+        }
+        if (message.startsWith(INTERNAL_PARSE_ERROR_PREFIX)) {
+            return message.substring(INTERNAL_PARSE_ERROR_PREFIX.length());
+        }
+        return message;
     }
 
     /**

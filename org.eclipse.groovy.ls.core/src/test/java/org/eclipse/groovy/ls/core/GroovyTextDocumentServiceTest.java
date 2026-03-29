@@ -11,6 +11,7 @@ package org.eclipse.groovy.ls.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -183,6 +184,36 @@ class GroovyTextDocumentServiceTest {
     void publishDiagnosticsHelpersUseClientUrisWhenEnabled() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
         setField(server, "diagnosticsEnabled", true);
+        setField(server, "firstFullBuildComplete", true);
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        GroovyCompilerService compilerService = mock(GroovyCompilerService.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+        when(documentManager.getOpenDocumentUris()).thenReturn(Set.of("file:///a.groovy", "file:///b.groovy"));
+        when(documentManager.getClientUri("file:///a.groovy")).thenReturn("file:///client-a.groovy");
+        when(documentManager.getClientUri("file:///b.groovy")).thenReturn("file:///client-b.groovy");
+        when(documentManager.hasJdtWorkingCopy("file:///a.groovy")).thenReturn(true);
+        when(documentManager.getCompilerService()).thenReturn(compilerService);
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+        service.publishDiagnosticsForOpenDocuments();
+
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-doc.groovy");
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-a.groovy");
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-b.groovy");
+        verify(compilerService).invalidateDocumentFamily("file:///a.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledUsesSyntaxOnlyPathDuringStartup() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        setField(server, "workspaceRoot", "file:///workspace");
         GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
 
         DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
@@ -191,16 +222,321 @@ class GroovyTextDocumentServiceTest {
         setField(service, "documentManager", documentManager);
 
         when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
-        when(documentManager.getOpenDocumentUris()).thenReturn(Set.of("file:///a.groovy", "file:///b.groovy"));
-        when(documentManager.getClientUri("file:///a.groovy")).thenReturn("file:///client-a.groovy");
-        when(documentManager.getClientUri("file:///b.groovy")).thenReturn("file:///client-b.groovy");
 
         service.publishDiagnosticsIfEnabled("file:///doc.groovy");
-        service.publishDiagnosticsForOpenDocuments();
+
+        verify(diagnostics).publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishDiagnosticsDebounced("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledUsesFullDiagnosticsAfterRootedStartupSettles() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        setField(server, "workspaceRoot", "file:///workspace");
+        setField(server, "firstFullBuildComplete", true);
+        setField(server, "initialBuildSettled", true);
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
 
         verify(diagnostics).publishDiagnosticsDebounced("file:///client-doc.groovy");
-        verify(diagnostics).publishDiagnosticsDebounced("file:///client-a.groovy");
-        verify(diagnostics).publishDiagnosticsDebounced("file:///client-b.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledUsesFullDiagnosticsForNoRootProjectOnceClasspathArrives() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public boolean areDiagnosticsEnabled() {
+                return true;
+            }
+
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return "extProj";
+            }
+
+            @Override
+            public boolean hasClasspathForProject(String projectName) {
+                return "extProj".equals(projectName);
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledInvalidatesStandaloneCacheForResolvedNoRootProjectWorkingCopy()
+            throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public boolean areDiagnosticsEnabled() {
+                return true;
+            }
+
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return "extProj";
+            }
+
+            @Override
+            public boolean hasClasspathForProject(String projectName) {
+                return "extProj".equals(projectName);
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        GroovyCompilerService compilerService = mock(GroovyCompilerService.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+        when(documentManager.hasJdtWorkingCopy("file:///doc.groovy")).thenReturn(true);
+        when(documentManager.getCompilerService()).thenReturn(compilerService);
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(compilerService).invalidateDocumentFamily("file:///doc.groovy");
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledUsesFullDiagnosticsAfterRootedInitialBuildFailureWhenClasspathReady()
+            throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public boolean areDiagnosticsEnabled() {
+                return true;
+            }
+
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return "projA";
+            }
+
+            @Override
+            public boolean hasClasspathForProject(String projectName) {
+                return "projA".equals(projectName);
+            }
+        };
+        setField(server, "workspaceRoot", "file:///workspace");
+        setField(server, "initialBuildStarted", true);
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledKeepsSyntaxOnlyForUnresolvedNoRootDocumentWithoutClasspath() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public boolean areDiagnosticsEnabled() {
+                return true;
+            }
+
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return null;
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(diagnostics).publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishDiagnosticsDebounced("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledUsesFullDiagnosticsForUnresolvedNoRootDocumentWorkingCopyProject()
+            throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public boolean areDiagnosticsEnabled() {
+                return true;
+            }
+
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return null;
+            }
+
+            @Override
+            public boolean hasClasspathForProject(String projectName) {
+                return "extProj".equals(projectName);
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        GroovyCompilerService compilerService = mock(GroovyCompilerService.class);
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IJavaProject javaProject = mock(org.eclipse.jdt.core.IJavaProject.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+        when(documentManager.getCompilerService()).thenReturn(compilerService);
+        when(documentManager.hasJdtWorkingCopy("file:///doc.groovy")).thenReturn(true);
+        when(documentManager.getWorkingCopy("file:///doc.groovy")).thenReturn(workingCopy);
+        when(workingCopy.getJavaProject()).thenReturn(javaProject);
+        when(javaProject.getElementName()).thenReturn("extProj");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(compilerService).invalidateDocumentFamily("file:///doc.groovy");
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+    }
+
+    @Test
+    void publishDiagnosticsIfEnabledKeepsSyntaxOnlyForUnresolvedNoRootWorkingCopyProjectWithoutClasspath()
+            throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public boolean areDiagnosticsEnabled() {
+                return true;
+            }
+
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return null;
+            }
+
+            @Override
+            public boolean hasClasspathForProject(String projectName) {
+                return false;
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IJavaProject javaProject = mock(org.eclipse.jdt.core.IJavaProject.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+        when(documentManager.getWorkingCopy("file:///doc.groovy")).thenReturn(workingCopy);
+        when(workingCopy.getJavaProject()).thenReturn(javaProject);
+        when(javaProject.getElementName()).thenReturn("extProjB");
+
+        service.publishDiagnosticsIfEnabled("file:///doc.groovy");
+
+        verify(diagnostics).publishSyntaxDiagnosticsImmediate("file:///client-doc.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishDiagnosticsDebounced("file:///client-doc.groovy");
+    }
+
+    @Test
+    void rootedClasspathCheckerDoesNotUseWorkingCopyFallbackDuringStartup() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "workspaceRoot", "file:///workspace");
+        @SuppressWarnings("unchecked")
+        Set<String> projectsWithClasspath =
+                (Set<String>) getField(server, "projectsWithClasspath");
+        projectsWithClasspath.add("extProj");
+
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DocumentManager documentManager = mock(DocumentManager.class);
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IJavaProject javaProject = mock(org.eclipse.jdt.core.IJavaProject.class);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+        when(documentManager.getWorkingCopy("file:///doc.groovy")).thenReturn(workingCopy);
+        when(workingCopy.getJavaProject()).thenReturn(javaProject);
+        when(javaProject.getElementName()).thenReturn("extProj");
+
+        DiagnosticsProvider diagnosticsProvider =
+                (DiagnosticsProvider) getField(service, "diagnosticsProvider");
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.atomic.AtomicReference<java.util.function.Predicate<String>> checkerRef =
+                (java.util.concurrent.atomic.AtomicReference<java.util.function.Predicate<String>>)
+                        getField(diagnosticsProvider, "classpathAvailableForUri");
+
+        assertFalse(checkerRef.get().test("file:///doc.groovy"));
+    }
+
+    @Test
+    void rootedClasspathCheckerUsesWorkingCopyFallbackAfterInitialBuildStarts() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "workspaceRoot", "file:///workspace");
+        setField(server, "initialBuildStarted", true);
+        @SuppressWarnings("unchecked")
+        Set<String> projectsWithClasspath =
+                (Set<String>) getField(server, "projectsWithClasspath");
+        projectsWithClasspath.add("extProj");
+
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DocumentManager documentManager = mock(DocumentManager.class);
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IJavaProject javaProject = mock(org.eclipse.jdt.core.IJavaProject.class);
+        setField(service, "documentManager", documentManager);
+
+        when(documentManager.getClientUri("file:///doc.groovy")).thenReturn("file:///client-doc.groovy");
+        when(documentManager.getWorkingCopy("file:///doc.groovy")).thenReturn(workingCopy);
+        when(workingCopy.getJavaProject()).thenReturn(javaProject);
+        when(javaProject.getElementName()).thenReturn("extProj");
+
+        DiagnosticsProvider diagnosticsProvider =
+                (DiagnosticsProvider) getField(service, "diagnosticsProvider");
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.atomic.AtomicReference<java.util.function.Predicate<String>> checkerRef =
+                (java.util.concurrent.atomic.AtomicReference<java.util.function.Predicate<String>>)
+                        getField(diagnosticsProvider, "classpathAvailableForUri");
+
+        assertTrue(checkerRef.get().test("file:///doc.groovy"));
     }
 
     @Test
@@ -254,6 +590,7 @@ class GroovyTextDocumentServiceTest {
     @Test
     void didOpenDelegatesToDocumentManagerAndPublishesDiagnosticsImmediately() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "firstFullBuildComplete", true);
         DocumentManager documentManager = new DocumentManager() {
             @Override
             public boolean isReadyForDiagnostics(String uri) {
@@ -277,6 +614,104 @@ class GroovyTextDocumentServiceTest {
         // Document should be stored
         assertNotNull(documentManager.getContent("file:///test/Open.groovy"));
         verify(diagnostics).publishDiagnosticsImmediate("file:///test/Open.groovy");
+    }
+
+    @Test
+    void didOpenPublishesSyntaxDiagnosticsDuringStartupEvenWhenWorkingCopyIsReady() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "workspaceRoot", "file:///workspace");
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public boolean isReadyForDiagnostics(String uri) {
+                return true;
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        org.eclipse.lsp4j.DidOpenTextDocumentParams params = new org.eclipse.lsp4j.DidOpenTextDocumentParams();
+        org.eclipse.lsp4j.TextDocumentItem item = new org.eclipse.lsp4j.TextDocumentItem();
+        item.setUri("file:///test/StartupReady.groovy");
+        item.setText("class StartupReady {}");
+        params.setTextDocument(item);
+
+        service.didOpen(params);
+
+        verify(diagnostics).publishSyntaxDiagnosticsImmediate("file:///test/StartupReady.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishDiagnosticsImmediate("file:///test/StartupReady.groovy");
+    }
+
+    @Test
+    void didOpenPublishesFullDiagnosticsAfterRootedStartupSettlesWhenWorkingCopyIsReady() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "workspaceRoot", "file:///workspace");
+        setField(server, "firstFullBuildComplete", true);
+        setField(server, "initialBuildSettled", true);
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public boolean isReadyForDiagnostics(String uri) {
+                return true;
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        org.eclipse.lsp4j.DidOpenTextDocumentParams params = new org.eclipse.lsp4j.DidOpenTextDocumentParams();
+        org.eclipse.lsp4j.TextDocumentItem item = new org.eclipse.lsp4j.TextDocumentItem();
+        item.setUri("file:///test/SettledReady.groovy");
+        item.setText("class SettledReady {}");
+        params.setTextDocument(item);
+
+        service.didOpen(params);
+
+        verify(diagnostics).publishDiagnosticsImmediate("file:///test/SettledReady.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///test/SettledReady.groovy");
+    }
+
+    @Test
+    void didOpenPublishesFullDiagnosticsForNoRootProjectOnceClasspathArrives() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer() {
+            @Override
+            public String getProjectNameForUri(String uri) {
+                return "extProj";
+            }
+
+            @Override
+            public boolean hasClasspathForProject(String projectName) {
+                return "extProj".equals(projectName);
+            }
+        };
+        DocumentManager documentManager = new DocumentManager() {
+            @Override
+            public boolean isReadyForDiagnostics(String uri) {
+                return true;
+            }
+        };
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        org.eclipse.lsp4j.DidOpenTextDocumentParams params = new org.eclipse.lsp4j.DidOpenTextDocumentParams();
+        org.eclipse.lsp4j.TextDocumentItem item = new org.eclipse.lsp4j.TextDocumentItem();
+        item.setUri("file:///test/NoRootReady.groovy");
+        item.setText("class NoRootReady {}");
+        params.setTextDocument(item);
+
+        service.didOpen(params);
+
+        verify(diagnostics).publishDiagnosticsImmediate("file:///test/NoRootReady.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///test/NoRootReady.groovy");
     }
 
     @Test
@@ -309,6 +744,7 @@ class GroovyTextDocumentServiceTest {
     void readyWorkingCopyCallbackPublishesDebouncedDiagnostics() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
         setField(server, "diagnosticsEnabled", true);
+        setField(server, "firstFullBuildComplete", true);
         DocumentManager documentManager = new DocumentManager();
         GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
 
@@ -327,6 +763,62 @@ class GroovyTextDocumentServiceTest {
 
         verify(diagnostics, org.mockito.Mockito.timeout(2000))
                 .publishDiagnosticsDebounced(uri);
+    }
+
+    @Test
+    void readyWorkingCopyCallbackPublishesSyntaxDiagnosticsDuringStartup() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        setField(server, "workspaceRoot", "file:///workspace");
+        DocumentManager documentManager = new DocumentManager();
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+
+        String uri = "file:///test/ListenerStartup.groovy";
+        documentManager.didOpen(uri, "class ListenerStartup {}\n");
+
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IBuffer buffer = mock(org.eclipse.jdt.core.IBuffer.class);
+        when(workingCopy.getBuffer()).thenReturn(buffer);
+        getWorkingCopies(documentManager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        documentManager.replayOpenDocuments(List.of(uri));
+
+        verify(diagnostics, org.mockito.Mockito.timeout(2000))
+                .publishSyntaxDiagnosticsImmediate(uri);
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishDiagnosticsDebounced(uri);
+    }
+
+    @Test
+    void readyWorkingCopyCallbackPublishesDebouncedDiagnosticsAfterRootedStartupSettles() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        setField(server, "workspaceRoot", "file:///workspace");
+        setField(server, "firstFullBuildComplete", true);
+        setField(server, "initialBuildSettled", true);
+        DocumentManager documentManager = new DocumentManager();
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+
+        String uri = "file:///test/ListenerSettled.groovy";
+        documentManager.didOpen(uri, "class ListenerSettled {}\n");
+
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IBuffer buffer = mock(org.eclipse.jdt.core.IBuffer.class);
+        when(workingCopy.getBuffer()).thenReturn(buffer);
+        getWorkingCopies(documentManager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        documentManager.replayOpenDocuments(List.of(uri));
+
+        verify(diagnostics, org.mockito.Mockito.timeout(2000))
+                .publishDiagnosticsDebounced(uri);
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate(uri);
     }
 
     @Test
@@ -383,6 +875,7 @@ class GroovyTextDocumentServiceTest {
     void didChangeUpdatesDiagnostics() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
         setField(server, "diagnosticsEnabled", true);
+        setField(server, "firstFullBuildComplete", true);
         DocumentManager documentManager = new DocumentManager();
         GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
 
@@ -406,6 +899,38 @@ class GroovyTextDocumentServiceTest {
 
         assertEquals("class Changed {}", documentManager.getContent("file:///test/Change.groovy"));
         verify(diagnostics).publishDiagnosticsAfterChange("file:///test/Change.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishSyntaxDiagnosticsImmediate("file:///test/Change.groovy");
+    }
+
+    @Test
+    void didChangePublishesSyntaxDiagnosticsDuringRootedStartup() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        setField(server, "workspaceRoot", "file:///workspace");
+        DocumentManager documentManager = new DocumentManager();
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+
+        documentManager.didOpen("file:///test/StartupChange.groovy", "class StartupChange {}");
+
+        org.eclipse.lsp4j.DidChangeTextDocumentParams changeParams = new org.eclipse.lsp4j.DidChangeTextDocumentParams();
+        org.eclipse.lsp4j.VersionedTextDocumentIdentifier versionedId = new org.eclipse.lsp4j.VersionedTextDocumentIdentifier();
+        versionedId.setUri("file:///test/StartupChange.groovy");
+        changeParams.setTextDocument(versionedId);
+        org.eclipse.lsp4j.TextDocumentContentChangeEvent change = new org.eclipse.lsp4j.TextDocumentContentChangeEvent();
+        change.setText("class StartupChanged {}");
+        changeParams.setContentChanges(java.util.List.of(change));
+
+        service.didChange(changeParams);
+
+        assertEquals("class StartupChanged {}", documentManager.getContent("file:///test/StartupChange.groovy"));
+        verify(diagnostics).publishSyntaxDiagnosticsImmediate("file:///test/StartupChange.groovy");
+        org.mockito.Mockito.verify(diagnostics, org.mockito.Mockito.never())
+                .publishDiagnosticsAfterChange("file:///test/StartupChange.groovy");
     }
 
     // ---- Additional delegation tests for untested methods ----
@@ -790,15 +1315,27 @@ class GroovyTextDocumentServiceTest {
     }
 
     private void setField(Object target, String fieldName, Object value) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
+        Field field = findField(target.getClass(), fieldName);
         field.setAccessible(true);
         field.set(target, value);
     }
 
     private Object getField(Object target, String fieldName) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
+        Field field = findField(target.getClass(), fieldName);
         field.setAccessible(true);
         return field.get(target);
+    }
+
+    private Field findField(Class<?> type, String fieldName) throws NoSuchFieldException {
+        Class<?> current = type;
+        while (current != null) {
+            try {
+                return current.getDeclaredField(fieldName);
+            } catch (NoSuchFieldException e) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(fieldName);
     }
 
     @SuppressWarnings("unchecked")
@@ -809,4 +1346,3 @@ class GroovyTextDocumentServiceTest {
         return (Map<String, org.eclipse.jdt.core.ICompilationUnit>) field.get(manager);
     }
 }
-

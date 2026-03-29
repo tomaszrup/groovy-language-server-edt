@@ -130,6 +130,8 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private final java.util.concurrent.atomic.AtomicBoolean initialBuildDone = new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile boolean diagnosticsEnabled = false;
     private volatile boolean firstFullBuildComplete = false;
+    private volatile boolean initialBuildStarted = false;
+    private volatile boolean initialBuildSettled = false;
     private volatile boolean buildInProgress = false;
     private volatile java.util.concurrent.ScheduledFuture<?> initialBuildTimer;
     private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.ScheduledFuture<?>>
@@ -405,6 +407,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     void triggerFullBuild() {
         initialBuildScheduler.submit(() -> {
             boolean initialBuild = !firstFullBuildComplete;
+            boolean buildSucceeded = false;
             long buildStartedAt = System.currentTimeMillis();
             int buildKind;
             if (initialBuild) {
@@ -418,10 +421,14 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             }
             GroovyLanguageServerPlugin.logInfo("[diag-trace] triggerBuild start (kind=" + buildKind + ")");
             buildInProgress = true;
+            if (initialBuild) {
+                initialBuildStarted = true;
+            }
             try {
                 ResourcesPlugin.getWorkspace().build(buildKind, new NullProgressMonitor());
 
                 firstFullBuildComplete = true;
+                buildSucceeded = true;
                 GroovyLanguageServerPlugin.logInfo("Build completed (kind=" + buildKind + ").");
                 startupTracker.duration(
                         initialBuild ? "build.initial" : "build.incremental",
@@ -432,6 +439,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 sendStatus("Error", "Build failed: " + e.getMessage());
             } finally {
                 buildInProgress = false;
+                if (initialBuild && buildSucceeded) {
+                    initialBuildSettled = true;
+                }
             }
 
             // Now that the workspace lock is released, publish full JDT-based
@@ -644,11 +654,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                         "[classpath-check] Added '" + projName + "' to projectsWithClasspath. "
                         + "All projects with classpath: " + projectsWithClasspath);
 
-                // Eagerly publish diagnostics for any currently-open files that
-                // belong to this project. This gives near-instant feedback for the
-                // files the user is looking at, rather than waiting for all 50
-                // projects' classpaths to arrive + a full workspace build.
-                publishDiagnosticsForProjectFiles(projName);
+                publishDiagnosticsForProjectFilesIfStartupReady(projName);
             } else {
                 GroovyLanguageServerPlugin.logInfo(
                         "[classpath-check] Deferred full diagnostics for '" + projName
@@ -1159,6 +1165,25 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     /**
+     * Returns {@code true} once the first rooted-workspace build has actually
+     * started. This stays {@code false} while startup is still waiting for the
+     * initial classpath batch/debounce and flips to {@code true} even if that
+     * first build later fails.
+     */
+    boolean isInitialBuildStarted() {
+        return workspaceRoot != null && initialBuildStarted;
+    }
+
+    /**
+     * Returns {@code true} once the first rooted-workspace build has completed
+     * successfully. No-root sessions return {@code false} here and rely on
+     * per-project classpath readiness instead.
+     */
+    boolean isInitialBuildSettled() {
+        return workspaceRoot != null && initialBuildSettled;
+    }
+
+    /**
      * Read optional tuning parameters from the client's
      * {@code initializationOptions} JSON and reconfigure the LSP request
      * executor if custom values are provided.
@@ -1238,7 +1263,17 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * fails (e.g., special characters, external projects, or race conditions
      * during initialization).
      */
-    private void publishDiagnosticsForProjectFiles(String projectName) {
+    void publishDiagnosticsForProjectFilesIfStartupReady(String projectName) {
+        if (workspaceRoot != null && !initialBuildSettled) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[eager-diag] Deferred eager diagnostics for " + projectName
+                    + " until startup build settles.");
+            return;
+        }
+        publishDiagnosticsForProjectFiles(projectName);
+    }
+
+    void publishDiagnosticsForProjectFiles(String projectName) {
         initialBuildScheduler.submit(() -> {
             try {
                 for (String uri : documentManager.getOpenDocumentUris()) {
