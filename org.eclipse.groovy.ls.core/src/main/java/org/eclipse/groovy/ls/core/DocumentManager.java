@@ -884,6 +884,9 @@ public class DocumentManager {
     private ICompilationUnit findCompilationUnit(String uriString) {
         try {
             URI uri = URI.create(uriString);
+            if (!"file".equals(uri.getScheme())) {
+                return null;
+            }
             java.io.File file = new java.io.File(uri);
 
             // First, try to find the file in an existing Eclipse project

@@ -796,6 +796,18 @@ class GroovyLanguageServerTest {
         assertNull(result);
     }
 
+    @Test
+    void resolveWorkspaceDirectoryNonFileUriReturnsNull() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        java.lang.reflect.Field wsField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        wsField.setAccessible(true);
+        wsField.set(server, "groovy-source:///workspace/Virtual.groovy");
+        java.lang.reflect.Method m = GroovyLanguageServer.class.getDeclaredMethod("resolveWorkspaceDirectory");
+        m.setAccessible(true);
+        java.io.File result = (java.io.File) m.invoke(server);
+        assertNull(result);
+    }
+
     // ================================================================
     // triggerBuildAfterClasspathUpdate tests
     // ================================================================
@@ -904,5 +916,20 @@ class GroovyLanguageServerTest {
         // Try to look up a URI under that subproject
         String result = server.getProjectNameForUri("file:///workspace/projA/src/Foo.groovy");
         assertTrue(result == null || result.equals("ProjA"));
+    }
+
+    @Test
+    void getProjectNameForUriNonFileUriReturnsNull() {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        assertNull(server.getProjectNameForUri("groovy-source:///workspace/projA/src/Foo.groovy"));
+    }
+
+    @Test
+    void resolveProjectFromUriNonFileUriReturnsNull() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        java.lang.reflect.Method method = GroovyLanguageServer.class.getDeclaredMethod(
+                "resolveProjectFromUri", String.class);
+        method.setAccessible(true);
+        assertNull(method.invoke(server, "groovy-source:///workspace/projA"));
     }
 }

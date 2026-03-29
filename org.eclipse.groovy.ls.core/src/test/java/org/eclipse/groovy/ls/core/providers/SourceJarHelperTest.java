@@ -56,6 +56,18 @@ class SourceJarHelperTest {
     }
 
     @Test
+    void extractFqnFromUriPreservesInnerClassMarker() {
+        assertEquals("a.b.Outer$Inner",
+                SourceJarHelper.extractFqnFromUri("groovy-source:///a/b/Outer$Inner.java"));
+    }
+
+    @Test
+    void sourceFileFqnReturnsTopLevelOwnerForNestedType() {
+        assertEquals("a.b.Outer", SourceJarHelper.sourceFileFqn("a.b.Outer$Inner$Leaf"));
+        assertEquals("a.b.Outer", SourceJarHelper.sourceFileFqn("a.b.Outer"));
+    }
+
+    @Test
     void findSourcesJarForBinaryJarFindsSiblingSourcesJar() throws IOException {
         Path libsDir = tempDir.resolve("libs");
         Files.createDirectories(libsDir);
@@ -154,6 +166,20 @@ class SourceJarHelperTest {
 
         assertNotNull(source);
         assertTrue(source.contains("class Foo"));
+    }
+
+    @Test
+    void readSourceFromJarReadsOuterEntryForInnerType() throws IOException {
+        File sourcesJar = createJar(
+                tempDir.resolve("nested-sources.jar"),
+                "com/example/Outer.java",
+                "package com.example;\npublic class Outer {\n    public enum Inner { VALUE }\n}\n");
+
+        String source = SourceJarHelper.readSourceFromJar(sourcesJar, "com.example.Outer$Inner");
+
+        assertNotNull(source);
+        assertTrue(source.contains("class Outer"));
+        assertTrue(source.contains("enum Inner"));
     }
 
     @Test

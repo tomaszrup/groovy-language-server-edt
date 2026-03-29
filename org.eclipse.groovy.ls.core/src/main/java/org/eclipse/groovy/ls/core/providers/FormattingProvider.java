@@ -571,6 +571,9 @@ public class FormattingProvider {
             if (documentUri == null) return;
 
             URI uri = URI.create(documentUri);
+            if (!"file".equals(uri.getScheme())) {
+                return;
+            }
             File docFile = new File(uri);
             File dir = docFile.getParentFile();
 

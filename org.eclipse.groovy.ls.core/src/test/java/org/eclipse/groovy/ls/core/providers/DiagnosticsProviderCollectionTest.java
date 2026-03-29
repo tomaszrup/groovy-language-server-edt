@@ -12,6 +12,7 @@ package org.eclipse.groovy.ls.core.providers;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -222,6 +223,17 @@ class DiagnosticsProviderCollectionTest {
         assertTrue(diagnostics.isEmpty(), "Valid Groovy should produce no compiler errors");
 
         documentManager.didClose(uri);
+    }
+
+    @Test
+    void toFileLocationUriReturnsNullForNonFileUri() throws Exception {
+        DiagnosticsProvider provider = new DiagnosticsProvider(new DocumentManager());
+        Method method = DiagnosticsProvider.class.getDeclaredMethod("toFileLocationUri", String.class);
+        method.setAccessible(true);
+
+        Object result = method.invoke(provider, "groovy-source:///test/Virtual.groovy");
+
+        assertNull(result);
     }
 
     // ---- Helpers ----

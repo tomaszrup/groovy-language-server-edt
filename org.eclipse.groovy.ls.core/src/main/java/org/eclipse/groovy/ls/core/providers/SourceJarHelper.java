@@ -119,6 +119,19 @@ public class SourceJarHelper {
     }
 
     /**
+     * Map a nested type FQN to the top-level source file owner.
+     * <p>
+     * Example: {@code a.b.Outer$Inner$Leaf -> a.b.Outer}.
+     */
+    static String sourceFileFqn(String fqn) {
+        if (fqn == null || fqn.isBlank()) {
+            return fqn;
+        }
+        int dollar = fqn.indexOf('$');
+        return dollar >= 0 ? fqn.substring(0, dollar) : fqn;
+    }
+
+    /**
      * Resolve source content for a {@code groovy-source:} URI.
      * Extracts the FQN from the URI path, looks up in the cache,
      * and falls back to re-reading from the JAR or JDK src.zip.
@@ -347,7 +360,8 @@ public class SourceJarHelper {
      * Tries both .groovy and .java extensions.
      */
     public static String readSourceFromJar(File sourcesJar, String fqn) {
-        String basePath = fqn.replace('.', '/');
+        String sourceOwnerFqn = sourceFileFqn(fqn);
+        String basePath = sourceOwnerFqn.replace('.', '/');
         String[] extensions = {GROOVY_EXTENSION, JAVA_EXTENSION};
 
         try (ZipFile zf = new ZipFile(sourcesJar)) {
@@ -363,14 +377,16 @@ public class SourceJarHelper {
                 }
             }
 
-            // Debugging: log entries matching the package
-            int lastDot = fqn.lastIndexOf('.');
+                        // Debugging: log entries matching the package
+                        int lastDot = sourceOwnerFqn.lastIndexOf('.');
             if (lastDot > 0) {
-                String pkgPrefix = fqn.substring(0, lastDot).replace('.', '/');
+                                String pkgPrefix = sourceOwnerFqn.substring(0, lastDot).replace('.', '/');
                 StringBuilder sb = new StringBuilder();
-                sb.append("[source] No entry for ").append(basePath)
-                  .append(".groovy/.java in ").append(sourcesJar.getName())
-                  .append(". Entries matching pkg: ");
+                                sb.append("[source] No entry for requested type ").append(fqn)
+                                    .append(" (source owner ").append(sourceOwnerFqn).append(") as ")
+                                    .append(basePath)
+                                    .append(".groovy/.java in ").append(sourcesJar.getName())
+                                    .append(". Entries matching pkg: ");
                 int count = 0;
                 Enumeration<? extends ZipEntry> entries = zf.entries();
                 while (entries.hasMoreElements() && count < 10) {
@@ -407,7 +423,7 @@ public class SourceJarHelper {
             return null;
         }
 
-        String basePath = fqn.replace('.', '/') + JAVA_EXTENSION;
+        String basePath = sourceFileFqn(fqn).replace('.', '/') + JAVA_EXTENSION;
 
         // JDK 9+ src.zip has module prefixes like java.base/, java.sql/, etc.
         // Try common modules first

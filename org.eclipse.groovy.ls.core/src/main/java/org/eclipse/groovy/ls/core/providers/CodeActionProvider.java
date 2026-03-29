@@ -787,7 +787,10 @@ public class CodeActionProvider {
 
         try {
             String normalizedUri = DocumentManager.normalizeUri(uri);
-            URI fileUri = URI.create(normalizedUri);
+            URI fileUri = toFileLocationUri(normalizedUri);
+            if (fileUri == null) {
+                throw new IllegalArgumentException("Not a file URI: " + normalizedUri);
+            }
             IFile[] files = ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri);
 
             for (IFile file : files) {
@@ -2041,8 +2044,11 @@ public class CodeActionProvider {
 
     private Path resolveNewTypePath(String currentUri, String currentPackage, String targetPackage,
             String simpleName) {
+        Path currentPath = toFilePath(DocumentManager.normalizeUri(currentUri));
+        if (currentPath == null) {
+            return null;
+        }
         try {
-            Path currentPath = Paths.get(URI.create(DocumentManager.normalizeUri(currentUri)));
             Path currentParent = currentPath.getParent();
             if (currentParent == null) {
                 return null;
@@ -2065,6 +2071,30 @@ public class CodeActionProvider {
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logInfo(
                     "[codeaction] Failed to resolve new type path for " + currentUri + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    private URI toFileLocationUri(String uri) {
+        if (uri == null || uri.isBlank()) {
+            return null;
+        }
+        try {
+            URI parsed = URI.create(uri);
+            return "file".equals(parsed.getScheme()) ? parsed : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Path toFilePath(String uri) {
+        URI fileUri = toFileLocationUri(uri);
+        if (fileUri == null) {
+            return null;
+        }
+        try {
+            return Paths.get(fileUri);
+        } catch (Exception e) {
             return null;
         }
     }

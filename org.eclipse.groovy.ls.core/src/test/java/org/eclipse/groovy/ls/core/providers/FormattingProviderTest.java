@@ -619,6 +619,17 @@ class FormattingProviderTest {
     }
 
     @Test
+    void loadWorkspaceFormatterPrefsDoesNothingForNonFileUri() throws Exception {
+        FormattingProvider provider = new FormattingProvider(new DocumentManager());
+        java.util.Map<String, String> options = new java.util.HashMap<>();
+        Method m = FormattingProvider.class.getDeclaredMethod(
+                "loadWorkspaceFormatterPrefs", Map.class, String.class);
+        m.setAccessible(true);
+        m.invoke(provider, options, "groovy-source:///virtual/Source.groovy");
+        assertTrue(options.isEmpty());
+    }
+
+    @Test
     void loadWorkspaceFormatterPrefsDoesNothingWhenNoSettingsDir() throws Exception {
         Path srcFile = tempDir.resolve("Orphan.groovy");
         Files.writeString(srcFile, "class Orphan {}");

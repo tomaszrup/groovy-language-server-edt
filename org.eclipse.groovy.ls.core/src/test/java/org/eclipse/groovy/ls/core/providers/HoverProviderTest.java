@@ -17,8 +17,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
@@ -47,11 +53,15 @@ import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Tests for pure-text and AST utility methods in {@link HoverProvider}.
  */
 class HoverProviderTest {
+
+    @TempDir
+    Path tempDir;
 
     private HoverProvider provider;
     private final GroovyCompilerService compilerService = new GroovyCompilerService();
@@ -696,6 +706,47 @@ class HoverProviderTest {
     }
 
     @Test
+    void buildHoverContentUsesSourcesJarForNestedBinaryTypeJavadoc() throws Exception {
+        File sourcesJar = createJar(tempDir.resolve("spring-test-sources.jar"),
+                "org/springframework/test/annotation/DirtiesContext.java",
+                "package org.springframework.test.annotation;\n"
+                + "public @interface DirtiesContext {\n"
+                + "    /** Nested enum docs. */\n"
+                + "    enum ClassMode {\n"
+                + "        BEFORE_EACH_TEST_METHOD\n"
+                + "    }\n"
+                + "}\n");
+
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        when(root.getSourceAttachmentPath()).thenReturn(
+                org.eclipse.core.runtime.Path.fromOSString(sourcesJar.getAbsolutePath()));
+
+        IType type = mock(IType.class);
+        when(type.getElementType()).thenReturn(IJavaElement.TYPE);
+        when(type.getElementName()).thenReturn("ClassMode");
+        when(type.getFlags()).thenReturn(Flags.AccPublic);
+        when(type.isInterface()).thenReturn(false);
+        when(type.isEnum()).thenReturn(true);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(type.getSuperclassName()).thenReturn(null);
+        when(type.getSuperInterfaceNames()).thenReturn(new String[0]);
+        when(type.getFullyQualifiedName()).thenReturn(
+                "org.springframework.test.annotation.DirtiesContext$ClassMode");
+        when(type.getClassFile()).thenReturn(mock(IOrdinaryClassFile.class));
+        when(type.getCompilationUnit()).thenReturn(null);
+        when(type.getResource()).thenReturn(null);
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(root);
+
+        HoverProvider hp = new HoverProvider(new DocumentManager());
+
+        String hover = invokeBuildHoverContent(hp, type);
+
+        assertNotNull(hover);
+        assertTrue(hover.contains("enum ClassMode"));
+        assertTrue(hover.contains("Nested enum docs."));
+    }
+
+    @Test
     void buildHoverContentForMockedField() throws Exception {
         IField field = mock(IField.class);
         when(field.getElementType()).thenReturn(IJavaElement.FIELD);
@@ -978,6 +1029,16 @@ class HoverProviderTest {
         Method m = HoverProvider.class.getDeclaredMethod("buildMethodHover", MethodNode.class);
         m.setAccessible(true);
         return (String) m.invoke(provider, method);
+    }
+
+    private File createJar(Path jarPath, String entryName, String content) throws IOException {
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(jarPath))) {
+            ZipEntry entry = new ZipEntry(entryName);
+            zos.putNextEntry(entry);
+            zos.write(content.getBytes());
+            zos.closeEntry();
+        }
+        return jarPath.toFile();
     }
 
     private String invokeBuildFieldHover(FieldNode field) throws Exception {

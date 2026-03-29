@@ -14,11 +14,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.util.List;
 
+import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextEdit;
 import org.junit.jupiter.api.Test;
@@ -298,6 +300,14 @@ class GroovyWorkspaceServiceRenameHelpersTest {
                 new Class<?>[] { String.class }, new Object[] { "file:///src/MyClass.groovy" }));
     }
 
+        @Test
+        void fileNameFromUriReturnsNullForNonFileUri() throws Exception {
+                GroovyWorkspaceService service = createService();
+
+                assertNull(invoke(service, "fileNameFromUri",
+                                new Class<?>[] { String.class }, new Object[] { "groovy-source:///src/MyClass.groovy" }));
+        }
+
     @Test
     void fileExtensionFromUriExtractsExtension() throws Exception {
         GroovyWorkspaceService service = createService();
@@ -507,6 +517,39 @@ class GroovyWorkspaceServiceRenameHelpersTest {
         String result = service.inferPackageFromPath(uri, "fallback");
         assertEquals("com.example", result);
     }
+
+        @Test
+        void inferPackageFromPathFallsBackForNonFileUri() {
+                GroovyWorkspaceService service = createService();
+
+                String result = service.inferPackageFromPath(
+                                "groovy-source:///project/src/main/groovy/com/example/MyClass.groovy", "fallback");
+
+                assertEquals("fallback", result);
+        }
+
+        @Test
+        void resolveMovedFilePackageFallsBackForNonFileUri() throws Exception {
+                GroovyWorkspaceService service = createService();
+                IJavaProject javaProject = mock(IJavaProject.class);
+
+                String result = (String) invoke(service, "resolveMovedFilePackage",
+                                new Class<?>[] { IJavaProject.class, String.class, String.class },
+                                new Object[] { javaProject, "groovy-source:///project/src/main/groovy/com/example/MyClass.groovy", "fallback.pkg" });
+
+                assertEquals("fallback.pkg", result);
+        }
+
+        @Test
+        void findTypeForFileRenameReturnsNullForNonFileUri() throws Exception {
+                GroovyWorkspaceService service = createService();
+
+                Object result = invoke(service, "findTypeForFileRename",
+                                new Class<?>[] { String.class, String.class },
+                                new Object[] { "groovy-source:///project/src/main/groovy/com/example/MyClass.groovy", "MyClass" });
+
+                assertNull(result);
+        }
 
     // ---- hasStarImport ----
 

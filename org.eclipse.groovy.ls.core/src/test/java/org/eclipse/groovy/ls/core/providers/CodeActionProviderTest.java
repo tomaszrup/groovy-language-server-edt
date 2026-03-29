@@ -15,9 +15,12 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -1453,6 +1456,53 @@ class CodeActionProviderTest {
             assertFalse(result.isEmpty());
         }
     }
+
+        @SuppressWarnings("unchecked")
+        @Test
+        void getSearchProjectsForUriFallsBackToAllProjectsForNonFileUri() throws Exception {
+                DocumentManager dm = new DocumentManager();
+                DiagnosticsProvider dp = new DiagnosticsProvider(dm);
+                CodeActionProvider provider = new CodeActionProvider(dm, dp);
+
+                IWorkspace workspace = mock(IWorkspace.class);
+                IWorkspaceRoot root = mock(IWorkspaceRoot.class);
+                IProject project = mock(IProject.class);
+                IJavaProject javaProject = mock(IJavaProject.class);
+
+                when(workspace.getRoot()).thenReturn(root);
+                when(root.getProjects()).thenReturn(new IProject[]{project});
+                when(project.isOpen()).thenReturn(true);
+                when(javaProject.exists()).thenReturn(true);
+
+                try (MockedStatic<ResourcesPlugin> rsMock = org.mockito.Mockito.mockStatic(ResourcesPlugin.class);
+                         MockedStatic<JavaCore> jcMock = org.mockito.Mockito.mockStatic(JavaCore.class)) {
+
+                        rsMock.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+                        jcMock.when(() -> JavaCore.create(project)).thenReturn(javaProject);
+
+                        List<IJavaProject> result = (List<IJavaProject>) invoke(provider,
+                                        "getSearchProjectsForUri",
+                                        new Class<?>[] { String.class },
+                                        new Object[] { "groovy-source:///test.groovy" });
+                        assertNotNull(result);
+                        assertFalse(result.isEmpty());
+                        verify(root, never()).findFilesForLocationURI(org.mockito.ArgumentMatchers.any());
+                }
+        }
+
+        @Test
+        void resolveNewTypePathReturnsNullForNonFileUri() throws Exception {
+                Path result = (Path) invoke(testProvider,
+                                "resolveNewTypePath",
+                                new Class<?>[] { String.class, String.class, String.class, String.class },
+                                new Object[] {
+                                                "groovy-source:///src/main/groovy/com/example/Current.groovy",
+                                                "com.example",
+                                                "com.example.newpkg",
+                                                "CreatedType"
+                                });
+                assertNull(result);
+        }
 
     // ================================================================
     // Implement interface edge cases

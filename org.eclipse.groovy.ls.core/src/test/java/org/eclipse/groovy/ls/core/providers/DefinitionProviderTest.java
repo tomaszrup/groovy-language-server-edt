@@ -23,11 +23,14 @@ import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassNode;
@@ -59,6 +62,7 @@ import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -68,6 +72,9 @@ import org.mockito.MockedStatic;
  * Tests for pure-text and AST utility methods in {@link DefinitionProvider}.
  */
 class DefinitionProviderTest {
+
+    @TempDir
+    Path tempDir;
 
     private DefinitionProvider provider;
     private DocumentManager documentManager;
@@ -426,6 +433,40 @@ class DefinitionProviderTest {
 
         assertNull(invokeResolveLocationForType(type));
         assertNull(SourceJarHelper.getCachedContent("test.binary.NoSource"));
+    }
+
+    @Test
+    void resolveLocationForTypeUsesSourcesJarForInnerBinaryType() throws Exception {
+        String source = "package test.binary;\n"
+            + "public class AttachedOuter {\n"
+            + "    public enum Inner {\n"
+            + "        VALUE\n"
+            + "    }\n"
+            + "}\n";
+        java.io.File sourcesJar = createJar(
+            tempDir.resolve("attached-outer-sources.jar"),
+            "test/binary/AttachedOuter.java",
+            source);
+
+        IType type = mock(IType.class);
+        when(type.getFullyQualifiedName()).thenReturn("test.binary.AttachedOuter$Inner");
+        when(type.getElementName()).thenReturn("Inner");
+
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        when(type.getAncestor(IJavaElement.PACKAGE_FRAGMENT_ROOT)).thenReturn(root);
+        when(root.getSourceAttachmentPath()).thenReturn(
+            org.eclipse.core.runtime.Path.fromOSString(sourcesJar.getAbsolutePath()));
+
+        Location loc = invokeResolveLocationForType(type);
+        String resolvedSource = SourceJarHelper.resolveSourceContent(loc.getUri());
+
+        assertNotNull(loc);
+        assertEquals("groovy-source:///test/binary/AttachedOuter$Inner.java", loc.getUri());
+        assertEquals(source, resolvedSource);
+        assertEquals(resolvedSource,
+            SourceJarHelper.getCachedContent("test.binary.AttachedOuter$Inner"));
+        assertTrue(resolvedSource.contains("enum Inner"));
+        assertTrue(loc.getRange().getStart().getLine() > 0);
     }
 
     @Test
@@ -2238,6 +2279,16 @@ class DefinitionProviderTest {
         Method m = DefinitionProvider.class.getDeclaredMethod("determineSourceExtension", java.io.File.class, String.class);
         m.setAccessible(true);
         return (String) m.invoke(provider, sourcesJar, fqn);
+    }
+
+    private java.io.File createJar(Path jarPath, String entryName, String content) throws IOException {
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(jarPath))) {
+            ZipEntry entry = new ZipEntry(entryName);
+            zos.putNextEntry(entry);
+            zos.write(content.getBytes());
+            zos.closeEntry();
+        }
+        return jarPath.toFile();
     }
 
     private void invokeAppendPackageDeclaration(StringBuilder sb, IType type) throws Exception {

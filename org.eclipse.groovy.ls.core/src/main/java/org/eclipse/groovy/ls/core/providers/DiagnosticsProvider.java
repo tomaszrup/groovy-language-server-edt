@@ -569,8 +569,10 @@ public class DiagnosticsProvider {
                         collectFromWorkingCopy(workingCopy, diagnostics, content, lineIndex);
 
                         // Also get problems from resource markers (for saved files)
-                        IFile[] files = ResourcesPlugin.getWorkspace().getRoot()
-                                .findFilesForLocationURI(URI.create(uri));
+                        URI fileUri = toFileLocationUri(uri);
+                        IFile[] files = fileUri != null
+                            ? ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri)
+                            : new IFile[0];
                         if (files.length > 0) {
                             collectFromMarkers(files[0], diagnostics, content, lineIndex);
                         }
@@ -724,6 +726,18 @@ public class DiagnosticsProvider {
             // Not a GroovyCompilationUnit or reflection failed — assume not empty
         }
         return false;
+    }
+
+    private URI toFileLocationUri(String uri) {
+        if (uri == null || uri.isBlank()) {
+            return null;
+        }
+        try {
+            URI parsed = URI.create(uri);
+            return "file".equals(parsed.getScheme()) ? parsed : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

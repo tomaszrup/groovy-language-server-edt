@@ -311,6 +311,16 @@ class DocumentManagerCoreMethodsTest {
     }
 
     @Test
+    void findCompilationUnitIgnoresNonFileUriWithoutLoggingError() throws Exception {
+        DocumentManager manager = new DocumentManager();
+
+        try (MockedStatic<GroovyLanguageServerPlugin> plugin = org.mockito.Mockito.mockStatic(GroovyLanguageServerPlugin.class)) {
+            assertNull(invokeFindCompilationUnit(manager, "groovy-source:///org/example/Outer$Inner.java"));
+            plugin.verifyNoInteractions();
+        }
+    }
+
+    @Test
     void didChangeWithIncrementalEditModifiesContent() {
         DocumentManager manager = new DocumentManager();
         String uri = "file:///test/Incr.groovy";
@@ -707,6 +717,12 @@ class DocumentManagerCoreMethodsTest {
         Method method = DocumentManager.class.getDeclaredMethod("detectProjectRoot", java.io.File.class);
         method.setAccessible(true);
         return (java.io.File) method.invoke(manager, file);
+    }
+
+    private ICompilationUnit invokeFindCompilationUnit(DocumentManager manager, String uri) throws Exception {
+        Method method = DocumentManager.class.getDeclaredMethod("findCompilationUnit", String.class);
+        method.setAccessible(true);
+        return (ICompilationUnit) method.invoke(manager, uri);
     }
 
     private void invokeRefreshWorkingCopy(DocumentManager manager, String uri, String trigger)

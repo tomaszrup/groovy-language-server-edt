@@ -318,7 +318,10 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     private void refreshWorkspaceFile(String uri) {
         try {
-            URI fileUri = URI.create(uri);
+            URI fileUri = toFileLocationUri(uri);
+            if (fileUri == null) {
+                return;
+            }
             org.eclipse.core.resources.IFile[] files =
                     ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri);
             for (org.eclipse.core.resources.IFile file : files) {
@@ -350,7 +353,10 @@ public class GroovyWorkspaceService implements WorkspaceService {
         java.util.Set<org.eclipse.core.resources.IProject> refreshed = new java.util.HashSet<>();
         for (FileEvent event : params.getChanges()) {
             try {
-                URI fileUri = URI.create(event.getUri());
+                URI fileUri = toFileLocationUri(event.getUri());
+                if (fileUri == null) {
+                    continue;
+                }
                 org.eclipse.core.resources.IFile[] files =
                         ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri);
                 for (org.eclipse.core.resources.IFile file : files) {
@@ -778,8 +784,11 @@ public class GroovyWorkspaceService implements WorkspaceService {
         if (workspaceRoot == null) {
             return;
         }
+        Path rootPath = toFilePath(workspaceRoot);
+        if (rootPath == null) {
+            return;
+        }
         try {
-            Path rootPath = Paths.get(URI.create(workspaceRoot));
             Files.walk(rootPath, 20)
                     .filter(Files::isRegularFile)
                     .filter(p -> p.toString().endsWith(".groovy"))
@@ -823,8 +832,11 @@ public class GroovyWorkspaceService implements WorkspaceService {
     }
 
     String inferPackageFromPath(String uri, String fallbackPackage) {
+        Path filePath = toFilePath(uri);
+        if (filePath == null) {
+            return fallbackPackage;
+        }
         try {
-            Path filePath = Paths.get(URI.create(uri));
             Path parent = filePath.getParent();
             if (parent == null) {
                 return fallbackPackage;
@@ -1001,13 +1013,12 @@ public class GroovyWorkspaceService implements WorkspaceService {
         if (uri == null || uri.isBlank()) {
             return null;
         }
-        try {
-            Path path = Paths.get(URI.create(uri));
-            Path fileName = path.getFileName();
-            return fileName != null ? fileName.toString() : null;
-        } catch (Exception e) {
+        Path path = toFilePath(uri);
+        if (path == null) {
             return null;
         }
+        Path fileName = path.getFileName();
+        return fileName != null ? fileName.toString() : null;
     }
 
     private String fileExtensionFromUri(String uri) {
@@ -1030,8 +1041,12 @@ public class GroovyWorkspaceService implements WorkspaceService {
             return openContent;
         }
 
+        Path path = toFilePath(uri);
+        if (path == null) {
+            return null;
+        }
+
         try {
-            Path path = Paths.get(URI.create(uri));
             if (Files.isRegularFile(path)) {
                 return Files.readString(path, StandardCharsets.UTF_8);
             }
@@ -1104,8 +1119,11 @@ public class GroovyWorkspaceService implements WorkspaceService {
         if (javaProject == null) {
             return fallbackPackage;
         }
+        Path newPath = toFilePath(newUri);
+        if (newPath == null) {
+            return fallbackPackage;
+        }
         try {
-            Path newPath = Paths.get(URI.create(newUri));
             Path newParent = newPath.getParent();
             if (newParent == null) {
                 return fallbackPackage;
@@ -1174,7 +1192,10 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     private IJavaProject findJavaProjectForUri(String uri) {
         try {
-            URI location = URI.create(uri);
+            URI location = toFileLocationUri(uri);
+            if (location == null) {
+                return null;
+            }
             org.eclipse.core.resources.IFile[] files =
                     ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(location);
             for (org.eclipse.core.resources.IFile file : files) {
@@ -1191,6 +1212,30 @@ public class GroovyWorkspaceService implements WorkspaceService {
             GroovyLanguageServerPlugin.logError("Failed to resolve Java project for URI: " + uri, e);
         }
         return null;
+    }
+
+    private URI toFileLocationUri(String uri) {
+        if (uri == null || uri.isBlank()) {
+            return null;
+        }
+        try {
+            URI parsed = URI.create(uri);
+            return "file".equals(parsed.getScheme()) ? parsed : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Path toFilePath(String uri) {
+        URI fileUri = toFileLocationUri(uri);
+        if (fileUri == null) {
+            return null;
+        }
+        try {
+            return Paths.get(fileUri);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private String packageNameForPath(Path relativePath) {
@@ -1579,7 +1624,10 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     private IType findTypeForFileRename(String oldUri, String oldTypeName) {
         try {
-            URI location = URI.create(oldUri);
+            URI location = toFileLocationUri(oldUri);
+            if (location == null) {
+                return null;
+            }
             org.eclipse.core.resources.IFile[] files =
                     ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(location);
 

@@ -972,12 +972,12 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     private IProject resolveProjectFromUri(String projectUri) {
-        if (projectUri == null) {
+        java.io.File uriFile = toFile(projectUri);
+        if (uriFile == null) {
             return null;
         }
 
         try {
-            java.io.File uriFile = new java.io.File(URI.create(projectUri));
             IProject byUriPath = findEclipseProjectByPath(uriFile.getAbsolutePath());
             if (byUriPath != null) {
                 return byUriPath;
@@ -1273,11 +1273,11 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * or {@code null} if none is found.
      */
     public String getProjectNameForUri(String uri) {
-        if (uri == null) {
+        java.io.File file = toFile(uri);
+        if (file == null) {
             return null;
         }
         try {
-            java.io.File file = new java.io.File(URI.create(uri));
             String fsPath = file.getAbsolutePath();
             IProject project = findEclipseProjectByPath(fsPath);
             String name = project != null ? project.getName() : null;
@@ -1332,10 +1332,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     private java.io.File resolveWorkspaceDirectory() {
+        return toFile(workspaceRoot);
+    }
+
+    private java.io.File toFile(String uri) {
+        if (uri == null || uri.isBlank()) {
+            return null;
+        }
         try {
-            return new java.io.File(URI.create(workspaceRoot));
+            URI parsed = URI.create(uri);
+            if (!"file".equals(parsed.getScheme())) {
+                return null;
+            }
+            return new java.io.File(parsed);
         } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("Failed to resolve workspace root URI", e);
             return null;
         }
     }

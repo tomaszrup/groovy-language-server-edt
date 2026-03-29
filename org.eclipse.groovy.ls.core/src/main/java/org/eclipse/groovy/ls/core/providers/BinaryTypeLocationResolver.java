@@ -84,7 +84,7 @@ final class BinaryTypeLocationResolver {
     }
 
     static String determineSourceExtension(java.io.File sourcesJar, String fqn) {
-        String entryPath = fqn.replace('.', '/') + EXT_GROOVY;
+        String entryPath = SourceJarHelper.sourceFileFqn(fqn).replace('.', '/') + EXT_GROOVY;
         try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(sourcesJar)) {
             if (zf.getEntry(entryPath) != null) {
                 return EXT_GROOVY;

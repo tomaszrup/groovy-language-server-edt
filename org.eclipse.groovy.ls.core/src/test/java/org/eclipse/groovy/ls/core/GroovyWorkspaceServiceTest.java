@@ -499,6 +499,12 @@ class GroovyWorkspaceServiceTest {
         assertNull(invoke("fileNameFromUri", new Class<?>[] {String.class}, new Object[] {"   "}));
     }
 
+        @Test
+        void fileNameFromUriReturnsNullForNonFileUri() throws Exception {
+                assertNull(invoke("fileNameFromUri",
+                                new Class<?>[] {String.class}, new Object[] {"groovy-source:///path/Hello.groovy"}));
+        }
+
     // ---- toSymbolKind (via mock) ----
 
     @Test
@@ -641,6 +647,14 @@ class GroovyWorkspaceServiceTest {
                 new Object[] {"file:///nonexistent/path/NotHere.groovy"});
         assertNull(result);
     }
+
+        @Test
+        void getSourceTextReturnsNullForNonFileUri() throws Exception {
+                String result = (String) invoke("getSourceText",
+                                new Class<?>[] {String.class},
+                                new Object[] {"groovy-source:///path/Virtual.groovy"});
+                assertNull(result);
+        }
 
     // ---- readNestedBoolean edge cases ----
 
