@@ -2,6 +2,26 @@ export function normalizeFsPath(inputPath: string): string {
     return inputPath.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
 }
 
+export function uriToFsPath(uriValue: string): string | undefined {
+    try {
+        const parsed = new URL(uriValue);
+        let pathname = decodeURIComponent(parsed.pathname);
+        if (/^\/[A-Za-z]:/.test(pathname)) {
+            pathname = pathname.slice(1);
+        }
+        if (parsed.protocol === 'file:') {
+            if (parsed.host) {
+                pathname = `//${parsed.host}${pathname}`;
+            }
+            return pathname;
+        }
+
+        return pathname.startsWith('/') || /^[A-Za-z]:/.test(pathname) ? pathname : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 export function isJdtWorkspaceUri(uriValue: string): boolean {
     const normalized = uriValue.toLowerCase().replaceAll('\\', '/');
     return normalized.includes('/jdt_ws/');

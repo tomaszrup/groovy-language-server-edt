@@ -389,17 +389,23 @@ public class DocumentManager {
             prev.cancel(true);
         }
 
-        final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.Future<?>> futureRef =
-                new java.util.concurrent.atomic.AtomicReference<>();
-        java.util.concurrent.Future<?> future = didOpenExecutor.submit(() -> {
-            try {
-                refreshWorkingCopy(bgUri, trigger);
-            } finally {
-                pendingOpenFutures.remove(bgUri, futureRef.get());
+        java.util.concurrent.FutureTask<Void> future = new java.util.concurrent.FutureTask<>(() -> {
+            refreshWorkingCopy(bgUri, trigger);
+            return null;
+        }) {
+            @Override
+            protected void done() {
+                pendingOpenFutures.remove(bgUri, this);
             }
-        });
-        futureRef.set(future);
+        };
         pendingOpenFutures.put(bgUri, future);
+        try {
+            didOpenExecutor.execute(future);
+        } catch (RuntimeException e) {
+            pendingOpenFutures.remove(bgUri, future);
+            future.cancel(true);
+            throw e;
+        }
     }
 
     private void refreshWorkingCopy(String uri, String trigger) {

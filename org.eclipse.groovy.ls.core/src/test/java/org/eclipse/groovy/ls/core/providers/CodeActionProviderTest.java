@@ -490,8 +490,8 @@ class CodeActionProviderTest {
         documentManager.didClose(uri);
     }
 
-    @Test
-    void getCodeActionsOffersSourceFixAll() {
+        @Test
+        void getCodeActionsOffersStandardSourceFixAllKind() {
         String uri = "file:///FixAllImports.groovy";
         String content = """
                 import java.time.LocalDate
@@ -513,12 +513,46 @@ class CodeActionProviderTest {
 
         CodeAction fixAll = actions(provider, uri, content,
                 List.of(CodeActionKind.SourceFixAll), List.of(diagnostic)).stream()
-                .filter(action -> CodeActionKind.SourceFixAll.equals(action.getKind()))
+                .filter(action -> "Fix all auto-fixable issues".equals(action.getTitle()))
                 .findFirst()
                 .orElse(null);
 
         assertNotNull(fixAll);
         assertEquals("Fix all auto-fixable issues", fixAll.getTitle());
+        assertEquals(CodeActionKind.SourceFixAll, fixAll.getKind());
+
+        documentManager.didClose(uri);
+    }
+
+    @Test
+    void getCodeActionsSupportsGroovySpecificFixAllRequest() {
+        String uri = "file:///FixAllImportsSpecific.groovy";
+        String content = """
+                import java.time.LocalDate
+                class Example {
+                    String name
+                }
+                """;
+
+        DocumentManager documentManager = new DocumentManager();
+        documentManager.didOpen(uri, content);
+
+        DiagnosticsProvider diagnosticsProvider = new DiagnosticsProvider(documentManager);
+        CodeActionProvider provider = new CodeActionProvider(documentManager, diagnosticsProvider);
+
+        Diagnostic diagnostic = new Diagnostic();
+        diagnostic.setCode(Either.forLeft(CodeActionProvider.DIAG_CODE_UNUSED_IMPORT));
+        diagnostic.setRange(new Range(new Position(0, 17), new Position(0, 26)));
+        diagnostic.setMessage("The import 'java.time.LocalDate' is never used");
+
+        CodeAction fixAll = actions(provider, uri, content,
+                List.of(CodeActionProvider.SOURCE_KIND_FIX_ALL_GROOVY), List.of(diagnostic)).stream()
+                .filter(action -> "Fix all auto-fixable issues".equals(action.getTitle()))
+                .findFirst()
+                .orElse(null);
+
+        assertNotNull(fixAll);
+        assertEquals(CodeActionProvider.SOURCE_KIND_FIX_ALL_GROOVY, fixAll.getKind());
 
         documentManager.didClose(uri);
     }

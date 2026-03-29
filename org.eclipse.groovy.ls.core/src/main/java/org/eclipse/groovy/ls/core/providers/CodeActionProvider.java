@@ -35,7 +35,6 @@ import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.IMethod;
-import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.ISourceReference;
@@ -1655,13 +1654,22 @@ public class CodeActionProvider {
         }
 
         CodeAction action = new CodeAction("Fix all auto-fixable issues");
-        action.setKind(CodeActionKind.SourceFixAll);
+        action.setKind(getFixAllActionKind(onlyKinds));
         action.setDiagnostics(diagnostics);
 
         WorkspaceEdit edit = new WorkspaceEdit();
         edit.setChanges(Collections.singletonMap(uri, edits));
         action.setEdit(edit);
         return action;
+    }
+
+    private String getFixAllActionKind(List<String> onlyKinds) {
+        if (onlyKinds != null
+                && onlyKinds.contains(SOURCE_KIND_FIX_ALL_GROOVY)
+                && !onlyKinds.contains(CodeActionKind.SourceFixAll)) {
+            return SOURCE_KIND_FIX_ALL_GROOVY;
+        }
+        return CodeActionKind.SourceFixAll;
     }
 
     private List<TextEdit> createRemoveUnusedImportEdits(String uri, String content) {

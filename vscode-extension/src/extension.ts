@@ -14,8 +14,19 @@ import {
     isJdtWorkspaceUri,
     normalizeFsPath,
     pathStartsWith,
+    uriToFsPath,
 } from './utils';
 import { prepareWritableConfigDir } from './serverConfig';
+import {
+    InitialClasspathStartupTracker,
+    type PendingStartupClasspathTargetHandle,
+    type PendingStartupClasspathSnapshot,
+    type StartupClasspathTarget,
+} from './startupTracking';
+import {
+    getInitialClasspathImportRefreshAction,
+    getInitialClasspathRetryAction,
+} from './startupRetryPolicy';
 import { detectWorkspaceRestoreCorruption } from './workspaceRecovery';
 import {
     LanguageClient,
@@ -38,12 +49,7 @@ interface ClasspathNotificationPayload {
     hasJarEntries: boolean;
 }
 
-interface JavaClasspathTarget {
-    requestUri: string;
-    projectUri: string;
-    projectPath?: string;
-    source: string;
-}
+type JavaClasspathTarget = StartupClasspathTarget;
 
 interface ServerSessionScope {
     client?: LanguageClient;
@@ -223,14 +229,6 @@ function logStartupDuration(phase: string, phaseStartAt: number, details?: strin
     startupTrace?.duration(phase, phaseStartAt, details);
 }
 
-function toFileSystemPath(uriValue: string): string | undefined {
-    try {
-        return vscode.Uri.parse(uriValue).fsPath;
-    } catch {
-        return undefined;
-    }
-}
-
 async function collectProjectRootMap(): Promise<Map<string, string>> {
     // Return the cached map if it's fresh (less than 30 s old).
     // Invalidation also happens via file system watcher on build file changes.
@@ -266,7 +264,7 @@ function resolveProjectPathFromUri(
     uriValue: string,
     projectRootMap: Map<string, string>
 ): string | undefined {
-    const fsPath = toFileSystemPath(uriValue);
+    const fsPath = uriToFsPath(uriValue);
     if (!fsPath) return undefined;
 
     const normalizedPath = normalizeFsPath(fsPath);
@@ -1002,7 +1000,7 @@ async function initJavaExtensionClasspath(
     let initialClasspathBatchCompleteSent = false;
     let initialClasspathFetchStarted = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    let pendingInitialRetryTargets: JavaClasspathTarget[] = [];
+    const initialClasspathTracker = new InitialClasspathStartupTracker();
     const isActive = (): boolean => isServerSessionActive(session, lsClient);
     const clearRetryTimer = (): void => {
         if (retryTimer) {
@@ -1013,7 +1011,7 @@ async function initJavaExtensionClasspath(
 
     addSessionDisposables(session, new vscode.Disposable(() => {
         initialClasspathBatchCompleteSent = true;
-        pendingInitialRetryTargets = [];
+        initialClasspathTracker.reset();
         clearRetryTimer();
     }));
 
@@ -1026,6 +1024,48 @@ async function initJavaExtensionClasspath(
         lsClient.sendNotification('groovy/classpathBatchComplete', {});
         outputChannel.appendLine(`[java-ext] Sent groovy/classpathBatchComplete to server (${reason}).`);
         markStartupPhase('java.classpath-batch-complete', reason);
+    };
+    const replaceDiscoveredInitialTargets = (
+        targets: JavaClasspathTarget[],
+        baselineSnapshot: PendingStartupClasspathSnapshot
+    ): void => {
+        initialClasspathTracker.replaceDiscoveredTargets(targets, baselineSnapshot);
+    };
+    const getPendingInitialTargetsSnapshot = (): PendingStartupClasspathSnapshot =>
+        initialClasspathTracker.getPendingTargetsSnapshot();
+    const clearPendingInitialTargets = (): void => {
+        initialClasspathTracker.clearPendingTargets();
+    };
+    const mergePendingInitialTargets = (
+        targets: JavaClasspathTarget[]
+    ): Array<PendingStartupClasspathTargetHandle | undefined> => initialClasspathTracker.mergePendingTargets(targets);
+    const markImportedInitialTargets = (targets: JavaClasspathTarget[]): void => {
+        initialClasspathTracker.markTargetsImportConfirmed(targets);
+    };
+    const enableEmptyImportFallback = (): void => {
+        initialClasspathTracker.enableEmptyImportFallback();
+    };
+    const reconcilePendingInitialTargets = (
+        attemptedSnapshot: PendingStartupClasspathSnapshot,
+        remainingTargets: JavaClasspathTarget[]
+    ): void => {
+        initialClasspathTracker.reconcilePendingTargets(attemptedSnapshot, remainingTargets);
+    };
+    const shouldSendInitialClasspathBatchComplete = (): boolean =>
+        initialClasspathTracker.shouldSendInitialClasspathBatchComplete();
+    const runInitialClasspathAttempt = async <T>(operation: () => Promise<T>): Promise<T> => {
+        return initialClasspathTracker.runSerializedBatchAttempt(operation);
+    };
+    const resolveInitialStartupTarget = (
+        handle: PendingStartupClasspathTargetHandle,
+        reason: string
+    ): void => {
+        if (initialClasspathBatchCompleteSent || !isActive()) {
+            return;
+        }
+        if (initialClasspathTracker.resolvePendingTarget(handle)) {
+            sendInitialClasspathBatchComplete(reason);
+        }
     };
 
     // Resolve Java home for filtering JDK entries from classpath
@@ -1103,9 +1143,9 @@ async function initJavaExtensionClasspath(
         rawEntries: string[],
         target: JavaClasspathTarget,
         projectRootMap: Map<string, string>
-    ): boolean => {
+    ): { delivered: boolean; resolved: boolean; hasJars: boolean } => {
         if (!isActive()) {
-            return false;
+            return { delivered: false, resolved: false, hasJars: false };
         }
 
         const filteredEntries: string[] = [];
@@ -1125,7 +1165,7 @@ async function initJavaExtensionClasspath(
         outputChannel.appendLine(`[java-ext]   → ${filteredEntries.length} entries after filtering`);
 
         if (filteredEntries.length === 0) {
-            return false;
+            return { delivered: false, resolved: false, hasJars: false };
         }
 
         const finalHasJars = filteredEntries.some(e => e.toLowerCase().endsWith('.jar'));
@@ -1145,15 +1185,22 @@ async function initJavaExtensionClasspath(
             (finalHasJars ? ' (includes JARs)' : ' (output dirs only, no JARs)')
             + (resolvedProjectPath ? `, projectPath=${resolvedProjectPath}` : '')
         );
-        return finalHasJars;
+        return {
+            delivered: true,
+            // Track the stronger resolved state separately from initial batch
+            // delivery so later refreshes can still distinguish output-only
+            // classpaths from fully imported jar-bearing ones.
+            resolved: initialClasspathTracker.isStartupClasspathResolved(target, finalHasJars),
+            hasJars: finalHasJars,
+        };
     };
 
     const fetchClasspathForProject = async (
         target: JavaClasspathTarget,
         projectRootMap: Map<string, string>
-    ): Promise<boolean> => {
+    ): Promise<{ delivered: boolean; resolved: boolean; hasJars: boolean }> => {
         if (!isActive()) {
-            return false;
+            return { delivered: false, resolved: false, hasJars: false };
         }
 
         try {
@@ -1164,7 +1211,7 @@ async function initJavaExtensionClasspath(
 
             const { rawEntries, hasJars } = await fetchRawEntries(target);
             if (!isActive()) {
-                return false;
+                return { delivered: false, resolved: false, hasJars: false };
             }
 
             outputChannel.appendLine(
@@ -1179,47 +1226,61 @@ async function initJavaExtensionClasspath(
             }
 
             outputChannel.appendLine(`[java-ext]   → no usable entries`);
-            return false;
+            return { delivered: false, resolved: false, hasJars: false };
         } catch (e) {
             outputChannel.appendLine(`[java-ext]   → error: ${e}`);
-            return false;
+            return { delivered: false, resolved: false, hasJars: false };
         }
     };
 
     const fetchClasspathBatch = async (
         targets: JavaClasspathTarget[],
         projectRootMap: Map<string, string>
-    ): Promise<number> => {
+    ): Promise<{ delivered: number; resolved: number; remainingTargets: JavaClasspathTarget[] }> => {
         if (!isActive()) {
-            return 0;
+            return { delivered: 0, resolved: 0, remainingTargets: targets };
         }
 
         if (targets.length > 0) {
             outputChannel.appendLine(`[java-ext] Total ${targets.length} project(s) to fetch classpath for`);
         }
 
-        let fetched = 0;
+        let delivered = 0;
+        let resolved = 0;
+        const remainingTargets: JavaClasspathTarget[] = [];
         const batchSize = 20;
         for (let i = 0; i < targets.length; i += batchSize) {
             if (!isActive()) {
-                return fetched;
+                return { delivered, resolved, remainingTargets };
             }
             const batch = targets.slice(i, i + batchSize);
-            const results = await Promise.allSettled(
-                batch.map(target => fetchClasspathForProject(target, projectRootMap))
-            );
+            const results = await Promise.allSettled(batch.map(target => fetchClasspathForProject(target, projectRootMap)));
             if (!isActive()) {
-                return fetched;
+                return { delivered, resolved, remainingTargets };
             }
-            for (const result of results) {
-                if (result.status === 'fulfilled' && result.value) {
-                    fetched++;
+            for (let j = 0; j < results.length; j++) {
+                const result = results[j];
+                if (result.status !== 'fulfilled') {
+                    remainingTargets.push(batch[j]);
+                    continue;
+                }
+                if (result.value.delivered) {
+                    delivered++;
+                }
+                if (result.value.resolved) {
+                    resolved++;
+                }
+                if (!result.value.delivered) {
+                    remainingTargets.push(batch[j]);
                 }
             }
         }
 
-        outputChannel.appendLine(`[java-ext] Sent classpath for ${fetched}/${targets.length} project(s)`);
-        return fetched;
+        outputChannel.appendLine(
+            `[java-ext] Sent usable classpath for ${delivered}/${targets.length} project(s)` +
+            ` (${resolved} fully resolved, ${remainingTargets.length} still awaiting initial delivery)`
+        );
+        return { delivered, resolved, remainingTargets };
     };
 
     /** Check whether a project URI should be included based on JDT workspace and root-folder heuristics. */
@@ -1266,12 +1327,13 @@ async function initJavaExtensionClasspath(
     };
 
     // Fetch classpath for all Java projects known to JDT LS.
-    // Returns the number of projects that had actual JAR entries.
+    // Returns the number of projects whose initial usable classpath was delivered.
     const fetchAllClasspaths = async (): Promise<number> => {
         if (!isActive()) {
             return 0;
         }
 
+        const pendingTargetsBaseline = getPendingInitialTargetsSnapshot();
         try {
             const projectRootMap = await collectProjectRootMap();
             if (!isActive()) {
@@ -1318,8 +1380,11 @@ async function initJavaExtensionClasspath(
             }));
 
             await addBuildFileScanTargets(targets, knownPaths, projectRootMap, wsRootPath);
-            pendingInitialRetryTargets = targets;
-            return fetchClasspathBatch(targets, projectRootMap);
+            replaceDiscoveredInitialTargets(targets, pendingTargetsBaseline);
+            const attemptedTargetsSnapshot = getPendingInitialTargetsSnapshot();
+            const batchResult = await fetchClasspathBatch(attemptedTargetsSnapshot.targets, projectRootMap);
+            reconcilePendingInitialTargets(attemptedTargetsSnapshot, batchResult.remainingTargets);
+            return batchResult.delivered;
         } catch (e) {
             outputChannel.appendLine(`[java-ext] Failed to enumerate projects: ${e}`);
             return fetchClasspathFallback();
@@ -1332,6 +1397,7 @@ async function initJavaExtensionClasspath(
             return 0;
         }
 
+        const pendingTargetsBaseline = getPendingInitialTargetsSnapshot();
         const folders = workspace.workspaceFolders;
         if (!folders) return 0;
         const projectRootMap = await collectProjectRootMap();
@@ -1351,8 +1417,11 @@ async function initJavaExtensionClasspath(
                 source: 'workspace-folder-fallback',
             });
         }
-        pendingInitialRetryTargets = targets;
-        return fetchClasspathBatch(targets, projectRootMap);
+        replaceDiscoveredInitialTargets(targets, pendingTargetsBaseline);
+        const attemptedTargetsSnapshot = getPendingInitialTargetsSnapshot();
+        const batchResult = await fetchClasspathBatch(attemptedTargetsSnapshot.targets, projectRootMap);
+        reconcilePendingInitialTargets(attemptedTargetsSnapshot, batchResult.remainingTargets);
+        return batchResult.delivered;
     };
 
     const fetchPendingInitialTargets = async (): Promise<number> => {
@@ -1360,7 +1429,7 @@ async function initJavaExtensionClasspath(
             return 0;
         }
 
-        if (pendingInitialRetryTargets.length === 0) {
+        if (initialClasspathTracker.getPendingTargetCount() === 0) {
             return fetchAllClasspaths();
         }
 
@@ -1368,7 +1437,12 @@ async function initJavaExtensionClasspath(
         if (!isActive()) {
             return 0;
         }
-        return fetchClasspathBatch(pendingInitialRetryTargets, projectRootMap);
+        // Snapshot the attempted batch so projects added by async import/classpath
+        // events during the fetch remain pending for later retries.
+        const attemptedTargetsSnapshot = getPendingInitialTargetsSnapshot();
+        const batchResult = await fetchClasspathBatch(attemptedTargetsSnapshot.targets, projectRootMap);
+        reconcilePendingInitialTargets(attemptedTargetsSnapshot, batchResult.remainingTargets);
+        return batchResult.delivered;
     };
 
     /** Force project configuration updates for all Java projects. */
@@ -1377,7 +1451,7 @@ async function initJavaExtensionClasspath(
             return;
         }
 
-        outputChannel.appendLine('[java-ext] No JARs on first attempt. Forcing project configuration update...');
+        outputChannel.appendLine('[java-ext] Initial classpath batch incomplete. Forcing project configuration update...');
         try {
             const projectUris: string[] =
                 (await vscode.commands.executeCommand('java.project.getAll')) ?? [];
@@ -1402,35 +1476,42 @@ async function initJavaExtensionClasspath(
     };
 
     // Retry wrapper: Java extension may not have finished Gradle/Maven import
-    // when we first fetch. Retry with increasing delays until we get actual JARs.
+    // when we first fetch. Retry with increasing delays until every discovered
+    // project has delivered an initial usable classpath.
     // On first failure, trigger java.projectConfiguration.update to force dependency resolution.
     const fetchWithRetry = async (attempt: number = 1, maxAttempts: number = 6): Promise<void> => {
         if (initialClasspathBatchCompleteSent || !isActive()) {
             return;
         }
-        const fetched = attempt === 1 ? await fetchAllClasspaths() : await fetchPendingInitialTargets();
+        const delivered = await runInitialClasspathAttempt(() =>
+            attempt === 1 ? fetchAllClasspaths() : fetchPendingInitialTargets()
+        );
         if (!isActive()) {
             return;
         }
-        if (fetched > 0) {
-            pendingInitialRetryTargets = [];
-            sendInitialClasspathBatchComplete(`fetched ${fetched} project(s) on attempt ${attempt}`);
+        const retryAction = getInitialClasspathRetryAction({
+            attempt,
+            maxAttempts,
+            canSendBatchComplete: shouldSendInitialClasspathBatchComplete(),
+        });
+        if (retryAction === 'batch-complete') {
+            sendInitialClasspathBatchComplete(`delivered ${delivered} project(s) on attempt ${attempt}`);
             return;
         }
-        if (attempt >= maxAttempts) {
-            pendingInitialRetryTargets = [];
+        if (retryAction === 'max-attempts') {
+            clearPendingInitialTargets();
             sendInitialClasspathBatchComplete(`max attempts reached (${attempt})`);
             return;
         }
 
-        if (attempt === 1) {
+        if (retryAction === 'force-config-and-retry') {
             await forceProjectConfigurationUpdates();
         }
 
         const delay = Math.min(attempt * 5000, 30000); // 5s, 10s, 15s, 20s, 25s
         outputChannel.appendLine(
-            `[java-ext] No JARs yet (attempt ${attempt}/${maxAttempts}). ` +
-            `Retrying in ${delay / 1000}s...`
+            `[java-ext] Still waiting on ${initialClasspathTracker.getPendingTargetCount()} project(s) ` +
+            `(attempt ${attempt}/${maxAttempts}). Retrying in ${delay / 1000}s...`
         );
         if (!isActive()) {
             return;
@@ -1487,12 +1568,24 @@ async function initJavaExtensionClasspath(
                 if (!isActive()) {
                     return;
                 }
-                await fetchClasspathForProject({
+                const updatedTarget = {
                     requestUri: uri.toString(),
                     projectUri: uri.toString(),
                     projectPath: resolveProjectPathFromUri(uri.toString(), projectRootMap),
                     source: 'onDidClasspathUpdate',
-                }, projectRootMap);
+                };
+                let updatedTargetHandle: PendingStartupClasspathTargetHandle | undefined;
+                if (!initialClasspathBatchCompleteSent) {
+                    [updatedTargetHandle] = mergePendingInitialTargets([updatedTarget]);
+                }
+                const result = await fetchClasspathForProject(updatedTarget, projectRootMap);
+                if (!result.delivered || !updatedTargetHandle) {
+                    return;
+                }
+                resolveInitialStartupTarget(
+                    updatedTargetHandle,
+                    `classpath updated for ${updatedTarget.projectUri}`
+                );
             })
         );
         outputChannel.appendLine('[java-ext] Registered onDidClasspathUpdate listener.');
@@ -1509,14 +1602,19 @@ async function initJavaExtensionClasspath(
                 outputChannel.appendLine(
                     `[java-ext] Projects imported (${uris.length}) — refreshing classpath...`
                 );
-                if (uris.length === 0) {
-                    fetchAllClasspaths()
-                        .then(fetched => {
-                            if (!isActive()) {
+                const importRefreshAction = getInitialClasspathImportRefreshAction({
+                    importedProjectCount: uris.length,
+                });
+                if (importRefreshAction === 're-enumerate-projects') {
+                    if (!initialClasspathBatchCompleteSent) {
+                        enableEmptyImportFallback();
+                    }
+                    runInitialClasspathAttempt(fetchAllClasspaths)
+                        .then(() => {
+                            if (!isActive() || initialClasspathBatchCompleteSent) {
                                 return;
                             }
-                            if (fetched > 0) {
-                                pendingInitialRetryTargets = [];
+                            if (shouldSendInitialClasspathBatchComplete()) {
                                 sendInitialClasspathBatchComplete('projects imported (empty payload fallback)');
                             }
                         })
@@ -1529,25 +1627,32 @@ async function initJavaExtensionClasspath(
                     if (!isActive()) {
                         return;
                     }
-                    let fetched = 0;
-                    for (const importedUri of uris) {
-                        if (!isActive()) {
-                            return;
-                        }
-                        if (isJdtWorkspaceUri(importedUri.toString())) continue;
-                        const ok = await fetchClasspathForProject({
+                    const importedTargets = uris
+                        .filter(importedUri => !isJdtWorkspaceUri(importedUri.toString()))
+                        .map(importedUri => ({
                             requestUri: importedUri.toString(),
                             projectUri: importedUri.toString(),
                             projectPath: resolveProjectPathFromUri(importedUri.toString(), projectRootMap),
-                            source: 'onDidProjectsImport',
-                        }, projectRootMap);
-                        if (ok) {
-                            fetched++;
-                        }
+                            source: 'onDidProjectsImport' as const,
+                        }));
+                    let importedTargetHandles: Array<PendingStartupClasspathTargetHandle | undefined> = [];
+                    if (!initialClasspathBatchCompleteSent) {
+                        markImportedInitialTargets(importedTargets);
+                        importedTargetHandles = mergePendingInitialTargets(importedTargets);
                     }
-                    if (fetched > 0) {
-                        pendingInitialRetryTargets = [];
-                        sendInitialClasspathBatchComplete(`projects imported (${fetched} project(s) with jars)`);
+                    for (let i = 0; i < importedTargets.length; i++) {
+                        const target = importedTargets[i];
+                        const targetHandle = importedTargetHandles[i];
+                        if (!isActive()) {
+                            return;
+                        }
+                        const result = await fetchClasspathForProject(target, projectRootMap);
+                        if (result.delivered && targetHandle) {
+                            resolveInitialStartupTarget(
+                                targetHandle,
+                                `project imported for ${target.projectUri}`
+                            );
+                        }
                     }
                 })().catch(e => outputChannel.appendLine(`[java-ext] onDidProjectsImport error: ${e}`));
             })

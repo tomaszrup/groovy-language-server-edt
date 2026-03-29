@@ -26,10 +26,15 @@ import static org.mockito.Mockito.when;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.codehaus.groovy.ast.ModuleNode;
@@ -480,6 +485,28 @@ class DocumentManagerCoreMethodsTest {
     }
 
     @Test
+    void didOpenClearsPendingRefreshEntryWhenTaskCompletesInline() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        ExecutorService originalExecutor = getDidOpenExecutor(manager);
+        InlineExecutorService inlineExecutor = new InlineExecutorService();
+        setDidOpenExecutor(manager, inlineExecutor);
+        originalExecutor.shutdownNow();
+
+        String uri = "file:///test/InlinePending.groovy";
+        String normalizedUri = DocumentManager.normalizeUri(uri);
+
+        try {
+            manager.didOpen(uri, "class InlinePending {}\n");
+
+            assertTrue(getPendingOpenFutures(manager).isEmpty());
+            assertTrue(manager.isReadyForDiagnostics(uri));
+            assertFalse(getPendingOpenFutures(manager).containsKey(normalizedUri));
+        } finally {
+            manager.dispose();
+        }
+    }
+
+    @Test
     void didChangeInvalidatesStandaloneCacheWhenWorkingCopyExists() throws Exception {
         DocumentManager manager = new DocumentManager();
         String uri = "file:///test/Replay.groovy";
@@ -709,6 +736,25 @@ class DocumentManagerCoreMethodsTest {
         java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("documentVersions");
         field.setAccessible(true);
         return (Map<String, Long>) field.get(manager);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Future<?>> getPendingOpenFutures(DocumentManager manager) throws Exception {
+        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("pendingOpenFutures");
+        field.setAccessible(true);
+        return (Map<String, Future<?>>) field.get(manager);
+    }
+
+    private ExecutorService getDidOpenExecutor(DocumentManager manager) throws Exception {
+        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("didOpenExecutor");
+        field.setAccessible(true);
+        return (ExecutorService) field.get(manager);
+    }
+
+    private void setDidOpenExecutor(DocumentManager manager, ExecutorService executor) throws Exception {
+        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("didOpenExecutor");
+        field.setAccessible(true);
+        field.set(manager, executor);
     }
 
     // ================================================================
@@ -1008,5 +1054,40 @@ class DocumentManagerCoreMethodsTest {
         when(entry.getEntryKind()).thenReturn(entryKind);
         when(entry.getPath()).thenReturn(new org.eclipse.core.runtime.Path(path));
         return entry;
+    }
+
+    private static final class InlineExecutorService extends AbstractExecutorService {
+        private volatile boolean shutdown;
+
+        @Override
+        public void shutdown() {
+            shutdown = true;
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            shutdown = true;
+            return Collections.emptyList();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) {
+            return true;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            command.run();
+        }
     }
 }

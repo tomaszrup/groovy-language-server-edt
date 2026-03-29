@@ -5,6 +5,7 @@ import {
     isJdtWorkspaceUri,
     normalizeFsPath,
     pathStartsWith,
+    uriToFsPath,
 } from '../utils';
 
 describe('utils', () => {
@@ -37,6 +38,30 @@ describe('utils', () => {
 
     it('detects jdt workspace URIs case-insensitively', () => {
         assert.equal(isJdtWorkspaceUri('file:///tmp/JDT_WS/project/src/Foo.groovy'), true);
+    });
+
+    it('converts file URIs to filesystem paths', () => {
+        assert.equal(uriToFsPath('file:///workspace/app/src/Main.groovy'), '/workspace/app/src/Main.groovy');
+        assert.equal(uriToFsPath('file:///C:/Work/Proj/App.groovy'), 'C:/Work/Proj/App.groovy');
+        assert.equal(uriToFsPath('file://server/share/folder/Main.groovy'), '//server/share/folder/Main.groovy');
+    });
+
+    it('extracts paths from remote hierarchical URIs', () => {
+        assert.equal(
+            uriToFsPath('vscode-remote://ssh-remote+dev/workspace/app/src/Main.groovy'),
+            '/workspace/app/src/Main.groovy'
+        );
+    });
+
+    it('extracts Windows drive-letter paths from remote hierarchical URIs', () => {
+        assert.equal(
+            uriToFsPath('vscode-remote://ssh-remote+dev/C%3A/Work/Proj/App.groovy'),
+            'C:/Work/Proj/App.groovy'
+        );
+    });
+
+    it('returns undefined for non-path-bearing URIs', () => {
+        assert.equal(uriToFsPath('untitled:Scratch.groovy'), undefined);
     });
 
     it('checks path prefix with segment boundaries', () => {
