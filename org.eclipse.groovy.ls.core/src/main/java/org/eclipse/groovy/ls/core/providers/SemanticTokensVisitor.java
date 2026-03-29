@@ -73,6 +73,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
     private static final String EXTENDS_KEYWORD = "extends";
     private static final String IMPLEMENTS_KEYWORD = "implements";
     private static final String INTERFACE_KEYWORD = "interface";
+    private static final String DEF_KEYWORD = "def";
     private static final String TRAIT_KEYWORD = "trait";
     private static final String VOID_TYPE = "void";
     private static final int[] NO_POSITION = new int[0];
@@ -574,10 +575,14 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         int nameLine = node.getLineNumber() - 1;
         int nameCol = node.getColumnNumber() - 1;
         int[] resolved = findNameNear(nameLine, nameCol, name, 5);
-        if (resolved.length > 0 && !name.equals("<init>") && !name.equals("<clinit>")
-                && isValidIdentifier(name)) {
-            addToken(resolved[0], resolved[1], name.length(),
-                    SemanticTokensProvider.TYPE_METHOD, modifiers);
+        if (!name.equals("<init>") && !name.equals("<clinit>")) {
+            if (resolved.length > 0 && isValidIdentifier(name)) {
+                emitDefKeywordBeforeName(resolved[0], resolved[1]);
+                addToken(resolved[0], resolved[1], name.length(),
+                        SemanticTokensProvider.TYPE_METHOD, modifiers);
+            } else {
+                emitDefKeywordBeforeMethodSignature(nameLine);
+            }
         }
 
         visitMethodParameters(node.getParameters());
@@ -648,6 +653,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         int col = param.getColumnNumber() - 1;
         int nameOffset = findNameInLine(line, col, name);
         if (nameOffset >= 0) {
+            emitDefKeywordBeforeName(line, nameOffset);
             addToken(line, nameOffset, name.length(),
                     SemanticTokensProvider.TYPE_PARAMETER,
                     SemanticTokensProvider.MOD_DECLARATION);
@@ -685,6 +691,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             return;
         }
 
+        emitDefKeywordBeforeName(resolved[0], resolved[1]);
         addToken(resolved[0], resolved[1], node.getName().length(), getFieldTokenType(node),
                 getFieldModifiers(node));
     }
@@ -749,6 +756,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             return;
         }
 
+        emitDefKeywordBeforeName(resolved[0], resolved[1]);
         addToken(resolved[0], resolved[1], node.getName().length(),
                 SemanticTokensProvider.TYPE_PROPERTY,
                 fieldModifiers(node.getModifiers()));
@@ -947,6 +955,7 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
         int line = varExpr.getLineNumber() - 1;
         int col = varExpr.getColumnNumber() - 1;
         if (col >= 0 && !name.isEmpty()) {
+            emitDefKeywordBeforeName(line, col);
             int modifiers = SemanticTokensProvider.MOD_DECLARATION;
             if (java.lang.reflect.Modifier.isFinal(varExpr.getModifiers())) {
                 modifiers |= SemanticTokensProvider.MOD_READONLY;
@@ -954,6 +963,56 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             addToken(line, col, name.length(),
                     SemanticTokensProvider.TYPE_VARIABLE, modifiers);
         }
+    }
+
+    private void emitDefKeywordBeforeName(int line, int nameOffset) {
+        if (line < 0 || nameOffset <= 0) {
+            return;
+        }
+        int lineStart = findLineStart(line);
+        if (lineStart < 0) {
+            return;
+        }
+        int lineEnd = source.indexOf('\n', lineStart);
+        if (lineEnd < 0) {
+            lineEnd = source.length();
+        }
+
+        int searchLimit = Math.min(lineStart + nameOffset, lineEnd);
+        int keywordOffset = -1;
+        int searchFrom = lineStart;
+        while (searchFrom <= searchLimit - DEF_KEYWORD.length()) {
+            int found = source.indexOf(DEF_KEYWORD, searchFrom);
+            if (found < 0 || found > searchLimit - DEF_KEYWORD.length()) {
+                break;
+            }
+            if (isWholeWordMatch(found, DEF_KEYWORD.length())) {
+                keywordOffset = found - lineStart;
+            }
+            searchFrom = found + 1;
+        }
+        if (keywordOffset >= 0 && keywordOffset < nameOffset) {
+            addToken(line, keywordOffset, DEF_KEYWORD.length(),
+                    SemanticTokensProvider.TYPE_TYPE, 0);
+        }
+    }
+
+    private void emitDefKeywordBeforeMethodSignature(int line) {
+        if (line < 0) {
+            return;
+        }
+        int lineStart = findLineStart(line);
+        if (lineStart < 0) {
+            return;
+        }
+        int lineEnd = source.indexOf('\n', lineStart);
+        if (lineEnd < 0) {
+            lineEnd = source.length();
+        }
+
+        int parenIndex = source.indexOf('(', lineStart);
+        int searchLimit = (parenIndex >= 0 && parenIndex < lineEnd) ? parenIndex - lineStart : lineEnd - lineStart;
+        emitDefKeywordBeforeName(line, searchLimit);
     }
 
     @Override

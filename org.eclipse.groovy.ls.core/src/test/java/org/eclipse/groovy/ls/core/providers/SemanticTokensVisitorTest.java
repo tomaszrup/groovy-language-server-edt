@@ -519,6 +519,26 @@ class SemanticTokensVisitorTest {
                 "Expected implicit trait member usage to be tokenized as property");
     }
 
+    @Test
+    void emitsTypeTokensForDefDeclarations() {
+        String source = """
+                class Person {
+                    def name
+
+                    def greet(def other) {
+                        def message = other
+                        message
+                    }
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+
+        assertEquals(4, tokens.stream()
+                .filter(t -> "def".equals(t.text)
+                        && t.tokenType == SemanticTokensProvider.TYPE_TYPE)
+                .count());
+    }
+
     // ---- Generics with bounds ----
 
     @Test
@@ -892,6 +912,24 @@ class SemanticTokensVisitorTest {
         // Verify 'and' is present as a keyword at line 5 (0-based)
         assertTrue(keywordTokens.stream().anyMatch(t -> t.line == 5 && t.length == 3),
                 "Expected 'and' keyword token at line 5");
+    }
+
+    @Test
+    void emitsTypeTokenForSpockStringNamedMethodDef() {
+        String source = """
+                class MySpec extends Object {
+                    def 'supports the full book CRUD lifecycle'() {
+                        given:
+                        def createRequest = '{}'
+                    }
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+
+        assertTrue(tokens.stream().anyMatch(t -> t.line == 1
+                && "def".equals(t.text)
+                && t.tokenType == SemanticTokensProvider.TYPE_TYPE),
+                "Expected the Spock feature method def keyword to be tokenized as TYPE_TYPE");
     }
 
     private List<DecodedToken> collectTokens(String source, Range range) {

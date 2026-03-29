@@ -156,8 +156,12 @@
                     "match": "\\b(import|package)\\b"
                 },
                 {
+                    "name": "storage.type.groovy",
+                    "match": "\\bdef\\b"
+                },
+                {
                     "name": "keyword.other.groovy",
-                    "match": "\\b(def|var|with|it)\\b"
+                    "match": "\\b(var|with|it)\\b"
                 },
                 {
                     "name": "keyword.control.exception.groovy",
