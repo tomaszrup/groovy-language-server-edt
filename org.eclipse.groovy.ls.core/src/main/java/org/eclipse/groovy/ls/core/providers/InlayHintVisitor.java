@@ -290,7 +290,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         int max = Math.min(arguments.size(), params.length);
         for (int index = 0; index < max; index++) {
             Expression arg = arguments.get(index);
-            String parameterName = params[index].getName();
+            String parameterName = ParameterNameSupport.displayName(params[index].getName());
             if (isHintableParameterArgument(arg, parameterName)) {
                 Position position = new Position(
                         Math.max(0, arg.getLineNumber() - 1),
@@ -324,7 +324,7 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
         int max = Math.min(arguments.size(), params.length);
         for (int index = 0; index < max; index++) {
             Expression arg = arguments.get(index);
-            String parameterName = params[index].getName();
+            String parameterName = ParameterNameSupport.displayName(params[index].getName());
             if (isHintableParameterArgument(arg, parameterName)) {
                 Position position = new Position(
                         Math.max(0, arg.getLineNumber() - 1),
@@ -408,17 +408,49 @@ public class InlayHintVisitor extends ClassCodeVisitorSupport {
             return null;
         }
 
-        for (MethodNode method : candidates) {
-            if (method.getParameters().length == argumentCount) {
-                return method;
-            }
+        MethodNode best = chooseBestCandidate(candidates, argumentCount, true);
+        if (best != null) {
+            return best;
         }
-        for (MethodNode method : candidates) {
-            if (method.getParameters().length >= argumentCount) {
-                return method;
-            }
+
+        best = chooseBestCandidate(candidates, argumentCount, false);
+        if (best != null) {
+            return best;
         }
+
         return candidates.get(0);
+    }
+
+    private MethodNode chooseBestCandidate(List<MethodNode> candidates, int argumentCount, boolean exactArityOnly) {
+        MethodNode best = null;
+        int bestScore = Integer.MAX_VALUE;
+
+        for (MethodNode method : candidates) {
+            int paramCount = method.getParameters().length;
+            if (exactArityOnly) {
+                if (paramCount != argumentCount) {
+                    continue;
+                }
+            } else if (paramCount < argumentCount) {
+                continue;
+            }
+
+            int score = Math.abs(paramCount - argumentCount) * 100;
+            score += ParameterNameSupport.placeholderPenalty(method.getParameters(), argumentCount) * 10;
+            if (method.isAbstract()) {
+                score += 2;
+            }
+            if (method.getDeclaringClass() != null && method.getDeclaringClass().isInterface()) {
+                score += 1;
+            }
+
+            if (score < bestScore) {
+                bestScore = score;
+                best = method;
+            }
+        }
+
+        return best;
     }
 
     private MethodNode findMatchingConstructor(ClassNode type, int argumentCount) {

@@ -72,7 +72,7 @@ final class JdtParameterNameResolver {
         }
 
         for (String parameterName : parameterNames) {
-            if (isSyntheticParameterName(parameterName)) {
+            if (isSyntheticParameterName(parameterName) || !ParameterNameSupport.isMeaningfulName(parameterName)) {
                 return true;
             }
         }
@@ -89,7 +89,9 @@ final class JdtParameterNameResolver {
             if (rawName == null || rawName.isBlank()) {
                 return true;
             }
-            if ((replaceSyntheticNames && isSyntheticParameterName(rawName)) || isDefaultArgumentName(rawName, index)) {
+            if ((replaceSyntheticNames && isSyntheticParameterName(rawName))
+                    || isDefaultArgumentName(rawName, index)
+                    || !ParameterNameSupport.isMeaningfulName(rawName)) {
                 return true;
             }
         }
@@ -111,7 +113,8 @@ final class JdtParameterNameResolver {
     }
 
     private static boolean isDefaultArgumentName(String parameterName, int index) {
-        return parameterName != null && parameterName.equals("arg" + index);
+        return parameterName != null
+                && (parameterName.equals("arg" + index) || parameterName.equals("args" + index));
     }
 
     private static String[] recoverConstructorFieldNames(IMethod method, int parameterCount) {
@@ -467,7 +470,10 @@ final class JdtParameterNameResolver {
         String[] resolvedNames = new String[parameterCount];
         for (int index = 0; index < parameterCount; index++) {
             String rawName = rawNames != null && index < rawNames.length ? rawNames[index] : null;
-            if (rawName != null && !rawName.isBlank() && !(replaceSyntheticNames && isSyntheticParameterName(rawName))) {
+            if (rawName != null
+                    && !rawName.isBlank()
+                    && !(replaceSyntheticNames && isSyntheticParameterName(rawName))
+                    && ParameterNameSupport.isMeaningfulName(rawName)) {
                 resolvedNames[index] = rawName;
             } else {
                 resolvedNames[index] = "arg" + index;

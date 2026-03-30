@@ -15,10 +15,19 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Method;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
+import org.codehaus.groovy.ast.ClassHelper;
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
+import org.codehaus.groovy.ast.Parameter;
+import org.codehaus.groovy.ast.expr.ArgumentListExpression;
+import org.codehaus.groovy.ast.expr.ConstantExpression;
+import org.codehaus.groovy.ast.expr.MethodCallExpression;
+import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.lsp4j.InlayHint;
 import org.eclipse.lsp4j.InlayHintKind;
@@ -1209,6 +1218,46 @@ class InlayHintVisitorTest {
                 new Object[] { inner });
         assertEquals("Inner", result);
     }
+
+        @Test
+        void suppressesPlaceholderParameterHintsFromFallbackVisitor() throws Exception {
+        InlayHintVisitor visitor = new InlayHintVisitor("greet('Bob')", null,
+            new InlayHintSettings(false, true, false, false));
+
+        MethodNode targetMethod = new MethodNode(
+            "greet",
+            0,
+            ClassHelper.VOID_TYPE,
+            new Parameter[] {new Parameter(ClassHelper.STRING_TYPE, "args0")},
+            ClassNode.EMPTY_ARRAY,
+            null);
+
+        java.lang.reflect.Field methodsByNameField = InlayHintVisitor.class.getDeclaredField("methodsByName");
+        methodsByNameField.setAccessible(true);
+        Map<String, List<MethodNode>> methodsByName = new HashMap<>();
+        methodsByName.put("greet", List.of(targetMethod));
+        methodsByNameField.set(visitor, methodsByName);
+
+        ConstantExpression argument = new ConstantExpression("Bob");
+        argument.setLineNumber(1);
+        argument.setColumnNumber(7);
+        argument.setLastLineNumber(1);
+        argument.setLastColumnNumber(12);
+
+        MethodCallExpression call = new MethodCallExpression(
+            new VariableExpression("this"),
+            "greet",
+            new ArgumentListExpression(argument));
+        call.setLineNumber(1);
+        call.setColumnNumber(1);
+        call.setLastLineNumber(1);
+        call.setLastColumnNumber(12);
+
+        invokePrivate(visitor, "addMethodCallParameterHints",
+            new Class<?>[] {MethodCallExpression.class}, new Object[] {call});
+
+        assertTrue(visitor.getHints().isEmpty());
+        }
 
     private Object invokePrivate(Object target, String methodName, Class<?>[] paramTypes, Object[] args) throws Exception {
         Method method = target.getClass().getDeclaredMethod(methodName, paramTypes);

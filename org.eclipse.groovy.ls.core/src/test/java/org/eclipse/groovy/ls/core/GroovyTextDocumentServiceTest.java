@@ -1013,6 +1013,35 @@ class GroovyTextDocumentServiceTest {
     }
 
     @Test
+    void didSavePublishesDiagnosticsForSavedUriOnly() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        setField(server, "diagnosticsEnabled", true);
+        setField(server, "firstFullBuildComplete", true);
+        GroovyTextDocumentService service = new GroovyTextDocumentService(server, new DocumentManager());
+
+        DiagnosticsProvider diagnostics = mock(DiagnosticsProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+        CodeLensProvider codeLensProvider = mock(CodeLensProvider.class);
+
+        setField(service, "diagnosticsProvider", diagnostics);
+        setField(service, "documentManager", documentManager);
+        setField(service, "codeLensProvider", codeLensProvider);
+
+        when(documentManager.getClientUri("file:///test/Save.groovy")).thenReturn("file:///client-Save.groovy");
+        when(documentManager.hasJdtWorkingCopy("file:///test/Save.groovy")).thenReturn(false);
+
+        org.eclipse.lsp4j.DidSaveTextDocumentParams params = new org.eclipse.lsp4j.DidSaveTextDocumentParams();
+        params.setTextDocument(new TextDocumentIdentifier("file:///test/Save.groovy"));
+
+        service.didSave(params);
+
+        verify(diagnostics).publishDiagnosticsDebounced("file:///client-Save.groovy");
+        verify(documentManager, org.mockito.Mockito.never()).getOpenDocumentUris();
+        verify(codeLensProvider).invalidateAllResolveCache();
+        verify(documentManager).scheduleCodeLensRefresh();
+    }
+
+    @Test
     void didSaveDoesNotThrow() {
         GroovyTextDocumentService service = createService();
 

@@ -10,6 +10,7 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -64,6 +65,35 @@ class ReferenceSearchHelperTest {
         try {
             assertTrue(ReferenceSearchHelper.hasReferences(
                     fixture.method, fixture.declarationUri, fixture.documentManager));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    void referenceExistenceForUnusedDeclarationSkipsGroovyProjectTextFallback() throws Exception {
+        TestFixture fixture = createFixture(
+                "sharedHelper",
+                """
+                class SupportSpec {
+                    void sharedHelper() {}
+                }
+                """,
+                """
+                class UseSpec {
+                    void runIt() {
+                        sharedHelper()
+                    }
+                }
+                """);
+
+        try {
+            ReferenceSearchHelper.ReferenceExistence result =
+                    ReferenceSearchHelper.referenceExistenceForUnusedDeclaration(
+                            fixture.method, fixture.declarationUri);
+
+            assertNotEquals(ReferenceSearchHelper.ReferenceExistence.FOUND, result);
+            verify(fixture.rootResource, times(0)).accept(any(IResourceVisitor.class));
         } finally {
             fixture.close();
         }

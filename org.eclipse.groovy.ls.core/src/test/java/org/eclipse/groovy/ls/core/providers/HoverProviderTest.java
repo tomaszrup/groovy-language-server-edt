@@ -26,10 +26,12 @@ import java.nio.file.Path;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import org.codehaus.groovy.ast.ClassHelper;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
+import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -303,6 +305,28 @@ class HoverProviderTest {
         assertNotNull(hover);
         assertTrue(hover.contains("encode"));
         assertTrue(hover.contains("String"));
+    }
+
+    @Test
+    void buildMethodHoverOmitsPlaceholderParameterNames() throws Exception {
+        MethodNode method = new MethodNode(
+                "greet",
+                0,
+                ClassHelper.VOID_TYPE,
+                new Parameter[] {
+                    new Parameter(ClassHelper.STRING_TYPE, "args0"),
+                    new Parameter(ClassHelper.int_TYPE, "arg1")
+                },
+                ClassNode.EMPTY_ARRAY,
+                null);
+
+        String hover = invokeBuildMethodHover(method);
+
+        assertTrue(hover.contains("greet"));
+        assertTrue(hover.contains("String"));
+        assertTrue(hover.contains("int"));
+        assertFalse(hover.contains("args0"));
+        assertFalse(hover.contains("arg1"));
     }
 
     @Test
@@ -1026,6 +1050,27 @@ class HoverProviderTest {
         assertTrue(hover.getContents().getRight().getValue().contains("com.example.Recc"));
     }
 
+    @Test
+    void resolveClassNodeToITypeUsesScopedLookupForTestSourceUri() throws Exception {
+        HoverProvider hp = new HoverProvider(new DocumentManager());
+        IJavaProject project = mock(IJavaProject.class);
+        IType foundType = mock(IType.class);
+        ModuleNode module = parseModule("package demo\nclass Example {}", "file:///HoverScopedLookup.groovy");
+        ClassNode node = new ClassNode("demo.Support", 0, null);
+
+        try (org.mockito.MockedStatic<ScopedTypeLookupSupport> lookup =
+                org.mockito.Mockito.mockStatic(ScopedTypeLookupSupport.class)) {
+            lookup.when(() -> ScopedTypeLookupSupport.findType(project, "demo.Support",
+                    "file:///workspace/sample/src/test/groovy/demo/Spec.groovy"))
+                    .thenReturn(foundType);
+
+            IType result = invokeResolveClassNodeToIType(hp, node, module, project,
+                    "file:///workspace/sample/src/test/groovy/demo/Spec.groovy");
+
+            assertEquals(foundType, result);
+        }
+    }
+
     // ================================================================
     // Reflection helpers
     // ================================================================
@@ -1130,6 +1175,17 @@ class HoverProviderTest {
         Method m = HoverProvider.class.getDeclaredMethod("buildGeneratedAccessorHover", IType.class, String.class);
         m.setAccessible(true);
         return (Hover) m.invoke(hp, receiverType, methodName);
+    }
+
+    private IType invokeResolveClassNodeToIType(HoverProvider hp,
+            ClassNode node,
+            ModuleNode module,
+            IJavaProject project,
+            String sourceUri) throws Exception {
+        Method m = HoverProvider.class.getDeclaredMethod(
+                "resolveClassNodeToIType", ClassNode.class, ModuleNode.class, IJavaProject.class, String.class);
+        m.setAccessible(true);
+        return (IType) m.invoke(hp, node, module, project, sourceUri);
     }
 
     // ---- AST helpers ----

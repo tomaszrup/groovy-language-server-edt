@@ -42,6 +42,7 @@ import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaElement;
+import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.ISourceReference;
@@ -997,7 +998,42 @@ public class DefinitionProvider {
             return null;
         }
 
+        Location memberLocation = resolveProjectMemberLocation(type, simpleName, sourceLookupContext);
+        if (memberLocation != null) {
+            return memberLocation;
+        }
+
         return BinaryTypeLocationResolver.resolveLocation(type, fqn, simpleName);
+    }
+
+    private Location resolveProjectMemberLocation(IType type, String simpleName,
+            SourceLookupContext sourceLookupContext) throws JavaModelException {
+        if (type == null || simpleName == null || simpleName.isBlank()) {
+            return null;
+        }
+
+        Map<String, String> contentCache = new HashMap<>();
+        Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
+
+        for (IMethod method : type.getMethods()) {
+            if (!method.isConstructor() && simpleName.equals(method.getElementName())) {
+                Location location = toLocation(method, contentCache, lineIndexCache, sourceLookupContext);
+                if (location != null) {
+                    return location;
+                }
+            }
+        }
+
+        for (org.eclipse.jdt.core.IField field : type.getFields()) {
+            if (simpleName.equals(field.getElementName())) {
+                Location location = toLocation(field, contentCache, lineIndexCache, sourceLookupContext);
+                if (location != null) {
+                    return location;
+                }
+            }
+        }
+
+        return null;
     }
 
     private Location navigateTypeFromSourcesJar(IType type, String fqn, String simpleName) {

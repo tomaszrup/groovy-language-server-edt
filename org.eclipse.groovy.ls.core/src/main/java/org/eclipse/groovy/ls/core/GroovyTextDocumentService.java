@@ -406,10 +406,10 @@ public class GroovyTextDocumentService implements TextDocumentService {
 
         invalidateSemanticProviderCaches();
 
-        // Republish diagnostics for ALL open documents — not just the saved
-        // file.  Changes in this file may affect unused-declaration fading in
-        // other open files (e.g. removing a call makes the callee unused).
-        publishDiagnosticsForOpenDocuments();
+        // Refresh diagnostics for the saved file only. Cross-file unused-
+        // declaration hints are now eventually consistent and are reconciled
+        // on later edits, watched-file refreshes, or post-build passes.
+        publishDiagnosticsIfEnabled(uri);
 
         // Refresh code lenses — structural changes committed on save may
         // affect reference counts across multiple files.

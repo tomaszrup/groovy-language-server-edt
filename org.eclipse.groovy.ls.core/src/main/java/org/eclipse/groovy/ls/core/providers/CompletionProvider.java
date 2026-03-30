@@ -38,6 +38,7 @@ import org.codehaus.groovy.ast.stmt.ExpressionStatement;
 import org.codehaus.groovy.ast.stmt.Statement;
 import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.OperationCanceledException;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.core.resources.IProject;
@@ -2840,9 +2841,11 @@ public class CompletionProvider {
             if (Thread.currentThread().isInterrupted()) {
                 return items;
             }
-            searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                    searchContext, items, IJavaSearchScope.APPLICATION_LIBRARIES, "6_",
-                    typeResolutionContext);
+            if (!shouldSkipLibraryTypeSearch(items, annotationOnly)) {
+                searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
+                        searchContext, items, IJavaSearchScope.APPLICATION_LIBRARIES, "6_",
+                        typeResolutionContext);
+            }
 
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"
                     + prefix + "': " + items.size() + " results");
@@ -2852,11 +2855,20 @@ public class CompletionProvider {
                 typeNameCache.put(cacheKey,
                         new CachedTypeNames(new ArrayList<>(items), System.currentTimeMillis()));
             }
+        } catch (OperationCanceledException e) {
+            GroovyLanguageServerPlugin.logInfo("[completion] Type search cancelled");
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[completion] Type search failed", e);
         }
 
         return items;
+    }
+
+    private boolean shouldSkipLibraryTypeSearch(List<CompletionItem> items, boolean annotationOnly) {
+        if (annotationOnly) {
+            return false;
+        }
+        return items.size() >= Math.max(25, MAX_TYPE_RESULTS / 2);
     }
 
     private boolean isSearchResultEligible(String simpleName, String fqn, int modifiers,

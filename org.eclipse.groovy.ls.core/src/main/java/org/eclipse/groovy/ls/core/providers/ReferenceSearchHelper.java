@@ -35,6 +35,12 @@ import org.eclipse.lsp4j.Range;
 
 public final class ReferenceSearchHelper {
 
+    enum ReferenceExistence {
+        FOUND,
+        NOT_FOUND,
+        INDETERMINATE
+    }
+
     private static final int GROOVY_FILE_LIST_CACHE_SIZE = 32;
     private static final long GROOVY_FILE_LIST_CACHE_TTL_MS = 10_000;
     private static final int FILE_CONTENT_CACHE_SIZE = 128;
@@ -95,10 +101,20 @@ public final class ReferenceSearchHelper {
      * The search is cancelled as soon as the first match is found.
      */
     static boolean hasReferences(IJavaElement element, String uri, DocumentManager documentManager) {
-        if (hasReferencesWithJdt(element, uri)) {
+        if (referenceExistenceWithJdt(element, uri) == ReferenceExistence.FOUND) {
             return true;
         }
         return !findTextFallbackLocations(element, uri, documentManager, true).isEmpty();
+    }
+
+    /**
+     * Fast yes/no reference existence check used by unused-declaration fading.
+     * Unlike the general reference helpers, this path intentionally avoids the
+     * textual fallback so a single fading update cannot walk every Groovy file
+     * in a project.
+     */
+    static ReferenceExistence referenceExistenceForUnusedDeclaration(IJavaElement element, String uri) {
+        return referenceExistenceWithJdt(element, uri);
     }
 
     static List<Location> findReferenceLocations(
@@ -110,12 +126,12 @@ public final class ReferenceSearchHelper {
         return findTextFallbackLocations(element, uri, documentManager, false);
     }
 
-    private static boolean hasReferencesWithJdt(IJavaElement element, String uri) {
+    private static ReferenceExistence referenceExistenceWithJdt(IJavaElement element, String uri) {
         try {
             SearchPattern pattern = SearchPattern.createPattern(
                     element, IJavaSearchConstants.REFERENCES);
             if (pattern == null) {
-                return false;
+                return ReferenceExistence.INDETERMINATE;
             }
 
             org.eclipse.jdt.core.IJavaProject javaProject = element.getJavaProject();
@@ -140,11 +156,11 @@ public final class ReferenceSearchHelper {
                     },
                     cancelOnFound);
 
-            return found[0];
+            return found[0] ? ReferenceExistence.FOUND : ReferenceExistence.NOT_FOUND;
         } catch (org.eclipse.core.runtime.OperationCanceledException ignored) {
-            return true;
+            return ReferenceExistence.FOUND;
         } catch (Exception e) {
-            return false;
+            return ReferenceExistence.INDETERMINATE;
         }
     }
 

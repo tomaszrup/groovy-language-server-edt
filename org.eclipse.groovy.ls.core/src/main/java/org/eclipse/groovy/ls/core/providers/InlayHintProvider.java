@@ -25,12 +25,14 @@ import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
 import org.codehaus.groovy.ast.expr.ArgumentListExpression;
+import org.codehaus.groovy.ast.expr.ClassExpression;
 import org.codehaus.groovy.ast.expr.ConstructorCallExpression;
 import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.codehaus.groovy.ast.expr.Expression;
 import org.codehaus.groovy.ast.expr.MapExpression;
 import org.codehaus.groovy.ast.expr.MethodCallExpression;
 import org.codehaus.groovy.ast.expr.NamedArgumentListExpression;
+import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.codehaus.groovy.ast.expr.TupleExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
 import org.codehaus.groovy.ast.stmt.BlockStatement;
@@ -44,6 +46,7 @@ import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.core.Signature;
 import org.eclipse.lsp4j.InlayHint;
 import org.eclipse.lsp4j.InlayHintKind;
 import org.eclipse.lsp4j.InlayHintParams;
@@ -181,7 +184,7 @@ public class InlayHintProvider {
 
                 if (workingCopy != null) {
                     ParameterHintCollector jdtCollector =
-                            new ParameterHintCollector(content, requestedRange, workingCopy,
+                            new ParameterHintCollector(this, content, requestedRange, workingCopy,
                                     documentManager);
                     jdtCollector.visitModule(module);
                     parameterHints.addAll(jdtCollector.getHints());
@@ -491,6 +494,12 @@ public class InlayHintProvider {
             return true;
         }
 
+        int candidateMeaningfulNames = countMeaningfulParameterNames(candidate);
+        int currentMeaningfulNames = countMeaningfulParameterNames(currentBest);
+        if (candidateMeaningfulNames != currentMeaningfulNames) {
+            return candidateMeaningfulNames > currentMeaningfulNames;
+        }
+
         if (isDeclaredInSubtype(candidate, currentBest)) {
             return true;
         }
@@ -513,6 +522,20 @@ public class InlayHintProvider {
         }
 
         return false;
+    }
+
+    private static int countMeaningfulParameterNames(IMethod method) {
+        try {
+            int meaningful = 0;
+            for (String parameterName : JdtParameterNameResolver.resolve(method)) {
+                if (ParameterNameSupport.isMeaningfulName(parameterName)) {
+                    meaningful++;
+                }
+            }
+            return meaningful;
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     private static boolean isDeclaredInSubtype(IMethod candidate, IMethod currentBest) {
@@ -744,28 +767,10 @@ public class InlayHintProvider {
             ModuleNode module, IJavaProject project,
             Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) {
         try {
-            Expression objectExpr = methodCall.getObjectExpression();
             String methodName = methodCall.getMethodAsString();
             if (methodName == null) return null;
 
-            IType receiverType = null;
-
-            if (objectExpr instanceof ConstructorCallExpression ctorCall) {
-                ClassNode ctorType = ctorCall.getType();
-                receiverType = resolveClassNodeToType(ctorType, module, project);
-            } else if (objectExpr instanceof MethodCallExpression nestedCall) {
-                ReturnTypeInfo nestedReturnType = resolveMethodCallChainInfo(nestedCall, module, project, hierarchyCache);
-                receiverType = nestedReturnType != null ? nestedReturnType.resolvedType() : null;
-            } else if (objectExpr instanceof VariableExpression varExpr) {
-                String receiverVarName = varExpr.getName();
-                if (!"this".equals(receiverVarName)) {
-                    // Try to resolve the variable's initializer type
-                    ClassNode varType = resolveLocalVarType(module, receiverVarName);
-                    if (varType != null && !"java.lang.Object".equals(varType.getName())) {
-                        receiverType = resolveClassNodeToType(varType, module, project);
-                    }
-                }
-            }
+            IType receiverType = resolveExpressionType(methodCall.getObjectExpression(), module, project, hierarchyCache);
 
             if (receiverType == null) return null;
 
@@ -865,6 +870,128 @@ public class InlayHintProvider {
             return null;
         }
         return createReturnTypeInfo(org.eclipse.jdt.core.Signature.toString(returnSig), context, project);
+    }
+
+    private IType resolveExpressionType(Expression expression,
+            ModuleNode module,
+            IJavaProject project,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) throws JavaModelException {
+        if (expression == null || project == null) {
+            return null;
+        }
+
+        if (expression instanceof ConstructorCallExpression ctorCall) {
+            return resolveClassNodeToType(ctorCall.getType(), module, project);
+        }
+
+        if (expression instanceof MethodCallExpression methodCall) {
+            ReturnTypeInfo nestedReturnType = resolveMethodCallChainInfo(methodCall, module, project, hierarchyCache);
+            if (nestedReturnType == null) {
+                return null;
+            }
+            if (nestedReturnType.resolvedType() != null) {
+                return nestedReturnType.resolvedType();
+            }
+            return resolveTypeByName(nestedReturnType.displayName(), null, project);
+        }
+
+        if (expression instanceof VariableExpression variableExpression) {
+            String variableName = variableExpression.getName();
+            if ("this".equals(variableName)) {
+                return null;
+            }
+
+            ClassNode varType = resolveLocalVarType(module, variableName);
+            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+                IType resolved = resolveClassNodeToType(varType, module, project);
+                if (resolved != null) {
+                    return resolved;
+                }
+            }
+
+            ClassNode declaredType = variableExpression.getType();
+            if (declaredType != null && !"java.lang.Object".equals(declaredType.getName())) {
+                return resolveClassNodeToType(declaredType, module, project);
+            }
+
+            return null;
+        }
+
+        if (expression instanceof PropertyExpression propertyExpression) {
+            IType receiverType = resolveExpressionType(propertyExpression.getObjectExpression(), module, project, hierarchyCache);
+            if (receiverType == null) {
+                return null;
+            }
+
+            String propertyName = propertyExpression.getPropertyAsString();
+            return resolveMemberExpressionType(receiverType, propertyName, project, hierarchyCache);
+        }
+
+        if (expression instanceof ClassExpression classExpression) {
+            return resolveClassNodeToType(classExpression.getType(), module, project);
+        }
+
+        return null;
+    }
+
+    private IType resolveMemberExpressionType(IType receiverType,
+            String memberName,
+            IJavaProject project,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) throws JavaModelException {
+        if (receiverType == null || memberName == null || memberName.isBlank()) {
+            return null;
+        }
+
+        IType memberSource = JavaBinaryMemberResolver.resolveMemberSource(receiverType);
+        if (memberSource == null) {
+            memberSource = receiverType;
+        }
+
+        org.eclipse.jdt.core.IField field = findFieldByName(memberSource, memberName);
+        if (field != null) {
+            return resolveTypeByName(Signature.toString(field.getTypeSignature()), memberSource, project);
+        }
+
+        ReturnTypeInfo getterReturnType = findMethodReturnInfo(memberSource, accessorName("get", memberName), project,
+                hierarchyCache);
+        if (getterReturnType != null) {
+            return getterReturnType.resolvedType() != null
+                    ? getterReturnType.resolvedType()
+                    : resolveTypeByName(getterReturnType.displayName(), memberSource, project);
+        }
+
+        ReturnTypeInfo booleanGetterReturnType = findMethodReturnInfo(memberSource, accessorName("is", memberName), project,
+                hierarchyCache);
+        if (booleanGetterReturnType != null) {
+            return booleanGetterReturnType.resolvedType() != null
+                    ? booleanGetterReturnType.resolvedType()
+                    : resolveTypeByName(booleanGetterReturnType.displayName(), memberSource, project);
+        }
+
+        return null;
+    }
+
+    private org.eclipse.jdt.core.IField findFieldByName(IType type, String name) throws JavaModelException {
+        org.eclipse.jdt.core.IField[] fields = type.getFields();
+        if (fields == null) {
+            return null;
+        }
+        for (org.eclipse.jdt.core.IField field : fields) {
+            if (name.equals(field.getElementName())) {
+                return field;
+            }
+        }
+        return null;
+    }
+
+    private String accessorName(String prefix, String memberName) {
+        if (memberName == null || memberName.isBlank()) {
+            return memberName;
+        }
+        if (memberName.length() == 1) {
+            return prefix + memberName.toUpperCase();
+        }
+        return prefix + Character.toUpperCase(memberName.charAt(0)) + memberName.substring(1);
     }
 
     private ReturnTypeInfo createReturnTypeInfo(String displayName, IType context,
@@ -1148,6 +1275,7 @@ public class InlayHintProvider {
 
     private static final class ParameterHintCollector extends ClassCodeVisitorSupport {
 
+        private final InlayHintProvider owner;
         private final String source;
         private final Range requestedRange;
         private final ICompilationUnit workingCopy;
@@ -1155,9 +1283,12 @@ public class InlayHintProvider {
         private final List<InlayHint> hints = new ArrayList<>();
         private final Set<String> emitted = new HashSet<>();
         private SourceUnit sourceUnit;
+        private ModuleNode module;
+        private IJavaProject javaProject;
 
-        ParameterHintCollector(String source, Range requestedRange, ICompilationUnit workingCopy,
+        ParameterHintCollector(InlayHintProvider owner, String source, Range requestedRange, ICompilationUnit workingCopy,
                                DocumentManager documentManager) {
+            this.owner = owner;
             this.source = source;
             this.requestedRange = requestedRange;
             this.workingCopy = workingCopy;
@@ -1174,7 +1305,13 @@ public class InlayHintProvider {
         }
 
         void visitModule(ModuleNode module) {
+            this.module = module;
             this.sourceUnit = module.getContext();
+            try {
+                this.javaProject = workingCopy != null ? workingCopy.getJavaProject() : null;
+            } catch (Exception ignored) {
+                this.javaProject = null;
+            }
 
             for (ClassNode classNode : module.getClasses()) {
                 if (Thread.currentThread().isInterrupted()) return;
@@ -1254,6 +1391,9 @@ public class InlayHintProvider {
 
             IMethod targetMethod = resolveBestMethodTarget(methodOffsets, methodName, arguments.size());
             if (targetMethod == null) {
+                targetMethod = resolveMethodTargetFromReceiver(call, methodName, arguments.size());
+            }
+            if (targetMethod == null) {
                 return;
             }
 
@@ -1286,6 +1426,9 @@ public class InlayHintProvider {
 
             IMethod constructor = resolveBestConstructorTarget(typeOffset, arguments.size());
             if (constructor == null) {
+                constructor = resolveConstructorTargetFromType(call.getType(), arguments.size());
+            }
+            if (constructor == null) {
                 return;
             }
 
@@ -1297,7 +1440,7 @@ public class InlayHintProvider {
             int max = Math.min(arguments.size(), parameterNames.length);
             for (int index = 0; index < max; index++) {
                 Expression argument = arguments.get(index);
-                String parameterName = parameterNames[index];
+                String parameterName = ParameterNameSupport.displayName(parameterNames[index]);
                 if (isHintableArgument(argument, parameterName) && parameterName != null && !parameterName.isBlank()) {
                     Position position = new Position(
                             Math.max(0, argument.getLineNumber() - 1),
@@ -1440,13 +1583,101 @@ public class InlayHintProvider {
                 boolean varargs = isVarargs(method);
 
                 int score = compatibilityScore(paramCount, varargs, argumentCount);
-                if (score < bestScore) {
+                if (score < bestScore || (score == bestScore && InlayHintProvider.isPreferredMethod(method, best))) {
                     bestScore = score;
                     best = method;
                 }
             }
 
             return best != null ? best : methods.get(0);
+        }
+
+        private IMethod resolveMethodTargetFromReceiver(MethodCallExpression call, String methodName, int argumentCount) {
+            if (owner == null || module == null || javaProject == null || methodName == null || methodName.isBlank()) {
+                return null;
+            }
+
+            try {
+                IType receiverType = owner.resolveExpressionType(call.getObjectExpression(), module, javaProject, owner.hierarchyCache);
+                if (receiverType == null) {
+                    return null;
+                }
+
+                List<IMethod> methods = collectHierarchyMethods(receiverType, methodName);
+                return chooseBestMethod(methods, argumentCount);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        private IMethod resolveConstructorTargetFromType(ClassNode typeNode, int argumentCount) {
+            if (owner == null || module == null || javaProject == null || typeNode == null) {
+                return null;
+            }
+
+            try {
+                IType resolvedType = owner.resolveClassNodeToType(typeNode, module, javaProject);
+                if (resolvedType == null) {
+                    return null;
+                }
+
+                List<IMethod> constructors = new ArrayList<>();
+                for (IMethod method : resolvedType.getMethods()) {
+                    if (method.isConstructor()) {
+                        constructors.add(method);
+                    }
+                }
+                return chooseBestMethod(constructors, argumentCount);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        private List<IMethod> collectHierarchyMethods(IType receiverType, String methodName) throws JavaModelException {
+            List<IMethod> methods = new ArrayList<>();
+            addMatchingMethods(receiverType, methodName, methods);
+
+            IType memberSource = JavaBinaryMemberResolver.resolveMemberSource(receiverType);
+            if (memberSource != null && !sameType(receiverType, memberSource)) {
+                addMatchingMethods(memberSource, methodName, methods);
+            }
+
+            org.eclipse.jdt.core.ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(receiverType);
+            if (hierarchy != null) {
+                for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
+                    addMatchingMethods(superType, methodName, methods);
+                    IType binarySuperType = JavaBinaryMemberResolver.resolveMemberSource(superType);
+                    if (binarySuperType != null && !sameType(superType, binarySuperType)) {
+                        addMatchingMethods(binarySuperType, methodName, methods);
+                    }
+                }
+            }
+
+            return methods;
+        }
+
+        private boolean sameType(IType left, IType right) {
+            if (left == null || right == null) {
+                return left == right;
+            }
+            try {
+                return left == right || left.getFullyQualifiedName().equals(right.getFullyQualifiedName())
+                        && left.getClassFile() == right.getClassFile()
+                        && left.getCompilationUnit() == right.getCompilationUnit();
+            } catch (Exception ignored) {
+                return left == right;
+            }
+        }
+
+        private void addMatchingMethods(IType type, String methodName, List<IMethod> methods) throws JavaModelException {
+            if (type == null) {
+                return;
+            }
+            for (IMethod method : type.getMethods()) {
+                if (!method.isConstructor() && methodName.equals(method.getElementName())) {
+                    methods.add(method);
+                }
+            }
         }
 
         private int compatibilityScore(int parameterCount, boolean varargs, int argumentCount) {

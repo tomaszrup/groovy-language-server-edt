@@ -330,7 +330,7 @@ public class HoverProvider {
             return null;
         }
 
-        IType receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content, lineIndex);
+        IType receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content, lineIndex, uri);
         if (receiverType == null) {
             return null;
         }
@@ -498,7 +498,10 @@ public class HoverProvider {
             if (i > 0) sb.append(", ");
             sb.append(Signature.toString(paramTypes[i]));
             if (paramNames != null && i < paramNames.length) {
-                sb.append(' ').append(paramNames[i]);
+                String displayName = ParameterNameSupport.displayName(paramNames[i]);
+                if (displayName != null) {
+                    sb.append(' ').append(displayName);
+                }
             }
         }
         sb.append(')');
@@ -968,7 +971,10 @@ public class HoverProvider {
         for (int i = 0; i < params.length; i++) {
             if (i > 0) sb.append(", ");
             sb.append(params[i].getType().getNameWithoutPackage());
-            sb.append(' ').append(params[i].getName());
+            String displayName = ParameterNameSupport.displayName(params[i].getName());
+            if (displayName != null) {
+                sb.append(' ').append(displayName);
+            }
         }
         sb.append(')');
         sb.append(FENCE_CLOSE_BARE);
@@ -1033,7 +1039,7 @@ public class HoverProvider {
     private IType resolveReceiverTypeFromAst(ModuleNode ast, IJavaProject project,
             int offset, String methodName, String content) {
         return resolveReceiverTypeFromAst(
-                ast, project, offset, methodName, content, PositionUtils.buildLineIndex(content));
+            ast, project, offset, methodName, content, PositionUtils.buildLineIndex(content), null);
     }
 
     private IType resolveReceiverTypeFromAst(ModuleNode ast,
@@ -1042,6 +1048,16 @@ public class HoverProvider {
             String methodName,
             String content,
             PositionUtils.LineIndex lineIndex) {
+        return resolveReceiverTypeFromAst(ast, project, offset, methodName, content, lineIndex, null);
+    }
+
+    private IType resolveReceiverTypeFromAst(ModuleNode ast,
+            IJavaProject project,
+            int offset,
+            String methodName,
+            String content,
+            PositionUtils.LineIndex lineIndex,
+            String sourceUri) {
         MethodCallExpression found = findMethodCallAtOffset(ast, offset, methodName, content, lineIndex);
         if (found == null) {
             return null;
@@ -1053,7 +1069,7 @@ public class HoverProvider {
             return null;
         }
 
-        return resolveClassNodeToIType(receiverClassNode, ast, project);
+        return resolveClassNodeToIType(receiverClassNode, ast, project, sourceUri);
     }
 
     private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
@@ -1240,6 +1256,11 @@ public class HoverProvider {
     }
 
     private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module, IJavaProject project) {
+        return resolveClassNodeToIType(typeNode, module, project, null);
+    }
+
+    private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module, IJavaProject project,
+            String sourceUri) {
         if (typeNode == null || project == null) {
             return null;
         }
@@ -1250,22 +1271,16 @@ public class HoverProvider {
             }
 
             if (typeName.contains(".")) {
-                IType type = project.findType(typeName);
+                IType type = ScopedTypeLookupSupport.findType(project, typeName, sourceUri);
                 if (type != null) {
                     return type;
-                }
-                if (typeName.contains("$")) {
-                    type = project.findType(typeName.replace('$', '.'));
-                    if (type != null) {
-                        return type;
-                    }
                 }
             }
 
             for (ImportNode imp : module.getImports()) {
                 ClassNode impType = imp.getType();
                 if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
-                    IType type = project.findType(impType.getName());
+                    IType type = ScopedTypeLookupSupport.findType(project, impType.getName(), sourceUri);
                     if (type != null) {
                         return type;
                     }
@@ -1275,7 +1290,7 @@ public class HoverProvider {
             for (ImportNode starImport : module.getStarImports()) {
                 String pkgName = starImport.getPackageName();
                 if (pkgName != null) {
-                    IType type = project.findType(pkgName + typeName);
+                    IType type = ScopedTypeLookupSupport.findType(project, pkgName + typeName, sourceUri);
                     if (type != null) {
                         return type;
                     }
@@ -1287,7 +1302,7 @@ public class HoverProvider {
                 if (pkg.endsWith(".")) {
                     pkg = pkg.substring(0, pkg.length() - 1);
                 }
-                IType type = project.findType(pkg + "." + typeName);
+                IType type = ScopedTypeLookupSupport.findType(project, pkg + "." + typeName, sourceUri);
                 if (type != null) {
                     return type;
                 }
@@ -1296,7 +1311,7 @@ public class HoverProvider {
             String[] autoPackages = {"java.lang.", "java.util.", "java.io.",
                     "groovy.lang.", "groovy.util.", "java.math."};
             for (String autoPkg : autoPackages) {
-                IType type = project.findType(autoPkg + typeName);
+                IType type = ScopedTypeLookupSupport.findType(project, autoPkg + typeName, sourceUri);
                 if (type != null) {
                     return type;
                 }

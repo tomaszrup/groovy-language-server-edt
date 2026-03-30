@@ -1460,6 +1460,14 @@ class MinimalCodeSelectHelperTest {
         return (IType) m.invoke(helper, node, module, project);
     }
 
+    private IType invokeResolveClassNodeToIType(ClassNode node, ModuleNode module, IJavaProject project,
+            String sourceUri) throws Exception {
+        Method m = MinimalCodeSelectHelper.class.getDeclaredMethod(
+                "resolveClassNodeToIType", ClassNode.class, ModuleNode.class, IJavaProject.class, String.class);
+        m.setAccessible(true);
+        return (IType) m.invoke(helper, node, module, project, sourceUri);
+    }
+
     @Test
     void resolveClassNodeToITypeReturnsNullForNullNode() throws Exception {
         IJavaProject project = mock(IJavaProject.class);
@@ -1477,6 +1485,26 @@ class MinimalCodeSelectHelperTest {
         ModuleNode module = parseModule(source);
         IType result = invokeResolveClassNodeToIType(node, module, project);
         assertEquals(foundType, result);
+    }
+
+    @Test
+    void resolveClassNodeToITypeUsesScopedLookupForTestSourceUri() throws Exception {
+        IJavaProject project = mock(IJavaProject.class);
+        IType foundType = mock(IType.class);
+        ClassNode node = new ClassNode("demo.Support", 0, null);
+        ModuleNode module = parseModule("package demo\nclass Example {}");
+
+        try (org.mockito.MockedStatic<ScopedTypeLookupSupport> lookup =
+                org.mockito.Mockito.mockStatic(ScopedTypeLookupSupport.class)) {
+            lookup.when(() -> ScopedTypeLookupSupport.findType(project, "demo.Support",
+                    "file:///workspace/sample/src/test/groovy/demo/Spec.groovy"))
+                    .thenReturn(foundType);
+
+            IType result = invokeResolveClassNodeToIType(node, module, project,
+                    "file:///workspace/sample/src/test/groovy/demo/Spec.groovy");
+
+            assertEquals(foundType, result);
+        }
     }
 
     // ================================================================

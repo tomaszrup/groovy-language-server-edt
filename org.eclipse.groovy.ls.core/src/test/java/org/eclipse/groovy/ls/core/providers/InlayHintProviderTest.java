@@ -37,6 +37,7 @@ import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IOrdinaryClassFile;
 import org.eclipse.jdt.core.IPackageFragment;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
+import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.lsp4j.InlayHint;
@@ -713,6 +714,45 @@ class InlayHintProviderTest {
     }
 
     @Test
+    void parameterCollectorFallsBackToReceiverResolutionWhenCodeSelectMisses() throws Exception {
+        String source = """
+                import demo.Support
+                new Support().greet('Ada')
+                """;
+        ModuleNode module = parseModule(source);
+
+        IJavaProject project = mock(IJavaProject.class);
+        IType supportType = mock(IType.class);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+        IMethod greetMethod = mock(IMethod.class);
+
+        when(project.findType("demo.Support")).thenReturn(supportType);
+        when(supportType.getFullyQualifiedName()).thenReturn("demo.Support");
+        when(supportType.getMethods()).thenReturn(new IMethod[] {greetMethod});
+        when(supportType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(supportType)).thenReturn(new IType[0]);
+
+        when(greetMethod.isConstructor()).thenReturn(false);
+        when(greetMethod.getElementName()).thenReturn("greet");
+        when(greetMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(greetMethod.getParameterNames()).thenReturn(new String[] {"person"});
+        when(greetMethod.getDeclaringType()).thenReturn(supportType);
+        when(greetMethod.getFlags()).thenReturn(0);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+        when(workingCopy.codeSelect(org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.eq(0)))
+                .thenReturn(new IJavaElement[0]);
+
+        Object collector = createCollector(source, new Range(new Position(0, 0), new Position(4, 0)), workingCopy);
+        invokeCollector(collector, "visitModule", new Class<?>[] {ModuleNode.class}, new Object[] {module});
+
+        @SuppressWarnings("unchecked")
+        List<InlayHint> hints = (List<InlayHint>) invokeCollector(collector, "getHints", new Class<?>[0], new Object[0]);
+        assertTrue(hints.stream().anyMatch(h -> "person:".equals(labelText(h))));
+    }
+
+    @Test
     void parameterCollectorPrefersOverrideMethodParameterNames() throws Exception {
         String source = """
                 interface Greeter {
@@ -765,6 +805,43 @@ class InlayHintProviderTest {
         List<InlayHint> hints = (List<InlayHint>) invokeCollector(collector, "getHints", new Class<?>[0], new Object[0]);
         assertTrue(hints.stream().anyMatch(h -> "person:".equals(labelText(h))));
         assertTrue(hints.stream().noneMatch(h -> "baseName:".equals(labelText(h))));
+    }
+
+    @Test
+    void parameterCollectorPrefersMeaningfulSourceInterfaceMethodOverPlaceholderBinaryMethod() throws Exception {
+        Object collector = createCollector("mockInterface.greet('Ada')\n", null);
+
+        IType sourceInterface = mock(IType.class);
+        when(sourceInterface.isInterface()).thenReturn(true);
+        when(sourceInterface.getFullyQualifiedName()).thenReturn("demo.SomeInterface");
+
+        IMethod sourceMethod = mock(IMethod.class);
+        when(sourceMethod.isConstructor()).thenReturn(false);
+        when(sourceMethod.getElementName()).thenReturn("greet");
+        when(sourceMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(sourceMethod.getParameterNames()).thenReturn(new String[] {"person"});
+        when(sourceMethod.getDeclaringType()).thenReturn(sourceInterface);
+        when(sourceMethod.getCompilationUnit()).thenReturn(mock(ICompilationUnit.class));
+        when(sourceMethod.getFlags()).thenReturn(0);
+
+        IType binaryInterface = mock(IType.class);
+        when(binaryInterface.isInterface()).thenReturn(true);
+        when(binaryInterface.getFullyQualifiedName()).thenReturn("demo.SomeInterface");
+
+        IMethod binaryMethod = mock(IMethod.class);
+        when(binaryMethod.isConstructor()).thenReturn(false);
+        when(binaryMethod.getElementName()).thenReturn("greet");
+        when(binaryMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(binaryMethod.getParameterNames()).thenReturn(new String[] {"args0"});
+        when(binaryMethod.getDeclaringType()).thenReturn(binaryInterface);
+        when(binaryMethod.getCompilationUnit()).thenReturn(null);
+        when(binaryMethod.getFlags()).thenReturn(0);
+
+        Object chosen = invokeCollector(collector, "chooseBestMethod",
+                new Class<?>[] {List.class, int.class},
+                new Object[] {Arrays.asList(binaryMethod, sourceMethod), 1});
+
+        assertEquals(sourceMethod, chosen);
     }
 
     @Test
@@ -844,7 +921,8 @@ class InlayHintProviderTest {
 
     private Object createCollector(String source, Range requestedRange, ICompilationUnit workingCopy) throws Exception {
         Class<?> collectorClass = Class.forName("org.eclipse.groovy.ls.core.providers.InlayHintProvider$ParameterHintCollector");
-        var constructor = collectorClass.getDeclaredConstructor(String.class, Range.class, ICompilationUnit.class, DocumentManager.class);
+        var constructor = collectorClass.getDeclaredConstructor(InlayHintProvider.class, String.class, Range.class,
+                ICompilationUnit.class, DocumentManager.class);
         constructor.setAccessible(true);
         // Configure mock DocumentManager to delegate cachedCodeSelect → workingCopy.codeSelect
         DocumentManager mockDm = mock(DocumentManager.class);
@@ -854,7 +932,7 @@ class InlayHintProviderTest {
             int offset = inv.getArgument(1);
             return unit.codeSelect(offset, 0);
         });
-        return constructor.newInstance(source, requestedRange, workingCopy, mockDm);
+        return constructor.newInstance(new InlayHintProvider(mockDm), source, requestedRange, workingCopy, mockDm);
     }
 
     private Object invokeCollector(Object collector, String methodName, Class<?>[] paramTypes, Object[] args) throws Exception {

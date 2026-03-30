@@ -442,9 +442,11 @@ public class DocumentSymbolProvider {
             if (i > 0) {
                 detail.append(", ");
             }
-            detail.append(params[i].getType().getNameWithoutPackage())
-                    .append(' ')
-                    .append(params[i].getName());
+            detail.append(params[i].getType().getNameWithoutPackage());
+            String displayName = ParameterNameSupport.displayName(params[i].getName());
+            if (displayName != null) {
+                detail.append(' ').append(displayName);
+            }
         }
         detail.append("): ").append(method.getReturnType().getNameWithoutPackage());
         return detail.toString();

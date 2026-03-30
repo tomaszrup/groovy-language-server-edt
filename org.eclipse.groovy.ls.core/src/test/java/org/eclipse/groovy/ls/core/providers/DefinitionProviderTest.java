@@ -55,6 +55,7 @@ import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.ITypeHierarchy;
+import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.lsp4j.DefinitionParams;
 import org.eclipse.lsp4j.Location;
 import org.eclipse.lsp4j.Position;
@@ -537,6 +538,54 @@ class DefinitionProviderTest {
         assertNotNull(loc);
         assertEquals("groovy-source:///test/binary/AttachedOuter.java", loc.getUri());
         assertEquals(7, loc.getRange().getStart().getLine());
+    }
+
+    @Test
+    void navigateViaProjectUsesMethodRangeForProjectDependencySource() throws Exception {
+        DocumentManager dm = mock(DocumentManager.class);
+        DefinitionProvider defProvider = new DefinitionProvider(dm);
+
+        IProject project = mock(IProject.class);
+        org.eclipse.jdt.core.IJavaProject javaProject = mock(org.eclipse.jdt.core.IJavaProject.class);
+        IType type = mock(IType.class);
+        IMethod method = mock(IMethod.class);
+
+        when(javaProject.exists()).thenReturn(true);
+        when(javaProject.findType("demo.Support")).thenReturn(type);
+        when(type.getMethods()).thenReturn(new IMethod[] {method});
+        when(type.getFields()).thenReturn(new IField[0]);
+
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getElementName()).thenReturn("greet");
+        when(method.getResource()).thenReturn(null);
+
+        ICompilationUnit compilationUnit = mock(ICompilationUnit.class);
+        IResource resource = mock(IResource.class);
+        ISourceRange nameRange = mock(ISourceRange.class);
+        String targetUri = "file:///workspace/dependency/src/main/groovy/demo/Support.groovy";
+        String source = "package demo\nclass Support {\n    void greet(String person) {}\n}\n";
+
+        when(method.getAncestor(IJavaElement.COMPILATION_UNIT)).thenReturn(compilationUnit);
+        when(compilationUnit.getResource()).thenReturn(resource);
+        when(method.getNameRange()).thenReturn(nameRange);
+        when(nameRange.getOffset()).thenReturn(source.indexOf("greet"));
+        when(nameRange.getLength()).thenReturn("greet".length());
+        when(dm.remapToWorkingCopyElement(method)).thenReturn(null);
+        when(dm.resolveElementUri(method)).thenReturn(targetUri);
+        when(dm.getContent(targetUri)).thenReturn(source);
+
+        try (MockedStatic<JavaCore> javaCore = org.mockito.Mockito.mockStatic(JavaCore.class)) {
+            javaCore.when(() -> JavaCore.create(project)).thenReturn(javaProject);
+
+            Method m = DefinitionProvider.class.getDeclaredMethod(
+                    "navigateViaProject", IProject.class, String.class, String.class);
+            m.setAccessible(true);
+            Location loc = (Location) m.invoke(defProvider, project, "demo.Support", "greet");
+
+            assertNotNull(loc);
+            assertEquals(targetUri, loc.getUri());
+            assertEquals(2, loc.getRange().getStart().getLine());
+        }
     }
 
     @Test

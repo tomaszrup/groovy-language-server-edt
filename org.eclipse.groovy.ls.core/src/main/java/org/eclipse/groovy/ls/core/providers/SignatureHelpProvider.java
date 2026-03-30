@@ -409,8 +409,8 @@ public class SignatureHelpProvider {
 
         for (int i = 0; i < params.length; i++) {
             String typeName = params[i].getType().getNameWithoutPackage();
-            String paramName = params[i].getName();
-            String paramLabel = typeName + " " + paramName;
+            String paramName = ParameterNameSupport.displayName(params[i].getName());
+            String paramLabel = paramName != null ? typeName + " " + paramName : typeName;
 
             if (i > 0) label.append(", ");
             label.append(paramLabel);
