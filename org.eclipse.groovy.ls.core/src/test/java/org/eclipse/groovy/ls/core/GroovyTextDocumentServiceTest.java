@@ -81,6 +81,7 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.MockedStatic;
 
 class GroovyTextDocumentServiceTest {
 
@@ -896,7 +897,38 @@ class GroovyTextDocumentServiceTest {
     }
 
     @Test
-    void refreshOpenDocumentsSemanticStateFiltersByProject() {
+    void refreshOpenDocumentsSemanticStateInvalidatesCachesBeforeReplayingAllOpenDocuments() throws Exception {
+        GroovyTextDocumentService service = createService();
+        DocumentManager documentManager = mock(DocumentManager.class);
+        CompletionProvider completionProvider = mock(CompletionProvider.class);
+        InlayHintProvider inlayHintProvider = mock(InlayHintProvider.class);
+        TypeHierarchyProvider typeHierarchyProvider = mock(TypeHierarchyProvider.class);
+        Set<String> openUris = Set.of(
+                "file:///test/A.groovy",
+                "file:///test/B.groovy");
+
+        try (MockedStatic<org.eclipse.groovy.ls.core.providers.TraitMemberResolver> traitResolver =
+                org.mockito.Mockito.mockStatic(org.eclipse.groovy.ls.core.providers.TraitMemberResolver.class)) {
+            setField(service, "documentManager", documentManager);
+            setField(service, "completionProvider", completionProvider);
+            setField(service, "inlayHintProvider", inlayHintProvider);
+            setField(service, "typeHierarchyProvider", typeHierarchyProvider);
+
+            when(documentManager.getOpenDocumentUris()).thenReturn(openUris);
+
+            service.refreshOpenDocumentsSemanticState();
+
+            verify(completionProvider).invalidateHierarchyCache();
+            verify(completionProvider).invalidateTypeNameCache();
+            verify(inlayHintProvider).invalidateCache();
+            verify(typeHierarchyProvider).invalidateCache();
+            traitResolver.verify(org.eclipse.groovy.ls.core.providers.TraitMemberResolver::invalidateCache);
+            verify(documentManager).replayOpenDocuments(openUris);
+        }
+    }
+
+    @Test
+    void refreshOpenDocumentsSemanticStateFiltersByProjectAndInvalidatesCaches() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer() {
             @Override
             public String getProjectNameForUri(String uri) {
@@ -911,6 +943,13 @@ class GroovyTextDocumentServiceTest {
         };
         DocumentManager documentManager = mock(DocumentManager.class);
         GroovyTextDocumentService service = new GroovyTextDocumentService(server, documentManager);
+        CompletionProvider completionProvider = mock(CompletionProvider.class);
+        InlayHintProvider inlayHintProvider = mock(InlayHintProvider.class);
+        TypeHierarchyProvider typeHierarchyProvider = mock(TypeHierarchyProvider.class);
+
+        setField(service, "completionProvider", completionProvider);
+        setField(service, "inlayHintProvider", inlayHintProvider);
+        setField(service, "typeHierarchyProvider", typeHierarchyProvider);
 
         when(documentManager.getOpenDocumentUris()).thenReturn(Set.of(
                 "file:///test/A.groovy",
@@ -920,7 +959,16 @@ class GroovyTextDocumentServiceTest {
         when(documentManager.getClientUri("file:///test/B.groovy")).thenReturn("file:///test/B.groovy");
         when(documentManager.getClientUri("file:///test/Unknown.groovy")).thenReturn("file:///test/Unknown.groovy");
 
-        service.refreshOpenDocumentsSemanticState("projA");
+        try (MockedStatic<org.eclipse.groovy.ls.core.providers.TraitMemberResolver> traitResolver =
+                org.mockito.Mockito.mockStatic(org.eclipse.groovy.ls.core.providers.TraitMemberResolver.class)) {
+            service.refreshOpenDocumentsSemanticState("projA");
+
+            verify(completionProvider).invalidateHierarchyCache();
+            verify(completionProvider).invalidateTypeNameCache();
+            verify(inlayHintProvider).invalidateCache();
+            verify(typeHierarchyProvider).invalidateCache();
+            traitResolver.verify(org.eclipse.groovy.ls.core.providers.TraitMemberResolver::invalidateCache);
+        }
 
         @SuppressWarnings("unchecked")
         Class<Iterable<String>> iterableClass = (Class<Iterable<String>>) (Class<?>) Iterable.class;
@@ -930,6 +978,38 @@ class GroovyTextDocumentServiceTest {
         java.util.List<String> replayed = new java.util.ArrayList<>();
         captor.getValue().forEach(replayed::add);
         assertEquals(Set.of("file:///test/A.groovy", "file:///test/Unknown.groovy"), Set.copyOf(replayed));
+    }
+
+    @Test
+    void didSaveInvalidatesSemanticCachesAndRefreshesCodeLenses() throws Exception {
+        GroovyTextDocumentService service = createService();
+        CompletionProvider completionProvider = mock(CompletionProvider.class);
+        InlayHintProvider inlayHintProvider = mock(InlayHintProvider.class);
+        TypeHierarchyProvider typeHierarchyProvider = mock(TypeHierarchyProvider.class);
+        CodeLensProvider codeLensProvider = mock(CodeLensProvider.class);
+        DocumentManager documentManager = mock(DocumentManager.class);
+
+        setField(service, "completionProvider", completionProvider);
+        setField(service, "inlayHintProvider", inlayHintProvider);
+        setField(service, "typeHierarchyProvider", typeHierarchyProvider);
+        setField(service, "codeLensProvider", codeLensProvider);
+        setField(service, "documentManager", documentManager);
+
+        org.eclipse.lsp4j.DidSaveTextDocumentParams params = new org.eclipse.lsp4j.DidSaveTextDocumentParams();
+        params.setTextDocument(new TextDocumentIdentifier("file:///test/Save.groovy"));
+
+        try (MockedStatic<org.eclipse.groovy.ls.core.providers.TraitMemberResolver> traitResolver =
+                org.mockito.Mockito.mockStatic(org.eclipse.groovy.ls.core.providers.TraitMemberResolver.class)) {
+            service.didSave(params);
+
+            verify(completionProvider).invalidateHierarchyCache();
+            verify(completionProvider).invalidateTypeNameCache();
+            verify(inlayHintProvider).invalidateCache();
+            verify(typeHierarchyProvider).invalidateCache();
+            verify(codeLensProvider).invalidateAllResolveCache();
+            verify(documentManager).scheduleCodeLensRefresh();
+            traitResolver.verify(org.eclipse.groovy.ls.core.providers.TraitMemberResolver::invalidateCache);
+        }
     }
 
     @Test

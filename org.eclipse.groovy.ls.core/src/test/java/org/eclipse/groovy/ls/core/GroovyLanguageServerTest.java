@@ -16,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -27,8 +28,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import org.eclipse.core.resources.IFolder;
+import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IWorkspace;
+import org.eclipse.core.resources.IWorkspaceRoot;
 import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.runtime.Path;
 import org.eclipse.lsp4j.CodeActionKind;
 import org.eclipse.lsp4j.InitializeParams;
 import org.eclipse.lsp4j.InitializeResult;
@@ -763,6 +768,22 @@ class GroovyLanguageServerTest {
         assertEquals(2, result.size());
     }
 
+            @Test
+            void findSubprojectsWithSourcesDoesNotDuplicateProjectWithMultipleSourceSuffixes(
+                @TempDir java.nio.file.Path tempDir) throws Exception {
+            java.nio.file.Files.createDirectories(tempDir.resolve("projA/src/main/java"));
+            java.nio.file.Files.createDirectories(tempDir.resolve("projA/src/main/groovy"));
+            GroovyLanguageServer server = new GroovyLanguageServer();
+            java.lang.reflect.Method m = GroovyLanguageServer.class.getDeclaredMethod(
+                "findSubprojectsWithSources", java.io.File.class, String[].class);
+            m.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            java.util.List<java.io.File> result = (java.util.List<java.io.File>) m.invoke(
+                server, tempDir.toFile(), new String[] {"src/main/java", "src/main/groovy"});
+            assertEquals(1, result.size());
+            assertEquals("projA", result.get(0).getName());
+            }
+
     // ================================================================
     // resolveWorkspaceDirectory tests
     // ================================================================
@@ -1094,6 +1115,118 @@ class GroovyLanguageServerTest {
         // Try to look up a URI under that subproject
         String result = server.getProjectNameForUri("file:///workspace/projA/src/Foo.groovy");
         assertTrue(result == null || result.equals("ProjA"));
+    }
+
+    @Test
+    void createProjectForDirectoryIfNeededReusesExistingLinkedProjectByPath() 
+            throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        java.nio.file.Path tempDir = java.nio.file.Files.createTempDirectory("groovy-ls-linked-project-test");
+        java.io.File projectDir = tempDir.resolve("app").toFile();
+        assertTrue(projectDir.mkdirs());
+
+        IWorkspace workspace = mock(IWorkspace.class);
+        IWorkspaceRoot root = mock(IWorkspaceRoot.class);
+        IProject linkedProject = mock(IProject.class);
+        IFolder linkedFolder = mock(IFolder.class);
+
+        when(workspace.getRoot()).thenReturn(root);
+        when(root.getProjects()).thenReturn(new IProject[] { linkedProject });
+        when(root.getProject("ExtGroovy_app_7")).thenReturn(linkedProject);
+        when(linkedProject.exists()).thenReturn(true);
+        when(linkedProject.isOpen()).thenReturn(true);
+        when(linkedProject.getName()).thenReturn("ExtGroovy_app_7");
+        when(linkedProject.findMember("linked")).thenReturn(linkedFolder);
+        when(linkedFolder.isLinked()).thenReturn(true);
+        when(linkedFolder.getLocation()).thenReturn(Path.fromOSString(projectDir.getAbsolutePath()));
+
+        try (MockedStatic<ResourcesPlugin> resourcesPlugin = org.mockito.Mockito.mockStatic(ResourcesPlugin.class)) {
+            resourcesPlugin.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+
+            IProject result = (IProject) invokePrivate(
+                    server,
+                    "createProjectForDirectoryIfNeeded",
+                    new Class<?>[] { java.io.File.class },
+                    new Object[] { projectDir });
+
+            assertEquals(linkedProject, result);
+
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, String> pathMap =
+                    (java.util.Map<String, String>) getField(server, "subprojectPathToEclipseName");
+            assertEquals("ExtGroovy_app_7", pathMap.get(projectDir.getAbsolutePath().replace('\\', '/').toLowerCase() + "/"));
+        }
+    }
+
+    @Test
+    void findUniqueProjectByDirectoryNameReturnsNullWhenAmbiguous() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, String> pathMap =
+                (java.util.Map<String, String>) getField(server, "subprojectPathToEclipseName");
+        pathMap.put("/workspace/services/common/", "CommonA");
+        pathMap.put("/workspace/libs/common/", "CommonB");
+
+        IWorkspace workspace = mock(IWorkspace.class);
+        IWorkspaceRoot root = mock(IWorkspaceRoot.class);
+        IProject commonA = mock(IProject.class);
+        IProject commonB = mock(IProject.class);
+
+        when(workspace.getRoot()).thenReturn(root);
+        when(root.getProject("CommonA")).thenReturn(commonA);
+        when(root.getProject("CommonB")).thenReturn(commonB);
+        when(commonA.exists()).thenReturn(true);
+        when(commonA.isOpen()).thenReturn(true);
+        when(commonB.exists()).thenReturn(true);
+        when(commonB.isOpen()).thenReturn(true);
+
+        try (MockedStatic<ResourcesPlugin> resourcesPlugin = org.mockito.Mockito.mockStatic(ResourcesPlugin.class)) {
+            resourcesPlugin.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+
+            Object result = invokePrivate(
+                    server,
+                    "findUniqueProjectByDirectoryName",
+                    new Class<?>[] { java.io.File.class },
+                    new Object[] { new java.io.File("/workspace/other/common") });
+
+            assertNull(result);
+        }
+    }
+
+    @Test
+    void findEclipseProjectByPathRebuildsMappingsFromLinkedWorkspaceProjects() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        IWorkspace workspace = mock(IWorkspace.class);
+        IWorkspaceRoot root = mock(IWorkspaceRoot.class);
+        IProject linkedProject = mock(IProject.class);
+        IFolder linkedFolder = mock(IFolder.class);
+
+        when(workspace.getRoot()).thenReturn(root);
+        when(root.getProjects()).thenReturn(new IProject[] { linkedProject });
+        when(root.getProject("ExtGroovy_app_7")).thenReturn(linkedProject);
+        when(linkedProject.exists()).thenReturn(true);
+        when(linkedProject.isOpen()).thenReturn(true);
+        when(linkedProject.getName()).thenReturn("ExtGroovy_app_7");
+        when(linkedProject.findMember("linked")).thenReturn(linkedFolder);
+        when(linkedFolder.isLinked()).thenReturn(true);
+        when(linkedFolder.getLocation()).thenReturn(Path.fromOSString("/workspace/app"));
+
+        try (MockedStatic<ResourcesPlugin> resourcesPlugin = org.mockito.Mockito.mockStatic(ResourcesPlugin.class)) {
+            resourcesPlugin.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+
+            IProject result = (IProject) invokePrivate(
+                    server,
+                    "findEclipseProjectByPath",
+                    new Class<?>[] { String.class },
+                    new Object[] { "/workspace/app/src/test/groovy/FooSpec.groovy" });
+
+            assertEquals(linkedProject, result);
+
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, String> pathMap =
+                    (java.util.Map<String, String>) getField(server, "subprojectPathToEclipseName");
+            assertEquals("ExtGroovy_app_7", pathMap.get("/workspace/app/"));
+        }
     }
 
     private static final class RecordingGroovyLanguageServer extends GroovyLanguageServer {

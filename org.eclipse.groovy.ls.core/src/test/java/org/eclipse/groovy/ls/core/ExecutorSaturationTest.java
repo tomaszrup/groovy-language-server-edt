@@ -135,6 +135,19 @@ class ExecutorSaturationTest {
     }
 
     /**
+     * Create a {@link CodeLensProvider} mock whose resolve step sleeps for
+     * {@code delayMs} before returning the same lens.
+     */
+    private CodeLensProvider slowCodeLensResolveProvider(long delayMs) throws Exception {
+        CodeLensProvider mock = mock(CodeLensProvider.class);
+        when(mock.resolveCodeLens(any(CodeLens.class))).thenAnswer(inv -> {
+            Thread.sleep(delayMs);
+            return inv.getArgument(0);
+        });
+        return mock;
+    }
+
+    /**
      * Create a {@link InlayHintProvider} mock that sleeps for
      * {@code delayMs} before returning an empty list.
      */
@@ -642,15 +655,50 @@ class ExecutorSaturationTest {
                 "No failures expected at 10 req/s with fast pool(4, 64) and 100ms latency");
     }
 
+    @Test
+    @Order(9)
+    @DisplayName("Priority: inlay hints complete while codeLens resolve queue is busy")
+    void inlayHintsHavePriorityOverCodeLensResolveLoad() throws Exception {
+        GroovyTextDocumentService service = createService();
+        service.configureBackgroundPool(BG_POOL_SIZE, BG_QUEUE_CAPACITY);
+        service.configureCodeLensResolvePool(1, 16);
+        setField(service, "codeLensProvider", slowCodeLensResolveProvider(1500));
+        setField(service, "inlayHintProvider", slowInlayHintProvider(50));
+
+        List<CompletableFuture<CodeLens>> resolveFutures = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            resolveFutures.add(service.resolveCodeLens(new CodeLens()));
+        }
+
+        InlayHintParams params = new InlayHintParams(
+                new TextDocumentIdentifier("file:///priority.groovy"),
+                new Range(new Position(0, 0), new Position(100, 0)));
+
+        long start = System.currentTimeMillis();
+        List<InlayHint> hints = service.inlayHint(params).get(5, TimeUnit.SECONDS);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertNotNull(hints);
+        assertTrue(elapsed < 1000,
+                "Inlay hints should not wait behind codeLens resolve work, took " + elapsed + " ms");
+
+        for (CompletableFuture<CodeLens> future : resolveFutures) {
+            try {
+                future.get(10, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     // ========================================================================
-    // Test 9: codeSelect cache — verifies DocumentManager.cachedCodeSelect()
+    // Test 10: codeSelect cache — verifies DocumentManager.cachedCodeSelect()
     //
     // Multiple requests for the same URI#offset should result in only ONE
     // actual codeSelect() call; subsequent hits come from the LRU cache.
     // ========================================================================
 
     @Test
-    @Order(9)
+    @Order(10)
     @DisplayName("codeSelect cache: 3 concurrent requests for same offset → 1 actual call")
     void codeSelectCacheSharesResult() throws Exception {
         DocumentManager dm = new DocumentManager();
@@ -697,7 +745,7 @@ class ExecutorSaturationTest {
     }
 
     @Test
-    @Order(10)
+    @Order(11)
     @DisplayName("codeSelect cache: invalidation on didChange clears cached results")
     void codeSelectCacheInvalidatedOnChange() throws Exception {
         DocumentManager dm = new DocumentManager();
@@ -733,7 +781,7 @@ class ExecutorSaturationTest {
     }
 
     @Test
-    @Order(11)
+    @Order(12)
     @DisplayName("codeSelect cache: entries expire after TTL (5s)")
     void codeSelectCacheTtlExpiry() throws Exception {
         DocumentManager dm = new DocumentManager();
@@ -769,7 +817,7 @@ class ExecutorSaturationTest {
     }
 
     @Test
-    @Order(12)
+    @Order(13)
     @DisplayName("Queue saturation: rejected hover falls back immediately instead of waiting for timeout")
     void rejectedHoverFallsBackImmediately() throws Exception {
         GroovyTextDocumentService service = createService();

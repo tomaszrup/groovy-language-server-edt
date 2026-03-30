@@ -77,12 +77,15 @@ public class TypeDefinitionProvider {
             }
 
             int offset = positionToOffset(content, position);
-            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
             if (elements == null || elements.length == 0) {
                 return locations;
             }
 
-            IJavaElement element = elements[0];
+            IJavaElement element = documentManager.remapToWorkingCopyElement(elements[0]);
+            if (element == null) {
+                element = elements[0];
+            }
             IType type = resolveType(element);
             if (type == null) {
                 return locations;
@@ -182,6 +185,11 @@ public class TypeDefinitionProvider {
 
     private Location toLocation(IType type) {
         try {
+            IJavaElement remappedType = documentManager.remapToWorkingCopyElement(type);
+            if (remappedType instanceof IType resolvedType) {
+                type = resolvedType;
+            }
+
             // Try workspace resource first
             org.eclipse.core.resources.IResource resource = type.getResource();
             if (resource == null) {
@@ -191,8 +199,8 @@ public class TypeDefinitionProvider {
                 }
             }
 
-            if (resource != null && resource.getLocationURI() != null) {
-                String targetUri = resource.getLocationURI().toString();
+            String targetUri = documentManager.resolveElementUri(type);
+            if (targetUri != null) {
                 Range range = new Range(new Position(0, 0), new Position(0, 0));
                 ISourceRange nameRange = type.getNameRange();
                 if (nameRange != null && nameRange.getOffset() >= 0) {

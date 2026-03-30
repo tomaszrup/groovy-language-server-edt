@@ -70,12 +70,15 @@ public class ImplementationProvider {
             }
 
             int offset = positionToOffset(content, position);
-            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
             if (elements == null || elements.length == 0) {
                 return locations;
             }
 
-            IJavaElement element = elements[0];
+            IJavaElement element = documentManager.remapToWorkingCopyElement(elements[0]);
+            if (element == null) {
+                element = elements[0];
+            }
 
             if (element instanceof IType type) {
                 findTypeImplementors(type, locations);
@@ -150,11 +153,10 @@ public class ImplementationProvider {
             Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
-            if (resource == null || resource.getLocationURI() == null) {
+            String targetUri = JdtSearchSupport.resolveResourceUri(documentManager, resource);
+            if (targetUri == null) {
                 return null;
             }
-
-            String targetUri = resource.getLocationURI().toString();
             String content = readContent(targetUri, resource, contentCache);
 
             int startOffset = match.getOffset();

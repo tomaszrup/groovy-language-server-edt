@@ -146,6 +146,62 @@ class DocumentManagerCoreMethodsTest {
         manager.didClose(uri);
     }
 
+    @Test
+    void resolveElementUriPrefersWorkingCopyBackedUri() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///linked/src/test/groovy/Spec.groovy";
+
+        org.eclipse.jdt.core.ICompilationUnit originalCompilationUnit = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IMethod method = mock(org.eclipse.jdt.core.IMethod.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+
+        when(method.getAncestor(org.eclipse.jdt.core.IJavaElement.COMPILATION_UNIT)).thenReturn(originalCompilationUnit);
+        when(originalCompilationUnit.getResource()).thenReturn(resource);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create(uri));
+
+        getWorkingCopies(manager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        assertEquals(DocumentManager.normalizeUri(uri), manager.resolveElementUri(method));
+    }
+
+    @Test
+    void remapToWorkingCopyElementReturnsMatchingMethodFromOpenDocument() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///linked/src/test/groovy/Spec.groovy";
+
+        org.eclipse.jdt.core.ICompilationUnit originalCompilationUnit = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.ICompilationUnit workingCopy = mock(org.eclipse.jdt.core.ICompilationUnit.class);
+        org.eclipse.jdt.core.IType originalType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IType remappedType = mock(org.eclipse.jdt.core.IType.class);
+        org.eclipse.jdt.core.IMethod originalMethod = mock(org.eclipse.jdt.core.IMethod.class);
+        org.eclipse.jdt.core.IMethod remappedMethod = mock(org.eclipse.jdt.core.IMethod.class);
+        org.eclipse.core.resources.IResource resource = mock(org.eclipse.core.resources.IResource.class);
+
+        when(originalMethod.getAncestor(org.eclipse.jdt.core.IJavaElement.COMPILATION_UNIT)).thenReturn(originalCompilationUnit);
+        when(originalMethod.getDeclaringType()).thenReturn(originalType);
+        when(originalMethod.getElementName()).thenReturn("someMethod");
+        when(originalMethod.getParameterTypes()).thenReturn(new String[]{"QString;"});
+        when(originalMethod.isConstructor()).thenReturn(false);
+
+        when(originalType.getFullyQualifiedName('$')).thenReturn("sample.Spec");
+        when(originalType.getElementName()).thenReturn("Spec");
+
+        when(originalCompilationUnit.getResource()).thenReturn(resource);
+        when(resource.getLocationURI()).thenReturn(java.net.URI.create(uri));
+
+        when(workingCopy.getTypes()).thenReturn(new org.eclipse.jdt.core.IType[]{remappedType});
+        when(remappedType.getFullyQualifiedName('$')).thenReturn("sample.Spec");
+        when(remappedType.getMethods()).thenReturn(new org.eclipse.jdt.core.IMethod[]{remappedMethod});
+        when(remappedMethod.getElementName()).thenReturn("someMethod");
+        when(remappedMethod.getParameterTypes()).thenReturn(new String[]{"QString;"});
+        when(remappedMethod.isConstructor()).thenReturn(false);
+
+        getWorkingCopies(manager).put(DocumentManager.normalizeUri(uri), workingCopy);
+
+        assertSame(remappedMethod, manager.remapToWorkingCopyElement(originalMethod));
+    }
+
     // ---- getGroovyAST ----
 
     @Test
@@ -579,6 +635,11 @@ class DocumentManagerCoreMethodsTest {
         String uri = "file:///test/RetryReconcile.groovy";
         String normalizedUri = DocumentManager.normalizeUri(uri);
         manager.didOpen(uri, "class Before {}\n");
+
+        Future<?> pendingDidOpen = getPendingOpenFutures(manager).remove(normalizedUri);
+        if (pendingDidOpen != null) {
+            pendingDidOpen.cancel(true);
+        }
 
         ICompilationUnit workingCopy = mock(ICompilationUnit.class);
         IBuffer buffer = mock(IBuffer.class);

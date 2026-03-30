@@ -80,8 +80,13 @@ public class DocumentHighlightProvider {
                 return highlights;
             }
 
+            IJavaElement targetElement = documentManager.remapToWorkingCopyElement(elements[0]);
+            if (targetElement == null) {
+                targetElement = elements[0];
+            }
+
             SearchPattern pattern = SearchPattern.createPattern(
-                    elements[0], IJavaSearchConstants.ALL_OCCURRENCES);
+                    targetElement, IJavaSearchConstants.ALL_OCCURRENCES);
             if (pattern == null) {
                 return highlights;
             }
@@ -117,11 +122,10 @@ public class DocumentHighlightProvider {
         return new SearchRequestor() {
             @Override
             public void acceptSearchMatch(SearchMatch match) {
-                if (match.getResource() == null
-                        || match.getResource().getLocationURI() == null) {
+                String matchUri = JdtSearchSupport.resolveResourceUri(documentManager, match.getResource());
+                if (matchUri == null) {
                     return;
                 }
-                String matchUri = match.getResource().getLocationURI().toString();
                 if (!normalizedUri.equals(normalizeUri(matchUri))) {
                     return;
                 }

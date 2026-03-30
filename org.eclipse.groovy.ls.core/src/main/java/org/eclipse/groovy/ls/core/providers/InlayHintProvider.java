@@ -91,6 +91,13 @@ public class InlayHintProvider {
      * Invalidate cached state for a URI (call on didChange / didClose).
      */
     public void invalidateCache(String uri) {
+        invalidateCache();
+    }
+
+    /**
+     * Invalidate all cached state.
+     */
+    public void invalidateCache() {
         // The hierarchy cache is keyed by FQN, not URI, so a targeted
         // per-URI eviction isn't practical.  A full clear is cheap and
         // correct — hierarchies are rebuilt on the next request.
@@ -881,6 +888,10 @@ public class InlayHintProvider {
                 List<IMethod> methods = new ArrayList<>();
                 if (elements != null) {
                     for (IJavaElement element : elements) {
+                        IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+                        if (remappedElement != null) {
+                            element = remappedElement;
+                        }
                         if (element instanceof IMethod method
                                 && !method.isConstructor()
                                 && methodName.equals(method.getElementName())) {
@@ -919,6 +930,10 @@ public class InlayHintProvider {
 
         private void addConstructorCandidates(IJavaElement element, List<IMethod> constructors)
                 throws JavaModelException {
+            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+            if (remappedElement != null) {
+                element = remappedElement;
+            }
             if (element instanceof IMethod method) {
                 if (method.isConstructor()) {
                     constructors.add(remapConstructorToResolved(method));

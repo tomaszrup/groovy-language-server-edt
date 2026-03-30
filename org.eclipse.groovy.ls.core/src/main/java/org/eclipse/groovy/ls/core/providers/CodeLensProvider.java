@@ -95,7 +95,7 @@ public class CodeLensProvider {
         // Handle IDs produced by JDT contain the project-relative path;
         // a simple URI suffix check covers the common case.
         resolveCache.entrySet().removeIf(
-                entry -> entry.getKey().contains(uri) || uri.contains(entry.getKey()));
+            entry -> entry.getKey().contains(uri) || uri.contains(entry.getKey()));
     }
 
     /**
@@ -178,19 +178,24 @@ public class CodeLensProvider {
             }
 
             IJavaElement element = JavaCore.create(handleId);
+            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+            if (remappedElement != null) {
+                element = remappedElement;
+            }
             if (element == null || !element.exists()) {
                 codeLens.setCommand(fallbackCommand());
                 return codeLens;
             }
 
             // Check cache first to avoid redundant searches
-            List<Location> cached = resolveCache.get(handleId);
+            String cacheKey = element.getHandleIdentifier();
+            List<Location> cached = resolveCache.get(cacheKey);
             List<Location> locations;
             if (cached != null) {
                 locations = cached;
             } else {
                 locations = findReferenceLocations(element, uri);
-                resolveCache.put(handleId, locations);
+                resolveCache.put(cacheKey, locations);
             }
             int count = locations.size();
 
@@ -239,7 +244,7 @@ public class CodeLensProvider {
             ModuleNode cachedAst) throws JavaModelException {
         CodeLens typeLens = createUnresolvedCodeLens(type, content);
         if (typeLens != null) {
-            lenses.add(typeLens);
+            addCodeLensIfAbsent(lenses, typeLens);
         }
 
         for (IMethod method : type.getMethods()) {
@@ -248,7 +253,7 @@ public class CodeLensProvider {
             }
             CodeLens methodLens = createUnresolvedCodeLens(method, content);
             if (methodLens != null) {
-                lenses.add(methodLens);
+                addCodeLensIfAbsent(lenses, methodLens);
             }
         }
 
@@ -463,6 +468,10 @@ public class CodeLensProvider {
     }
 
     CodeLens createCodeLensIfReferenced(IJavaElement element, String content, String uri) {
+        IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+        if (remappedElement != null) {
+            element = remappedElement;
+        }
         if (!hasReferences(element, uri)) {
             return null;
         }
@@ -481,6 +490,10 @@ public class CodeLensProvider {
      */
     CodeLens createUnresolvedCodeLens(IJavaElement element, String content) {
         try {
+            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+            if (remappedElement != null) {
+                element = remappedElement;
+            }
             if (!(element instanceof ISourceReference sourceRef)) {
                 return null;
             }
@@ -499,8 +512,8 @@ public class CodeLensProvider {
 
             JsonObject data = new JsonObject();
             data.addProperty(HANDLE_ID_KEY, element.getHandleIdentifier());
-            data.addProperty(URI_KEY, element.getResource() != null
-                    ? element.getResource().getLocationURI().toString() : "");
+        String uri = documentManager.resolveElementUri(element);
+        data.addProperty(URI_KEY, uri != null ? uri : "");
             lens.setData(data);
 
             return lens;
@@ -525,5 +538,25 @@ public class CodeLensProvider {
 
     Position offsetToPosition(String content, int offset) {
         return PositionUtils.offsetToPosition(content, offset);
+    }
+
+    private void addCodeLensIfAbsent(List<CodeLens> lenses, CodeLens candidate) {
+        Range candidateRange = candidate.getRange();
+        if (candidateRange == null || candidateRange.getStart() == null) {
+            lenses.add(candidate);
+            return;
+        }
+
+        for (CodeLens existing : lenses) {
+            Range existingRange = existing.getRange();
+            if (existingRange == null || existingRange.getStart() == null) {
+                continue;
+            }
+            if (existingRange.getStart().equals(candidateRange.getStart())) {
+                return;
+            }
+        }
+
+        lenses.add(candidate);
     }
 }

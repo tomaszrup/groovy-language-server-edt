@@ -154,7 +154,7 @@ class CodeLensProviderTest {
 
             javaCoreMock.when(() -> JavaCore.create(handleId)).thenReturn(element);
             searchMock.when(() -> ReferenceSearchHelper.findReferenceLocations(element, uri, documentManager))
-                    .thenReturn(List.of());
+                .thenReturn(List.of());
 
             CodeLens result = provider.resolveCodeLens(lens);
 
@@ -188,7 +188,7 @@ class CodeLensProviderTest {
 
             javaCoreMock.when(() -> JavaCore.create(handleId)).thenReturn(element);
             searchMock.when(() -> ReferenceSearchHelper.findReferenceLocations(element, uri, documentManager))
-                    .thenReturn(locations);
+                .thenReturn(locations);
 
             CodeLens result = provider.resolveCodeLens(lens);
 
@@ -575,6 +575,36 @@ class CodeLensProviderTest {
         JsonObject methodData = (JsonObject) lenses.get(1).getData();
         assertEquals("=Proj/src{SpecNoCachedAst.groovy[MySpec", typeData.get("handleId").getAsString());
         assertEquals("=Proj/src{SpecNoCachedAst.groovy[MySpec~namedFeature", methodData.get("handleId").getAsString());
+    }
+
+    @Test
+    void addCodeLensesForTypeDeduplicatesMethodsAtSameDeclarationOffset() throws Exception {
+        String uri = "file:///SpecDuplicateLens.groovy";
+        String content = """
+                class MySpec {
+                    void helperMethod() {
+                        println "hi"
+                    }
+                }
+                """;
+
+        CodeLensProvider localProvider = new CodeLensProvider(documentManager);
+        IType specType = mockType("MySpec", "MySpec", "Object",
+                content.indexOf("MySpec"), "=Proj/src{SpecDuplicateLens.groovy[MySpec");
+        int methodOffset = content.indexOf("helperMethod()");
+        IMethod helperMethodA = mockMethod("helperMethod", methodOffset,
+                "=Proj/src{SpecDuplicateLens.groovy[MySpec~helperMethod#1", specType);
+        IMethod helperMethodB = mockMethod("helperMethod", methodOffset,
+                "=Proj/src{SpecDuplicateLens.groovy[MySpec~helperMethod#2", specType);
+        when(specType.getMethods()).thenReturn(new IMethod[]{helperMethodA, helperMethodB});
+        when(specType.getTypes()).thenReturn(new IType[0]);
+
+        List<CodeLens> lenses = invokeAddCodeLensesForType(localProvider, specType, content, uri);
+
+        assertEquals(2, lenses.size());
+        JsonObject methodData = (JsonObject) lenses.get(1).getData();
+        assertEquals("=Proj/src{SpecDuplicateLens.groovy[MySpec~helperMethod#1",
+                methodData.get("handleId").getAsString());
     }
 
     @Test

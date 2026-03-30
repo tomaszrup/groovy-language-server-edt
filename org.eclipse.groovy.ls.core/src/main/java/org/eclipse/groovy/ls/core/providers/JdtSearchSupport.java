@@ -52,6 +52,9 @@ public final class JdtSearchSupport {
             String targetUri,
             IResource resource,
             Map<String, String> contentCache) {
+        if (targetUri == null) {
+            targetUri = resolveResourceUri(documentManager, resource);
+        }
         if (contentCache != null && contentCache.containsKey(targetUri)) {
             return contentCache.get(targetUri);
         }
@@ -69,6 +72,15 @@ public final class JdtSearchSupport {
             contentCache.put(targetUri, content);
         }
         return content;
+    }
+
+    public static String resolveResourceUri(DocumentManager documentManager, IResource resource) {
+        if (documentManager == null) {
+            return resource != null && resource.getLocationURI() != null
+                    ? resource.getLocationURI().toString()
+                    : null;
+        }
+        return documentManager.resolveResourceUri(resource);
     }
 
     public static void searchAllTypeNames(char[] packageName,

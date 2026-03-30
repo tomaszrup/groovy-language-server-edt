@@ -89,10 +89,15 @@ public class ReferenceProvider {
                 return locations;
             }
 
+            IJavaElement targetElement = documentManager.remapToWorkingCopyElement(elements[0]);
+            if (targetElement == null) {
+                targetElement = elements[0];
+            }
+
             int searchFor = includeDeclaration
                     ? IJavaSearchConstants.ALL_OCCURRENCES
                     : IJavaSearchConstants.REFERENCES;
-            SearchPattern pattern = SearchPattern.createPattern(elements[0], searchFor);
+            SearchPattern pattern = SearchPattern.createPattern(targetElement, searchFor);
             if (pattern == null) {
                 return locations;
             }
@@ -140,11 +145,10 @@ public class ReferenceProvider {
             Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
-            if (resource == null || resource.getLocationURI() == null) {
+            String targetUri = JdtSearchSupport.resolveResourceUri(documentManager, resource);
+            if (targetUri == null) {
                 return null;
             }
-
-            String targetUri = resource.getLocationURI().toString();
 
             // Get content for offset->position conversion
             String content = readContent(targetUri, resource, contentCache);

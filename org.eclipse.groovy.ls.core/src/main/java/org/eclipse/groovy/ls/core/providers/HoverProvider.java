@@ -25,7 +25,6 @@ import org.codehaus.groovy.ast.stmt.BlockStatement;
 import org.codehaus.groovy.ast.stmt.ExpressionStatement;
 import org.codehaus.groovy.ast.stmt.Statement;
 import org.codehaus.groovy.control.SourceUnit;
-import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -148,7 +147,12 @@ public class HoverProvider {
             return null;
         }
 
-        String hoverContent = buildHoverContent(elements[0]);
+        IJavaElement element = documentManager.remapToWorkingCopyElement(elements[0]);
+        if (element == null) {
+            element = elements[0];
+        }
+
+        String hoverContent = buildHoverContent(element);
         if (hoverContent == null || hoverContent.isEmpty()) {
             return null;
         }
@@ -499,15 +503,14 @@ public class HoverProvider {
     }
 
     private String loadOpenDocumentSource(IType type, ICompilationUnit compilationUnit) {
-        IResource resource = type.getResource();
-        if (resource == null && compilationUnit != null) {
-            resource = compilationUnit.getResource();
+        String normalizedUri = documentManager.resolveElementUri(type);
+        if ((normalizedUri == null || normalizedUri.isBlank()) && compilationUnit != null) {
+            normalizedUri = documentManager.resolveElementUri(compilationUnit);
         }
-        if (resource == null || resource.getLocationURI() == null) {
+        if (normalizedUri == null || normalizedUri.isBlank()) {
             return null;
         }
 
-        String normalizedUri = DocumentManager.normalizeUri(resource.getLocationURI().toString());
         return documentManager.getContent(normalizedUri);
     }
 

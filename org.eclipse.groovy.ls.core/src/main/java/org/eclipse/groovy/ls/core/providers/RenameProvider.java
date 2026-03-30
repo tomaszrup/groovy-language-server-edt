@@ -100,7 +100,7 @@ public class RenameProvider {
                 String content = documentManager.getContent(uri);
                 if (content != null) {
                     int offset = positionToOffset(content, position);
-                    IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+                    IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
                     if (elements != null && elements.length > 0) {
                         String word = extractWordAt(content, offset);
                         if (word != null && !word.isEmpty()) {
@@ -174,13 +174,18 @@ public class RenameProvider {
             }
 
             int offset = positionToOffset(content, position);
-            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
             if (elements == null || elements.length == 0) {
                 return null;
             }
 
+            IJavaElement targetElement = documentManager.remapToWorkingCopyElement(elements[0]);
+            if (targetElement == null) {
+                targetElement = elements[0];
+            }
+
             SearchPattern pattern = SearchPattern.createPattern(
-                    elements[0],
+                    targetElement,
                     IJavaSearchConstants.ALL_OCCURRENCES);
             if (pattern == null) {
                 return null;
@@ -241,11 +246,10 @@ public class RenameProvider {
             Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             IResource resource = match.getResource();
-            if (resource == null || resource.getLocationURI() == null) {
+            String targetUri = JdtSearchSupport.resolveResourceUri(documentManager, resource);
+            if (targetUri == null) {
                 return;
             }
-
-            String targetUri = resource.getLocationURI().toString();
             int startOffset = match.getOffset();
             int endOffset = startOffset + match.getLength();
 
@@ -360,13 +364,12 @@ public class RenameProvider {
                         @Override
                         public void acceptSearchMatch(SearchMatch match) {
                             try {
-                                if (match.getResource() == null
-                                        || match.getResource().getLocationURI() == null) {
-                                    return;
-                                }
                                 // Only process import statement matches
                                 org.eclipse.core.resources.IResource res = match.getResource();
-                                String uri = res.getLocationURI().toString();
+                                String uri = JdtSearchSupport.resolveResourceUri(documentManager, res);
+                                if (uri == null) {
+                                    return;
+                                }
                                 String content = readContent(uri, res, contentCache);
                                 if (content == null) return;
 

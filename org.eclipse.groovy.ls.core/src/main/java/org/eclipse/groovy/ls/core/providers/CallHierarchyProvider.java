@@ -94,12 +94,15 @@ public class CallHierarchyProvider {
             }
 
             int offset = positionToOffset(content, position);
-            IJavaElement[] elements = workingCopy.codeSelect(offset, 0);
+            IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
             if (elements == null || elements.length == 0) {
                 return result;
             }
 
-            IJavaElement element = elements[0];
+            IJavaElement element = documentManager.remapToWorkingCopyElement(elements[0]);
+            if (element == null) {
+                element = elements[0];
+            }
 
             // Accept methods and types (for constructor calls)
             if (element instanceof IMethod || element instanceof IType) {
@@ -281,9 +284,10 @@ public class CallHierarchyProvider {
         Range firstRange = data.ranges.get(0);
         int callOffset = lineIndex.positionToOffset(firstRange.getStart());
         try {
-            IJavaElement[] resolved = workingCopy.codeSelect(callOffset, 0);
+            IJavaElement[] resolved = documentManager.cachedCodeSelect(workingCopy, callOffset);
             if (resolved != null && resolved.length > 0) {
-                return buildCallHierarchyItem(resolved[0]);
+                IJavaElement element = documentManager.remapToWorkingCopyElement(resolved[0]);
+                return buildCallHierarchyItem(element != null ? element : resolved[0]);
             }
         } catch (Exception e) {
             // codeSelect failed, create a stub item
@@ -375,11 +379,10 @@ public class CallHierarchyProvider {
             Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             org.eclipse.core.resources.IResource resource = match.getResource();
-            if (resource == null || resource.getLocationURI() == null) {
+            String targetUri = JdtSearchSupport.resolveResourceUri(documentManager, resource);
+            if (targetUri == null) {
                 return null;
             }
-
-            String targetUri = resource.getLocationURI().toString();
             String content = getContent(targetUri, resource, contentCache);
             if (content == null) {
                 return null;
@@ -445,6 +448,11 @@ public class CallHierarchyProvider {
      */
     private CallHierarchyItem buildCallHierarchyItem(IJavaElement element) {
         try {
+            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+            if (remappedElement != null) {
+                element = remappedElement;
+            }
+
             CallHierarchyItem item = new CallHierarchyItem();
             item.setName(element.getElementName());
 
@@ -514,26 +522,7 @@ public class CallHierarchyProvider {
     }
 
     private String resolveElementUri(IJavaElement element) {
-        try {
-            org.eclipse.core.resources.IResource resource = element.getResource();
-            if (resource != null && resource.getLocationURI() != null) {
-                return resource.getLocationURI().toString();
-            }
-
-            // Try the compilation unit
-            if (element instanceof IMember member) {
-                ICompilationUnit cu = member.getCompilationUnit();
-                if (cu != null) {
-                    resource = cu.getResource();
-                    if (resource != null && resource.getLocationURI() != null) {
-                        return resource.getLocationURI().toString();
-                    }
-                }
-            }
-        } catch (Exception e) {
-            // ignore
-        }
-        return null;
+        return documentManager.resolveElementUri(element);
     }
 
     private Range getElementRange(IJavaElement element, String uri) {

@@ -559,10 +559,14 @@ export async function activate(context: ExtensionContext): Promise<void> {
         commands.registerCommand('groovy.codeLensNoop', () => {
             return undefined;
         }),
-        commands.registerCommand('groovy.showReferences', async (uri: string, position: { line: number; character: number }, locations: Array<{ uri: string; range: { start: { line: number; character: number }; end: { line: number; character: number } } }>) => {
+        commands.registerCommand('groovy.showReferences', async (
+            uri: string,
+            position: { line: number; character: number },
+            locations?: Array<{ uri: string; range: { start: { line: number; character: number }; end: { line: number; character: number } } }>
+        ) => {
             const vsUri = vscode.Uri.parse(uri);
             const vsPos = new vscode.Position(position.line, position.character);
-            const vsLocations = (locations || []).map(loc =>
+            let vsLocations = (locations || []).map(loc =>
                 new vscode.Location(
                     vscode.Uri.parse(loc.uri),
                     new vscode.Range(
@@ -571,6 +575,14 @@ export async function activate(context: ExtensionContext): Promise<void> {
                     )
                 )
             );
+            if (vsLocations.length === 0) {
+                const resolved = await vscode.commands.executeCommand<vscode.Location[]>(
+                    'vscode.executeReferenceProvider',
+                    vsUri,
+                    vsPos
+                );
+                vsLocations = resolved ?? [];
+            }
             await vscode.commands.executeCommand('editor.action.showReferences', vsUri, vsPos, vsLocations);
         }),
         commands.registerCommand('groovy.restartServer', async () => {

@@ -274,6 +274,11 @@ public class DefinitionProvider {
             Map<String, PositionUtils.LineIndex> lineIndexCache,
             SourceLookupContext sourceLookupContext) {
         try {
+            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+            if (remappedElement != null) {
+                element = remappedElement;
+            }
+
             Location resourceLoc = toLocationFromResource(element, contentCache, lineIndexCache);
             if (resourceLoc != null) {
                 return resourceLoc;
@@ -325,13 +330,13 @@ public class DefinitionProvider {
             }
         }
 
-        if (resource != null && resource.getLocationURI() != null) {
-            String name = resource.getName();
+        String targetUri = documentManager.resolveElementUri(element);
+        if (targetUri != null) {
+            String name = resource != null ? resource.getName() : null;
             // Skip binary .class files — we want source files only
             if (name != null && name.endsWith(".class")) {
                 return null;
             }
-            String targetUri = resource.getLocationURI().toString();
             Range range = new Range(new Position(0, 0), new Position(0, 0));
             if (element instanceof ISourceReference sourceRef) {
                 ISourceRange nameRange = sourceRef.getNameRange();

@@ -12,6 +12,7 @@ package org.eclipse.groovy.ls.core;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -152,6 +153,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     private final java.util.concurrent.ConcurrentHashMap<String, String> subprojectPathToEclipseName
             = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Object projectCreationLock = new Object();
 
     /**
      * Tracks which Eclipse project names have received at least one successful
@@ -667,6 +669,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             // project whose classpath just became available so semantic tokens
             // can upgrade without waiting for an edit.
             textDocumentService.refreshOpenDocumentsSemanticState(projName);
+            textDocumentService.refreshCodeLenses();
 
             triggerBuildAfterClasspathUpdate();
 
@@ -997,7 +1000,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
                 return null;
             }
 
-            IProject byName = findProjectByDirectoryName(projectDir);
+            IProject linkedProject = findProjectLinkedToDirectory(projectDir);
+            if (linkedProject != null) {
+                putSubprojectMapping(projectDir.getAbsolutePath(), linkedProject.getName());
+                return linkedProject;
+            }
+
+            IProject byName = findUniqueProjectByDirectoryName(projectDir);
             if (byName != null) {
                 return byName;
             }
@@ -1010,17 +1019,54 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
     }
 
-    private IProject findProjectByDirectoryName(java.io.File projectDir) {
+    private IProject findUniqueProjectByDirectoryName(java.io.File projectDir) {
         String dirName = projectDir.getName().toLowerCase();
+        IProject uniqueProject = null;
         for (var entry : subprojectPathToEclipseName.entrySet()) {
             if (!entry.getKey().endsWith("/" + dirName + "/")) {
                 continue;
             }
             IProject project = ResourcesPlugin.getWorkspace().getRoot().getProject(entry.getValue());
             if (project.exists() && project.isOpen()) {
+                if (uniqueProject != null && !uniqueProject.equals(project)) {
+                    GroovyLanguageServerPlugin.logInfo(
+                            "[classpathUpdate] Ambiguous directory-name match for '" + projectDir
+                                    + "'. Waiting for path-based resolution instead of guessing.");
+                    return null;
+                }
+                uniqueProject = project;
+            }
+        }
+        return uniqueProject;
+    }
+
+    private IProject findProjectLinkedToDirectory(java.io.File projectDir) {
+        String targetPath = normalizePath(projectDir.getAbsolutePath());
+        if (targetPath == null) {
+            return null;
+        }
+
+        for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
+            if (!project.exists() || !project.isOpen()) {
+                continue;
+            }
+
+            IResource linkedRoot = project.findMember(LINKED_FOLDER_NAME);
+            if (!(linkedRoot instanceof IFolder folder) || !folder.isLinked()) {
+                continue;
+            }
+
+            IPath linkedLocation = folder.getLocation();
+            if (linkedLocation == null) {
+                continue;
+            }
+
+            String linkedPath = normalizePath(linkedLocation.toOSString());
+            if (targetPath.equals(linkedPath)) {
                 return project;
             }
         }
+
         return null;
     }
 
@@ -1029,34 +1075,26 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
             return null;
         }
 
-        // Check if DocumentManager already imported this path as an ExtGroovy_ project.
-        // If so, reuse it instead of creating a duplicate Groovy_ project.
-        // This ensures the classpath is applied to the project that already holds
-        // working copies for files in this directory.
-        String dirName = projectDir.getName();
-        IWorkspace workspace = ResourcesPlugin.getWorkspace();
-        String extProjectName = "ExtGroovy_" + dirName;
-        IProject extProject = workspace.getRoot().getProject(extProjectName);
-        if (extProject.exists() && extProject.isOpen()) {
-            // Verify it really points to the same directory
-            IPath extLocation = extProject.getLocation();
-            if (extLocation != null) {
-                String extPath = normalizePath(extLocation.toOSString());
-                String targetPath = normalizePath(projectDir.getAbsolutePath());
-                if (extPath != null && extPath.equals(targetPath)) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[classpathUpdate] Reusing existing '" + extProjectName
-                            + "' for: " + projectDir);
-                    putSubprojectMapping(projectDir.getAbsolutePath(), extProjectName);
-                    return extProject;
-                }
+        synchronized (projectCreationLock) {
+            IProject existingByPath = findEclipseProjectByPath(projectDir.getAbsolutePath());
+            if (existingByPath != null) {
+                return existingByPath;
             }
-        }
 
-        GroovyLanguageServerPlugin.logInfo(
-                "[classpathUpdate] Creating on-the-fly project for: " + projectDir);
-        createEclipseProjectFor(projectDir, DEFAULT_SOURCE_DIR_SUFFIXES);
-        return findEclipseProjectByPath(projectDir.getAbsolutePath());
+            IProject linkedProject = findProjectLinkedToDirectory(projectDir);
+            if (linkedProject != null) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[classpathUpdate] Reusing existing linked project '"
+                                + linkedProject.getName() + "' for: " + projectDir);
+                putSubprojectMapping(projectDir.getAbsolutePath(), linkedProject.getName());
+                return linkedProject;
+            }
+
+            GroovyLanguageServerPlugin.logInfo(
+                    "[classpathUpdate] Creating on-the-fly project for: " + projectDir);
+            createEclipseProjectFor(projectDir, DEFAULT_SOURCE_DIR_SUFFIXES);
+            return findEclipseProjectByPath(projectDir.getAbsolutePath());
+        }
     }
 
     private IProject fallbackGroovyProject() {
@@ -1070,6 +1108,20 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         }
 
         String normalizedPath = normalizePath(filesystemPath);
+        if (normalizedPath == null) {
+            return null;
+        }
+
+        IProject mappedProject = findMappedProjectByPath(normalizedPath);
+        if (mappedProject != null) {
+            return mappedProject;
+        }
+
+        rebuildSubprojectMappingsFromWorkspaceProjects();
+        return findMappedProjectByPath(normalizedPath);
+    }
+
+    private IProject findMappedProjectByPath(String normalizedPath) {
         if (normalizedPath == null) {
             return null;
         }
@@ -1420,13 +1472,16 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private void initializeMultiProjectWorkspace(
             java.io.File workspaceDir,
             List<java.io.File> subprojects) {
+        List<java.io.File> uniqueSubprojects = deduplicateSubprojectsByPath(subprojects);
         GroovyLanguageServerPlugin.logInfo(
-                "[workspace] Found " + subprojects.size() + " subproject(s). "
+            "[workspace] Found " + uniqueSubprojects.size() + " subproject(s). "
                         + "Creating isolated Eclipse projects for classpath separation.");
 
-        for (java.io.File subDir : subprojects) {
+        for (java.io.File subDir : uniqueSubprojects) {
             createSubprojectSafely(subDir);
         }
+
+        rebuildSubprojectMappingsFromWorkspaceProjects();
 
         if (subprojectPathToEclipseName.isEmpty()) {
             GroovyLanguageServerPlugin.logInfo(
@@ -1442,10 +1497,65 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     private void createSubprojectSafely(java.io.File subDir) {
         try {
+            IProject existingProject = findProjectLinkedToDirectory(subDir);
+            if (existingProject != null) {
+                putSubprojectMapping(subDir.getAbsolutePath(), existingProject.getName());
+                return;
+            }
+
             createEclipseProjectFor(subDir, DEFAULT_SOURCE_DIR_SUFFIXES);
         } catch (Exception e) {
+            IProject recoveredProject = findProjectLinkedToDirectory(subDir);
+            if (recoveredProject != null) {
+                putSubprojectMapping(subDir.getAbsolutePath(), recoveredProject.getName());
+                GroovyLanguageServerPlugin.logInfo(
+                        "[workspace] Recovered existing linked project '"
+                                + recoveredProject.getName() + "' for " + subDir.getAbsolutePath()
+                                + " after create conflict: " + e.getMessage());
+                return;
+            }
             GroovyLanguageServerPlugin.logError(
                     "[workspace] Skipped " + subDir.getName() + ": " + e.getMessage(), e);
+        }
+    }
+
+    private List<java.io.File> deduplicateSubprojectsByPath(List<java.io.File> subprojects) {
+        LinkedHashMap<String, java.io.File> uniqueSubprojects = new LinkedHashMap<>();
+        for (java.io.File subproject : subprojects) {
+            if (subproject == null) {
+                continue;
+            }
+
+            String normalizedPath = normalizePath(subproject.getAbsolutePath());
+            if (normalizedPath != null) {
+                uniqueSubprojects.putIfAbsent(normalizedPath, subproject);
+            }
+        }
+        return new ArrayList<>(uniqueSubprojects.values());
+    }
+
+    private void rebuildSubprojectMappingsFromWorkspaceProjects() {
+        try {
+            for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
+                if (!project.exists() || !project.isOpen()) {
+                    continue;
+                }
+
+                IResource linkedRoot = project.findMember(LINKED_FOLDER_NAME);
+                if (!(linkedRoot instanceof IFolder folder) || !folder.isLinked()) {
+                    continue;
+                }
+
+                IPath linkedLocation = folder.getLocation();
+                if (linkedLocation == null) {
+                    continue;
+                }
+
+                putSubprojectMapping(linkedLocation.toOSString(), project.getName());
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "[workspace] Failed to rebuild linked-project mappings", e);
         }
     }
 
@@ -1464,58 +1574,60 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      */
     private void createEclipseProjectFor(java.io.File subDir, String[] srcDirSuffixes)
             throws CoreException {
-        IWorkspace workspace = ResourcesPlugin.getWorkspace();
-        String baseName = subDir.getName();
-        String projectName = GROOVY_PROJECT_PREFIX + baseName;
+        synchronized (projectCreationLock) {
+            IProject existingProject = findProjectLinkedToDirectory(subDir);
+            if (existingProject != null) {
+            putSubprojectMapping(subDir.getAbsolutePath(), existingProject.getName());
+            return;
+            }
 
-        int counter = 1;
-        while (workspace.getRoot().getProject(projectName).exists()) {
+            IWorkspace workspace = ResourcesPlugin.getWorkspace();
+            String baseName = subDir.getName();
+            String projectName = GROOVY_PROJECT_PREFIX + baseName;
+
+            int counter = 1;
+            while (workspace.getRoot().getProject(projectName).exists()) {
             projectName = GROOVY_PROJECT_PREFIX + baseName + "_" + counter++;
-        }
+            }
 
-        IProject project = workspace.getRoot().getProject(projectName);
-        IProjectDescription description = workspace.newProjectDescription(projectName);
-        description.setNatureIds(new String[]{
+            IProject project = workspace.getRoot().getProject(projectName);
+            IProjectDescription description = workspace.newProjectDescription(projectName);
+            description.setNatureIds(new String[]{
                 JavaCore.NATURE_ID,
             GROOVY_NATURE_ID
-        });
+            });
 
-        project.create(description, new NullProgressMonitor());
-        project.open(new NullProgressMonitor());
+            project.create(description, new NullProgressMonitor());
+            project.open(new NullProgressMonitor());
 
-        IFolder linkedRoot = project.getFolder(LINKED_FOLDER_NAME);
-        linkedRoot.createLink(
+            IFolder linkedRoot = project.getFolder(LINKED_FOLDER_NAME);
+            linkedRoot.createLink(
                 org.eclipse.core.runtime.Path.fromOSString(subDir.getAbsolutePath()),
                 IResource.ALLOW_MISSING_LOCAL,
                 new NullProgressMonitor());
-        applyLinkedResourceFilter(linkedRoot, "[" + projectName + "]");
+            applyLinkedResourceFilter(linkedRoot, "[" + projectName + "]");
 
-        GroovyLanguageServerPlugin.logInfo(
+            GroovyLanguageServerPlugin.logInfo(
                 "[" + projectName + "] Linked folder → " + subDir.getAbsolutePath());
 
-        // Ensure the resource model sees the linked folder's children
-        // before we probe for source directories.  The createFilter() call
-        // above uses BACKGROUND_REFRESH, so without this the nested folders
-        // may not be visible yet.
-        linkedRoot.refreshLocal(IResource.DEPTH_INFINITE, new NullProgressMonitor());
+            linkedRoot.refreshLocal(IResource.DEPTH_INFINITE, new NullProgressMonitor());
 
-        // Configure source folders (relative to the linked root)
-        IJavaProject javaProject = JavaCore.create(project);
-        List<IClasspathEntry> entries = createSourceEntries(linkedRoot, srcDirSuffixes,
+            IJavaProject javaProject = JavaCore.create(project);
+            List<IClasspathEntry> entries = createSourceEntries(linkedRoot, srcDirSuffixes,
                 "[" + projectName + "] Source folder: linked/");
-        entries.add(JavaCore.newContainerEntry(new org.eclipse.core.runtime.Path(JRE_CONTAINER_ID)));
+            entries.add(JavaCore.newContainerEntry(new org.eclipse.core.runtime.Path(JRE_CONTAINER_ID)));
 
-        javaProject.setRawClasspath(
+            javaProject.setRawClasspath(
                 entries.toArray(new IClasspathEntry[0]),
                 project.getFullPath().append("bin"),
                 new NullProgressMonitor());
 
-        // Store mapping: normalized filesystem path → Eclipse project name
-        putSubprojectMapping(subDir.getAbsolutePath(), projectName);
+            putSubprojectMapping(subDir.getAbsolutePath(), projectName);
 
-        GroovyLanguageServerPlugin.logInfo(
+            GroovyLanguageServerPlugin.logInfo(
                 "[workspace] Created '" + projectName + "' (linked folder) at "
                 + subDir.getAbsolutePath() + " with " + entries.size() + " classpath entries.");
+        }
     }
 
     /**
@@ -1698,7 +1810,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     private List<java.io.File> findSubprojectsWithSources(java.io.File root, String[] srcDirSuffixes) {
         List<java.io.File> result = new ArrayList<>();
         scanForSubprojects(root, result, srcDirSuffixes, 0, 5);
-        return result;
+        return deduplicateSubprojectsByPath(result);
     }
 
     private void scanForSubprojects(java.io.File dir, List<java.io.File> result,

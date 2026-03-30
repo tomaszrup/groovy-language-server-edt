@@ -89,7 +89,12 @@ public class TypeHierarchyProvider {
                 return result;
             }
 
-            IType type = resolveToType(elements[0]);
+            IJavaElement element = documentManager.remapToWorkingCopyElement(elements[0]);
+            if (element == null) {
+                element = elements[0];
+            }
+
+            IType type = resolveToType(element);
             if (type == null) {
                 return result;
             }
@@ -260,6 +265,11 @@ public class TypeHierarchyProvider {
             Map<String, String> contentCache,
             Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
+            IJavaElement remappedType = documentManager.remapToWorkingCopyElement(type);
+            if (remappedType instanceof IType resolvedType) {
+                type = resolvedType;
+            }
+
             // Determine the URI first — skip if not resolvable
             String uri = resolveTypeUri(type);
             if (uri == null) {
@@ -315,22 +325,7 @@ public class TypeHierarchyProvider {
 
     private String resolveTypeUri(IType type) {
         try {
-            org.eclipse.core.resources.IResource resource = type.getResource();
-            if (resource != null && resource.getLocationURI() != null) {
-                return resource.getLocationURI().toString();
-            }
-
-            // Binary type — check if we can find the source
-            ICompilationUnit cu = type.getCompilationUnit();
-            if (cu != null) {
-                resource = cu.getResource();
-                if (resource != null && resource.getLocationURI() != null) {
-                    return resource.getLocationURI().toString();
-                }
-            }
-
-            // No accessible source
-            return null;
+            return documentManager.resolveElementUri(type);
         } catch (Exception e) {
             return null;
         }
@@ -386,29 +381,19 @@ public class TypeHierarchyProvider {
     }
 
     private String getContent(IType type, String uri, Map<String, String> contentCache) {
-        if (contentCache.containsKey(uri)) {
-            return contentCache.get(uri);
-        }
-
-        String content = documentManager.getContent(uri);
-        if (content != null) {
-            contentCache.put(uri, content);
-            return content;
-        }
         try {
             org.eclipse.core.resources.IResource resource = type.getResource();
-            if (resource instanceof org.eclipse.core.resources.IFile file) {
-                try (java.io.InputStream is = file.getContents()) {
-                    content = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                    contentCache.put(uri, content);
-                    return content;
+            if (resource == null) {
+                ICompilationUnit compilationUnit = type.getCompilationUnit();
+                if (compilationUnit != null) {
+                    resource = compilationUnit.getResource();
                 }
             }
+            return JdtSearchSupport.readContent(documentManager, uri, resource, contentCache);
         } catch (Exception e) {
-            // ignore
+            contentCache.put(uri, null);
+            return null;
         }
-        contentCache.put(uri, null);
-        return null;
     }
 
     private Range toRange(String content, ISourceRange sourceRange) {

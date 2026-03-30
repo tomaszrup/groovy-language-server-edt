@@ -187,7 +187,7 @@ public final class ReferenceSearchHelper {
         }
 
         String symbolName = element.getElementName();
-        String declarationUri = getElementUri(element);
+        String declarationUri = documentManager.resolveElementUri(element);
         if (symbolName == null || symbolName.isBlank()
                 || declarationUri == null || !isGroovyFileUri(declarationUri)) {
             return List.of();
@@ -344,17 +344,6 @@ public final class ReferenceSearchHelper {
         return startOffset < declarationEnd && declarationStart < endOffset;
     }
 
-    private static String getElementUri(IJavaElement element) {
-        try {
-            if (element.getResource() != null && element.getResource().getLocationURI() != null) {
-                return DocumentManager.normalizeUri(element.getResource().getLocationURI().toString());
-            }
-        } catch (Exception e) {
-            return null;
-        }
-        return null;
-    }
-
     private static boolean isGroovyFileUri(String uri) {
         return uri != null && uri.toLowerCase(java.util.Locale.ROOT).endsWith(".groovy");
     }
@@ -365,11 +354,10 @@ public final class ReferenceSearchHelper {
             Map<String, PositionUtils.LineIndex> lineIndexCache) {
         try {
             IResource resource = match.getResource();
-            if (resource == null || resource.getLocationURI() == null) {
+            String targetUri = JdtSearchSupport.resolveResourceUri(documentManager, resource);
+            if (targetUri == null) {
                 return null;
             }
-
-            String targetUri = DocumentManager.normalizeUri(resource.getLocationURI().toString());
             String content = readContent(documentManager, targetUri, resource, contentCache);
 
             int startOffset = match.getOffset();

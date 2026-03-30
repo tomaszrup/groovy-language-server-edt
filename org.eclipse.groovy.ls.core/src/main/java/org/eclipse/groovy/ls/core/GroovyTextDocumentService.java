@@ -80,18 +80,22 @@ public class GroovyTextDocumentService implements TextDocumentService {
      * {@link LinkedBlockingQueue} absorbs request bursts (e.g. opening
      * 4 files simultaneously) instead of rejecting them.
      *
-     * <h3>Dual-pool architecture</h3>
+    * <h3>Priority architecture</h3>
      * <ul>
      *   <li><b>Fast pool</b> ({@link #lspRequestExecutor}) — user-interactive requests:
      *       hover, completion, definition, semanticTokens, codeAction, etc.</li>
      *   <li><b>Background pool</b> ({@link #lspBackgroundExecutor}) — decorative/gutter
-     *       features: documentSymbol, codeLens, foldingRange, inlayHint.</li>
+    *       features that should stay responsive: documentSymbol, codeLens,
+    *       foldingRange, inlayHint.</li>
+    *   <li><b>Code-lens resolve pool</b> ({@link #lspCodeLensResolveExecutor}) —
+    *       heavy reference-count resolution for visible code lenses only.</li>
      * </ul>
-     * This isolation prevents background decoration work from starving
-     * latency-sensitive interactive requests.
+    * This isolation prevents heavy code-lens reference searches from
+    * starving inlay hints and other lighter decoration work.
      */
     private volatile ExecutorService lspRequestExecutor;
     private volatile ExecutorService lspBackgroundExecutor;
+    private volatile ExecutorService lspCodeLensResolveExecutor;
     static {
         // Initialised in the instance initialiser — see below.
     }
@@ -101,11 +105,19 @@ public class GroovyTextDocumentService implements TextDocumentService {
         int fastQueueCapacity = 64;
         int bgPoolSize = Math.max(3, cpus - 1);
         int bgQueueCapacity = 128;
+        int codeLensResolvePoolSize = Math.max(1, Math.min(2, cpus / 4));
+        int codeLensResolveQueueCapacity = 64;
         lspRequestExecutor = createLspExecutor(fastPoolSize, fastQueueCapacity, "groovy-ls-fast");
         lspBackgroundExecutor = createLspExecutor(bgPoolSize, bgQueueCapacity, "groovy-ls-background");
+        lspCodeLensResolveExecutor = createLspExecutor(
+            codeLensResolvePoolSize,
+            codeLensResolveQueueCapacity,
+            "groovy-ls-codelens-resolve");
         GroovyLanguageServerPlugin.logInfo(
                 "LSP fast pool: poolSize=" + fastPoolSize + ", queueCapacity=" + fastQueueCapacity
-                + "; background pool: poolSize=" + bgPoolSize + ", queueCapacity=" + bgQueueCapacity);
+            + "; background pool: poolSize=" + bgPoolSize + ", queueCapacity=" + bgQueueCapacity
+            + "; codeLens resolve pool: poolSize=" + codeLensResolvePoolSize
+            + ", queueCapacity=" + codeLensResolveQueueCapacity);
     }
 
     private static ExecutorService createLspExecutor(int poolSize, int queueCapacity,
@@ -172,6 +184,18 @@ public class GroovyTextDocumentService implements TextDocumentService {
                 "LSP background pool reconfigured: poolSize=" + poolSize
                 + ", queueCapacity=" + queueCapacity);
     }
+
+        void configureCodeLensResolvePool(int poolSize, int queueCapacity) {
+        ExecutorService old = this.lspCodeLensResolveExecutor;
+        this.lspCodeLensResolveExecutor = createLspExecutor(
+            poolSize,
+            queueCapacity,
+            "groovy-ls-codelens-resolve");
+        old.shutdownNow();
+        GroovyLanguageServerPlugin.logInfo(
+            "LSP codeLens resolve pool reconfigured: poolSize=" + poolSize
+            + ", queueCapacity=" + queueCapacity);
+        }
 
     /**
      * Tracks the latest in-flight semantic-token future per URI so that we
@@ -380,15 +404,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
         String uri = params.getTextDocument().getUri();
         GroovyLanguageServerPlugin.logInfo("Document saved: " + uri);
 
-        // Invalidate type hierarchy cache on save — structural changes
-        // (new supertypes, removed interfaces) are picked up at this point.
-        completionProvider.invalidateHierarchyCache();
-        TraitMemberResolver.invalidateCache();
-        typeHierarchyProvider.invalidateCache();
-
-        // Invalidate type-name cache on save — new types or removed types
-        // should be reflected in subsequent type-name completions.
-        completionProvider.invalidateTypeNameCache();
+        invalidateSemanticProviderCaches();
 
         // Republish diagnostics for ALL open documents — not just the saved
         // file.  Changes in this file may affect unused-declaration fading in
@@ -1314,7 +1330,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
         }
 
         CompletableFuture<CodeLens> future = submitLspRequest(
-                "Code lens resolve", lspBackgroundExecutor, () -> {
+                "Code lens resolve", lspCodeLensResolveExecutor, () -> {
             try {
                 return codeLensProvider.resolveCodeLens(codeLens);
             } catch (Exception e) {
@@ -1449,6 +1465,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
     }
 
     void refreshOpenDocumentsSemanticState() {
+        invalidateSemanticProviderCaches();
         documentManager.replayOpenDocuments(documentManager.getOpenDocumentUris());
     }
 
@@ -1456,6 +1473,8 @@ public class GroovyTextDocumentService implements TextDocumentService {
         if (projectName == null) {
             return;
         }
+
+        invalidateSemanticProviderCaches();
 
         java.util.List<String> urisToReplay = new java.util.ArrayList<>();
         for (String uri : documentManager.getOpenDocumentUris()) {
@@ -1465,6 +1484,14 @@ public class GroovyTextDocumentService implements TextDocumentService {
             }
         }
         documentManager.replayOpenDocuments(urisToReplay);
+    }
+
+    private void invalidateSemanticProviderCaches() {
+        completionProvider.invalidateHierarchyCache();
+        completionProvider.invalidateTypeNameCache();
+        inlayHintProvider.invalidateCache();
+        TraitMemberResolver.invalidateCache();
+        typeHierarchyProvider.invalidateCache();
     }
 
     void publishDiagnosticsForOpenDocuments() {
@@ -1484,6 +1511,7 @@ public class GroovyTextDocumentService implements TextDocumentService {
     void shutdown() {
         lspRequestExecutor.shutdownNow();
         lspBackgroundExecutor.shutdownNow();
+        lspCodeLensResolveExecutor.shutdownNow();
         pendingHovers.values().forEach(f -> f.cancel(true));
         pendingHovers.clear();
         pendingSemanticTokens.values().forEach(f -> f.cancel(true));

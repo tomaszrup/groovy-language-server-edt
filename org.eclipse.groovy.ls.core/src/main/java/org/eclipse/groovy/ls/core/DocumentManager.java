@@ -15,6 +15,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,7 +39,11 @@ import org.eclipse.core.runtime.Path;
 import org.eclipse.groovy.ls.core.providers.ReferenceSearchHelper;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.ICompilationUnit;
+import org.eclipse.jdt.core.IField;
 import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.IMember;
+import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.WorkingCopyOwner;
@@ -641,6 +646,120 @@ public class DocumentManager {
     }
 
     /**
+     * Resolve a canonical source URI for a workspace resource.
+     * If the resource backs an open document, prefer the normalized open-document
+     * URI so providers operate on the same source-of-truth key.
+     */
+    public String resolveResourceUri(IResource resource) {
+        if (resource == null || resource.getLocationURI() == null) {
+            return null;
+        }
+
+        String resourceUri = resource.getLocationURI().toString();
+        String normalizedResourceUri = normalizeUri(resourceUri);
+        String clientUri = clientUris.get(normalizedResourceUri);
+        if (clientUri != null) {
+            return clientUri;
+        }
+        if (workingCopies.containsKey(normalizedResourceUri)
+                || openDocuments.containsKey(normalizedResourceUri)
+                || clientUris.containsKey(normalizedResourceUri)) {
+            return normalizedResourceUri;
+        }
+
+        return resourceUri;
+    }
+
+    /**
+     * Resolve a canonical source URI for a JDT element.
+     * Prefers the open working-copy mapping when available so linked resources
+     * use a stable URI across providers.
+     */
+    public String resolveElementUri(IJavaElement element) {
+        if (element == null) {
+            return null;
+        }
+
+        ICompilationUnit compilationUnit = toCompilationUnit(element);
+        if (compilationUnit != null) {
+            String mappedUri = findWorkingCopyUri(compilationUnit);
+            if (mappedUri != null) {
+                return mappedUri;
+            }
+
+            try {
+                IResource resource = compilationUnit.getResource();
+                String resourceUri = resolveResourceUri(resource);
+                if (resourceUri != null) {
+                    return resourceUri;
+                }
+            } catch (Exception ignored) {
+                // ignored
+            }
+        }
+
+        try {
+            String resourceUri = resolveResourceUri(element.getResource());
+            if (resourceUri != null) {
+                return resourceUri;
+            }
+        } catch (Exception ignored) {
+            // ignored
+        }
+
+        return null;
+    }
+
+    /**
+     * Remap a source element onto the current working copy for its file when one
+     * is open. This avoids stale linked-resource members leaking into provider
+     * logic for hover, definitions, inlay hints, and code lenses.
+     */
+    public IJavaElement remapToWorkingCopyElement(IJavaElement element) {
+        if (element == null) {
+            return null;
+        }
+
+        try {
+            if (element instanceof ICompilationUnit compilationUnit) {
+                return resolveOpenCompilationUnit(compilationUnit);
+            }
+
+            ICompilationUnit targetCompilationUnit = resolveOpenCompilationUnit(element);
+            if (targetCompilationUnit == null) {
+                return element;
+            }
+
+            if (element instanceof IType type) {
+                IType resolvedType = findMatchingType(targetCompilationUnit, type);
+                return resolvedType != null ? resolvedType : element;
+            }
+
+            if (element instanceof IMethod method) {
+                IType resolvedType = findMatchingType(targetCompilationUnit, method.getDeclaringType());
+                if (resolvedType == null) {
+                    return element;
+                }
+                IMethod resolvedMethod = findMatchingMethod(resolvedType, method);
+                return resolvedMethod != null ? resolvedMethod : element;
+            }
+
+            if (element instanceof IField field) {
+                IType resolvedType = findMatchingType(targetCompilationUnit, field.getDeclaringType());
+                if (resolvedType == null) {
+                    return element;
+                }
+                IField resolvedField = findMatchingField(resolvedType, field);
+                return resolvedField != null ? resolvedField : element;
+            }
+        } catch (Exception ignored) {
+            // ignored
+        }
+
+        return element;
+    }
+
+    /**
      * Returns all currently open document URIs.
      */
     public java.util.Set<String> getOpenDocumentUris() {
@@ -733,6 +852,168 @@ public class DocumentManager {
         }
         // Last resort — use identity hash to avoid collisions
         return "unknown-" + System.identityHashCode(workingCopy);
+    }
+
+    private ICompilationUnit resolveOpenCompilationUnit(IJavaElement element) {
+        return resolveOpenCompilationUnit(toCompilationUnit(element));
+    }
+
+    private ICompilationUnit resolveOpenCompilationUnit(ICompilationUnit compilationUnit) {
+        if (compilationUnit == null) {
+            return null;
+        }
+
+        String uri = resolveUri(compilationUnit);
+        if (uri == null || uri.startsWith("unknown-")) {
+            return compilationUnit;
+        }
+
+        ICompilationUnit workingCopy = workingCopies.get(uri);
+        return workingCopy != null ? workingCopy : compilationUnit;
+    }
+
+    private ICompilationUnit toCompilationUnit(IJavaElement element) {
+        if (element instanceof ICompilationUnit compilationUnit) {
+            return compilationUnit;
+        }
+
+        IJavaElement ancestor = element.getAncestor(IJavaElement.COMPILATION_UNIT);
+        if (ancestor instanceof ICompilationUnit compilationUnit) {
+            return compilationUnit;
+        }
+
+        if (element instanceof IMember member) {
+            return member.getCompilationUnit();
+        }
+
+        return null;
+    }
+
+    private String findWorkingCopyUri(ICompilationUnit workingCopy) {
+        for (Map.Entry<String, ICompilationUnit> entry : workingCopies.entrySet()) {
+            if (entry.getValue() == workingCopy) {
+                return normalizeUri(entry.getKey());
+            }
+        }
+
+        return null;
+    }
+
+    private IType findMatchingType(ICompilationUnit compilationUnit, IType originalType)
+            throws JavaModelException {
+        if (compilationUnit == null || originalType == null) {
+            return null;
+        }
+
+        String fullyQualifiedName = safeFullyQualifiedName(originalType);
+        if (fullyQualifiedName != null) {
+            IType exact = findTypeByFullyQualifiedName(compilationUnit.getTypes(), fullyQualifiedName);
+            if (exact != null) {
+                return exact;
+            }
+        }
+
+        String simpleName = originalType.getElementName();
+        if (simpleName == null || simpleName.isBlank()) {
+            return null;
+        }
+
+        List<IType> matches = new ArrayList<>();
+        collectTypesBySimpleName(compilationUnit.getTypes(), simpleName, matches);
+        return matches.size() == 1 ? matches.get(0) : null;
+    }
+
+    private IType findTypeByFullyQualifiedName(IType[] types, String fullyQualifiedName)
+            throws JavaModelException {
+        if (types == null || fullyQualifiedName == null || fullyQualifiedName.isBlank()) {
+            return null;
+        }
+
+        for (IType type : types) {
+            if (type == null) {
+                continue;
+            }
+
+            if (fullyQualifiedName.equals(safeFullyQualifiedName(type))) {
+                return type;
+            }
+
+            IType nested = findTypeByFullyQualifiedName(type.getTypes(), fullyQualifiedName);
+            if (nested != null) {
+                return nested;
+            }
+        }
+
+        return null;
+    }
+
+    private void collectTypesBySimpleName(IType[] types, String simpleName, List<IType> matches)
+            throws JavaModelException {
+        if (types == null || simpleName == null || simpleName.isBlank()) {
+            return;
+        }
+
+        for (IType type : types) {
+            if (type == null) {
+                continue;
+            }
+
+            if (simpleName.equals(type.getElementName())) {
+                matches.add(type);
+            }
+
+            collectTypesBySimpleName(type.getTypes(), simpleName, matches);
+        }
+    }
+
+    private IMethod findMatchingMethod(IType declaringType, IMethod originalMethod)
+            throws JavaModelException {
+        if (declaringType == null || originalMethod == null) {
+            return null;
+        }
+
+        String[] parameterTypes = originalMethod.getParameterTypes();
+        IMethod fallback = null;
+        int fallbackCount = 0;
+        for (IMethod candidate : declaringType.getMethods()) {
+            if (candidate == null || candidate.isConstructor() != originalMethod.isConstructor()) {
+                continue;
+            }
+            if (!originalMethod.getElementName().equals(candidate.getElementName())) {
+                continue;
+            }
+            if (Arrays.equals(parameterTypes, candidate.getParameterTypes())) {
+                return candidate;
+            }
+            if (candidate.getNumberOfParameters() == parameterTypes.length) {
+                fallback = candidate;
+                fallbackCount++;
+            }
+        }
+
+        return fallbackCount == 1 ? fallback : null;
+    }
+
+    private IField findMatchingField(IType declaringType, IField originalField) {
+        if (declaringType == null || originalField == null) {
+            return null;
+        }
+
+        IField candidate = declaringType.getField(originalField.getElementName());
+        return candidate != null && candidate.exists() ? candidate : null;
+    }
+
+    private String safeFullyQualifiedName(IType type) {
+        try {
+            String fullyQualifiedName = type.getFullyQualifiedName('$');
+            if (fullyQualifiedName != null && !fullyQualifiedName.isBlank()) {
+                return fullyQualifiedName;
+            }
+        } catch (Exception ignored) {
+            // ignored
+        }
+
+        return null;
     }
 
     /**
@@ -1160,7 +1441,7 @@ public class DocumentManager {
     }
 
     private IProject findExistingProjectForRoot(IWorkspace workspace, java.io.File projectRoot) {
-        String targetPath = projectRoot.getAbsolutePath();
+        String targetPath = normalizeFilesystemPath(projectRoot.getAbsolutePath());
         for (IProject project : workspace.getRoot().getProjects()) {
             if (!project.exists() || !project.isOpen()) {
                 continue;
@@ -1173,11 +1454,18 @@ public class DocumentManager {
 
             org.eclipse.core.runtime.IPath linkedLocation = linkedRoot.getLocation();
             if (linkedLocation != null
-                    && targetPath.equals(linkedLocation.toFile().getAbsolutePath())) {
+                    && targetPath.equals(normalizeFilesystemPath(linkedLocation.toFile().getAbsolutePath()))) {
                 return project;
             }
         }
         return null;
+    }
+
+    private String normalizeFilesystemPath(String path) {
+        if (path == null || path.isBlank()) {
+            return "";
+        }
+        return path.replace('\\', '/').toLowerCase();
     }
 
     private void refreshProjectLinkedRoot(IProject project) {
