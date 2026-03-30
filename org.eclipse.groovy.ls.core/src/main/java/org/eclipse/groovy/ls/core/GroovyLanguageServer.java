@@ -1231,8 +1231,9 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     /**
      * Returns {@code true} once the first rooted-workspace build has completed
-     * successfully. No-root sessions return {@code false} here and rely on
-     * per-project classpath readiness instead.
+     * successfully and the stricter startup diagnostics gate has settled.
+     * No-root sessions return {@code false} here and rely on per-project
+     * classpath readiness instead.
      */
     boolean isInitialBuildSettled() {
         return workspaceRoot != null && initialBuildSettled;
@@ -1327,10 +1328,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
     }
 
     private void sendPostBuildStartupStatus() {
-        if (workspaceRoot != null
-                && delegatedClasspathStartupExpected
-                && !initialBuildSettled) {
-            sendStatus(STATUS_IMPORTING, "Finalizing classpath...");
+        if (workspaceRoot != null && !firstFullBuildComplete) {
             return;
         }
         sendStatus(STATUS_READY, null);

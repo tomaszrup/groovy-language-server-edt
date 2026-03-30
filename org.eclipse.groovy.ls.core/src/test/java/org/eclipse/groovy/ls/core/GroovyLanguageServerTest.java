@@ -16,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
@@ -999,7 +1000,7 @@ class GroovyLanguageServerTest {
     }
 
     @Test
-    void sendPostBuildStartupStatusKeepsImportingWhileDelegatedClasspathStartupPending() throws Exception {
+    void sendPostBuildStartupStatusSendsReadyAfterSuccessfulInitialBuildWhileDelegatedClasspathStartupContinues() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
         Endpoint endpoint = mock(Endpoint.class);
 
@@ -1015,6 +1016,10 @@ class GroovyLanguageServerTest {
         delegatedClasspathField.setAccessible(true);
         delegatedClasspathField.set(server, true);
 
+        Field firstBuildField = GroovyLanguageServer.class.getDeclaredField("firstFullBuildComplete");
+        firstBuildField.setAccessible(true);
+        firstBuildField.set(server, true);
+
         Method method = GroovyLanguageServer.class.getDeclaredMethod("sendPostBuildStartupStatus");
         method.setAccessible(true);
         method.invoke(server);
@@ -1023,9 +1028,29 @@ class GroovyLanguageServerTest {
                 org.mockito.ArgumentMatchers.eq("groovy/status"),
                 org.mockito.ArgumentMatchers.argThat(arg -> {
                     JsonObject params = (JsonObject) arg;
-                    return "Importing".equals(params.get("state").getAsString())
-                            && "Finalizing classpath...".equals(params.get("message").getAsString());
+                    return "Ready".equals(params.get("state").getAsString())
+                            && !params.has("message");
                 }));
+    }
+
+    @Test
+    void sendPostBuildStartupStatusDoesNothingBeforeFirstSuccessfulBuild() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        Endpoint endpoint = mock(Endpoint.class);
+
+        Field endpointField = GroovyLanguageServer.class.getDeclaredField("remoteEndpoint");
+        endpointField.setAccessible(true);
+        endpointField.set(server, endpoint);
+
+        Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+        workspaceRootField.setAccessible(true);
+        workspaceRootField.set(server, "file:///workspace");
+
+        Method method = GroovyLanguageServer.class.getDeclaredMethod("sendPostBuildStartupStatus");
+        method.setAccessible(true);
+        method.invoke(server);
+
+        verifyNoInteractions(endpoint);
     }
 
     @Test
@@ -1044,6 +1069,10 @@ class GroovyLanguageServerTest {
         Field settledField = GroovyLanguageServer.class.getDeclaredField("initialBuildSettled");
         settledField.setAccessible(true);
         settledField.set(server, true);
+
+        Field firstBuildField = GroovyLanguageServer.class.getDeclaredField("firstFullBuildComplete");
+        firstBuildField.setAccessible(true);
+        firstBuildField.set(server, true);
 
         Method method = GroovyLanguageServer.class.getDeclaredMethod("sendPostBuildStartupStatus");
         method.setAccessible(true);

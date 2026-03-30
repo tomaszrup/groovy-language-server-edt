@@ -24,6 +24,7 @@ import java.util.List;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IField;
+import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IOrdinaryClassFile;
@@ -463,6 +464,28 @@ class SignatureHelpProviderTest {
     }
 
     @Test
+    void toSignatureInformationRecoversSourceMethodParameterNames() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn("save");
+        when(method.getParameterTypes()).thenReturn(new String[] {"QString;", "I"});
+        when(method.getParameterNames()).thenReturn(new String[] {"arg0", "arg1"});
+        when(method.getSource()).thenReturn("public void save(String named, int id) {}\n");
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getReturnType()).thenReturn("V");
+
+        SignatureInformation sig = invokeToSignatureInformation(provider, method);
+
+        assertNotNull(sig);
+        assertTrue(sig.getLabel().contains("String named"));
+        assertTrue(sig.getLabel().contains("int id"));
+        assertFalse(sig.getLabel().contains("arg0"));
+        assertFalse(sig.getLabel().contains("arg1"));
+    }
+
+    @Test
     void toSignatureInformationRecoversSyntheticConstructorParameterNames() throws Exception {
         DocumentManager dm = new DocumentManager();
         SignatureHelpProvider provider = new SignatureHelpProvider(dm);
@@ -562,10 +585,42 @@ class SignatureHelpProviderTest {
         assertEquals(2, signatures.get(0).getParameters().size());
     }
 
+    @Test
+    void collectJdtSignaturesRemapsSelectedElements() throws Exception {
+        DocumentManager dm = mock(DocumentManager.class);
+        SignatureHelpProvider provider = new SignatureHelpProvider(dm);
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        IMethod originalMethod = mock(IMethod.class);
+        IMethod remappedMethod = mock(IMethod.class);
+
+        when(dm.cachedCodeSelect(workingCopy, 12)).thenReturn(new IJavaElement[] {originalMethod});
+        when(dm.remapToWorkingCopyElement(originalMethod)).thenReturn(remappedMethod);
+
+        when(remappedMethod.getElementName()).thenReturn("greet");
+        when(remappedMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(remappedMethod.getParameterNames()).thenReturn(new String[] {"name"});
+        when(remappedMethod.isConstructor()).thenReturn(false);
+        when(remappedMethod.getReturnType()).thenReturn("V");
+
+        List<SignatureInformation> signatures = invokeCollectJdtSignatures(provider, workingCopy, 12);
+
+        assertEquals(1, signatures.size());
+        assertTrue(signatures.get(0).getLabel().contains("greet(String name)"));
+    }
+
     private SignatureInformation invokeToSignatureInformation(SignatureHelpProvider provider, IMethod method) throws Exception {
         Method m = SignatureHelpProvider.class.getDeclaredMethod("toSignatureInformation", IMethod.class);
         m.setAccessible(true);
         return (SignatureInformation) m.invoke(provider, method);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<SignatureInformation> invokeCollectJdtSignatures(SignatureHelpProvider provider,
+                                                                  ICompilationUnit workingCopy,
+                                                                  int methodNameEnd) throws Exception {
+        Method m = SignatureHelpProvider.class.getDeclaredMethod("collectJdtSignatures", ICompilationUnit.class, int.class);
+        m.setAccessible(true);
+        return (List<SignatureInformation>) m.invoke(provider, workingCopy, methodNameEnd);
     }
 
     private void invokeAddJdtSignaturesForElement(SignatureHelpProvider provider,

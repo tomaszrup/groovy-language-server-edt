@@ -14,6 +14,7 @@ import {
     isJdtWorkspaceUri,
     normalizeFsPath,
     pathStartsWith,
+    prioritizeTargetsByOpenDocumentProjects,
     uriToFsPath,
 } from './utils';
 import { prepareWritableConfigDir } from './serverConfig';
@@ -258,6 +259,12 @@ function invalidateProjectRootMapCache(): void {
     cachedProjectRootMap = undefined;
     projectRootMapTimestamp = 0;
     representativeSourceUriCache.clear();
+}
+
+function getOpenGroovyDocumentUris(): string[] {
+    return workspace.textDocuments
+        .filter(document => document.languageId === 'groovy' && document.uri.scheme === 'file')
+        .map(document => document.uri.toString());
 }
 
 function resolveProjectPathFromUri(
@@ -608,6 +615,7 @@ export async function activate(context: ExtensionContext): Promise<void> {
         outputChannel.appendLine('Java extension not available — starting Groovy LS without classpath delegation.');
     }
 
+    updateStatusBar('Starting', 'Launching Groovy Language Server...');
     await startLanguageServer(context);
     markStartupPhase('activate.complete');
 }
@@ -1392,7 +1400,15 @@ async function initJavaExtensionClasspath(
             }));
 
             await addBuildFileScanTargets(targets, knownPaths, projectRootMap, wsRootPath);
-            replaceDiscoveredInitialTargets(targets, pendingTargetsBaseline);
+            const prioritizedTargets = prioritizeTargetsByOpenDocumentProjects(
+                targets,
+                getOpenGroovyDocumentUris(),
+                projectRootMap
+            );
+            if (prioritizedTargets !== targets) {
+                outputChannel.appendLine('[java-ext] Prioritized projects for currently open Groovy documents.');
+            }
+            replaceDiscoveredInitialTargets(prioritizedTargets, pendingTargetsBaseline);
             const attemptedTargetsSnapshot = getPendingInitialTargetsSnapshot();
             const batchResult = await fetchClasspathBatch(attemptedTargetsSnapshot.targets, projectRootMap);
             reconcilePendingInitialTargets(attemptedTargetsSnapshot, batchResult.remainingTargets);
@@ -1429,7 +1445,12 @@ async function initJavaExtensionClasspath(
                 source: 'workspace-folder-fallback',
             });
         }
-        replaceDiscoveredInitialTargets(targets, pendingTargetsBaseline);
+        const prioritizedTargets = prioritizeTargetsByOpenDocumentProjects(
+            targets,
+            getOpenGroovyDocumentUris(),
+            projectRootMap
+        );
+        replaceDiscoveredInitialTargets(prioritizedTargets, pendingTargetsBaseline);
         const attemptedTargetsSnapshot = getPendingInitialTargetsSnapshot();
         const batchResult = await fetchClasspathBatch(attemptedTargetsSnapshot.targets, projectRootMap);
         reconcilePendingInitialTargets(attemptedTargetsSnapshot, batchResult.remainingTargets);

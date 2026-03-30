@@ -9,6 +9,9 @@
  *******************************************************************************/
 package org.eclipse.groovy.ls.core.providers;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ClassCodeVisitorSupport;
 import org.codehaus.groovy.ast.FieldNode;
@@ -35,6 +38,7 @@ import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.ILocalVariable;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.Signature;
 import java.util.Collections;
@@ -147,9 +151,9 @@ public class HoverProvider {
             return null;
         }
 
-        IJavaElement element = documentManager.remapToWorkingCopyElement(elements[0]);
+        IJavaElement element = selectBestElement(elements);
         if (element == null) {
-            element = elements[0];
+            return null;
         }
 
         String hoverContent = buildHoverContent(element);
@@ -161,6 +165,143 @@ public class HoverProvider {
         markup.setKind(MarkupKind.MARKDOWN);
         markup.setValue(hoverContent);
         return new Hover(markup);
+    }
+
+    private IJavaElement selectBestElement(IJavaElement[] elements) throws JavaModelException {
+        if (elements == null || elements.length == 0) {
+            return null;
+        }
+
+        List<IMethod> methods = new ArrayList<>();
+        IJavaElement fallback = null;
+        for (IJavaElement originalElement : elements) {
+            IJavaElement element = documentManager.remapToWorkingCopyElement(originalElement);
+            if (element == null) {
+                element = originalElement;
+            }
+            if (element == null) {
+                continue;
+            }
+            if (fallback == null) {
+                fallback = element;
+            }
+            if (element instanceof IMethod method) {
+                methods.add(method);
+            }
+        }
+
+        if (!methods.isEmpty()) {
+            return choosePreferredMethod(methods);
+        }
+        return fallback;
+    }
+
+    private IMethod choosePreferredMethod(List<IMethod> methods) {
+        IMethod best = null;
+        for (IMethod method : methods) {
+            if (isPreferredMethod(method, best)) {
+                best = method;
+            }
+        }
+        return best != null ? best : methods.get(0);
+    }
+
+    private boolean isPreferredMethod(IMethod candidate, IMethod currentBest) {
+        if (candidate == null) {
+            return false;
+        }
+        if (currentBest == null) {
+            return true;
+        }
+
+        if (isDeclaredInSubtype(candidate, currentBest)) {
+            return true;
+        }
+        if (isDeclaredInSubtype(currentBest, candidate)) {
+            return false;
+        }
+
+        if (isConcreteDeclaringType(candidate) && !isConcreteDeclaringType(currentBest)) {
+            return true;
+        }
+        if (!isConcreteDeclaringType(candidate) && isConcreteDeclaringType(currentBest)) {
+            return false;
+        }
+
+        if (isSourceBacked(candidate) && !isSourceBacked(currentBest)) {
+            return true;
+        }
+        if (!isSourceBacked(candidate) && isSourceBacked(currentBest)) {
+            return false;
+        }
+
+        return false;
+    }
+
+    private boolean isDeclaredInSubtype(IMethod candidate, IMethod currentBest) {
+        try {
+            IType candidateType = resolveComparisonType(candidate);
+            IType currentType = resolveComparisonType(currentBest);
+            if (candidateType == null || currentType == null) {
+                return false;
+            }
+
+            String currentName = currentType.getFullyQualifiedName();
+            if (currentName == null || currentName.isBlank()
+                    || currentName.equals(candidateType.getFullyQualifiedName())) {
+                return false;
+            }
+
+            ITypeHierarchy hierarchy = candidateType.newSupertypeHierarchy(null);
+            if (hierarchy == null) {
+                return false;
+            }
+
+            for (IType superType : hierarchy.getAllSupertypes(candidateType)) {
+                if (currentName.equals(superType.getFullyQualifiedName())) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    private IType resolveComparisonType(IMethod method) {
+        try {
+            IType declaringType = method != null ? method.getDeclaringType() : null;
+            if (declaringType == null) {
+                return null;
+            }
+            IType resolvedType = JavaBinaryMemberResolver.resolveMemberSource(declaringType);
+            return resolvedType != null ? resolvedType : declaringType;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean isConcreteDeclaringType(IMethod method) {
+        try {
+            IType declaringType = resolveComparisonType(method);
+            return declaringType != null && !declaringType.isInterface();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean isSourceBacked(IMethod method) {
+        try {
+            if (method == null) {
+                return false;
+            }
+            if (method.getCompilationUnit() != null) {
+                return true;
+            }
+            IType declaringType = method.getDeclaringType();
+            return declaringType != null && declaringType.getCompilationUnit() != null;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private Hover computeGeneratedAccessorHover(String uri, String content,
@@ -352,7 +493,7 @@ public class HoverProvider {
     private void appendMethodParameters(StringBuilder sb, IMethod method) throws JavaModelException {
         sb.append('(');
         String[] paramTypes = method.getParameterTypes();
-        String[] paramNames = method.getParameterNames();
+        String[] paramNames = JdtParameterNameResolver.resolve(method);
         for (int i = 0; i < paramTypes.length; i++) {
             if (i > 0) sb.append(", ");
             sb.append(Signature.toString(paramTypes[i]));

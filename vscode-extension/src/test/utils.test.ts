@@ -1,10 +1,11 @@
-import { strict as assert } from 'assert';
+import { strict as assert } from 'node:assert';
 import {
     getConfigNameForPlatform,
     inferProjectPathFromEntries,
     isJdtWorkspaceUri,
     normalizeFsPath,
     pathStartsWith,
+    prioritizeTargetsByOpenDocumentProjects,
     uriToFsPath,
 } from '../utils';
 
@@ -110,6 +111,67 @@ describe('utils', () => {
         ]);
         const entries = ['/workspace/root/build/classes/java/main'];
         assert.equal(inferProjectPathFromEntries(entries, map), '/workspace/root');
+    });
+
+    it('prioritizes startup targets that own open Groovy documents', () => {
+        const map = new Map<string, string>([
+            ['/workspace/root/app', '/workspace/root/app'],
+            ['/workspace/root/lib', '/workspace/root/lib'],
+        ]);
+        const targets = [
+            {
+                requestUri: 'file:///workspace/root/lib',
+                projectUri: 'file:///workspace/root/lib',
+                projectPath: '/workspace/root/lib',
+                source: 'java.project.getAll',
+            },
+            {
+                requestUri: 'file:///workspace/root/app',
+                projectUri: 'file:///workspace/root/app',
+                projectPath: '/workspace/root/app',
+                source: 'java.project.getAll',
+            },
+        ];
+
+        const prioritized = prioritizeTargetsByOpenDocumentProjects(
+            targets,
+            ['file:///workspace/root/app/src/main/groovy/App.groovy'],
+            map
+        );
+
+        assert.deepEqual(prioritized.map(target => target.projectPath), [
+            '/workspace/root/app',
+            '/workspace/root/lib',
+        ]);
+    });
+
+    it('keeps target order unchanged when no open Groovy document resolves to a project', () => {
+        const map = new Map<string, string>([
+            ['/workspace/root/app', '/workspace/root/app'],
+            ['/workspace/root/lib', '/workspace/root/lib'],
+        ]);
+        const targets = [
+            {
+                requestUri: 'file:///workspace/root/lib',
+                projectUri: 'file:///workspace/root/lib',
+                projectPath: '/workspace/root/lib',
+                source: 'java.project.getAll',
+            },
+            {
+                requestUri: 'file:///workspace/root/app',
+                projectUri: 'file:///workspace/root/app',
+                projectPath: '/workspace/root/app',
+                source: 'java.project.getAll',
+            },
+        ];
+
+        const prioritized = prioritizeTargetsByOpenDocumentProjects(
+            targets,
+            ['file:///workspace/other/Foo.groovy'],
+            map
+        );
+
+        assert.strictEqual(prioritized, targets);
     });
 
     it('maps platform to config dir name', () => {

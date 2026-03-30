@@ -83,6 +83,76 @@ function selectBestScoredProject(scores: Map<string, number>): string | undefine
     return bestPathNorm;
 }
 
+export function prioritizeTargetsByOpenDocumentProjects<
+    T extends { requestUri: string; projectUri: string; projectPath?: string }
+>(
+    targets: T[],
+    openDocumentUris: string[],
+    projectRootMap: Map<string, string>
+): T[] {
+    if (targets.length < 2 || openDocumentUris.length === 0) {
+        return targets;
+    }
+
+    const prioritizedProjectRoots = new Set<string>();
+    for (const documentUri of openDocumentUris) {
+        const projectPath = resolveProjectPathFromRootMap(documentUri, projectRootMap);
+        if (projectPath) {
+            prioritizedProjectRoots.add(normalizeFsPath(projectPath));
+        }
+    }
+
+    if (prioritizedProjectRoots.size === 0) {
+        return targets;
+    }
+
+    const prioritizedTargets: T[] = [];
+    const remainingTargets: T[] = [];
+    for (const target of targets) {
+        const projectPath = target.projectPath
+            ?? resolveProjectPathFromRootMap(target.projectUri, projectRootMap)
+            ?? resolveProjectPathFromRootMap(target.requestUri, projectRootMap);
+
+        if (projectPath && prioritizedProjectRoots.has(normalizeFsPath(projectPath))) {
+            prioritizedTargets.push(target);
+        } else {
+            remainingTargets.push(target);
+        }
+    }
+
+    return prioritizedTargets.length === 0
+        ? targets
+        : [...prioritizedTargets, ...remainingTargets];
+}
+
+function resolveProjectPathFromRootMap(
+    uriValue: string,
+    projectRootMap: Map<string, string>
+): string | undefined {
+    const fsPath = uriToFsPath(uriValue);
+    if (!fsPath) {
+        return undefined;
+    }
+
+    const normalizedPath = normalizeFsPath(fsPath);
+    const exactMatch = projectRootMap.get(normalizedPath);
+    if (exactMatch) {
+        return exactMatch;
+    }
+
+    let bestMatch: string | undefined;
+    for (const [projectNorm] of projectRootMap) {
+        if (!pathStartsWith(normalizedPath, projectNorm)) {
+            continue;
+        }
+        if (!bestMatch || projectNorm.length > bestMatch.length) {
+            bestMatch = projectNorm;
+        }
+    }
+
+    return bestMatch ? projectRootMap.get(bestMatch) : undefined;
+}
+
 export function getConfigNameForPlatform(platform: NodeJS.Platform): string {
     switch (platform) {
         case 'win32':

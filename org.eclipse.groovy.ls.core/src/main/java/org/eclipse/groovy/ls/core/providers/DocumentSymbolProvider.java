@@ -177,7 +177,7 @@ public class DocumentSymbolProvider {
     private String resolveMethodDetail(IMethod method) throws JavaModelException {
         StringBuilder detail = new StringBuilder("(");
         String[] paramTypes = method.getParameterTypes();
-        String[] paramNames = method.getParameterNames();
+        String[] paramNames = JdtParameterNameResolver.resolve(method);
 
         for (int i = 0; i < paramTypes.length; i++) {
             if (i > 0) {

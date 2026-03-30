@@ -2097,12 +2097,13 @@ public class DefinitionProvider {
     }
 
     private void appendStubParameters(StringBuilder sb, org.eclipse.jdt.core.IMethod method) throws JavaModelException {
-        String[] paramNames = method.getParameterNames();
+        String[] paramNames = JdtParameterNameResolver.resolve(method);
         String[] paramTypes = method.getParameterTypes();
-        for (int i = 0; i < paramNames.length; i++) {
+        for (int i = 0; i < paramTypes.length; i++) {
             if (i > 0) sb.append(", ");
             sb.append(org.eclipse.jdt.core.Signature.toString(paramTypes[i]));
-            sb.append(" ").append(paramNames[i]);
+            String paramName = paramNames != null && i < paramNames.length ? paramNames[i] : "arg" + i;
+            sb.append(" ").append(paramName);
         }
     }
 

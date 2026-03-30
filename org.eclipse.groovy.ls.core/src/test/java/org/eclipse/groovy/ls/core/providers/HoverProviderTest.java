@@ -869,6 +869,56 @@ class HoverProviderTest {
         assertNull(hover);
     }
 
+    @Test
+    void computeHoverForOffsetPrefersOverrideMethodContent() throws Exception {
+        DocumentManager dm = mock(DocumentManager.class);
+        HoverProvider hp = new HoverProvider(dm);
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+
+        IType interfaceType = mock(IType.class);
+        when(interfaceType.getFullyQualifiedName()).thenReturn("demo.Greeter");
+        when(interfaceType.isInterface()).thenReturn(true);
+
+        IMethod interfaceMethod = mock(IMethod.class);
+        when(interfaceMethod.getElementType()).thenReturn(IJavaElement.METHOD);
+        when(interfaceMethod.getElementName()).thenReturn("greet");
+        when(interfaceMethod.getFlags()).thenReturn(0);
+        when(interfaceMethod.isConstructor()).thenReturn(false);
+        when(interfaceMethod.getReturnType()).thenReturn("V");
+        when(interfaceMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(interfaceMethod.getParameterNames()).thenReturn(new String[] {"baseName"});
+        when(interfaceMethod.getExceptionTypes()).thenReturn(new String[0]);
+        when(interfaceMethod.getDeclaringType()).thenReturn(interfaceType);
+
+        IType implType = mock(IType.class);
+        when(implType.getFullyQualifiedName()).thenReturn("demo.Impl");
+        when(implType.isInterface()).thenReturn(false);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+        when(implType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(implType)).thenReturn(new IType[] {interfaceType});
+
+        IMethod overrideMethod = mock(IMethod.class);
+        when(overrideMethod.getElementType()).thenReturn(IJavaElement.METHOD);
+        when(overrideMethod.getElementName()).thenReturn("greet");
+        when(overrideMethod.getFlags()).thenReturn(0);
+        when(overrideMethod.isConstructor()).thenReturn(false);
+        when(overrideMethod.getReturnType()).thenReturn("V");
+        when(overrideMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(overrideMethod.getParameterNames()).thenReturn(new String[] {"person"});
+        when(overrideMethod.getExceptionTypes()).thenReturn(new String[0]);
+        when(overrideMethod.getDeclaringType()).thenReturn(implType);
+
+        when(dm.cachedCodeSelect(workingCopy, 12)).thenReturn(new IJavaElement[] {interfaceMethod, overrideMethod});
+
+        Hover hover = invokeComputeHoverForOffset(hp, workingCopy, 12);
+
+        assertNotNull(hover);
+        String content = hover.getContents().getRight().getValue();
+        assertTrue(content.contains("person"));
+        assertTrue(content.contains("demo.Impl"));
+        assertFalse(content.contains("baseName"));
+    }
+
     // ---- resolveTraitMemberHover via AST ----
 
     @Test
@@ -988,6 +1038,14 @@ class HoverProviderTest {
         Method m = HoverProvider.class.getDeclaredMethod("buildHoverContent", IJavaElement.class);
         m.setAccessible(true);
         return (String) m.invoke(hoverProvider, element);
+    }
+
+    private Hover invokeComputeHoverForOffset(HoverProvider hoverProvider,
+            ICompilationUnit workingCopy,
+            int offset) throws Exception {
+        Method m = HoverProvider.class.getDeclaredMethod("computeHoverForOffset", ICompilationUnit.class, int.class);
+        m.setAccessible(true);
+        return (Hover) m.invoke(hoverProvider, workingCopy, offset);
     }
 
     private boolean invokeIsTrait(IType type) throws Exception {

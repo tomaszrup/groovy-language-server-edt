@@ -38,6 +38,7 @@ import org.eclipse.jdt.core.IOrdinaryClassFile;
 import org.eclipse.jdt.core.IPackageFragment;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.IType;
+import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.lsp4j.InlayHint;
 import org.eclipse.lsp4j.InlayHintKind;
 import org.eclipse.lsp4j.InlayHintLabelPart;
@@ -646,6 +647,124 @@ class InlayHintProviderTest {
         assertNotNull(hints);
         // Should have produced hints from the method calls
         assertFalse(hints.isEmpty());
+    }
+
+    @Test
+    void parameterCollectorVisitModuleUsesMethodIdentifierEndForStaticCalls() throws Exception {
+        String source = """
+                class Util {
+                    static void greet(String person) {}
+                }
+                Util.greet('Ada')
+                """;
+        ModuleNode module = parseModule(source);
+
+        IMethod method = mock(IMethod.class);
+        when(method.isConstructor()).thenReturn(false);
+        when(method.getElementName()).thenReturn("greet");
+        when(method.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(method.getParameterNames()).thenReturn(new String[] {"person"});
+        when(method.getFlags()).thenReturn(java.lang.reflect.Modifier.STATIC);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.codeSelect(org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.eq(0)))
+                .thenReturn(new IJavaElement[0]);
+    when(workingCopy.codeSelect(org.mockito.ArgumentMatchers.eq(64), org.mockito.ArgumentMatchers.eq(0)))
+        .thenReturn(new IJavaElement[] {method});
+
+        Object collector = createCollector(source, new Range(new Position(0, 0), new Position(6, 0)), workingCopy);
+        invokeCollector(collector, "visitModule", new Class<?>[] {ModuleNode.class}, new Object[] {module});
+
+        @SuppressWarnings("unchecked")
+        List<InlayHint> hints = (List<InlayHint>) invokeCollector(collector, "getHints", new Class<?>[0], new Object[0]);
+        assertTrue(hints.stream().anyMatch(h -> "person:".equals(labelText(h))));
+    }
+
+    @Test
+    void parameterCollectorVisitModuleHandlesStaticCallWhenCodeSelectReturnsType() throws Exception {
+        String source = """
+                class Util {
+                    static void greet(String person) {}
+                }
+                Util.greet('Ada')
+                """;
+        ModuleNode module = parseModule(source);
+
+        IMethod staticMethod = mock(IMethod.class);
+        when(staticMethod.isConstructor()).thenReturn(false);
+        when(staticMethod.getElementName()).thenReturn("greet");
+        when(staticMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(staticMethod.getParameterNames()).thenReturn(new String[] {"person"});
+        when(staticMethod.getFlags()).thenReturn(java.lang.reflect.Modifier.STATIC);
+
+        IType type = mock(IType.class);
+        when(type.getMethods()).thenReturn(new IMethod[] {staticMethod});
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.codeSelect(org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.eq(0)))
+                .thenReturn(new IJavaElement[] {type});
+
+        Object collector = createCollector(source, new Range(new Position(0, 0), new Position(6, 0)), workingCopy);
+        invokeCollector(collector, "visitModule", new Class<?>[] {ModuleNode.class}, new Object[] {module});
+
+        @SuppressWarnings("unchecked")
+        List<InlayHint> hints = (List<InlayHint>) invokeCollector(collector, "getHints", new Class<?>[0], new Object[0]);
+        assertTrue(hints.stream().anyMatch(h -> "person:".equals(labelText(h))));
+    }
+
+    @Test
+    void parameterCollectorPrefersOverrideMethodParameterNames() throws Exception {
+        String source = """
+                interface Greeter {
+                    void greet(String baseName)
+                }
+                class Impl implements Greeter {
+                    @Override
+                    void greet(String person) {}
+                }
+                def impl = new Impl()
+                impl.greet('Ada')
+                """;
+        ModuleNode module = parseModule(source);
+
+        IType greeterType = mock(IType.class);
+        when(greeterType.getFullyQualifiedName()).thenReturn("demo.Greeter");
+        when(greeterType.isInterface()).thenReturn(true);
+
+        IMethod interfaceMethod = mock(IMethod.class);
+        when(interfaceMethod.isConstructor()).thenReturn(false);
+        when(interfaceMethod.getElementName()).thenReturn("greet");
+        when(interfaceMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(interfaceMethod.getParameterNames()).thenReturn(new String[] {"baseName"});
+        when(interfaceMethod.getDeclaringType()).thenReturn(greeterType);
+        when(interfaceMethod.getFlags()).thenReturn(0);
+
+        IType implType = mock(IType.class);
+        when(implType.getFullyQualifiedName()).thenReturn("demo.Impl");
+        when(implType.isInterface()).thenReturn(false);
+        ITypeHierarchy hierarchy = mock(ITypeHierarchy.class);
+        when(implType.newSupertypeHierarchy(null)).thenReturn(hierarchy);
+        when(hierarchy.getAllSupertypes(implType)).thenReturn(new IType[] {greeterType});
+
+        IMethod overrideMethod = mock(IMethod.class);
+        when(overrideMethod.isConstructor()).thenReturn(false);
+        when(overrideMethod.getElementName()).thenReturn("greet");
+        when(overrideMethod.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(overrideMethod.getParameterNames()).thenReturn(new String[] {"person"});
+        when(overrideMethod.getDeclaringType()).thenReturn(implType);
+        when(overrideMethod.getFlags()).thenReturn(0);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.codeSelect(org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.eq(0)))
+                .thenReturn(new IJavaElement[] {interfaceMethod, overrideMethod});
+
+        Object collector = createCollector(source, new Range(new Position(0, 0), new Position(12, 0)), workingCopy);
+        invokeCollector(collector, "visitModule", new Class<?>[] {ModuleNode.class}, new Object[] {module});
+
+        @SuppressWarnings("unchecked")
+        List<InlayHint> hints = (List<InlayHint>) invokeCollector(collector, "getHints", new Class<?>[0], new Object[0]);
+        assertTrue(hints.stream().anyMatch(h -> "person:".equals(labelText(h))));
+        assertTrue(hints.stream().noneMatch(h -> "baseName:".equals(labelText(h))));
     }
 
     @Test
@@ -1411,6 +1530,36 @@ class InlayHintProviderTest {
     }
 
     @Test
+    void computeJdtVariableTypeHintsUsesDirectCodeSelectForStaticMethodCalls() throws Exception {
+        String source = "def result = Util.answer()";
+        ModuleNode module = parseModule(source);
+
+        DocumentManager documentManager = mock(DocumentManager.class);
+        InlayHintProvider directProvider = new InlayHintProvider(documentManager);
+
+        org.eclipse.jdt.core.IJavaProject project = mock(org.eclipse.jdt.core.IJavaProject.class);
+        when(project.exists()).thenReturn(true);
+
+        ICompilationUnit workingCopy = mock(ICompilationUnit.class);
+        when(workingCopy.getJavaProject()).thenReturn(project);
+
+        IMethod method = mock(IMethod.class);
+        IType declaringType = mock(IType.class);
+        when(method.getElementName()).thenReturn("answer");
+        when(method.getReturnType()).thenReturn("QString;");
+        when(method.getDeclaringType()).thenReturn(declaringType);
+        when(declaringType.getFullyQualifiedName()).thenReturn("demo.Util");
+
+        when(documentManager.cachedCodeSelect(workingCopy, 23)).thenReturn(new IJavaElement[] {method});
+
+        Range range = new Range(new Position(0, 0), new Position(5, 0));
+        List<InlayHint> hints = invokeComputeJdtVariableTypeHints(directProvider, module, source, range, workingCopy);
+
+        assertFalse(hints.isEmpty());
+        assertTrue(hints.stream().anyMatch(h -> ": String".equals(labelText(h))));
+    }
+
+    @Test
     void computeJdtVariableTypeHintsUsesSourceRecordAccessorFallback() throws Exception {
         String source = """
                 import com.example.Recc
@@ -1683,5 +1832,14 @@ class InlayHintProviderTest {
                 ModuleNode.class, String.class, Range.class, ICompilationUnit.class);
         m.setAccessible(true);
         return (List<InlayHint>) m.invoke(provider, module, content, requestedRange, workingCopy);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<InlayHint> invokeComputeJdtVariableTypeHints(InlayHintProvider targetProvider,
+            ModuleNode module, String content, Range requestedRange, ICompilationUnit workingCopy) throws Exception {
+        Method m = InlayHintProvider.class.getDeclaredMethod("computeJdtVariableTypeHints",
+                ModuleNode.class, String.class, Range.class, ICompilationUnit.class);
+        m.setAccessible(true);
+        return (List<InlayHint>) m.invoke(targetProvider, module, content, requestedRange, workingCopy);
     }
 }

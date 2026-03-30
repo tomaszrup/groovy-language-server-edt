@@ -130,7 +130,8 @@ public class SignatureHelpProvider {
         }
 
         for (IJavaElement element : elements) {
-            addJdtSignaturesForElement(signatures, element);
+            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+            addJdtSignaturesForElement(signatures, remappedElement != null ? remappedElement : element);
         }
         return signatures;
     }

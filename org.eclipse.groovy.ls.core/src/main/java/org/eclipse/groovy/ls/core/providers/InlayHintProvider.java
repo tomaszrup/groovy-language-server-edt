@@ -268,7 +268,13 @@ public class InlayHintProvider {
                 if (requestedRange != null && !isInRange(info.line, requestedRange)) {
                     continue;
                 }
-                ReturnTypeInfo returnType = resolveMethodCallChainInfo(info.methodCall, module, project, hierarchyCache);
+                ReturnTypeInfo returnType = resolveMethodCallInfo(
+                        info.methodCall,
+                        module,
+                        project,
+                        workingCopy,
+                        content,
+                        hierarchyCache);
                 if (returnType != null && returnType.displayName() != null && !returnType.displayName().isBlank()) {
                     String typeName = returnType.displayName();
                     Position hintPos = new Position(info.line, info.column + info.varName.length());
@@ -285,9 +291,443 @@ public class InlayHintProvider {
         return hints;
     }
 
+    private ReturnTypeInfo resolveMethodCallInfo(MethodCallExpression methodCall,
+            ModuleNode module,
+            IJavaProject project,
+            ICompilationUnit workingCopy,
+            String content,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) {
+        ReturnTypeInfo directReturnType = resolveDirectMethodReturnInfo(methodCall, project, workingCopy, content);
+        if (directReturnType != null) {
+            return directReturnType;
+        }
+        return resolveMethodCallChainInfo(methodCall, module, project, hierarchyCache);
+    }
+
+    private ReturnTypeInfo resolveDirectMethodReturnInfo(MethodCallExpression methodCall,
+            IJavaProject project,
+            ICompilationUnit workingCopy,
+            String content) {
+        if (methodCall == null || project == null || workingCopy == null || content == null) {
+            return null;
+        }
+
+        String methodName = methodCall.getMethodAsString();
+        if (methodName == null || methodName.isBlank()) {
+            return null;
+        }
+
+        int[] selectionOffsets = resolveMethodSelectionOffsets(content, methodCall, methodName);
+        if (selectionOffsets.length == 0) {
+            return null;
+        }
+
+        IMethod targetMethod = resolveBestMethodTarget(
+                documentManager,
+                workingCopy,
+                selectionOffsets,
+                methodName,
+                toArgumentExpressions(methodCall.getArguments()).size());
+        if (targetMethod == null) {
+            return null;
+        }
+
+        try {
+            IType contextType = targetMethod.getDeclaringType();
+            if (contextType != null) {
+                IType resolvedContextType = JavaBinaryMemberResolver.resolveMemberSource(contextType);
+                if (resolvedContextType != null) {
+                    contextType = resolvedContextType;
+                }
+            }
+            return createReturnTypeInfoFromSignature(targetMethod.getReturnType(), contextType, project);
+        } catch (JavaModelException ignored) {
+            return null;
+        }
+    }
+
     private boolean isInRange(int zeroBasedLine, Range range) {
         return zeroBasedLine >= range.getStart().getLine()
                 && zeroBasedLine <= range.getEnd().getLine();
+    }
+
+    private static IMethod resolveBestMethodTarget(DocumentManager documentManager,
+            ICompilationUnit workingCopy,
+            int offset,
+            String methodName,
+            int argumentCount) {
+        return resolveBestMethodTarget(documentManager, workingCopy, new int[] {offset}, methodName, argumentCount);
+    }
+
+    private static IMethod resolveBestMethodTarget(DocumentManager documentManager,
+            ICompilationUnit workingCopy,
+            int[] offsets,
+            String methodName,
+            int argumentCount) {
+        if (documentManager == null || workingCopy == null
+                || methodName == null || methodName.isBlank()) {
+            return null;
+        }
+
+        try {
+            List<IMethod> methods = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            if (offsets == null || offsets.length == 0) {
+                return null;
+            }
+            for (int offset : offsets) {
+                if (offset < 0) {
+                    continue;
+                }
+                IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
+                List<IMethod> offsetMethods = collectMethodCandidates(documentManager, elements, methodName);
+                for (IMethod method : offsetMethods) {
+                    if (method != null && seen.add(methodCandidateKey(method))) {
+                        methods.add(method);
+                    }
+                }
+            }
+            return chooseBestMethod(methods, argumentCount);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String methodCandidateKey(IMethod method) {
+        if (method == null) {
+            return "<null>";
+        }
+
+        try {
+            String handle = method.getHandleIdentifier();
+            if (handle != null && !handle.isBlank()) {
+                return handle;
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            IType declaringType = method.getDeclaringType();
+            String declaringTypeName = declaringType != null ? declaringType.getFullyQualifiedName() : "";
+            return declaringTypeName + "#" + method.getElementName() + "#" + String.join(",", method.getParameterTypes());
+        } catch (Exception ignored) {
+            return String.valueOf(System.identityHashCode(method));
+        }
+    }
+
+    private static List<IMethod> collectMethodCandidates(DocumentManager documentManager,
+            IJavaElement[] elements,
+            String methodName) throws JavaModelException {
+        List<IMethod> methods = new ArrayList<>();
+        if (elements == null || methodName == null || methodName.isBlank()) {
+            return methods;
+        }
+
+        for (IJavaElement element : elements) {
+            addMethodCandidates(documentManager, element, methodName, methods);
+        }
+        return methods;
+    }
+
+    private static void addMethodCandidates(DocumentManager documentManager,
+            IJavaElement element,
+            String methodName,
+            List<IMethod> methods) throws JavaModelException {
+        if (element == null || methodName == null || methodName.isBlank()) {
+            return;
+        }
+
+        if (documentManager != null) {
+            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+            if (remappedElement != null) {
+                element = remappedElement;
+            }
+        }
+
+        if (element instanceof IMethod method) {
+            if (!method.isConstructor() && methodName.equals(method.getElementName())) {
+                methods.add(method);
+            }
+            return;
+        }
+
+        if (element instanceof IType type) {
+            IType resolvedType = JavaBinaryMemberResolver.resolveMemberSource(type);
+            if (resolvedType == null) {
+                resolvedType = type;
+            }
+            for (IMethod method : resolvedType.getMethods()) {
+                if (!method.isConstructor() && methodName.equals(method.getElementName())) {
+                    methods.add(method);
+                }
+            }
+        }
+    }
+
+    private static IMethod chooseBestMethod(List<IMethod> methods, int argumentCount) {
+        if (methods == null || methods.isEmpty()) {
+            return null;
+        }
+
+        IMethod best = null;
+        int bestScore = Integer.MAX_VALUE;
+
+        for (IMethod method : methods) {
+            int score = compatibilityScore(getParameterCount(method), isVarargs(method), argumentCount);
+            if (score < bestScore || (score == bestScore && isPreferredMethod(method, best))) {
+                bestScore = score;
+                best = method;
+            }
+        }
+
+        return best != null ? best : methods.get(0);
+    }
+
+    private static boolean isPreferredMethod(IMethod candidate, IMethod currentBest) {
+        if (candidate == null) {
+            return false;
+        }
+        if (currentBest == null) {
+            return true;
+        }
+
+        if (isDeclaredInSubtype(candidate, currentBest)) {
+            return true;
+        }
+        if (isDeclaredInSubtype(currentBest, candidate)) {
+            return false;
+        }
+
+        if (isConcreteDeclaringType(candidate) && !isConcreteDeclaringType(currentBest)) {
+            return true;
+        }
+        if (!isConcreteDeclaringType(candidate) && isConcreteDeclaringType(currentBest)) {
+            return false;
+        }
+
+        if (isSourceBacked(candidate) && !isSourceBacked(currentBest)) {
+            return true;
+        }
+        if (!isSourceBacked(candidate) && isSourceBacked(currentBest)) {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static boolean isDeclaredInSubtype(IMethod candidate, IMethod currentBest) {
+        try {
+            IType candidateType = resolveComparisonType(candidate);
+            IType currentType = resolveComparisonType(currentBest);
+            if (candidateType == null || currentType == null) {
+                return false;
+            }
+
+            String currentName = currentType.getFullyQualifiedName();
+            if (currentName == null || currentName.isBlank()
+                    || currentName.equals(candidateType.getFullyQualifiedName())) {
+                return false;
+            }
+
+            org.eclipse.jdt.core.ITypeHierarchy hierarchy = candidateType.newSupertypeHierarchy(null);
+            if (hierarchy == null) {
+                return false;
+            }
+
+            for (IType superType : hierarchy.getAllSupertypes(candidateType)) {
+                if (currentName.equals(superType.getFullyQualifiedName())) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    private static IType resolveComparisonType(IMethod method) {
+        try {
+            IType declaringType = method != null ? method.getDeclaringType() : null;
+            if (declaringType == null) {
+                return null;
+            }
+            IType resolvedType = JavaBinaryMemberResolver.resolveMemberSource(declaringType);
+            return resolvedType != null ? resolvedType : declaringType;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isConcreteDeclaringType(IMethod method) {
+        try {
+            IType declaringType = resolveComparisonType(method);
+            return declaringType != null && !declaringType.isInterface();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isSourceBacked(IMethod method) {
+        try {
+            if (method == null) {
+                return false;
+            }
+            if (method.getCompilationUnit() != null) {
+                return true;
+            }
+            IType declaringType = method.getDeclaringType();
+            return declaringType != null && declaringType.getCompilationUnit() != null;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static int compatibilityScore(int parameterCount, boolean varargs, int argumentCount) {
+        if (varargs) {
+            int required = Math.max(0, parameterCount - 1);
+            if (argumentCount < required) {
+                return 10_000 + (required - argumentCount);
+            }
+            return argumentCount - required;
+        }
+
+        if (argumentCount == parameterCount) {
+            return 0;
+        }
+        if (argumentCount < parameterCount) {
+            return parameterCount - argumentCount;
+        }
+        return 10_000 + (argumentCount - parameterCount);
+    }
+
+    private static int getParameterCount(IMethod method) {
+        try {
+            return method.getParameterTypes().length;
+        } catch (Exception ignored) {
+            return Integer.MAX_VALUE / 2;
+        }
+    }
+
+    private static boolean isVarargs(IMethod method) {
+        try {
+            return Flags.isVarargs(method.getFlags());
+        } catch (JavaModelException ignored) {
+            return false;
+        }
+    }
+
+    private static List<Expression> toArgumentExpressions(Expression argsExpression) {
+        if (argsExpression instanceof ArgumentListExpression argumentListExpression) {
+            return argumentListExpression.getExpressions();
+        }
+        if (argsExpression instanceof TupleExpression tupleExpression) {
+            return tupleExpression.getExpressions();
+        }
+        return Collections.emptyList();
+    }
+
+    private static int[] resolveMethodSelectionOffsets(String source,
+            MethodCallExpression call,
+            String methodName) {
+        Expression methodExpression = call.getMethod();
+        int line = methodExpression != null && methodExpression.getLineNumber() > 0
+                ? methodExpression.getLineNumber() - 1
+                : call.getLineNumber() - 1;
+        int startCol = methodExpression != null && methodExpression.getColumnNumber() > 0
+                ? methodExpression.getColumnNumber() - 1
+                : Math.max(0, call.getColumnNumber() - 1);
+
+        int nameColumn = findNameInLine(source, line, startCol, methodName);
+        if (nameColumn < 0) {
+            return new int[0];
+        }
+
+        int startOffset = lineToOffset(source, line, nameColumn);
+        int endOffset = lineToOffset(source, line, nameColumn + methodName.length() - 1);
+        if (startOffset < 0 && endOffset < 0) {
+            return new int[0];
+        }
+        if (startOffset == endOffset || startOffset < 0) {
+            return new int[] {endOffset};
+        }
+        if (endOffset < 0) {
+            return new int[] {startOffset};
+        }
+        return new int[] {endOffset, startOffset};
+    }
+
+    private static int findNameInLine(String source, int line, int fromColumn, String name) {
+        String lineText = getLineText(source, line);
+        if (lineText == null || name == null || name.isBlank()) {
+            return -1;
+        }
+
+        int safeStart = Math.max(0, Math.min(fromColumn, lineText.length()));
+        int index = lineText.indexOf(name, safeStart);
+        if (index >= 0 && hasIdentifierBoundaries(lineText, index, index + name.length())) {
+            return index;
+        }
+
+        index = lineText.indexOf(name);
+        if (index >= 0 && hasIdentifierBoundaries(lineText, index, index + name.length())) {
+            return index;
+        }
+
+        return -1;
+    }
+
+    private static boolean hasIdentifierBoundaries(String lineText, int start, int end) {
+        boolean leftBoundary = start <= 0 || !Character.isJavaIdentifierPart(lineText.charAt(start - 1));
+        boolean rightBoundary = end >= lineText.length() || !Character.isJavaIdentifierPart(lineText.charAt(end));
+        return leftBoundary && rightBoundary;
+    }
+
+    private static String getLineText(String source, int targetLine) {
+        if (targetLine < 0 || source == null || source.isEmpty()) {
+            return null;
+        }
+
+        int line = 0;
+        int start = 0;
+        for (int index = 0; index < source.length(); index++) {
+            if (line == targetLine) {
+                break;
+            }
+            if (source.charAt(index) == '\n') {
+                line++;
+                start = index + 1;
+            }
+        }
+
+        if (line != targetLine) {
+            return null;
+        }
+
+        int end = source.indexOf('\n', start);
+        if (end < 0) {
+            end = source.length();
+        }
+        return source.substring(start, end);
+    }
+
+    private static int lineToOffset(String source, int targetLine, int targetColumn) {
+        if (targetLine < 0 || targetColumn < 0 || source == null) {
+            return -1;
+        }
+
+        int line = 0;
+        int index = 0;
+        while (index < source.length() && line < targetLine) {
+            if (source.charAt(index) == '\n') {
+                line++;
+            }
+            index++;
+        }
+
+        if (line != targetLine) {
+            return -1;
+        }
+
+        return Math.min(index + targetColumn, source.length());
     }
 
     /**
@@ -807,12 +1247,12 @@ public class InlayHintProvider {
                 return;
             }
 
-            int methodOffset = resolveMethodNameOffset(call, methodName);
-            if (methodOffset < 0) {
+            int[] methodOffsets = resolveMethodNameOffsets(call, methodName);
+            if (methodOffsets.length == 0) {
                 return;
             }
 
-            IMethod targetMethod = resolveBestMethodTarget(methodOffset, methodName, arguments.size());
+            IMethod targetMethod = resolveBestMethodTarget(methodOffsets, methodName, arguments.size());
             if (targetMethod == null) {
                 return;
             }
@@ -883,26 +1323,13 @@ public class InlayHintProvider {
         }
 
         private IMethod resolveBestMethodTarget(int offset, String methodName, int argumentCount) {
-            try {
-                IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
-                List<IMethod> methods = new ArrayList<>();
-                if (elements != null) {
-                    for (IJavaElement element : elements) {
-                        IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
-                        if (remappedElement != null) {
-                            element = remappedElement;
-                        }
-                        if (element instanceof IMethod method
-                                && !method.isConstructor()
-                                && methodName.equals(method.getElementName())) {
-                            methods.add(method);
-                        }
-                    }
-                }
-                return chooseBestMethod(methods, argumentCount);
-            } catch (Exception ignored) {
-                return null;
-            }
+            return InlayHintProvider.resolveBestMethodTarget(
+                    documentManager, workingCopy, offset, methodName, argumentCount);
+        }
+
+        private IMethod resolveBestMethodTarget(int[] offsets, String methodName, int argumentCount) {
+            return InlayHintProvider.resolveBestMethodTarget(
+                documentManager, workingCopy, offsets, methodName, argumentCount);
         }
 
         private IMethod resolveBestConstructorTarget(int offset, int argumentCount) {
@@ -1060,20 +1487,8 @@ public class InlayHintProvider {
             return JdtParameterNameResolver.resolve(method);
         }
 
-        private int resolveMethodNameOffset(MethodCallExpression call, String methodName) {
-            Expression methodExpression = call.getMethod();
-            int line = methodExpression != null && methodExpression.getLineNumber() > 0
-                    ? methodExpression.getLineNumber() - 1
-                    : call.getLineNumber() - 1;
-            int startCol = methodExpression != null && methodExpression.getColumnNumber() > 0
-                    ? methodExpression.getColumnNumber() - 1
-                    : Math.max(0, call.getColumnNumber() - 1);
-
-            int nameColumn = findNameInLine(line, startCol, methodName);
-            if (nameColumn < 0) {
-                return -1;
-            }
-            return lineToOffset(line, nameColumn);
+        private int[] resolveMethodNameOffsets(MethodCallExpression call, String methodName) {
+            return InlayHintProvider.resolveMethodSelectionOffsets(source, call, methodName);
         }
 
         private int resolveConstructorTypeOffset(ConstructorCallExpression call, String typeName) {
