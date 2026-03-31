@@ -130,8 +130,10 @@ class ReferenceSearchHelperTest {
         String usageUri = DocumentManager.normalizeUri(
                 "file:///c:/workspace/project-" + fixtureId + "/src/test/groovy/UseSpec.groovy");
         String usageContent = "class UseSpec {\n    void run() { rareSymbol() }\n}\n";
-        documentManager.didOpen(usageUri, usageContent);
         IFile usageFile = mockGroovyFile(usageUri);
+        when(usageFile.getModificationStamp()).thenReturn(1L);
+        when(usageFile.getContents()).thenAnswer(inv ->
+                new ByteArrayInputStream(usageContent.getBytes(StandardCharsets.UTF_8)));
 
         IResource rootResource = mock(IResource.class);
         doAnswer(invocation -> {
@@ -171,9 +173,9 @@ class ReferenceSearchHelperTest {
             // The cap is exceeded before reaching the usage file, so the result
             // should be INDETERMINATE (safe: avoids incorrectly fading the declaration).
             assertEquals(ReferenceSearchHelper.ReferenceExistence.INDETERMINATE, result);
+            verify(usageFile, times(0)).getContents();
         } finally {
             documentManager.didClose(declarationUri);
-            documentManager.didClose(usageUri);
         }
     }
 

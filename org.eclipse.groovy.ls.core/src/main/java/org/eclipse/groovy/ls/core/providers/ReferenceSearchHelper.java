@@ -185,15 +185,16 @@ public final class ReferenceSearchHelper {
                 continue;
             }
 
+            if (filesScanned >= MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE) {
+                return ReferenceExistence.INDETERMINATE;
+            }
+
             String content = readContent(documentManager, targetUri, file);
             if (content == null) {
                 continue;
             }
 
             filesScanned++;
-            if (filesScanned > MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE) {
-                return ReferenceExistence.INDETERMINATE;
-            }
 
             int matchStart = -1;
             while ((matchStart = findNextIdentifierMatch(content, symbolName, matchStart + 1)) >= 0) {
