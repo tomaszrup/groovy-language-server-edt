@@ -553,8 +553,9 @@ class DocumentManagerCoreMethodsTest {
             assertTrue(getPendingOpenFutures(manager).containsKey(normalizedUri));
             assertFalse(manager.isReadyForDiagnostics(uri));
         } finally {
-            originalExecutor.shutdownNow();
             manager.didClose(uri);
+            setDidOpenExecutor(manager, originalExecutor);
+            deferredExecutor.shutdownNow();
             manager.dispose();
         }
     }
@@ -1179,6 +1180,7 @@ class DocumentManagerCoreMethodsTest {
 
     private static final class DeferredExecutorService extends AbstractExecutorService {
         private volatile boolean shutdown;
+        private final List<Runnable> submitted = Collections.synchronizedList(new ArrayList<>());
 
         @Override
         public void shutdown() {
@@ -1188,7 +1190,7 @@ class DocumentManagerCoreMethodsTest {
         @Override
         public List<Runnable> shutdownNow() {
             shutdown = true;
-            return Collections.emptyList();
+            return new ArrayList<>(submitted);
         }
 
         @Override
@@ -1208,8 +1210,12 @@ class DocumentManagerCoreMethodsTest {
 
         @Override
         public void execute(Runnable command) {
+            if (shutdown) {
+                throw new java.util.concurrent.RejectedExecutionException("executor is shut down");
+            }
             // Intentionally leave submitted tasks pending so the test can
             // assert diagnostics readiness before the didOpen refresh runs.
+            submitted.add(command);
         }
     }
 }
