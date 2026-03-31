@@ -544,7 +544,6 @@ class DocumentManagerCoreMethodsTest {
         ExecutorService originalExecutor = getDidOpenExecutor(manager);
         DeferredExecutorService deferredExecutor = new DeferredExecutorService();
         setDidOpenExecutor(manager, deferredExecutor);
-        originalExecutor.shutdownNow();
         String uri = "file:///test/Pending.groovy";
         String normalizedUri = DocumentManager.normalizeUri(uri);
 
@@ -554,6 +553,7 @@ class DocumentManagerCoreMethodsTest {
             assertTrue(getPendingOpenFutures(manager).containsKey(normalizedUri));
             assertFalse(manager.isReadyForDiagnostics(uri));
         } finally {
+            originalExecutor.shutdownNow();
             manager.didClose(uri);
             manager.dispose();
         }
@@ -1208,6 +1208,8 @@ class DocumentManagerCoreMethodsTest {
 
         @Override
         public void execute(Runnable command) {
+            // Intentionally leave submitted tasks pending so the test can
+            // assert diagnostics readiness before the didOpen refresh runs.
         }
     }
 }
