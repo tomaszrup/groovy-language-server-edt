@@ -10,7 +10,6 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -71,7 +70,7 @@ class ReferenceSearchHelperTest {
     }
 
     @Test
-    void referenceExistenceForUnusedDeclarationSkipsGroovyProjectTextFallback() throws Exception {
+    void referenceExistenceForUnusedDeclarationFallsBackToGroovyProjectTextSearch() throws Exception {
         TestFixture fixture = createFixture(
                 "sharedHelper",
                 """
@@ -90,10 +89,10 @@ class ReferenceSearchHelperTest {
         try {
             ReferenceSearchHelper.ReferenceExistence result =
                     ReferenceSearchHelper.referenceExistenceForUnusedDeclaration(
-                            fixture.method, fixture.declarationUri);
+                            fixture.method, fixture.declarationUri, fixture.documentManager);
 
-            assertNotEquals(ReferenceSearchHelper.ReferenceExistence.FOUND, result);
-            verify(fixture.rootResource, times(0)).accept(any(IResourceVisitor.class));
+            assertEquals(ReferenceSearchHelper.ReferenceExistence.FOUND, result);
+            verify(fixture.rootResource, times(1)).accept(any(IResourceVisitor.class));
         } finally {
             fixture.close();
         }
@@ -134,6 +133,34 @@ class ReferenceSearchHelperTest {
                             && declarationPosition.equals(location.getRange().getStart())));
             assertTrue(locations.stream().anyMatch(location ->
                     fixture.usageUri.equals(location.getUri())));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    void findReferenceLocationsDoesNotMatchIdentifiersContainingMethodName() throws Exception {
+        TestFixture fixture = createFixture(
+                "sharedHelper",
+                """
+                class SupportSpec {
+                    void sharedHelper() {}
+                }
+                """,
+                """
+                class UseSpec {
+                    void runIt() {
+                        def sharedHelper$count = 1
+                        println sharedHelper$count
+                    }
+                }
+                """);
+
+        try {
+            List<Location> locations = ReferenceSearchHelper.findReferenceLocations(
+                    fixture.method, fixture.declarationUri, fixture.documentManager);
+
+            assertTrue(locations.isEmpty());
         } finally {
             fixture.close();
         }

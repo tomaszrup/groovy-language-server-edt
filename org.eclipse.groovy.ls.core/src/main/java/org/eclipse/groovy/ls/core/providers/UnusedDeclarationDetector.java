@@ -191,7 +191,7 @@ public class UnusedDeclarationDetector {
             IType[] types = workingCopy.getTypes();
             for (IType type : types) {
                 if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-                collectUnusedDeclarations(type, content, uri, diagnostics, searchBudget);
+                collectUnusedDeclarations(type, content, uri, documentManager, diagnostics, searchBudget);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -203,6 +203,7 @@ public class UnusedDeclarationDetector {
 
     private static void collectUnusedDeclarations(
             IType type, String content, String uri,
+            DocumentManager documentManager,
             List<Diagnostic> diagnostics,
             int[] searchBudget)
             throws JavaModelException {
@@ -211,7 +212,7 @@ public class UnusedDeclarationDetector {
 
         // Check the type itself — but skip if it's in a test class context
         if (!isTestType(type)) {
-            Boolean unreferenced = isUnreferenced(type, uri);
+            Boolean unreferenced = isUnreferenced(type, uri, documentManager);
             searchBudget[0]--;
             if (Boolean.TRUE.equals(unreferenced)) {
                 Diagnostic diag = createUnusedDiagnostic(type, content);
@@ -235,7 +236,7 @@ public class UnusedDeclarationDetector {
             if (frameworkType && method.isConstructor()) {
                 continue;
             }
-            Boolean unreferenced = isUnreferenced(method, uri);
+            Boolean unreferenced = isUnreferenced(method, uri, documentManager);
             searchBudget[0]--;
             if (Boolean.TRUE.equals(unreferenced)) {
                 Diagnostic diag = createUnusedDiagnostic(method, content);
@@ -248,7 +249,7 @@ public class UnusedDeclarationDetector {
         // Recurse into inner types
         for (IType innerType : type.getTypes()) {
             if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-            collectUnusedDeclarations(innerType, content, uri, diagnostics, searchBudget);
+            collectUnusedDeclarations(innerType, content, uri, documentManager, diagnostics, searchBudget);
         }
     }
 
@@ -259,11 +260,12 @@ public class UnusedDeclarationDetector {
      * all subprojects in large multi-project builds — a private member
      * can only be referenced within its own project anyway.
      * The search is cancelled as soon as the first match is found.
-     * When reference existence cannot be determined cheaply, the detector
-     * skips fading instead of falling back to a whole-project text scan.
+     * Falls back to the same identifier-aware Groovy text search used by
+     * reference code lenses so fading stays consistent with the shown count.
      */
-    private static Boolean isUnreferenced(IJavaElement element, String uri) {
-        return switch (ReferenceSearchHelper.referenceExistenceForUnusedDeclaration(element, uri)) {
+    private static Boolean isUnreferenced(IJavaElement element, String uri, DocumentManager documentManager) {
+        return switch (ReferenceSearchHelper.referenceExistenceForUnusedDeclaration(
+                element, uri, documentManager)) {
             case FOUND -> Boolean.FALSE;
             case NOT_FOUND -> Boolean.TRUE;
             case INDETERMINATE -> null;

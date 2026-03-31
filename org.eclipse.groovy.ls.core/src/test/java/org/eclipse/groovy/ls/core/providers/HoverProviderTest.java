@@ -455,34 +455,56 @@ class HoverProviderTest {
                 dm.didOpen(uri, content);
                 HoverProvider hp = new HoverProvider(dm);
 
-                Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(3, 10));
-                assertNotNull(hover);
-                assertTrue(hover.getContents().getRight().getValue().contains("Service level docs."));
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(3, 10));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("Service level docs."));
 
-                dm.didClose(uri);
-        }
+        dm.didClose(uri);
+    }
 
-        @Test
-        void getHoverFromGroovyASTIncludesMemberGroovydoc() throws Exception {
-                String uri = "file:///HoverASTMemberDoc.groovy";
-                String content = """
-                                class DocumentedService {
-                                    /**
-                                     * Greets callers.
-                                     */
-                                    String greet(String name) { '' }
-                                }
-                                """;
-                DocumentManager dm = new DocumentManager();
-                dm.didOpen(uri, content);
-                HoverProvider hp = new HoverProvider(dm);
+    @Test
+    void getHoverFromGroovyASTIncludesMemberGroovydoc() throws Exception {
+        String uri = "file:///HoverASTMemberDoc.groovy";
+        String content = """
+                        class DocumentedService {
+                            /**
+                             * Greets callers.
+                             */
+                            String greet(String name) { '' }
+                        }
+                        """;
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
 
-                Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(4, 12));
-                assertNotNull(hover);
-                assertTrue(hover.getContents().getRight().getValue().contains("Greets callers."));
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(4, 12));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("Greets callers."));
 
-                dm.didClose(uri);
-        }
+        dm.didClose(uri);
+    }
+
+    @Test
+    void getHoverFromGroovyASTIncludesClassGroovydocForNewTypeCall() throws Exception {
+        String uri = "file:///HoverASTCtorDoc.groovy";
+        String content = """
+                /**
+                 * Service level docs.
+                 */
+                class DocumentedService {}
+                new DocumentedService()
+                """;
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
+
+        Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(4, 6));
+        assertNotNull(hover);
+        assertTrue(hover.getContents().getRight().getValue().contains("DocumentedService"));
+        assertTrue(hover.getContents().getRight().getValue().contains("Service level docs."));
+
+        dm.didClose(uri);
+    }
 
     @Test
     void getHoverFromGroovyASTReturnsNullForBlankArea() throws Exception {
@@ -629,6 +651,44 @@ class HoverProviderTest {
         assertNotNull(hover);
         assertTrue(hover.contains("MyClass"));
         assertTrue(hover.contains("name"));
+    }
+
+    @Test
+    void buildHoverContentUsesDeclaringTypeJavadocForConstructor() throws Exception {
+        String source = """
+                /**
+                 * Constructor type docs.
+                 */
+                class Demo {
+                    Demo(String name) {}
+                }
+                """;
+
+        ICompilationUnit cu = mock(ICompilationUnit.class);
+        when(cu.getSource()).thenReturn(source);
+
+        IType type = mock(IType.class);
+        when(type.getElementName()).thenReturn("Demo");
+        when(type.getCompilationUnit()).thenReturn(cu);
+        when(type.getResource()).thenReturn(null);
+        when(type.getFullyQualifiedName()).thenReturn("com.example.Demo");
+        when(type.getClassFile()).thenReturn(null);
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementType()).thenReturn(IJavaElement.METHOD);
+        when(method.getElementName()).thenReturn("Demo");
+        when(method.getFlags()).thenReturn(Flags.AccPublic);
+        when(method.isConstructor()).thenReturn(true);
+        when(method.getParameterTypes()).thenReturn(new String[] {"QString;"});
+        when(method.getParameterNames()).thenReturn(new String[] {"name"});
+        when(method.getExceptionTypes()).thenReturn(new String[0]);
+        when(method.getDeclaringType()).thenReturn(type);
+        when(method.getAncestor(IJavaElement.TYPE)).thenReturn(type);
+
+        String hover = invokeBuildHoverContent(method);
+
+        assertNotNull(hover);
+        assertTrue(hover.contains("Constructor type docs."));
     }
 
     @Test

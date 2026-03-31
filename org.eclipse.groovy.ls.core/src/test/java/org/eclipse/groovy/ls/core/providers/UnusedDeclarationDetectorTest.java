@@ -351,24 +351,26 @@ class UnusedDeclarationDetectorTest {
     @Test
     void isUnreferencedReturnsNullWhenReferenceLookupIsIndeterminate() throws Exception {
         IJavaElement element = mock(IJavaElement.class);
+        DocumentManager documentManager = new DocumentManager();
 
         try (org.mockito.MockedStatic<ReferenceSearchHelper> searchHelper =
                 org.mockito.Mockito.mockStatic(ReferenceSearchHelper.class)) {
             searchHelper.when(() -> ReferenceSearchHelper.referenceExistenceForUnusedDeclaration(
-                    element, "file:///src/main/groovy/Foo.groovy"))
+                    element, "file:///src/main/groovy/Foo.groovy", documentManager))
                     .thenReturn(ReferenceSearchHelper.ReferenceExistence.INDETERMINATE);
 
-            assertNull(invokeIsUnreferenced(element, "file:///src/main/groovy/Foo.groovy"));
+            assertNull(invokeIsUnreferenced(element, "file:///src/main/groovy/Foo.groovy", documentManager));
         }
     }
 
     // ----- Reflection helpers -----
 
-    private static Boolean invokeIsUnreferenced(IJavaElement element, String uri) throws Exception {
+    private static Boolean invokeIsUnreferenced(
+            IJavaElement element, String uri, DocumentManager documentManager) throws Exception {
         Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "isUnreferenced", IJavaElement.class, String.class);
+                "isUnreferenced", IJavaElement.class, String.class, DocumentManager.class);
         m.setAccessible(true);
-        return (Boolean) m.invoke(null, element, uri);
+        return (Boolean) m.invoke(null, element, uri, documentManager);
     }
 
     private static boolean invokeIsSpockSpecification(IType type) throws Exception {

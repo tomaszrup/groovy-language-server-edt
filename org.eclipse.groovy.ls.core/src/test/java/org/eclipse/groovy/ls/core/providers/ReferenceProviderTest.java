@@ -215,6 +215,29 @@ class ReferenceProviderTest {
     }
 
     @Test
+    void getReferencesFromGroovyASTIgnoresIdentifiersContainingMethodName() throws Exception {
+        DocumentManager manager = new DocumentManager();
+        String uri = "file:///ReferenceASTDollar.groovy";
+        manager.didOpen(uri, """
+                class Service {
+                    void process() {}
+                    void run() {
+                        process()
+                        def process$count = 1
+                        println process$count
+                    }
+                }
+                """);
+
+        ReferenceProvider provider = new ReferenceProvider(manager);
+        List<Location> refs = invokeGetReferencesFromGroovyAST(provider, uri, new Position(1, 10));
+
+        assertEquals(2, refs.size(), "Should only find the declaration and actual method call");
+
+        manager.didClose(uri);
+    }
+
+    @Test
     void getReferencesFromGroovyASTReturnsEmptyForMissingContent() throws Exception {
         ReferenceProvider provider = new ReferenceProvider(new DocumentManager());
         assertTrue(invokeGetReferencesFromGroovyAST(provider,

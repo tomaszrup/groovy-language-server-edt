@@ -17,9 +17,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -109,12 +106,18 @@ public final class ReferenceSearchHelper {
 
     /**
      * Fast yes/no reference existence check used by unused-declaration fading.
-     * Unlike the general reference helpers, this path intentionally avoids the
-     * textual fallback so a single fading update cannot walk every Groovy file
-     * in a project.
+     * Reuses the same textual fallback as code lens resolution so declarations
+     * are not faded when the code lens can still find Groovy-only references.
      */
-    static ReferenceExistence referenceExistenceForUnusedDeclaration(IJavaElement element, String uri) {
-        return referenceExistenceWithJdt(element, uri);
+    static ReferenceExistence referenceExistenceForUnusedDeclaration(
+            IJavaElement element, String uri, DocumentManager documentManager) {
+        ReferenceExistence result = referenceExistenceWithJdt(element, uri);
+        if (result == ReferenceExistence.FOUND) {
+            return result;
+        }
+        return findTextFallbackLocations(element, uri, documentManager, true).isEmpty()
+                ? result
+                : ReferenceExistence.FOUND;
     }
 
     static List<Location> findReferenceLocations(
@@ -214,7 +217,6 @@ public final class ReferenceSearchHelper {
             return List.of();
         }
 
-        Pattern pattern = Pattern.compile("\\b" + Pattern.quote(symbolName) + "\\b");
         org.eclipse.jdt.core.ISourceRange declarationRange = getDeclarationRange(element);
         List<Location> locations = new ArrayList<>();
         Set<String> visitedUris = new HashSet<>();
@@ -236,14 +238,15 @@ public final class ReferenceSearchHelper {
             }
             PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
 
-            Matcher matcher = pattern.matcher(content);
-            while (matcher.find()) {
+            int matchStart = -1;
+            while ((matchStart = findNextIdentifierMatch(content, symbolName, matchStart + 1)) >= 0) {
+                int matchEnd = matchStart + symbolName.length();
                 if (isDeclarationMatch(targetUri, declarationUri, declarationRange,
-                        matcher.start(), matcher.end())) {
+                        matchStart, matchEnd)) {
                     continue;
                 }
-                Position start = lineIndex.offsetToPosition(matcher.start());
-                Position end = lineIndex.offsetToPosition(matcher.end());
+                Position start = lineIndex.offsetToPosition(matchStart);
+                Position end = lineIndex.offsetToPosition(matchEnd);
                 locations.add(new Location(targetUri, new Range(start, end)));
                 if (stopAfterFirst) {
                     return locations;
@@ -252,6 +255,28 @@ public final class ReferenceSearchHelper {
         }
 
         return locations;
+    }
+
+    static int findNextIdentifierMatch(String content, String symbolName, int fromIndex) {
+        if (content == null || symbolName == null || symbolName.isEmpty()) {
+            return -1;
+        }
+
+        int index = Math.max(0, fromIndex);
+        while ((index = content.indexOf(symbolName, index)) >= 0) {
+            int end = index + symbolName.length();
+            if (isIdentifierBoundary(content, index - 1) && isIdentifierBoundary(content, end)) {
+                return index;
+            }
+            index++;
+        }
+        return -1;
+    }
+
+    private static boolean isIdentifierBoundary(String content, int index) {
+        return index < 0
+                || index >= content.length()
+                || !Character.isJavaIdentifierPart(content.charAt(index));
     }
 
     private static List<IFile> collectScopedGroovyFiles(
