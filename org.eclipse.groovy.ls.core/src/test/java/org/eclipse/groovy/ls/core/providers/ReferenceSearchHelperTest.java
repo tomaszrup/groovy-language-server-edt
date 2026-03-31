@@ -99,6 +99,85 @@ class ReferenceSearchHelperTest {
     }
 
     @Test
+    void referenceExistenceForUnusedDeclarationReturnsIndeterminateWhenFileCapExceeded() throws Exception {
+        String symbolName = "rareSymbol";
+        String fixtureId = Long.toHexString(System.nanoTime());
+        DocumentManager documentManager = new DocumentManager();
+        String declarationUri = DocumentManager.normalizeUri(
+                "file:///c:/workspace/project-" + fixtureId + "/src/test/groovy/DeclSpec.groovy");
+        String declarationContent = "class DeclSpec {\n    void rareSymbol() {}\n}\n";
+        documentManager.didOpen(declarationUri, declarationContent);
+
+        IFile declarationFile = mockGroovyFile(declarationUri);
+
+        // Create enough filler files (with content that does NOT contain the symbol)
+        // to exceed the text-fallback existence cap.
+        int fillerCount = ReferenceSearchHelper.MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE + 5;
+        String fillerContent = "class Filler { void other() {} }\n";
+        List<IFile> fillerFiles = new java.util.ArrayList<>();
+        for (int i = 0; i < fillerCount; i++) {
+            String fillerUri = DocumentManager.normalizeUri(
+                    "file:///c:/workspace/project-" + fixtureId
+                            + "/src/test/groovy/Filler" + i + ".groovy");
+            IFile fillerFile = mockGroovyFile(fillerUri);
+            when(fillerFile.getModificationStamp()).thenReturn(1L);
+            when(fillerFile.getContents()).thenAnswer(inv ->
+                    new ByteArrayInputStream(fillerContent.getBytes(StandardCharsets.UTF_8)));
+            fillerFiles.add(fillerFile);
+        }
+
+        // Usage file placed after all fillers — beyond the cap
+        String usageUri = DocumentManager.normalizeUri(
+                "file:///c:/workspace/project-" + fixtureId + "/src/test/groovy/UseSpec.groovy");
+        String usageContent = "class UseSpec {\n    void run() { rareSymbol() }\n}\n";
+        documentManager.didOpen(usageUri, usageContent);
+        IFile usageFile = mockGroovyFile(usageUri);
+
+        IResource rootResource = mock(IResource.class);
+        doAnswer(invocation -> {
+            IResourceVisitor visitor = invocation.getArgument(0);
+            visitor.visit(declarationFile);
+            for (IFile filler : fillerFiles) {
+                visitor.visit(filler);
+            }
+            visitor.visit(usageFile);  // beyond the cap
+            return null;
+        }).when(rootResource).accept(any(IResourceVisitor.class));
+
+        IPackageFragmentRoot root = mock(IPackageFragmentRoot.class);
+        when(root.getKind()).thenReturn(IPackageFragmentRoot.K_SOURCE);
+        when(root.getPath()).thenReturn(new Path("/project/src/test/groovy"));
+        when(root.getResource()).thenReturn(rootResource);
+
+        IJavaProject javaProject = mock(IJavaProject.class);
+        when(javaProject.getPackageFragmentRoots()).thenReturn(new IPackageFragmentRoot[]{root});
+
+        ISourceRange nameRange = mock(ISourceRange.class);
+        int declOffset = declarationContent.indexOf(symbolName);
+        when(nameRange.getOffset()).thenReturn(declOffset);
+        when(nameRange.getLength()).thenReturn(symbolName.length());
+
+        IMethod method = mock(IMethod.class);
+        when(method.getElementName()).thenReturn(symbolName);
+        when(method.getNameRange()).thenReturn(nameRange);
+        when(method.getResource()).thenReturn(declarationFile);
+        when(method.getJavaProject()).thenReturn(javaProject);
+
+        try {
+            ReferenceSearchHelper.ReferenceExistence result =
+                    ReferenceSearchHelper.referenceExistenceForUnusedDeclaration(
+                            method, declarationUri, documentManager);
+
+            // The cap is exceeded before reaching the usage file, so the result
+            // should be INDETERMINATE (safe: avoids incorrectly fading the declaration).
+            assertEquals(ReferenceSearchHelper.ReferenceExistence.INDETERMINATE, result);
+        } finally {
+            documentManager.didClose(declarationUri);
+            documentManager.didClose(usageUri);
+        }
+    }
+
+    @Test
     void findReferenceLocationsFallsBackAndSkipsDeclarationName() throws Exception {
         TestFixture fixture = createFixture(
                 "sharedHelper",
