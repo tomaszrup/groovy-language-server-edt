@@ -189,9 +189,15 @@ public class UnusedDeclarationDetector {
 
         try {
             IType[] types = workingCopy.getTypes();
+            boolean skipMethodDiagnostics = exceedsMethodSearchBudget(types);
+            if (skipMethodDiagnostics) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "Skipping unused method detection for method-heavy file: " + uri);
+            }
             for (IType type : types) {
                 if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-                collectUnusedDeclarations(type, content, uri, documentManager, diagnostics, searchBudget);
+                collectUnusedDeclarations(
+                        type, content, uri, documentManager, diagnostics, searchBudget, !skipMethodDiagnostics);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
@@ -205,7 +211,8 @@ public class UnusedDeclarationDetector {
             IType type, String content, String uri,
             DocumentManager documentManager,
             List<Diagnostic> diagnostics,
-            int[] searchBudget)
+            int[] searchBudget,
+            boolean includeMethods)
             throws JavaModelException {
 
         if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) return;
@@ -225,23 +232,20 @@ public class UnusedDeclarationDetector {
         }
 
         // Check methods
-        boolean frameworkType = isFrameworkManagedType(type);
-        for (IMethod method : type.getMethods()) {
-            if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-            if (isTestMethod(method) || isMainMethod(method) || isFrameworkMethod(method)) {
-                continue;
-            }
-            // Constructors in framework-managed types (e.g. @Component) are
-            // invoked by the framework at runtime — never flag them as unused.
-            if (frameworkType && method.isConstructor()) {
-                continue;
-            }
-            Boolean unreferenced = isUnreferenced(method, uri, documentManager);
-            searchBudget[0]--;
-            if (Boolean.TRUE.equals(unreferenced)) {
-                Diagnostic diag = createUnusedDiagnostic(method, content);
-                if (diag != null) {
-                    diagnostics.add(diag);
+        if (includeMethods) {
+            boolean frameworkType = isFrameworkManagedType(type);
+            for (IMethod method : type.getMethods()) {
+                if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
+                if (shouldSkipMethod(method, frameworkType)) {
+                    continue;
+                }
+                Boolean unreferenced = isUnreferenced(method, uri, documentManager);
+                searchBudget[0]--;
+                if (Boolean.TRUE.equals(unreferenced)) {
+                    Diagnostic diag = createUnusedDiagnostic(method, content);
+                    if (diag != null) {
+                        diagnostics.add(diag);
+                    }
                 }
             }
         }
@@ -249,8 +253,55 @@ public class UnusedDeclarationDetector {
         // Recurse into inner types
         for (IType innerType : type.getTypes()) {
             if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-            collectUnusedDeclarations(innerType, content, uri, documentManager, diagnostics, searchBudget);
+            collectUnusedDeclarations(
+                    innerType, content, uri, documentManager, diagnostics, searchBudget, includeMethods);
         }
+    }
+
+    private static boolean exceedsMethodSearchBudget(IType[] types) throws JavaModelException {
+        int remainingCandidateMethods = MAX_SEARCHES_PER_FILE;
+        for (IType type : types) {
+            remainingCandidateMethods = countMethodSearchCandidates(type, remainingCandidateMethods);
+            if (remainingCandidateMethods < 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int countMethodSearchCandidates(IType type, int remainingCandidateMethods)
+            throws JavaModelException {
+        if (remainingCandidateMethods < 0) {
+            return remainingCandidateMethods;
+        }
+
+        boolean frameworkType = isFrameworkManagedType(type);
+        for (IMethod method : type.getMethods()) {
+            if (shouldSkipMethod(method, frameworkType)) {
+                continue;
+            }
+            remainingCandidateMethods--;
+            if (remainingCandidateMethods < 0) {
+                return remainingCandidateMethods;
+            }
+        }
+
+        for (IType innerType : type.getTypes()) {
+            remainingCandidateMethods = countMethodSearchCandidates(innerType, remainingCandidateMethods);
+            if (remainingCandidateMethods < 0) {
+                return remainingCandidateMethods;
+            }
+        }
+        return remainingCandidateMethods;
+    }
+
+    private static boolean shouldSkipMethod(IMethod method, boolean frameworkType) throws JavaModelException {
+        if (isTestMethod(method) || isMainMethod(method) || isFrameworkMethod(method)) {
+            return true;
+        }
+        // Constructors in framework-managed types (e.g. @Component) are
+        // invoked by the framework at runtime — never flag them as unused.
+        return frameworkType && method.isConstructor();
     }
 
     /**

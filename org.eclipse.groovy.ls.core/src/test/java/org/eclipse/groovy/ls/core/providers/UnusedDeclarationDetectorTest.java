@@ -471,10 +471,10 @@ class UnusedDeclarationDetectorTest {
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
             "collectUnusedDeclarations", IType.class, String.class, String.class,
-            DocumentManager.class, java.util.List.class, int[].class);
+            DocumentManager.class, java.util.List.class, int[].class, boolean.class);
         m.setAccessible(true);
         m.invoke(null, type, "class Foo { void regularMethod() {} void anotherMethod() {} }",
-            "file:///src/main/groovy/Foo.groovy", new DocumentManager(), diagnostics, new int[]{20});
+            "file:///src/main/groovy/Foo.groovy", new DocumentManager(), diagnostics, new int[]{20}, true);
 
         // Methods were iterated without exceptions
         assertNotNull(diagnostics);
@@ -497,10 +497,10 @@ class UnusedDeclarationDetectorTest {
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
             "collectUnusedDeclarations", IType.class, String.class, String.class,
-            DocumentManager.class, java.util.List.class, int[].class);
+            DocumentManager.class, java.util.List.class, int[].class, boolean.class);
         m.setAccessible(true);
         m.invoke(null, type, "class Foo { void testSomething() {} }",
-            "file:///src/main/groovy/Foo.groovy", new DocumentManager(), diagnostics, new int[]{20});
+            "file:///src/main/groovy/Foo.groovy", new DocumentManager(), diagnostics, new int[]{20}, true);
 
         // Test methods should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -522,10 +522,10 @@ class UnusedDeclarationDetectorTest {
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
             "collectUnusedDeclarations", IType.class, String.class, String.class,
-            DocumentManager.class, java.util.List.class, int[].class);
+            DocumentManager.class, java.util.List.class, int[].class, boolean.class);
         m.setAccessible(true);
         m.invoke(null, type, "class Foo { static void main(String[] args) {} }",
-            "file:///src/main/groovy/Foo.groovy", new DocumentManager(), diagnostics, new int[]{20});
+            "file:///src/main/groovy/Foo.groovy", new DocumentManager(), diagnostics, new int[]{20}, true);
 
         // Main method should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -552,10 +552,10 @@ class UnusedDeclarationDetectorTest {
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
             "collectUnusedDeclarations", IType.class, String.class, String.class,
-            DocumentManager.class, java.util.List.class, int[].class);
+            DocumentManager.class, java.util.List.class, int[].class, boolean.class);
         m.setAccessible(true);
         m.invoke(null, outerType, "class Outer { class Inner {} }",
-            "file:///src/main/groovy/Outer.groovy", new DocumentManager(), diagnostics, new int[]{20});
+            "file:///src/main/groovy/Outer.groovy", new DocumentManager(), diagnostics, new int[]{20}, true);
 
         // Should complete without error (inner type was recursed)
         assertNotNull(diagnostics);
@@ -676,10 +676,10 @@ class UnusedDeclarationDetectorTest {
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
             "collectUnusedDeclarations", IType.class, String.class, String.class,
-            DocumentManager.class, java.util.List.class, int[].class);
+            DocumentManager.class, java.util.List.class, int[].class, boolean.class);
         m.setAccessible(true);
         m.invoke(null, type, "class MyService { MyService() {} }",
-            "file:///src/main/groovy/MyService.groovy", new DocumentManager(), diagnostics, new int[]{20});
+            "file:///src/main/groovy/MyService.groovy", new DocumentManager(), diagnostics, new int[]{20}, true);
 
         // Constructor in @Component type should be skipped
         assertTrue(diagnostics.isEmpty());
@@ -701,10 +701,10 @@ class UnusedDeclarationDetectorTest {
 
         java.lang.reflect.Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
             "collectUnusedDeclarations", IType.class, String.class, String.class,
-            DocumentManager.class, java.util.List.class, int[].class);
+            DocumentManager.class, java.util.List.class, int[].class, boolean.class);
         m.setAccessible(true);
         m.invoke(null, type, "class PlainClass { PlainClass() {} }",
-            "file:///src/main/groovy/PlainClass.groovy", new DocumentManager(), diagnostics, new int[]{20});
+            "file:///src/main/groovy/PlainClass.groovy", new DocumentManager(), diagnostics, new int[]{20}, true);
 
         // Constructor in plain (non-framework) type should NOT be skipped —
         // it will proceed to isUnreferenced() which returns false for mocks
@@ -729,5 +729,61 @@ class UnusedDeclarationDetectorTest {
 
         // When reference existence cannot be determined cheaply, fading is skipped.
         assertNull(result);
+    }
+
+    @Test
+    void exceedsMethodSearchBudgetReturnsTrueWhenCandidateMethodsExceedLimit() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(type.getMethods()).thenReturn(createMethods(type, 21));
+        when(type.getTypes()).thenReturn(new IType[0]);
+
+        assertTrue(invokeExceedsMethodSearchBudget(new IType[] { type }));
+    }
+
+    @Test
+    void exceedsMethodSearchBudgetIgnoresSkippedMethods() throws Exception {
+        IType type = mock(IType.class);
+        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+
+        IMethod[] methods = new IMethod[25];
+        for (int i = 0; i < methods.length; i++) {
+            methods[i] = mockMethod("testMethod" + i, type, new IAnnotation[0]);
+        }
+        when(type.getMethods()).thenReturn(methods);
+        when(type.getTypes()).thenReturn(new IType[0]);
+
+        assertFalse(invokeExceedsMethodSearchBudget(new IType[] { type }));
+    }
+
+    @Test
+    void exceedsMethodSearchBudgetCountsInnerTypeMethods() throws Exception {
+        IType outerType = mock(IType.class);
+        when(outerType.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(outerType.getMethods()).thenReturn(createMethods(outerType, 10));
+
+        IType innerType = mock(IType.class);
+        when(innerType.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(innerType.getMethods()).thenReturn(createMethods(innerType, 11));
+        when(innerType.getTypes()).thenReturn(new IType[0]);
+
+        when(outerType.getTypes()).thenReturn(new IType[] { innerType });
+
+        assertTrue(invokeExceedsMethodSearchBudget(new IType[] { outerType }));
+    }
+
+    private static boolean invokeExceedsMethodSearchBudget(IType[] types) throws Exception {
+        Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
+                "exceedsMethodSearchBudget", IType[].class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(null, (Object) types);
+    }
+
+    private static IMethod[] createMethods(IType declaringType, int count) throws Exception {
+        IMethod[] methods = new IMethod[count];
+        for (int i = 0; i < count; i++) {
+            methods[i] = mockMethod("method" + i, declaringType, new IAnnotation[0]);
+        }
+        return methods;
     }
 }
