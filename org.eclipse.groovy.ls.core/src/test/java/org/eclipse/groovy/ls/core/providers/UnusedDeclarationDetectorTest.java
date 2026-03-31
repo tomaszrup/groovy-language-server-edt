@@ -797,9 +797,9 @@ class UnusedDeclarationDetectorTest {
 
         Thread.currentThread().interrupt();
         try {
-            assertFalse(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { shouldNotBeVisited }));
+            assertTrue(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { shouldNotBeVisited }));
         } finally {
-            Thread.interrupted();
+            assertTrue(Thread.interrupted());
         }
     }
 

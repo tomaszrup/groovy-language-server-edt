@@ -264,8 +264,8 @@ public class UnusedDeclarationDetector {
     private static boolean hasMoreMethodCandidatesThanSearchBudget(IType[] types) throws JavaModelException {
         int remainingCandidateMethods = MAX_SEARCHES_PER_FILE;
         for (IType type : types) {
-            if (remainingCandidateMethods < 0 || Thread.currentThread().isInterrupted()) {
-                return remainingCandidateMethods < 0;
+            if (shouldStopMethodCandidateScan(remainingCandidateMethods)) {
+                return true;
             }
             remainingCandidateMethods = countMethodSearchCandidates(type, remainingCandidateMethods);
         }
@@ -274,12 +274,12 @@ public class UnusedDeclarationDetector {
 
     private static int countMethodSearchCandidates(IType type, int remainingCandidateMethods)
             throws JavaModelException {
-        if (remainingCandidateMethods < 0 || Thread.currentThread().isInterrupted()) {
+        if (shouldStopMethodCandidateScan(remainingCandidateMethods)) {
             return remainingCandidateMethods;
         }
         boolean frameworkType = isFrameworkManagedType(type);
         for (IMethod method : type.getMethods()) {
-            if (Thread.currentThread().isInterrupted()) {
+            if (shouldStopMethodCandidateScan(remainingCandidateMethods)) {
                 return remainingCandidateMethods;
             }
             if (shouldSkipMethod(method, frameworkType)) {
@@ -292,7 +292,7 @@ public class UnusedDeclarationDetector {
         }
 
         for (IType innerType : type.getTypes()) {
-            if (remainingCandidateMethods < 0 || Thread.currentThread().isInterrupted()) {
+            if (shouldStopMethodCandidateScan(remainingCandidateMethods)) {
                 return remainingCandidateMethods;
             }
             remainingCandidateMethods = countMethodSearchCandidates(innerType, remainingCandidateMethods);
@@ -301,6 +301,10 @@ public class UnusedDeclarationDetector {
             }
         }
         return remainingCandidateMethods;
+    }
+
+    private static boolean shouldStopMethodCandidateScan(int remainingCandidateMethods) {
+        return remainingCandidateMethods < 0 || Thread.currentThread().isInterrupted();
     }
 
     private static boolean shouldSkipMethod(IMethod method, boolean frameworkType) throws JavaModelException {
