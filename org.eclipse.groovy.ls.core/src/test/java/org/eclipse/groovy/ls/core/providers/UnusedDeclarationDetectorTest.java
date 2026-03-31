@@ -746,9 +746,12 @@ class UnusedDeclarationDetectorTest {
         IType type = mock(IType.class);
         when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
 
+        IAnnotation testAnnotation = mock(IAnnotation.class);
+        when(testAnnotation.getElementName()).thenReturn("org.junit.jupiter.api.Test");
+
         IMethod[] methods = new IMethod[25];
         for (int i = 0; i < methods.length; i++) {
-            methods[i] = mockMethod("testMethod" + i, type, new IAnnotation[0]);
+            methods[i] = mockMethod("testMethod" + i, type, new IAnnotation[] { testAnnotation });
         }
         when(type.getMethods()).thenReturn(methods);
         when(type.getTypes()).thenReturn(new IType[0]);
