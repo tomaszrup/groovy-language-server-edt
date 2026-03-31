@@ -539,15 +539,25 @@ class DocumentManagerCoreMethodsTest {
     }
 
     @Test
-    void isReadyForDiagnosticsReturnsFalseWhileDidOpenRefreshIsPending() {
+    void isReadyForDiagnosticsReturnsFalseWhileDidOpenRefreshIsPending() throws Exception {
         DocumentManager manager = new DocumentManager();
+        ExecutorService originalExecutor = getDidOpenExecutor(manager);
+        DeferredExecutorService deferredExecutor = new DeferredExecutorService();
+        setDidOpenExecutor(manager, deferredExecutor);
         String uri = "file:///test/Pending.groovy";
+        String normalizedUri = DocumentManager.normalizeUri(uri);
 
-        manager.didOpen(uri, "class Pending {}\n");
+        try {
+            manager.didOpen(uri, "class Pending {}\n");
 
-        assertFalse(manager.isReadyForDiagnostics(uri));
-
-        manager.didClose(uri);
+            assertTrue(getPendingOpenFutures(manager).containsKey(normalizedUri));
+            assertFalse(manager.isReadyForDiagnostics(uri));
+        } finally {
+            manager.didClose(uri);
+            setDidOpenExecutor(manager, originalExecutor);
+            deferredExecutor.shutdownNow();
+            manager.dispose();
+        }
     }
 
     @Test
@@ -1165,6 +1175,47 @@ class DocumentManagerCoreMethodsTest {
         @Override
         public void execute(Runnable command) {
             command.run();
+        }
+    }
+
+    private static final class DeferredExecutorService extends AbstractExecutorService {
+        private volatile boolean shutdown;
+        private final List<Runnable> submitted = Collections.synchronizedList(new ArrayList<>());
+
+        @Override
+        public void shutdown() {
+            shutdown = true;
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            shutdown = true;
+            return new ArrayList<>(submitted);
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) {
+            return true;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            if (shutdown) {
+                throw new java.util.concurrent.RejectedExecutionException("executor is shut down");
+            }
+            // Intentionally leave submitted tasks pending so the test can
+            // assert diagnostics readiness before the didOpen refresh runs.
+            submitted.add(command);
         }
     }
 }

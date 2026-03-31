@@ -17,9 +17,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -40,6 +37,13 @@ public final class ReferenceSearchHelper {
         NOT_FOUND,
         INDETERMINATE
     }
+
+    /**
+     * Maximum number of Groovy files the text-fallback existence check will
+     * scan before giving up and returning {@link ReferenceExistence#INDETERMINATE}.
+     * This caps the per-call cost of unused-declaration fading on large projects.
+     */
+    static final int MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE = 50;
 
     private static final int GROOVY_FILE_LIST_CACHE_SIZE = 32;
     private static final long GROOVY_FILE_LIST_CACHE_TTL_MS = 10_000;
@@ -109,12 +113,28 @@ public final class ReferenceSearchHelper {
 
     /**
      * Fast yes/no reference existence check used by unused-declaration fading.
-     * Unlike the general reference helpers, this path intentionally avoids the
-     * textual fallback so a single fading update cannot walk every Groovy file
-     * in a project.
+     * Reuses the same textual fallback as code lens resolution so declarations
+     * are not faded when the code lens can still find Groovy-only references.
+     * <p>
+     * The textual fallback is capped at {@link #MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE}
+     * files to avoid long UI stalls on large projects; when the cap is exceeded
+     * without finding a reference the result is {@link ReferenceExistence#INDETERMINATE}.
      */
-    static ReferenceExistence referenceExistenceForUnusedDeclaration(IJavaElement element, String uri) {
-        return referenceExistenceWithJdt(element, uri);
+    static ReferenceExistence referenceExistenceForUnusedDeclaration(
+            IJavaElement element, String uri, DocumentManager documentManager) {
+        ReferenceExistence result = referenceExistenceWithJdt(element, uri);
+        if (result == ReferenceExistence.FOUND) {
+            return result;
+        }
+        ReferenceExistence textResult = textFallbackExistence(element, uri, documentManager);
+        if (textResult == ReferenceExistence.FOUND) {
+            return ReferenceExistence.FOUND;
+        }
+        if (result == ReferenceExistence.INDETERMINATE
+                || textResult == ReferenceExistence.INDETERMINATE) {
+            return ReferenceExistence.INDETERMINATE;
+        }
+        return result;
     }
 
     static List<Location> findReferenceLocations(
@@ -124,6 +144,69 @@ public final class ReferenceSearchHelper {
             return locations;
         }
         return findTextFallbackLocations(element, uri, documentManager, false);
+    }
+
+    /**
+     * Lightweight existence-only scan for the textual fallback path.
+     * Unlike {@link #findTextFallbackLocations}, this method does not allocate
+     * {@link Location} objects and caps the number of files scanned at
+     * {@link #MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE} to bound the cost of
+     * unused-declaration detection on large projects.
+     */
+    private static ReferenceExistence textFallbackExistence(
+            IJavaElement element, String uri, DocumentManager documentManager) {
+        if (element == null || documentManager == null) {
+            return ReferenceExistence.INDETERMINATE;
+        }
+
+        String symbolName = element.getElementName();
+        String declarationUri = documentManager.resolveElementUri(element);
+        if (symbolName == null || symbolName.isBlank()
+                || declarationUri == null || !isGroovyFileUri(declarationUri)) {
+            return ReferenceExistence.INDETERMINATE;
+        }
+
+        List<IFile> candidateFiles = collectScopedGroovyFiles(element.getJavaProject(), uri);
+        if (candidateFiles.isEmpty()) {
+            return ReferenceExistence.NOT_FOUND;
+        }
+
+        org.eclipse.jdt.core.ISourceRange declarationRange = getDeclarationRange(element);
+        Set<String> visitedUris = new HashSet<>();
+        int filesScanned = 0;
+
+        for (IFile file : candidateFiles) {
+            if (file == null || file.getLocationURI() == null) {
+                continue;
+            }
+
+            String targetUri = DocumentManager.normalizeUri(file.getLocationURI().toString());
+            if (targetUri == null || !visitedUris.add(targetUri)) {
+                continue;
+            }
+
+            if (filesScanned >= MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE) {
+                return ReferenceExistence.INDETERMINATE;
+            }
+
+            String content = readContent(documentManager, targetUri, file);
+            if (content == null) {
+                continue;
+            }
+
+            filesScanned++;
+
+            int matchStart = -1;
+            while ((matchStart = findNextIdentifierMatch(content, symbolName, matchStart + 1)) >= 0) {
+                int matchEnd = matchStart + symbolName.length();
+                if (!isDeclarationMatch(targetUri, declarationUri, declarationRange,
+                        matchStart, matchEnd)) {
+                    return ReferenceExistence.FOUND;
+                }
+            }
+        }
+
+        return ReferenceExistence.NOT_FOUND;
     }
 
     private static ReferenceExistence referenceExistenceWithJdt(IJavaElement element, String uri) {
@@ -214,7 +297,6 @@ public final class ReferenceSearchHelper {
             return List.of();
         }
 
-        Pattern pattern = Pattern.compile("\\b" + Pattern.quote(symbolName) + "\\b");
         org.eclipse.jdt.core.ISourceRange declarationRange = getDeclarationRange(element);
         List<Location> locations = new ArrayList<>();
         Set<String> visitedUris = new HashSet<>();
@@ -234,16 +316,17 @@ public final class ReferenceSearchHelper {
             if (content == null) {
                 continue;
             }
-            PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
 
-            Matcher matcher = pattern.matcher(content);
-            while (matcher.find()) {
+            PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
+            int matchStart = -1;
+            while ((matchStart = findNextIdentifierMatch(content, symbolName, matchStart + 1)) >= 0) {
+                int matchEnd = matchStart + symbolName.length();
                 if (isDeclarationMatch(targetUri, declarationUri, declarationRange,
-                        matcher.start(), matcher.end())) {
+                        matchStart, matchEnd)) {
                     continue;
                 }
-                Position start = lineIndex.offsetToPosition(matcher.start());
-                Position end = lineIndex.offsetToPosition(matcher.end());
+                Position start = lineIndex.offsetToPosition(matchStart);
+                Position end = lineIndex.offsetToPosition(matchEnd);
                 locations.add(new Location(targetUri, new Range(start, end)));
                 if (stopAfterFirst) {
                     return locations;
@@ -252,6 +335,28 @@ public final class ReferenceSearchHelper {
         }
 
         return locations;
+    }
+
+    static int findNextIdentifierMatch(String content, String symbolName, int fromIndex) {
+        if (content == null || symbolName == null || symbolName.isEmpty()) {
+            return -1;
+        }
+
+        int index = Math.max(0, fromIndex);
+        while ((index = content.indexOf(symbolName, index)) >= 0) {
+            int end = index + symbolName.length();
+            if (isIdentifierBoundary(content, index - 1) && isIdentifierBoundary(content, end)) {
+                return index;
+            }
+            index++;
+        }
+        return -1;
+    }
+
+    private static boolean isIdentifierBoundary(String content, int index) {
+        return index < 0
+                || index >= content.length()
+                || !Character.isJavaIdentifierPart(content.charAt(index));
     }
 
     private static List<IFile> collectScopedGroovyFiles(

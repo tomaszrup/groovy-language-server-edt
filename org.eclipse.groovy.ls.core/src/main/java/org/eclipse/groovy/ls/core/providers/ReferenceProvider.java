@@ -13,9 +13,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.MethodNode;
@@ -212,7 +209,7 @@ public class ReferenceProvider {
     /**
      * Find references using text search when JDT is not available.
      * Finds all occurrences of the identifier under the cursor within the same file,
-     * filtering to word boundaries to avoid partial matches.
+     * filtering to Java identifier boundaries to avoid partial matches.
      */
     private List<Location> getReferencesFromGroovyAST(String uri, Position position) {
         List<Location> locations = new ArrayList<>();
@@ -230,12 +227,10 @@ public class ReferenceProvider {
 
         isKnownAstSymbol(documentManager.getGroovyAST(uri), word);
 
-        Pattern pattern = Pattern.compile("\\b" + Pattern.quote(word) + "\\b");
-        Matcher matcher = pattern.matcher(content);
         PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
-        while (matcher.find()) {
-            int matchStart = matcher.start();
-            int matchEnd = matcher.end();
+        int matchStart = -1;
+        while ((matchStart = ReferenceSearchHelper.findNextIdentifierMatch(content, word, matchStart + 1)) >= 0) {
+            int matchEnd = matchStart + word.length();
             Position start = lineIndex.offsetToPosition(matchStart);
             Position end = lineIndex.offsetToPosition(matchEnd);
             locations.add(new Location(uri, new Range(start, end)));

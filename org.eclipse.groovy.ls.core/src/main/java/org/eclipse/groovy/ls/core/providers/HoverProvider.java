@@ -573,7 +573,13 @@ public class HoverProvider {
                 return null;
             }
 
-            return extractJavadocFromSource(source, element, type);
+            String javadoc = extractJavadocFromSource(source, element, type);
+            if ((javadoc == null || javadoc.isEmpty())
+                    && element instanceof IMethod method
+                    && method.isConstructor()) {
+                return extractJavadocFromSource(source, type, type);
+            }
+            return javadoc;
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[hover] Failed to get Javadoc for " + element.getElementName(), e);
             return null;
@@ -752,6 +758,11 @@ public class HoverProvider {
             return null;
         }
 
+        Hover constructorHover = findConstructorTypeHover(ast, content, word, offset, lineIndex);
+        if (constructorHover != null) {
+            return constructorHover;
+        }
+
         for (ClassNode classNode : ast.getClasses()) {
             Hover hover = findHoverInClass(classNode, ast, content, word, targetLine);
             if (hover != null) {
@@ -760,6 +771,19 @@ public class HoverProvider {
         }
 
         return null;
+    }
+
+    private Hover findConstructorTypeHover(
+            ModuleNode ast, String content, String word, int offset, PositionUtils.LineIndex lineIndex) {
+        ConstructorCallExpression call = findConstructorCallAtOffset(ast, offset, word, lineIndex);
+        if (call == null || call.getType() == null) {
+            return null;
+        }
+
+        ClassNode declaredType = findDeclaredClassNode(ast, call.getType());
+        ClassNode hoverType = declaredType != null ? declaredType : call.getType();
+        String documentation = declaredType != null ? extractClassDocumentation(content, declaredType) : null;
+        return buildASTHover(buildClassHover(hoverType), documentation);
     }
 
     /**
@@ -780,6 +804,95 @@ public class HoverProvider {
 
         // Check members inherited from traits/interfaces
         return resolveTraitMemberHover(classNode, ast, content, word, targetLine);
+    }
+
+    private ConstructorCallExpression findConstructorCallAtOffset(
+            ModuleNode module, int offset, String typeName, PositionUtils.LineIndex lineIndex) {
+        Position pos = lineIndex.offsetToPosition(offset);
+        int targetLine = pos.getLine() + 1;
+        int targetCol = pos.getCharacter() + 1;
+
+        final ConstructorCallExpression[] result = new ConstructorCallExpression[1];
+        ClassCodeVisitorSupport visitor = new ClassCodeVisitorSupport() {
+            @Override
+            protected SourceUnit getSourceUnit() {
+                return module.getContext();
+            }
+
+            @Override
+            public void visitConstructorCallExpression(ConstructorCallExpression call) {
+                if (result[0] != null || call.getType() == null) {
+                    return;
+                }
+                if (!typeName.equals(call.getType().getNameWithoutPackage())) {
+                    super.visitConstructorCallExpression(call);
+                    return;
+                }
+
+                int line = call.getLineNumber();
+                int col = call.getColumnNumber();
+                int lastLine = call.getLastLineNumber();
+                int lastCol = call.getLastColumnNumber();
+                if (isWithinRange(targetLine, targetCol, line, col, lastLine, lastCol)) {
+                    result[0] = call;
+                    return;
+                }
+                super.visitConstructorCallExpression(call);
+            }
+        };
+
+        for (ClassNode classNode : module.getClasses()) {
+            if (result[0] != null) {
+                break;
+            }
+            visitor.visitClass(classNode);
+        }
+
+        if (result[0] == null) {
+            BlockStatement stmtBlock = module.getStatementBlock();
+            if (stmtBlock != null) {
+                for (Statement stmt : stmtBlock.getStatements()) {
+                    if (result[0] != null) {
+                        break;
+                    }
+                    stmt.visit(visitor);
+                }
+            }
+        }
+
+        return result[0];
+    }
+
+    private boolean isWithinRange(
+            int targetLine, int targetCol, int line, int col, int lastLine, int lastCol) {
+        if (line <= 0 || col <= 0 || lastLine <= 0 || lastCol <= 0) {
+            return false;
+        }
+        if (targetLine < line || targetLine > lastLine) {
+            return false;
+        }
+        if (targetLine == line && targetCol < col) {
+            return false;
+        }
+        return targetLine != lastLine || targetCol <= lastCol;
+    }
+
+    private ClassNode findDeclaredClassNode(ModuleNode module, ClassNode typeNode) {
+        if (module == null || typeNode == null) {
+            return null;
+        }
+        String targetName = typeNode.getName();
+        String targetSimpleName = typeNode.getNameWithoutPackage();
+        boolean typeIsUnqualified = targetName.equals(targetSimpleName);
+        for (ClassNode classNode : module.getClasses()) {
+            if (targetName.equals(classNode.getName())) {
+                return classNode;
+            }
+            if (typeIsUnqualified && targetSimpleName.equals(classNode.getNameWithoutPackage())) {
+                return classNode;
+            }
+        }
+        return null;
     }
 
     /**
