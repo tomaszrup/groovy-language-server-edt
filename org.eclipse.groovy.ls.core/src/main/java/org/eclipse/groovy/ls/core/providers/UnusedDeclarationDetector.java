@@ -189,7 +189,7 @@ public class UnusedDeclarationDetector {
 
         try {
             IType[] types = workingCopy.getTypes();
-            boolean skipMethodDiagnostics = exceedsMethodSearchBudget(types);
+            boolean skipMethodDiagnostics = hasMoreMethodCandidatesThanSearchBudget(types);
             if (skipMethodDiagnostics) {
                 GroovyLanguageServerPlugin.logInfo(
                         "Skipping unused method detection for method-heavy file: " + uri);
@@ -258,23 +258,16 @@ public class UnusedDeclarationDetector {
         }
     }
 
-    private static boolean exceedsMethodSearchBudget(IType[] types) throws JavaModelException {
+    private static boolean hasMoreMethodCandidatesThanSearchBudget(IType[] types) throws JavaModelException {
         int remainingCandidateMethods = MAX_SEARCHES_PER_FILE;
         for (IType type : types) {
             remainingCandidateMethods = countMethodSearchCandidates(type, remainingCandidateMethods);
-            if (remainingCandidateMethods < 0) {
-                return true;
-            }
         }
-        return false;
+        return remainingCandidateMethods < 0;
     }
 
     private static int countMethodSearchCandidates(IType type, int remainingCandidateMethods)
             throws JavaModelException {
-        if (remainingCandidateMethods < 0) {
-            return remainingCandidateMethods;
-        }
-
         boolean frameworkType = isFrameworkManagedType(type);
         for (IMethod method : type.getMethods()) {
             if (shouldSkipMethod(method, frameworkType)) {

@@ -732,17 +732,17 @@ class UnusedDeclarationDetectorTest {
     }
 
     @Test
-    void exceedsMethodSearchBudgetReturnsTrueWhenCandidateMethodsExceedLimit() throws Exception {
+    void hasMoreMethodCandidatesThanSearchBudgetReturnsTrueWhenCandidateMethodsExceedLimit() throws Exception {
         IType type = mock(IType.class);
         when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
         when(type.getMethods()).thenReturn(createMethods(type, 21));
         when(type.getTypes()).thenReturn(new IType[0]);
 
-        assertTrue(invokeExceedsMethodSearchBudget(new IType[] { type }));
+        assertTrue(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { type }));
     }
 
     @Test
-    void exceedsMethodSearchBudgetIgnoresSkippedMethods() throws Exception {
+    void hasMoreMethodCandidatesThanSearchBudgetIgnoresSkippedMethods() throws Exception {
         IType type = mock(IType.class);
         when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
 
@@ -753,11 +753,11 @@ class UnusedDeclarationDetectorTest {
         when(type.getMethods()).thenReturn(methods);
         when(type.getTypes()).thenReturn(new IType[0]);
 
-        assertFalse(invokeExceedsMethodSearchBudget(new IType[] { type }));
+        assertFalse(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { type }));
     }
 
     @Test
-    void exceedsMethodSearchBudgetCountsInnerTypeMethods() throws Exception {
+    void hasMoreMethodCandidatesThanSearchBudgetCountsInnerTypeMethods() throws Exception {
         IType outerType = mock(IType.class);
         when(outerType.getAnnotations()).thenReturn(new IAnnotation[0]);
         when(outerType.getMethods()).thenReturn(createMethods(outerType, 10));
@@ -769,12 +769,12 @@ class UnusedDeclarationDetectorTest {
 
         when(outerType.getTypes()).thenReturn(new IType[] { innerType });
 
-        assertTrue(invokeExceedsMethodSearchBudget(new IType[] { outerType }));
+        assertTrue(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { outerType }));
     }
 
-    private static boolean invokeExceedsMethodSearchBudget(IType[] types) throws Exception {
+    private static boolean invokeHasMoreMethodCandidatesThanSearchBudget(IType[] types) throws Exception {
         Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
-                "exceedsMethodSearchBudget", IType[].class);
+                "hasMoreMethodCandidatesThanSearchBudget", IType[].class);
         m.setAccessible(true);
         return (boolean) m.invoke(null, (Object) types);
     }
