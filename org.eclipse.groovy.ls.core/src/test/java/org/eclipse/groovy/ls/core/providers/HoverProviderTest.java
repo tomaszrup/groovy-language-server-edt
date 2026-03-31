@@ -440,20 +440,20 @@ class HoverProviderTest {
         dm.didClose(uri);
     }
 
-        @Test
-        void getHoverFromGroovyASTIncludesClassGroovydoc() throws Exception {
-                String uri = "file:///HoverASTClassDoc.groovy";
-                String content = """
-                                /**
-                                 * Service level docs.
-                                 */
-                                class DocumentedService {
-                                    String run() { '' }
-                                }
-                                """;
-                DocumentManager dm = new DocumentManager();
-                dm.didOpen(uri, content);
-                HoverProvider hp = new HoverProvider(dm);
+    @Test
+    void getHoverFromGroovyASTIncludesClassGroovydoc() throws Exception {
+        String uri = "file:///HoverASTClassDoc.groovy";
+        String content = """
+                        /**
+                         * Service level docs.
+                         */
+                        class DocumentedService {
+                            String run() { '' }
+                        }
+                        """;
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        HoverProvider hp = new HoverProvider(dm);
 
         Hover hover = invokeGetHoverFromGroovyAST(hp, uri, new Position(3, 10));
         assertNotNull(hover);
