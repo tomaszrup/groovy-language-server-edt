@@ -775,6 +775,34 @@ class UnusedDeclarationDetectorTest {
         assertTrue(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { outerType }));
     }
 
+    @Test
+    void hasMoreMethodCandidatesThanSearchBudgetStopsAfterBudgetExceeded() throws Exception {
+        IType overflowingType = mock(IType.class);
+        when(overflowingType.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(overflowingType.getMethods()).thenReturn(createMethods(overflowingType, 21));
+        when(overflowingType.getTypes()).thenReturn(new IType[0]);
+
+        IType shouldNotBeVisited = mock(IType.class);
+        when(shouldNotBeVisited.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(shouldNotBeVisited.getMethods()).thenThrow(new AssertionError("should not be visited"));
+
+        assertTrue(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { overflowingType, shouldNotBeVisited }));
+    }
+
+    @Test
+    void hasMoreMethodCandidatesThanSearchBudgetReturnsEarlyWhenInterrupted() throws Exception {
+        IType shouldNotBeVisited = mock(IType.class);
+        when(shouldNotBeVisited.getAnnotations()).thenReturn(new IAnnotation[0]);
+        when(shouldNotBeVisited.getMethods()).thenThrow(new AssertionError("should not be visited"));
+
+        Thread.currentThread().interrupt();
+        try {
+            assertTrue(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { shouldNotBeVisited }));
+        } finally {
+            assertTrue(Thread.interrupted());
+        }
+    }
+
     private static boolean invokeHasMoreMethodCandidatesThanSearchBudget(IType[] types) throws Exception {
         Method m = UnusedDeclarationDetector.class.getDeclaredMethod(
                 "hasMoreMethodCandidatesThanSearchBudget", IType[].class);
