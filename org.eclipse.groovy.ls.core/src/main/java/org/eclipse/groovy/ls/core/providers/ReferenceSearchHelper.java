@@ -191,6 +191,9 @@ public final class ReferenceSearchHelper {
             }
 
             filesScanned++;
+            if (filesScanned > MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE) {
+                return ReferenceExistence.INDETERMINATE;
+            }
 
             int matchStart = -1;
             while ((matchStart = findNextIdentifierMatch(content, symbolName, matchStart + 1)) >= 0) {
@@ -199,10 +202,6 @@ public final class ReferenceSearchHelper {
                         matchStart, matchEnd)) {
                     return ReferenceExistence.FOUND;
                 }
-            }
-
-            if (filesScanned >= MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE) {
-                return ReferenceExistence.INDETERMINATE;
             }
         }
 
