@@ -38,6 +38,13 @@ public final class ReferenceSearchHelper {
         INDETERMINATE
     }
 
+    /**
+     * Maximum number of Groovy files the text-fallback existence check will
+     * scan before giving up and returning {@link ReferenceExistence#INDETERMINATE}.
+     * This caps the per-call cost of unused-declaration fading on large projects.
+     */
+    static final int MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE = 50;
+
     private static final int GROOVY_FILE_LIST_CACHE_SIZE = 32;
     private static final long GROOVY_FILE_LIST_CACHE_TTL_MS = 10_000;
     private static final int FILE_CONTENT_CACHE_SIZE = 128;
@@ -108,6 +115,10 @@ public final class ReferenceSearchHelper {
      * Fast yes/no reference existence check used by unused-declaration fading.
      * Reuses the same textual fallback as code lens resolution so declarations
      * are not faded when the code lens can still find Groovy-only references.
+     * <p>
+     * The textual fallback is capped at {@link #MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE}
+     * files to avoid long UI stalls on large projects; when the cap is exceeded
+     * without finding a reference the result is {@link ReferenceExistence#INDETERMINATE}.
      */
     static ReferenceExistence referenceExistenceForUnusedDeclaration(
             IJavaElement element, String uri, DocumentManager documentManager) {
@@ -115,9 +126,15 @@ public final class ReferenceSearchHelper {
         if (result == ReferenceExistence.FOUND) {
             return result;
         }
-        return findTextFallbackLocations(element, uri, documentManager, true).isEmpty()
-                ? result
-                : ReferenceExistence.FOUND;
+        ReferenceExistence textResult = textFallbackExistence(element, uri, documentManager);
+        if (textResult == ReferenceExistence.FOUND) {
+            return ReferenceExistence.FOUND;
+        }
+        if (result == ReferenceExistence.INDETERMINATE
+                || textResult == ReferenceExistence.INDETERMINATE) {
+            return ReferenceExistence.INDETERMINATE;
+        }
+        return result;
     }
 
     static List<Location> findReferenceLocations(
@@ -127,6 +144,68 @@ public final class ReferenceSearchHelper {
             return locations;
         }
         return findTextFallbackLocations(element, uri, documentManager, false);
+    }
+
+    /**
+     * Lightweight existence-only scan for the textual fallback path.
+     * Unlike {@link #findTextFallbackLocations}, this method does not allocate
+     * {@link Location} objects and caps the number of files scanned at
+     * {@link #MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE} to bound the cost of
+     * unused-declaration detection on large projects.
+     */
+    private static ReferenceExistence textFallbackExistence(
+            IJavaElement element, String uri, DocumentManager documentManager) {
+        if (element == null || documentManager == null) {
+            return ReferenceExistence.INDETERMINATE;
+        }
+
+        String symbolName = element.getElementName();
+        String declarationUri = documentManager.resolveElementUri(element);
+        if (symbolName == null || symbolName.isBlank()
+                || declarationUri == null || !isGroovyFileUri(declarationUri)) {
+            return ReferenceExistence.INDETERMINATE;
+        }
+
+        List<IFile> candidateFiles = collectScopedGroovyFiles(element.getJavaProject(), uri);
+        if (candidateFiles.isEmpty()) {
+            return ReferenceExistence.NOT_FOUND;
+        }
+
+        org.eclipse.jdt.core.ISourceRange declarationRange = getDeclarationRange(element);
+        Set<String> visitedUris = new HashSet<>();
+        int filesScanned = 0;
+
+        for (IFile file : candidateFiles) {
+            if (file == null || file.getLocationURI() == null) {
+                continue;
+            }
+
+            String targetUri = DocumentManager.normalizeUri(file.getLocationURI().toString());
+            if (targetUri == null || !visitedUris.add(targetUri)) {
+                continue;
+            }
+
+            String content = readContent(documentManager, targetUri, file);
+            if (content == null) {
+                continue;
+            }
+
+            filesScanned++;
+            if (filesScanned > MAX_TEXT_FALLBACK_FILES_FOR_EXISTENCE) {
+                return ReferenceExistence.INDETERMINATE;
+            }
+
+            int matchStart = -1;
+            while ((matchStart = findNextIdentifierMatch(content, symbolName, matchStart + 1)) >= 0) {
+                int matchEnd = matchStart + symbolName.length();
+                if (!isDeclarationMatch(targetUri, declarationUri, declarationRange,
+                        matchStart, matchEnd)) {
+                    return ReferenceExistence.FOUND;
+                }
+            }
+        }
+
+        return ReferenceExistence.NOT_FOUND;
     }
 
     private static ReferenceExistence referenceExistenceWithJdt(IJavaElement element, String uri) {
