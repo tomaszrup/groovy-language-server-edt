@@ -735,7 +735,8 @@ class UnusedDeclarationDetectorTest {
     void hasMoreMethodCandidatesThanSearchBudgetReturnsTrueWhenCandidateMethodsExceedLimit() throws Exception {
         IType type = mock(IType.class);
         when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
-        when(type.getMethods()).thenReturn(createMethods(type, 21));
+        IMethod[] methods = createMethods(type, 21);
+        when(type.getMethods()).thenReturn(methods);
         when(type.getTypes()).thenReturn(new IType[0]);
 
         assertTrue(invokeHasMoreMethodCandidatesThanSearchBudget(new IType[] { type }));
@@ -763,11 +764,13 @@ class UnusedDeclarationDetectorTest {
     void hasMoreMethodCandidatesThanSearchBudgetCountsInnerTypeMethods() throws Exception {
         IType outerType = mock(IType.class);
         when(outerType.getAnnotations()).thenReturn(new IAnnotation[0]);
-        when(outerType.getMethods()).thenReturn(createMethods(outerType, 10));
+        IMethod[] outerMethods = createMethods(outerType, 10);
+        when(outerType.getMethods()).thenReturn(outerMethods);
 
         IType innerType = mock(IType.class);
         when(innerType.getAnnotations()).thenReturn(new IAnnotation[0]);
-        when(innerType.getMethods()).thenReturn(createMethods(innerType, 11));
+        IMethod[] innerMethods = createMethods(innerType, 11);
+        when(innerType.getMethods()).thenReturn(innerMethods);
         when(innerType.getTypes()).thenReturn(new IType[0]);
 
         when(outerType.getTypes()).thenReturn(new IType[] { innerType });
@@ -779,7 +782,8 @@ class UnusedDeclarationDetectorTest {
     void hasMoreMethodCandidatesThanSearchBudgetStopsAfterBudgetExceeded() throws Exception {
         IType overflowingType = mock(IType.class);
         when(overflowingType.getAnnotations()).thenReturn(new IAnnotation[0]);
-        when(overflowingType.getMethods()).thenReturn(createMethods(overflowingType, 21));
+        IMethod[] overflowingMethods = createMethods(overflowingType, 21);
+        when(overflowingType.getMethods()).thenReturn(overflowingMethods);
         when(overflowingType.getTypes()).thenReturn(new IType[0]);
 
         IType shouldNotBeVisited = mock(IType.class);
