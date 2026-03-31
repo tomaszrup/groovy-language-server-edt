@@ -236,7 +236,6 @@ public final class ReferenceSearchHelper {
             if (content == null) {
                 continue;
             }
-            PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
 
             int matchStart = -1;
             while ((matchStart = findNextIdentifierMatch(content, symbolName, matchStart + 1)) >= 0) {
@@ -245,6 +244,7 @@ public final class ReferenceSearchHelper {
                         matchStart, matchEnd)) {
                     continue;
                 }
+                PositionUtils.LineIndex lineIndex = lineIndexFor(targetUri, content, lineIndexCache);
                 Position start = lineIndex.offsetToPosition(matchStart);
                 Position end = lineIndex.offsetToPosition(matchEnd);
                 locations.add(new Location(targetUri, new Range(start, end)));
