@@ -882,9 +882,13 @@ public class HoverProvider {
             return null;
         }
         String targetName = typeNode.getName();
+        String targetSimpleName = typeNode.getNameWithoutPackage();
+        boolean typeIsUnqualified = targetName.equals(targetSimpleName);
         for (ClassNode classNode : module.getClasses()) {
-            if (targetName.equals(classNode.getName())
-                    || typeNode.getNameWithoutPackage().equals(classNode.getNameWithoutPackage())) {
+            if (targetName.equals(classNode.getName())) {
+                return classNode;
+            }
+            if (typeIsUnqualified && targetSimpleName.equals(classNode.getNameWithoutPackage())) {
                 return classNode;
             }
         }
