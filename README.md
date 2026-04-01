@@ -7,6 +7,10 @@ A [Language Server Protocol](https://microsoft.github.io/language-server-protoco
 
 The language server runs as a headless [Eclipse/Equinox](https://www.eclipse.org/equinox/) application, reusing the same Groovy compiler and type inference engine that powers the Eclipse IDE's Groovy support — giving you accurate completions, diagnostics, and navigation backed by a real compiler.
 
+## Legal Notice
+
+This project and its VS Code extension are independent community work. They are not affiliated with, endorsed by, or officially released by the Apache Software Foundation.
+
 ## Features
 
 The following LSP capabilities are supported:
