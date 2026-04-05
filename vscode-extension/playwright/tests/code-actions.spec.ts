@@ -45,16 +45,21 @@ test('organize imports removes an unused Groovy import', async () => {
         await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/CodeActionScratch.groovy:3:20');
-        await runCommand(session.page, 'Organize Imports');
+        await expect(session.page.locator('.tabs-container .tab.active')).toContainText('CodeActionScratch.groovy', {
+            timeout: 30_000,
+        });
+
+        await session.page.keyboard.press('Shift+Alt+O');
+
+        const editorContent = session.page.locator('.view-lines');
+        await expect(editorContent).toContainText('class CodeActionScratch', { timeout: 30_000 });
+        await expect(editorContent).toContainText('String name', { timeout: 30_000 });
+        await expect(editorContent).not.toContainText('import java.time.LocalDate', { timeout: 30_000 });
 
         await expect.poll(() => fs.readFileSync(scratchFilePath, 'utf8'), {
             timeout: 30_000,
-            message: 'Timed out waiting for Organize Imports to update CodeActionScratch.groovy',
-        }).not.toContain('import java.time.LocalDate');
-
-        const updatedSource = fs.readFileSync(scratchFilePath, 'utf8');
-        expect(updatedSource).toContain('class CodeActionScratch');
-        expect(updatedSource).toContain('String name');
+            message: 'Timed out waiting for Organize Imports to save CodeActionScratch.groovy',
+        }).toContain('class CodeActionScratch');
     } finally {
         await session.close();
         workspace.dispose();
@@ -122,6 +127,7 @@ async function waitForSampleClasspathReady(page: import('@playwright/test').Page
     await expect(page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })).toBeVisible({
         timeout: 60_000,
     });
+    await page.keyboard.press('Control+J');
 }
 
 async function applyQuickFix(
