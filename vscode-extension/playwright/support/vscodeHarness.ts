@@ -375,6 +375,7 @@ function hasInstalledJavaExtension(extensionsDir: string): boolean {
 
 async function acquireInstallLock(lockDir: string, timeoutMs = 180_000): Promise<() => void> {
     const startedAt = Date.now();
+    fs.mkdirSync(path.dirname(lockDir), { recursive: true });
 
     while (true) {
         try {
