@@ -49,17 +49,17 @@ test('organize imports removes an unused Groovy import', async () => {
             timeout: 30_000,
         });
 
-        await session.page.keyboard.press('Shift+Alt+O');
-
-        const editorContent = session.page.locator('.view-lines');
-        await expect(editorContent).toContainText('class CodeActionScratch', { timeout: 30_000 });
-        await expect(editorContent).toContainText('String name', { timeout: 30_000 });
-        await expect(editorContent).not.toContainText('import java.time.LocalDate', { timeout: 30_000 });
+        await runCommand(session.page, 'Organize Imports');
+        await session.page.keyboard.press('Control+S');
 
         await expect.poll(() => fs.readFileSync(scratchFilePath, 'utf8'), {
             timeout: 30_000,
             message: 'Timed out waiting for Organize Imports to save CodeActionScratch.groovy',
-        }).toContain('class CodeActionScratch');
+        }).not.toContain('import java.time.LocalDate');
+
+        const updatedSource = fs.readFileSync(scratchFilePath, 'utf8');
+        expect(updatedSource).toContain('class CodeActionScratch');
+        expect(updatedSource).toContain('String name');
     } finally {
         await session.close();
         workspace.dispose();
