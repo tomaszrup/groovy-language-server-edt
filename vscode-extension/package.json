@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.2.36",
+    "version": "1.2.37",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -79,6 +79,21 @@
                     "string.quoted.triple.double.groovy - meta.interpolation.groovy",
                     "string.quoted.slashy.groovy - meta.interpolation.groovy",
                     "string.quoted.dollar-slashy.groovy - meta.interpolation.groovy"
+                ]
+            },
+            {
+                "scopeName": "source.groovy.spock-feature-name.injection",
+                "path": "./syntaxes/groovy-spock-feature-name.injection.json",
+                "injectTo": [
+                    "source.groovy"
+                ],
+                "tokenTypes": {
+                    "string.quoted.single.groovy": "string",
+                    "string.quoted.double.groovy": "string"
+                },
+                "unbalancedBracketScopes": [
+                    "string.quoted.single.groovy",
+                    "string.quoted.double.groovy - meta.interpolation.groovy"
                 ]
             }
         ],

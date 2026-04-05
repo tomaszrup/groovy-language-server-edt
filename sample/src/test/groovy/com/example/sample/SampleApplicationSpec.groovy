@@ -31,7 +31,7 @@ class SampleApplicationSpec extends Specification implements Trat, OthererName, 
     @Autowired
     ApplicationContext context
 
-    def "abc loads"() {
+    def "abc loads()"() {
         expect:
         true
         method(2)

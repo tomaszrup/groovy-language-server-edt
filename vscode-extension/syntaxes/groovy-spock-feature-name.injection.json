@@ -1,0 +1,76 @@
+{
+    "scopeName": "source.groovy.spock-feature-name.injection",
+    "injectionSelector": "L:source.groovy -comment -string",
+    "patterns": [
+        { "include": "#spock-feature-names" }
+    ],
+    "repository": {
+        "spock-feature-names": {
+            "patterns": [
+                {
+                    "comment": "Spock feature methods declared with double-quoted names.",
+                    "begin": "(\\bdef\\b)(\\s+)(\")",
+                    "beginCaptures": {
+                        "1": { "name": "storage.type.groovy" },
+                        "3": { "name": "punctuation.definition.string.begin.groovy" }
+                    },
+                    "end": "\"(?=\\s*\\()",
+                    "endCaptures": {
+                        "0": { "name": "punctuation.definition.string.end.groovy" }
+                    },
+                    "contentName": "string.quoted.double.groovy",
+                    "patterns": [
+                        { "include": "#string-interpolation" },
+                        { "include": "#string-escape" }
+                    ]
+                },
+                {
+                    "comment": "Spock feature methods declared with single-quoted names.",
+                    "begin": "(\\bdef\\b)(\\s+)(')",
+                    "beginCaptures": {
+                        "1": { "name": "storage.type.groovy" },
+                        "3": { "name": "punctuation.definition.string.begin.groovy" }
+                    },
+                    "end": "'(?=\\s*\\()",
+                    "endCaptures": {
+                        "0": { "name": "punctuation.definition.string.end.groovy" }
+                    },
+                    "contentName": "string.quoted.single.groovy",
+                    "patterns": [
+                        { "include": "#string-escape" }
+                    ]
+                }
+            ]
+        },
+        "string-interpolation": {
+            "patterns": [
+                {
+                    "name": "meta.interpolation.groovy",
+                    "begin": "\\$\\{",
+                    "end": "\\}",
+                    "beginCaptures": {
+                        "0": { "name": "punctuation.section.embedded.begin.groovy" }
+                    },
+                    "endCaptures": {
+                        "0": { "name": "punctuation.section.embedded.end.groovy" }
+                    },
+                    "patterns": [
+                        { "include": "source.groovy" }
+                    ]
+                },
+                {
+                    "name": "variable.other.interpolated.groovy",
+                    "match": "\\$[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*"
+                }
+            ]
+        },
+        "string-escape": {
+            "patterns": [
+                {
+                    "name": "constant.character.escape.groovy",
+                    "match": "\\\\(u[0-9a-fA-F]{4}|[btnfr\"'\\\\$]|[0-3]?[0-7]{1,2})"
+                }
+            ]
+        }
+    }
+}

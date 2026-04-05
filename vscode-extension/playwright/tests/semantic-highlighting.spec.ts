@@ -215,8 +215,18 @@ async function assertFeatureNameRendering(
     expectedStringToken: string,
 ): Promise<void> {
     const segments = await getRenderedLineSegments(page, renderedLine);
-    expect(segments.some(segment => segment.text === expectedStringToken && !segment.className.includes('bracket-highlighting')))
+    const openingParenIndex = segments.findIndex(segment =>
+        segment.text === '(' && segment.className.includes('bracket-highlighting'));
+    expect(openingParenIndex).toBeGreaterThan(1);
+
+    const signatureSegments = segments.slice(0, openingParenIndex);
+    expect(signatureSegments[0]?.text).toBe('def');
+
+    const quotedSegments = signatureSegments.slice(1);
+    expect(quotedSegments.every(segment => !segment.className.includes('bracket-highlighting')))
         .toBe(true);
+    expect(quotedSegments.map(segment => segment.text).join('')).toBe(expectedStringToken);
+
     expect(segments.some(segment => segment.text === '(' && segment.className.includes('bracket-highlighting')))
         .toBe(true);
     expect(segments.some(segment => segment.text === ')' && segment.className.includes('bracket-highlighting')))
