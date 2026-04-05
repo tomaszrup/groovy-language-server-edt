@@ -2,7 +2,7 @@
     "name": "groovy-spock-support",
     "displayName": "Language Support for Groovy",
     "description": "Rich Groovy language support powered by Eclipse/groovy-eclipse — completion, diagnostics, hover, go-to-definition, references, rename, and more.",
-    "version": "1.2.35",
+    "version": "1.2.36",
     "publisher": "TomaszRup",
     "license": "EPL-2.0",
     "homepage": "https://github.com/tomaszrup/groovy-language-server-edt",
@@ -62,6 +62,15 @@
                 "language": "groovy",
                 "scopeName": "source.groovy",
                 "path": "./syntaxes/groovy.tmLanguage.json",
+                "tokenTypes": {
+                    "comment": "comment",
+                    "string.quoted.single.groovy": "string",
+                    "string.quoted.triple.single.groovy": "string",
+                    "string.quoted.double.groovy": "string",
+                    "string.quoted.triple.double.groovy": "string",
+                    "string.quoted.slashy.groovy": "string",
+                    "string.quoted.dollar-slashy.groovy": "string"
+                },
                 "unbalancedBracketScopes": [
                     "comment",
                     "string.quoted.single.groovy",

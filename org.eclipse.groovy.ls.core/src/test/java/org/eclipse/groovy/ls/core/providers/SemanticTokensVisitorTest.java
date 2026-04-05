@@ -932,6 +932,47 @@ class SemanticTokensVisitorTest {
                 "Expected the Spock feature method def keyword to be tokenized as TYPE_TYPE");
     }
 
+    @Test
+    void doesNotEmitSemanticTokensInsideDoubleQuotedSpockFeatureNameWithParentheses() {
+        String source = """
+                class MySpec extends Object {
+                    def "abc loads(Asas)"() {
+                        expect:
+                        true
+                    }
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+
+        assertTrue(tokens.stream().anyMatch(t -> t.line == 1
+                && "def".equals(t.text)
+                && t.tokenType == SemanticTokensProvider.TYPE_TYPE),
+                "Expected the Spock feature method def keyword to be tokenized as TYPE_TYPE");
+        assertEquals(List.of("def"), tokens.stream()
+                .filter(t -> t.line == 1)
+                .map(t -> t.text)
+                .toList(),
+                "Expected semantic tokens on the feature declaration line to stay out of the quoted name");
+    }
+
+    @Test
+    void emitsDefTokenForStringNamedMethodWhenEarlierParenthesesAreInsideAnnotationStrings() {
+        String source = """
+                class MySpec extends Object {
+                    @Unroll("abc loads(Asas)") def "abc loads(Asas)"() {
+                        expect:
+                        true
+                    }
+                }
+                """;
+        List<DecodedToken> tokens = collectTokens(source, null);
+
+        assertTrue(tokens.stream().anyMatch(t -> t.line == 1
+                && "def".equals(t.text)
+                && t.tokenType == SemanticTokensProvider.TYPE_TYPE),
+                "Expected the Spock feature method def keyword to be tokenized even when earlier parentheses belong to annotation strings");
+    }
+
     private List<DecodedToken> collectTokens(String source, Range range) {
         ModuleNode moduleNode = parseModule(source);
         SemanticTokensVisitor visitor = new SemanticTokensVisitor(source, range);

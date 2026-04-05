@@ -1010,9 +1010,77 @@ public class SemanticTokensVisitor extends ClassCodeVisitorSupport {
             lineEnd = source.length();
         }
 
-        int parenIndex = source.indexOf('(', lineStart);
-        int searchLimit = (parenIndex >= 0 && parenIndex < lineEnd) ? parenIndex - lineStart : lineEnd - lineStart;
+        int defOffset = findNameInLine(line, 0, DEF_KEYWORD);
+        int parenOffset = findFirstNonLiteralCharInLine(line,
+                defOffset >= 0 ? defOffset + DEF_KEYWORD.length() : 0, '(', lineEnd);
+        int searchLimit = parenOffset >= 0 ? parenOffset : lineEnd - lineStart;
         emitDefKeywordBeforeName(line, searchLimit);
+    }
+
+    private int findFirstNonLiteralCharInLine(int line, int startCol, char target, int lineEnd) {
+        int lineStart = findLineStart(line);
+        if (lineStart < 0) {
+            return -1;
+        }
+
+        int index = Math.max(lineStart, lineStart + startCol);
+        while (index < lineEnd) {
+            if (startsLineComment(index, lineEnd)) {
+                return -1;
+            }
+
+            int skippedIndex = skipLineLiteralOrComment(index, lineEnd);
+            if (skippedIndex > index) {
+                index = skippedIndex;
+            } else if (source.charAt(index) == target) {
+                return index - lineStart;
+            } else {
+                index++;
+            }
+        }
+
+        return -1;
+    }
+
+    private boolean startsLineComment(int index, int lineEnd) {
+        return index + 1 < lineEnd && source.charAt(index) == '/' && source.charAt(index + 1) == '/';
+    }
+
+    private int skipLineLiteralOrComment(int index, int lineEnd) {
+        if (index >= lineEnd) {
+            return index;
+        }
+
+        char current = source.charAt(index);
+        if (current == '"' || current == '\'') {
+            return skipQuotedSegment(index, lineEnd, current);
+        }
+
+        if (index + 1 < lineEnd && current == '/' && source.charAt(index + 1) == '*') {
+            return skipInlineBlockComment(index, lineEnd);
+        }
+
+        return index;
+    }
+
+    private int skipQuotedSegment(int startIndex, int lineEnd, char quote) {
+        boolean escaping = false;
+        for (int index = startIndex + 1; index < lineEnd; index++) {
+            char current = source.charAt(index);
+            if (!escaping && current == quote) {
+                return index + 1;
+            }
+            escaping = current == '\\' && !escaping;
+        }
+        return lineEnd;
+    }
+
+    private int skipInlineBlockComment(int startIndex, int lineEnd) {
+        int blockCommentEnd = source.indexOf("*/", startIndex + 2);
+        if (blockCommentEnd < 0 || blockCommentEnd >= lineEnd) {
+            return lineEnd;
+        }
+        return blockCommentEnd + 2;
     }
 
     @Override
