@@ -8,6 +8,7 @@ import {
 } from '../support/vscodeHarness';
 
 test('opens SpringBootTest external library source from a Groovy import', async () => {
+    test.setTimeout(10 * 60 * 1000);
     const workspace = createWorkspaceCopy();
     const session = await launchVsCode({ workspacePath: workspace.workspacePath });
 
@@ -32,6 +33,7 @@ test('opens SpringBootTest external library source from a Groovy import', async 
 });
 
 test('opens Spring external library source from a Groovy import', async () => {
+    test.setTimeout(10 * 60 * 1000);
     const workspace = createWorkspaceCopy();
     const session = await launchVsCode({ workspacePath: workspace.workspacePath });
 
@@ -56,6 +58,7 @@ test('opens Spring external library source from a Groovy import', async () => {
 });
 
 test('opens Spock external library source from a Groovy import', async () => {
+    test.setTimeout(10 * 60 * 1000);
     const workspace = createWorkspaceCopy();
     const session = await launchVsCode({ workspacePath: workspace.workspacePath });
 

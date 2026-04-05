@@ -9,6 +9,7 @@ import {
 } from '../support/vscodeHarness';
 
 test('resolves classpath for a deeply nested sibling Gradle module', async () => {
+    test.setTimeout(10 * 60 * 1000);
     const workspace = createTemporaryWorkspace();
     workspace.seedGradleWrapper();
 

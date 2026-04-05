@@ -337,17 +337,21 @@ async function ensureVsCodeExecutablePath(): Promise<string> {
 
 async function ensureSharedExtensionsDir(vscodeExecutablePath: string): Promise<string> {
     sharedExtensionsDirPromise ??= Promise.resolve().then(() => {
-            const extensionsDir = path.join(
-                getExtensionRoot(),
-                '.playwright-cache',
-                `extensions-${getPlaywrightWorkerKey()}`
-            );
+            const extensionsDir = path.join(getExtensionRoot(), '.playwright-cache', 'extensions');
             fs.mkdirSync(extensionsDir, { recursive: true });
 
-            const hasJavaExtension = hasInstalledJavaExtension(extensionsDir);
+            return extensionsDir;
+        }).then(async extensionsDir => {
+            if (!hasInstalledJavaExtension(extensionsDir)) {
+                const releaseLock = await acquireInstallLock(`${extensionsDir}.install.lock`);
 
-            if (!hasJavaExtension) {
-                installJavaExtension(vscodeExecutablePath, extensionsDir);
+                try {
+                    if (!hasInstalledJavaExtension(extensionsDir)) {
+                        installJavaExtension(vscodeExecutablePath, extensionsDir);
+                    }
+                } finally {
+                    releaseLock();
+                }
             }
 
             return extensionsDir;
@@ -356,13 +360,37 @@ async function ensureSharedExtensionsDir(vscodeExecutablePath: string): Promise<
     return sharedExtensionsDirPromise;
 }
 
-function getPlaywrightWorkerKey(): string {
-    return process.env.TEST_WORKER_INDEX ?? process.env.TEST_PARALLEL_INDEX ?? 'default';
-}
-
 function hasInstalledJavaExtension(extensionsDir: string): boolean {
     return fs.readdirSync(extensionsDir, { withFileTypes: true })
         .some(entry => entry.isDirectory() && entry.name.startsWith(`${JAVA_EXTENSION_ID}-`));
+}
+
+async function acquireInstallLock(lockDir: string, timeoutMs = 180_000): Promise<() => void> {
+    const startedAt = Date.now();
+
+    while (true) {
+        try {
+            fs.mkdirSync(lockDir);
+            return () => {
+                try {
+                    fs.rmSync(lockDir, { recursive: true, force: true });
+                } catch {
+                    // Best effort cleanup only.
+                }
+            };
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== 'EEXIST') {
+                throw error;
+            }
+
+            if ((Date.now() - startedAt) >= timeoutMs) {
+                throw new Error(`Timed out waiting for Playwright extension install lock: ${lockDir}`);
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+    }
 }
 
 function installJavaExtension(vscodeExecutablePath: string, extensionsDir: string, attempts = 3): void {
