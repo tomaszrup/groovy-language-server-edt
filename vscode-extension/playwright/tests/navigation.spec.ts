@@ -1,8 +1,8 @@
 import { expect, test } from '@playwright/test';
 import {
     createWorkspaceCopy,
-    goToDefinition,
     launchVsCode,
+    openFile,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -16,9 +16,10 @@ test('opens SpringBootTest external library source from a Groovy import', async 
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
 
-        await goToDefinition(
+        await goToDefinitionByCtrlClick(
             session.page,
             'src/test/groovy/com/example/sample/SampleApplicationSpec.groovy:3:49',
+            'SpringBootTest',
             'SpringBootTest.java'
         );
 
@@ -41,9 +42,10 @@ test('opens Spring external library source from a Groovy import', async () => {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
 
-        await goToDefinition(
+        await goToDefinitionByCtrlClick(
             session.page,
             'src/test/groovy/com/example/sample/SampleApplicationSpec.groovy:4:36',
+            'ApplicationContext',
             'ApplicationContext.java'
         );
 
@@ -66,9 +68,10 @@ test('opens Spock external library source from a Groovy import', async () => {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
 
-        await goToDefinition(
+        await goToDefinitionByCtrlClick(
             session.page,
             'src/test/groovy/com/example/sample/SampleApplicationSpec.groovy:6:19',
+            'Specification',
             'Specification.java'
         );
 
@@ -81,3 +84,39 @@ test('opens Spock external library source from a Groovy import', async () => {
         workspace.dispose();
     }
 });
+
+async function goToDefinitionByCtrlClick(
+    page: import('@playwright/test').Page,
+    location: string,
+    symbolText: string,
+    expectedTabName: string,
+    attempts = 3
+): Promise<void> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        await openFile(page, location);
+
+        const symbol = page.getByText(symbolText, { exact: true }).nth(0);
+        await expect(symbol).toBeVisible({ timeout: 30_000 });
+        await symbol.click({ modifiers: [process.platform === 'darwin' ? 'Meta' : 'Control'] });
+
+        try {
+            await expect(page.locator('.tabs-container .tab.active')).toContainText(expectedTabName, {
+                timeout: attempt === attempts ? 30_000 : 5_000,
+            });
+            return;
+        } catch (error) {
+            lastError = error;
+
+            if (attempt === attempts) {
+                throw error;
+            }
+
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(1_500);
+        }
+    }
+
+    throw lastError;
+}

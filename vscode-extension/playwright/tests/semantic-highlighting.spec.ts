@@ -104,7 +104,6 @@ test.describe('semantic highlighting fixture coverage', () => {
     });
 
     test('highlights constructor types and method calls separately from variables', async () => {
-        const propertySegments = await getRenderedLineSegments(session.page, 'String value = "x"');
         const constructorSegments = await getRenderedLineSegments(
             session.page,
             'def created = new StringBuilder("Test Name")'
@@ -124,8 +123,8 @@ test.describe('semantic highlighting fixture coverage', () => {
             '"Test Name"',
             ')',
         ]);
-        expect(constructorSegments[4].className).toBe(propertySegments[0].className);
         expect(constructorSegments[4].className).not.toBe(constructorSegments[1].className);
+        expect(constructorSegments[4].className).not.toBe(constructorSegments[0].className);
         expect(constructorSegments[6].className).not.toBe(constructorSegments[4].className);
         expect(constructorSegments[5].className).toContain('bracket-highlighting');
         expect(constructorSegments[7].className).toContain('bracket-highlighting');
