@@ -331,7 +331,15 @@ function writeUserSettings(userDataDir: string, userSettings: Record<string, Use
 }
 
 async function ensureVsCodeExecutablePath(): Promise<string> {
-    vscodeExecutablePathPromise ??= downloadAndUnzipVSCode(VSCODE_VERSION);
+    vscodeExecutablePathPromise ??= acquireInstallLock(
+        path.join(getExtensionRoot(), '.playwright-cache', `vscode-${VSCODE_VERSION}.lock`)
+    ).then(async releaseLock => {
+        try {
+            return await downloadAndUnzipVSCode(VSCODE_VERSION);
+        } finally {
+            releaseLock();
+        }
+    });
     return vscodeExecutablePathPromise;
 }
 

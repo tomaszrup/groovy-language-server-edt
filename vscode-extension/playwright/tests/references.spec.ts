@@ -3,6 +3,7 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
+    runCommand,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -16,10 +17,7 @@ test('opens the references peek from a Groovy symbol', async () => {
         await waitForBlockingNotificationsToClear(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/OthererName.groovy:3:9');
-
-        const referencesLens = session.page.getByText('1 reference', { exact: false }).first();
-        await expect(referencesLens).toBeVisible({ timeout: 30_000 });
-        await referencesLens.click();
+        await runCommand(session.page, 'Peek References');
 
         const peek = session.page.locator('.peekview-widget');
         await expect(peek).toBeVisible({ timeout: 30_000 });
