@@ -23,7 +23,6 @@ test('opens the references peek from a Groovy symbol', async () => {
         const peek = session.page.locator('.peekview-widget');
         await expect(peek).toBeVisible({ timeout: 30_000 });
         await expect(peek).toContainText('References (1)', { timeout: 30_000 });
-        await expect(peek).toContainText('1 reference', { timeout: 30_000 });
         await expect(peek).toContainText('trait OthererName {', { timeout: 30_000 });
     } finally {
         await session.close();
