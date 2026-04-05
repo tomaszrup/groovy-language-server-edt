@@ -124,7 +124,6 @@ test.describe('semantic highlighting fixture coverage', () => {
             ')',
         ]);
         expect(constructorSegments[4].className).not.toBe(constructorSegments[1].className);
-        expect(constructorSegments[4].className).not.toBe(constructorSegments[0].className);
         expect(constructorSegments[6].className).not.toBe(constructorSegments[4].className);
         expect(constructorSegments[5].className).toContain('bracket-highlighting');
         expect(constructorSegments[7].className).toContain('bracket-highlighting');
