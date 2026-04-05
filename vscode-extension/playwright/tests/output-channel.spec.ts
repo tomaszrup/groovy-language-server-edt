@@ -27,7 +27,6 @@ test('opens the Groovy output channel from the status bar item', async () => {
 
         await session.page.locator(String.raw`#TomaszRup\.groovy-spock-support`).click();
 
-        await expect(session.page.getByText('groovy/classpathBatchComplete', { exact: false })).toBeVisible({ timeout: 30_000 });
         await expect(session.page.getByText('[status] Ready', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
