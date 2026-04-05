@@ -1945,6 +1945,7 @@ async function getJavaMajorVersion(javaExecutable: string): Promise<number | und
 function resolveServerDir(context: ExtensionContext): string | undefined {
     const candidates = [
         path.join(context.extensionPath, 'server'),
+        path.join(context.extensionPath, '..', 'org.eclipse.groovy.ls.product', 'build', 'product'),
         path.join(context.extensionPath, '..', 'org.eclipse.groovy.ls.product', 'target', 'repository'),
     ];
 

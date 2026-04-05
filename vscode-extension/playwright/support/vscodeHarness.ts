@@ -139,10 +139,10 @@ export async function launchVsCode(options: LaunchVsCodeOptions = {}): Promise<V
         userDataDir,
         extensionsDir,
         async close(): Promise<void> {
-            await app.close();
-            fs.rmSync(userDataDir, { recursive: true, force: true });
+            await closeElectronApp(app);
+            await removeDirectoryWithRetries(userDataDir);
             if (!useSharedExtensionsDir) {
-                fs.rmSync(extensionsDir, { recursive: true, force: true });
+                await removeDirectoryWithRetries(extensionsDir);
             }
         },
     };
@@ -249,6 +249,40 @@ export async function waitForBlockingNotificationsToClear(page: Page, timeout = 
 
 function getExtensionRoot(): string {
     return process.cwd();
+}
+
+async function closeElectronApp(app: ElectronApplication): Promise<void> {
+    try {
+        await app.evaluate(({ app: electronApp }) => electronApp.exit(0));
+    } catch {
+        // Ignore disconnect errors while the dev host is exiting.
+    }
+
+    try {
+        await app.close();
+    } catch {
+        // VS Code may already be gone after the forced exit path above.
+    }
+}
+
+async function removeDirectoryWithRetries(dirPath: string, attempts = 8, delayMs = 250): Promise<void> {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            fs.rmSync(dirPath, { recursive: true, force: true });
+            return;
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (!isRetryableCleanupErrorCode(code) || attempt === attempts) {
+                return;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, delayMs * attempt));
+        }
+    }
+}
+
+function isRetryableCleanupErrorCode(code: string | undefined): boolean {
+    return code === 'EBUSY' || code === 'ENOTEMPTY' || code === 'EPERM';
 }
 
 function getRepositoryRoot(): string {

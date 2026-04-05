@@ -247,13 +247,14 @@
     },
     "scripts": {
         "vscode:prepublish": "npm run compile",
+        "prepare:playwright-server": "node ./scripts/preparePlaywrightServer.js",
         "compile": "webpack --mode production",
         "watch": "webpack --mode development --watch",
         "lint": "eslint src/**/*.ts",
         "package": "vsce package",
         "test": "mocha --require ts-node/register --extension ts \"src/test/**/*.test.ts\"",
-        "test:playwright": "npm run compile && playwright test",
-        "test:playwright:headed": "npm run compile && playwright test --headed"
+        "test:playwright": "npm run prepare:playwright-server && npm run compile && playwright test",
+        "test:playwright:headed": "npm run prepare:playwright-server && npm run compile && playwright test --headed"
     },
     "devDependencies": {
         "@playwright/test": "^1.59.1",
