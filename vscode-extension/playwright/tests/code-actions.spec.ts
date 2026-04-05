@@ -42,6 +42,7 @@ test('organize imports removes an unused Groovy import', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/CodeActionScratch.groovy:3:20');
         await runCommand(session.page, 'Organize Imports');
@@ -95,15 +96,10 @@ test('quick fix creates a missing Groovy class', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/QuickFixScratch.groovy:4:6');
-        await session.page.keyboard.press('Control+.');
-
-        const quickFixRow = session.page.locator('.context-view .monaco-list-row', {
-            hasText: "Create class 'Foo'",
-        });
-        await expect(quickFixRow).toBeVisible({ timeout: 30_000 });
-        await quickFixRow.dispatchEvent('click');
+        await applyQuickFix(session.page, "Create class 'Foo'");
 
         await expect.poll(() => fs.existsSync(createdFilePath), {
             timeout: 30_000,
@@ -116,3 +112,37 @@ test('quick fix creates a missing Groovy class', async () => {
         workspace.dispose();
     }
 });
+
+async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
+    await runCommand(page, 'Groovy: Show Output Channel');
+    await expect(page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })).toBeVisible({
+        timeout: 60_000,
+    });
+}
+
+async function applyQuickFix(
+    page: import('@playwright/test').Page,
+    title: string,
+    attempts = 6
+): Promise<void> {
+    const quickFixRow = page.locator('.context-view .monaco-list-row', {
+        hasText: title,
+    }).first();
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        await page.keyboard.press('Control+.');
+
+        try {
+            await expect(quickFixRow).toBeVisible({ timeout: 10_000 });
+            await quickFixRow.click();
+            return;
+        } catch (error) {
+            if (attempt === attempts) {
+                throw error;
+            }
+
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(1_500);
+        }
+    }
+}

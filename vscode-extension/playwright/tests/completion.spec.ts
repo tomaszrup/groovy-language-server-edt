@@ -97,11 +97,14 @@ test('applies known-type completion for a workspace class', async () => {
         await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/KnownTypeCompletionScratch.groovy:3:20');
+        await expect(session.page.locator('.tabs-container .tab.active')).toContainText('KnownTypeCompletionScratch.groovy', {
+            timeout: 30_000,
+        });
         await waitForCompletionSuggestion(session.page, 'Bababxa');
 
         await session.page.keyboard.press('Enter');
 
-        await expect(session.page.locator('.view-lines')).toContainText('new Bababxa', { timeout: 30_000 });
+        await expect(session.page.getByText('def value = new Bababxa', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
         workspace.dispose();
