@@ -126,6 +126,16 @@ This:
 
 The server communicates via standard I/O using the Language Server Protocol.
 
+### Run the VS Code extension tests
+
+```sh
+cd vscode-extension
+npm test
+npm run test:playwright
+```
+
+The Playwright suite launches a VS Code extension-development host and currently covers startup readiness, restart flow, references via Groovy code lens, code actions via organize imports and quick fixes, member and type completion application, nested Gradle module classpath resolution, output-channel visibility from both the command palette and the status bar item, external library source navigation for Spring and Spock sources, and missing-JDK error handling including the error status item opening the output channel.
+
 ## Provenance & Credits
 
 This project is a clean-room reimplementation of a Groovy language server, built on top of Eclipse JDT and groovy-eclipse. It was started from an initial scaffold in [groovy-language-server/groovy-language-server](https://github.com/groovy-language-server/groovy-language-server) and then rewritten to use the Eclipse compiler infrastructure for accurate type inference, completion, and navigation.

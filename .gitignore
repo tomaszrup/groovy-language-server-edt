@@ -13,6 +13,9 @@ vscode-extension/dist/
 vscode-extension/out/
 vscode-extension/server/
 vscode-extension/*.vsix
+vscode-extension/.playwright-cache/
+vscode-extension/.vscode-test/
+vscode-extension/playwright-results/
 
 # IDE files
 .idea/

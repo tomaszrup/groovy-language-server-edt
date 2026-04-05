@@ -98,6 +98,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -113,12 +119,24 @@ jobs:
         working-directory: vscode-extension
         run: npm test
 
+      - name: Run Playwright tests
+        working-directory: vscode-extension
+        run: xvfb-run -a npm run test:playwright
+
       - name: Upload Extension test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: extension-test-results
           path: vscode-extension/test-results/
+
+      - name: Upload Playwright results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-playwright-results
+          path: vscode-extension/playwright-results/
+          if-no-files-found: ignore
 
   update-badges:
     name: Update Coverage Badges

@@ -61,7 +61,16 @@
             {
                 "language": "groovy",
                 "scopeName": "source.groovy",
-                "path": "./syntaxes/groovy.tmLanguage.json"
+                "path": "./syntaxes/groovy.tmLanguage.json",
+                "unbalancedBracketScopes": [
+                    "comment",
+                    "string.quoted.single.groovy",
+                    "string.quoted.triple.single.groovy",
+                    "string.quoted.double.groovy - meta.interpolation.groovy",
+                    "string.quoted.triple.double.groovy - meta.interpolation.groovy",
+                    "string.quoted.slashy.groovy - meta.interpolation.groovy",
+                    "string.quoted.dollar-slashy.groovy - meta.interpolation.groovy"
+                ]
             }
         ],
         "semanticTokenTypes": [
@@ -218,12 +227,16 @@
         "watch": "webpack --mode development --watch",
         "lint": "eslint src/**/*.ts",
         "package": "vsce package",
-        "test": "mocha --require ts-node/register --extension ts \"src/test/**/*.test.ts\""
+        "test": "mocha --require ts-node/register --extension ts \"src/test/**/*.test.ts\"",
+        "test:playwright": "npm run compile && playwright test",
+        "test:playwright:headed": "npm run compile && playwright test --headed"
     },
     "devDependencies": {
+        "@playwright/test": "^1.59.1",
         "@types/node": "^20.0.0",
         "@types/mocha": "^10.0.10",
         "@types/vscode": "^1.85.0",
+        "@vscode/test-electron": "^2.5.2",
         "mocha": "^11.7.1",
         "sinon": "^21.0.0",
         "@types/sinon": "^17.0.4",
