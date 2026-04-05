@@ -337,30 +337,60 @@ async function ensureVsCodeExecutablePath(): Promise<string> {
 
 async function ensureSharedExtensionsDir(vscodeExecutablePath: string): Promise<string> {
     sharedExtensionsDirPromise ??= Promise.resolve().then(() => {
-            const extensionsDir = path.join(getExtensionRoot(), '.playwright-cache', 'extensions');
+            const extensionsDir = path.join(
+                getExtensionRoot(),
+                '.playwright-cache',
+                `extensions-${getPlaywrightWorkerKey()}`
+            );
             fs.mkdirSync(extensionsDir, { recursive: true });
 
-            const hasJavaExtension = fs.readdirSync(extensionsDir, { withFileTypes: true })
-                .some(entry => entry.isDirectory() && entry.name.startsWith(`${JAVA_EXTENSION_ID}-`));
+            const hasJavaExtension = hasInstalledJavaExtension(extensionsDir);
 
             if (!hasJavaExtension) {
-                const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodeExecutablePath);
-                execFileSync(
-                    cliPath,
-                    ['--install-extension', JAVA_EXTENSION_ID, '--extensions-dir', extensionsDir],
-                    {
-                        cwd: getExtensionRoot(),
-                        env: {
-                            ...process.env,
-                            DONT_PROMPT_WSL_INSTALL: '1',
-                        },
-                        stdio: 'inherit',
-                    }
-                );
+                installJavaExtension(vscodeExecutablePath, extensionsDir);
             }
 
             return extensionsDir;
         });
 
     return sharedExtensionsDirPromise;
+}
+
+function getPlaywrightWorkerKey(): string {
+    return process.env.TEST_WORKER_INDEX ?? process.env.TEST_PARALLEL_INDEX ?? 'default';
+}
+
+function hasInstalledJavaExtension(extensionsDir: string): boolean {
+    return fs.readdirSync(extensionsDir, { withFileTypes: true })
+        .some(entry => entry.isDirectory() && entry.name.startsWith(`${JAVA_EXTENSION_ID}-`));
+}
+
+function installJavaExtension(vscodeExecutablePath: string, extensionsDir: string, attempts = 3): void {
+    const cliPath = resolveCliPathFromVSCodeExecutablePath(vscodeExecutablePath);
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            execFileSync(
+                cliPath,
+                ['--install-extension', JAVA_EXTENSION_ID, '--extensions-dir', extensionsDir],
+                {
+                    cwd: getExtensionRoot(),
+                    env: {
+                        ...process.env,
+                        DONT_PROMPT_WSL_INSTALL: '1',
+                    },
+                    stdio: 'inherit',
+                }
+            );
+            return;
+        } catch (error) {
+            if (hasInstalledJavaExtension(extensionsDir)) {
+                return;
+            }
+
+            if (attempt === attempts) {
+                throw error;
+            }
+        }
+    }
 }

@@ -5,6 +5,7 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
+    runCommand,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -93,13 +94,10 @@ test('applies known-type completion for a workspace class', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/KnownTypeCompletionScratch.groovy:3:20');
-        await session.page.keyboard.press('Control+Space');
-
-        const suggestWidget = session.page.locator('.suggest-widget');
-        await expect(suggestWidget).toBeVisible({ timeout: 30_000 });
-        await expect(suggestWidget).toContainText('Bababxa', { timeout: 30_000 });
+        await waitForCompletionSuggestion(session.page, 'Bababxa');
 
         await session.page.keyboard.press('Enter');
 
@@ -109,3 +107,35 @@ test('applies known-type completion for a workspace class', async () => {
         workspace.dispose();
     }
 });
+
+async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
+    await runCommand(page, 'Groovy: Show Output Channel');
+    await expect(page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })).toBeVisible({
+        timeout: 60_000,
+    });
+}
+
+async function waitForCompletionSuggestion(
+    page: import('@playwright/test').Page,
+    expectedText: string,
+    attempts = 6
+): Promise<void> {
+    const suggestWidget = page.locator('.suggest-widget');
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        await page.keyboard.press('Control+Space');
+        await expect(suggestWidget).toBeVisible({ timeout: 30_000 });
+
+        try {
+            await expect(suggestWidget).toContainText(expectedText, { timeout: 10_000 });
+            return;
+        } catch (error) {
+            if (attempt === attempts) {
+                throw error;
+            }
+
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(1_500);
+        }
+    }
+}
