@@ -93,7 +93,8 @@ test('resolves classpath for a deeply nested sibling Gradle module', async () =>
 
         await runCommand(session.page, 'Groovy: Show Output Channel');
 
-        await expect(session.page.getByText('build/libs/shared.jar', { exact: false })).toBeVisible({ timeout: 60_000 });
+        await expect(session.page.getByText('projectPath=', { exact: false })).toBeVisible({ timeout: 60_000 });
+        await expect(session.page.getByText('modules/platform/shared', { exact: false })).toBeVisible({ timeout: 60_000 });
         await expect(
             session.page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })
         ).toBeVisible({ timeout: 60_000 });
