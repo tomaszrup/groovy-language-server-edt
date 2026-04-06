@@ -11,6 +11,7 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -38,6 +39,7 @@ import org.codehaus.groovy.ast.stmt.ExpressionStatement;
 import org.codehaus.groovy.ast.stmt.Statement;
 import org.codehaus.groovy.control.SourceUnit;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.core.runtime.OperationCanceledException;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
@@ -85,7 +87,10 @@ import org.eclipse.lsp4j.TextEdit;
  *   <li><b>Fallback</b>: Uses the Groovy AST when JDT is unavailable.</li>
  * </ul>
  */
+@SuppressWarnings("unused")
 public class CompletionProvider {
+
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
 
     private static final class TypeSearchContext {
         final boolean annotationOnly;
@@ -105,6 +110,66 @@ public class CompletionProvider {
     private static final class TypeResolutionContext {
         private final Map<String, IType> resolvedTypes = new HashMap<>();
         private final Set<String> missingTypes = new HashSet<>();
+    }
+
+        private record CompletionRequestContext(
+            ICompilationUnit workingCopy,
+            String uri,
+            String content,
+            Position position,
+            String prefix,
+            int prefixStart,
+            boolean isDotCompletion,
+            boolean isAnnotationCompletion,
+            TypeResolutionContext typeResolutionContext) {
+        }
+
+    private record DotExpressionBounds(int start, int end) {
+    }
+
+        private record DotCompletionContext(
+            ICompilationUnit workingCopy,
+            String uri,
+            String content,
+            Position position,
+            int dotPos,
+            String exprName,
+            String prefix,
+            List<CompletionItem> items,
+            TypeResolutionContext typeResolutionContext) {
+        }
+
+    private record TypeSearchRequest(
+            String prefix,
+            boolean annotationOnly,
+            Set<String> seenSimpleNames,
+            TypeSearchContext searchContext,
+            List<CompletionItem> items,
+            int scopeMask,
+            String sortPrefix,
+            TypeResolutionContext typeResolutionContext) {
+    }
+
+    private static final class SearchProgressMonitor extends NullProgressMonitor {
+        private final java.util.function.BooleanSupplier additionalCancelCondition;
+        private volatile boolean cancelled;
+
+        private SearchProgressMonitor(java.util.function.BooleanSupplier additionalCancelCondition) {
+            this.additionalCancelCondition = additionalCancelCondition;
+        }
+
+        @Override
+        public boolean isCanceled() {
+            return cancelled
+                    || Thread.currentThread().isInterrupted()
+                    || (additionalCancelCondition != null && additionalCancelCondition.getAsBoolean());
+        }
+
+        @Override
+        public void setCanceled(boolean value) {
+            cancelled = value;
+            super.setCanceled(value);
+        }
     }
 
     private record ScopedVariable(String name, ClassNode type) {
@@ -198,7 +263,7 @@ public class CompletionProvider {
                 return null;
             }
             String name = type.getName();
-            if (name == null || name.isEmpty() || "void".equals(name) || "java.lang.Object".equals(name)) {
+            if (name == null || name.isEmpty() || "void".equals(name) || JAVA_LANG_OBJECT.equals(name)) {
                 return null;
             }
             return type;
@@ -620,43 +685,76 @@ public class CompletionProvider {
         }
 
         try {
-            if (isDotCompletion) {
-                if (Thread.currentThread().isInterrupted()) {
-                    return items;
-                }
-                int dotPos = prefixStart - 1; // position of the '.'
-                items.addAll(getDotCompletions(
-                        workingCopy, uri, content, position, dotPos, prefix, typeResolutionContext));
-                // Never add keywords/types after a dot — only member completions
-            } else if (isAnnotationCompletion) {
-                if (Thread.currentThread().isInterrupted()) {
-                    return items;
-                }
-                // After '@', only annotation types are valid.
-                items.addAll(getTypeCompletions(
-                        workingCopy, uri, content, prefix, true, typeResolutionContext));
-            } else {
-                // Non-dot context: identifiers + types + keywords
-                items.addAll(getIdentifierCompletions(
-                        workingCopy, uri, position, prefix, typeResolutionContext));
-                if (Thread.currentThread().isInterrupted()) {
-                    return items;
-                }
-                if (!prefix.isEmpty()) {
-                    items.addAll(getTypeCompletions(
-                            workingCopy, uri, content, prefix, false, typeResolutionContext));
-                    if (Thread.currentThread().isInterrupted()) {
-                        return items;
-                    }
-                    items.addAll(getKeywordCompletions(prefix));
-                }
-            }
+                items.addAll(collectCompletions(new CompletionRequestContext(
+                    workingCopy,
+                    uri,
+                    content,
+                    position,
+                    prefix,
+                    prefixStart,
+                    isDotCompletion,
+                    isAnnotationCompletion,
+                    typeResolutionContext)));
 
             GroovyLanguageServerPlugin.logInfo("[completion] Returning " + items.size() + " items");
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[completion] Failed", e);
         }
 
+        return items;
+    }
+
+    private List<CompletionItem> collectCompletions(CompletionRequestContext request) {
+        List<CompletionItem> items = new ArrayList<>();
+        if (request.isDotCompletion()) {
+            if (Thread.currentThread().isInterrupted()) {
+                return items;
+            }
+            items.addAll(getDotCompletions(
+                    request.workingCopy(),
+                    request.uri(),
+                    request.content(),
+                    request.position(),
+                    request.prefixStart() - 1,
+                    request.prefix(),
+                    request.typeResolutionContext()));
+            return items;
+        }
+
+        if (request.isAnnotationCompletion()) {
+            if (Thread.currentThread().isInterrupted()) {
+                return items;
+            }
+            items.addAll(getTypeCompletions(
+                    request.workingCopy(),
+                    request.uri(),
+                    request.content(),
+                    request.prefix(),
+                    true,
+                    request.typeResolutionContext()));
+            return items;
+        }
+
+        items.addAll(getIdentifierCompletions(
+                request.workingCopy(),
+                request.uri(),
+                request.position(),
+                request.prefix(),
+                request.typeResolutionContext()));
+        if (Thread.currentThread().isInterrupted() || request.prefix().isEmpty()) {
+            return items;
+        }
+        items.addAll(getTypeCompletions(
+                request.workingCopy(),
+                request.uri(),
+                request.content(),
+                request.prefix(),
+                false,
+                request.typeResolutionContext()));
+        if (Thread.currentThread().isInterrupted()) {
+            return items;
+        }
+        items.addAll(getKeywordCompletions(request.prefix()));
         return items;
     }
 
@@ -688,114 +786,38 @@ public class CompletionProvider {
             return items;
         }
 
-        // Walk backwards from the dot to find the identifier before it.
-        int exprEnd = dotPos; // content[dotPos] == '.'
-        int exprStart = exprEnd - 1;
-        while (exprStart >= 0 && Character.isJavaIdentifierPart(content.charAt(exprStart))) {
-            exprStart--;
-        }
-        exprStart++;
-
-        if (exprStart >= exprEnd) {
+        DotExpressionBounds expressionBounds = findDotExpressionBounds(content, dotPos);
+        if (expressionBounds == null) {
             GroovyLanguageServerPlugin.logInfo(
                     "[completion] No identifier before dot at " + dotPos);
             return items;
         }
 
-        String exprName = content.substring(exprStart, exprEnd);
+        String exprName = content.substring(expressionBounds.start(), expressionBounds.end());
         GroovyLanguageServerPlugin.logInfo("[completion] Dot on '" + exprName + "'");
 
-        // Fast path for "foo.|": try direct member lookup and cached AST
-        // first. They are usually enough for locals/fields after typing '.',
-        // and they avoid a full working-copy reconcile on the request thread.
-        if (prefix.isEmpty()) {
-            if (Thread.currentThread().isInterrupted()) {
-                return items;
-            }
-            addCheapDotCompletions(
-                    workingCopy, lspUri, position, exprName, prefix, items, typeResolutionContext);
-            if (!items.isEmpty()) {
-                GroovyLanguageServerPlugin.logInfo(
-                        "[completion] Dot completion resolved without patched reconcile");
-                return items;
-            }
-            if (shouldSkipPatchedDotReconcile(lspUri, content, dotPos)) {
-                GroovyLanguageServerPlugin.logInfo(
-                        "[completion] Skipping repeated patched reconcile for unresolved dot completion");
-                return items;
-            }
+        DotCompletionContext context = new DotCompletionContext(
+                workingCopy,
+                lspUri,
+                content,
+                position,
+                dotPos,
+                exprName,
+                prefix,
+                items,
+                typeResolutionContext);
+
+        if (tryCheapDotCompletions(context)) {
+            return items;
         }
 
         boolean patched = false;
         try {
-            // When the prefix is empty (cursor right after the dot), the source
-            // contains an incomplete expression like "foo." which breaks the
-            // Groovy parser and causes codeSelect to return 0 elements.
-            // Temporarily insert a dummy identifier after the dot so the parser
-            // produces a valid AST. Restore only AFTER all fallback attempts,
-            // so that AST-based fallbacks also see a valid AST.
             patched = patchContentForDotCompletion(workingCopy, content, dotPos, prefix);
-
-            if (Thread.currentThread().isInterrupted()) {
-                return items;
-            }
-            IJavaElement[] elements = workingCopy.codeSelect(exprStart, exprEnd - exprStart);
-            GroovyLanguageServerPlugin.logInfo(
-                    "[completion] codeSelect returned " + elements.length + " element(s)");
-
-            if (elements.length > 0) {
-                IJavaElement element = elements[0];
-                GroovyLanguageServerPlugin.logInfo("[completion]   element: "
-                        + element.getClass().getSimpleName()
-                        + " '" + element.getElementName() + "'");
-
-                IJavaProject project = findWorkingProject(workingCopy);
-                IType type = resolveElementType(element, project, typeResolutionContext);
-
-                if (type != null) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[completion]   resolved type: " + type.getFullyQualifiedName());
-                    // If the expression starts with lowercase, it's a variable/field reference,
-                    // not a type name — don't restrict to static members.
-                    boolean staticOnly = (element instanceof IType)
-                            && !exprName.isEmpty()
-                            && Character.isUpperCase(exprName.charAt(0));
-                    addMembersOfType(type, prefix, staticOnly, items);
-                } else {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[completion]   could not resolve element type");
-                }
-            }
-
-            // If codeSelect failed (e.g. broken AST after typing dot),
-            // try direct JDT model lookup for the field
-            if (items.isEmpty()) {
-                if (Thread.currentThread().isInterrupted()) {
-                    return items;
-                }
-                IJavaProject proj = findWorkingProject(workingCopy);
-                IType fieldType = findFieldTypeDirectly(
-                        workingCopy, lspUri, exprName, proj, typeResolutionContext);
-                if (fieldType != null) {
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[completion] Direct field lookup resolved: "
-                            + fieldType.getFullyQualifiedName());
-                    addMembersOfType(fieldType, prefix, false, items);
-                }
-            }
-
-            // AST-based dot completion fallback: resolve the expression type via the AST
-            if (items.isEmpty()) {
-                if (Thread.currentThread().isInterrupted()) {
-                    return items;
-                }
-                addAstDotCompletions(
-                        workingCopy, lspUri, position, exprName, prefix, items, typeResolutionContext);
-            }
+            populateDotCompletions(context, expressionBounds);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[completion] Dot completion failed", e);
         } finally {
-            // Restore original content after ALL resolution attempts are done
             if (patched) {
                 restoreOriginalContent(workingCopy, content);
             }
@@ -810,6 +832,119 @@ public class CompletionProvider {
         }
 
         return items;
+    }
+
+    private DotExpressionBounds findDotExpressionBounds(String content, int dotPos) {
+        int exprEnd = dotPos;
+        int exprStart = exprEnd - 1;
+        while (exprStart >= 0 && Character.isJavaIdentifierPart(content.charAt(exprStart))) {
+            exprStart--;
+        }
+        exprStart++;
+        return exprStart < exprEnd ? new DotExpressionBounds(exprStart, exprEnd) : null;
+    }
+
+    private boolean tryCheapDotCompletions(DotCompletionContext context) {
+        if (!context.prefix().isEmpty()) {
+            return false;
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            return true;
+        }
+        addCheapDotCompletions(
+                context.workingCopy(),
+                context.uri(),
+                context.position(),
+                context.exprName(),
+                context.prefix(),
+                context.items(),
+                context.typeResolutionContext());
+        if (!context.items().isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] Dot completion resolved without patched reconcile");
+            return true;
+        }
+        if (!shouldSkipPatchedDotReconcile(context.uri(), context.content(), context.dotPos())) {
+            return false;
+        }
+        GroovyLanguageServerPlugin.logInfo(
+                "[completion] Skipping repeated patched reconcile for unresolved dot completion");
+        return true;
+    }
+
+    private void populateDotCompletions(DotCompletionContext context, DotExpressionBounds expressionBounds)
+            throws JavaModelException {
+        if (Thread.currentThread().isInterrupted()) {
+            return;
+        }
+        populateCodeSelectDotCompletions(
+                context.workingCopy(),
+                expressionBounds,
+                context.exprName(),
+                context.prefix(),
+                context.items(),
+                context.typeResolutionContext());
+        if (!context.items().isEmpty() || Thread.currentThread().isInterrupted()) {
+            return;
+        }
+
+        IJavaProject project = findWorkingProject(context.workingCopy());
+        IType fieldType = findFieldTypeDirectly(
+                context.workingCopy(),
+                context.uri(),
+                context.exprName(),
+                project,
+                context.typeResolutionContext());
+        if (fieldType != null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[completion] Direct field lookup resolved: " + fieldType.getFullyQualifiedName());
+            addMembersOfType(fieldType, context.prefix(), false, context.items());
+        }
+
+        if (context.items().isEmpty() && !Thread.currentThread().isInterrupted()) {
+            addAstDotCompletions(
+                    context.workingCopy(),
+                    context.uri(),
+                    context.position(),
+                    context.exprName(),
+                    context.prefix(),
+                    context.items(),
+                    context.typeResolutionContext());
+        }
+    }
+
+    private void populateCodeSelectDotCompletions(
+            ICompilationUnit workingCopy,
+            DotExpressionBounds expressionBounds,
+            String exprName,
+            String prefix,
+            List<CompletionItem> items,
+            TypeResolutionContext typeResolutionContext) throws JavaModelException {
+        IJavaElement[] elements = workingCopy.codeSelect(
+                expressionBounds.start(), expressionBounds.end() - expressionBounds.start());
+        GroovyLanguageServerPlugin.logInfo(
+                "[completion] codeSelect returned " + elements.length + " element(s)");
+        if (elements.length == 0) {
+            return;
+        }
+
+        IJavaElement element = elements[0];
+        GroovyLanguageServerPlugin.logInfo("[completion]   element: "
+                + element.getClass().getSimpleName() + " '" + element.getElementName() + "'");
+
+        IJavaProject project = findWorkingProject(workingCopy);
+        IType type = resolveElementType(element, project, typeResolutionContext);
+        if (type == null) {
+            GroovyLanguageServerPlugin.logInfo("[completion]   could not resolve element type");
+            return;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[completion]   resolved type: " + type.getFullyQualifiedName());
+        boolean staticOnly = (element instanceof IType)
+                && !exprName.isEmpty()
+                && Character.isUpperCase(exprName.charAt(0));
+        addMembersOfType(type, prefix, staticOnly, items);
     }
 
     private void addCheapDotCompletions(ICompilationUnit workingCopy, String lspUri,
@@ -1084,22 +1219,20 @@ public class CompletionProvider {
 
         for (IMethod method : ownerType.getMethods()) {
             if (items.size() >= MAX_MEMBER_RESULTS) {
-                break;
+                return;
             }
 
             String name = method.getElementName();
-            if (!isFieldBackedAccessorPropertyCandidate(method, candidateFields.get(name), prefix)
-                    || !seen.add("p:" + name)) {
-                continue;
+            if (isFieldBackedAccessorPropertyCandidate(method, candidateFields.get(name), prefix)
+                    && seen.add("p:" + name)) {
+                CompletionItem item = new CompletionItem(name);
+                item.setKind(CompletionItemKind.Property);
+                item.setDetail(resolveFieldBackedAccessorDetail(method, ownerType));
+                item.setInsertText(name);
+                item.setFilterText(name);
+                item.setSortText(sortPrefix + "_" + name);
+                items.add(item);
             }
-
-            CompletionItem item = new CompletionItem(name);
-            item.setKind(CompletionItemKind.Property);
-            item.setDetail(resolveFieldBackedAccessorDetail(method, ownerType));
-            item.setInsertText(name);
-            item.setFilterText(name);
-            item.setSortText(sortPrefix + "_" + name);
-            items.add(item);
         }
     }
 
@@ -2443,34 +2576,38 @@ public class CompletionProvider {
         if (block == null) return null;
 
         for (Statement stmt : block.getStatements()) {
-            if (!(stmt instanceof ExpressionStatement exprStmt)) continue;
-            if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) continue;
-
-            Expression left = decl.getLeftExpression();
-            if (!(left instanceof VariableExpression varExpr)) continue;
-            if (!varName.equals(varExpr.getName())) continue;
-
-            // Found the declaration — determine the type
-            Expression initializer = decl.getRightExpression();
-
-            // "def x = new Foo()" → use the constructor call type directly
-            if (initializer instanceof ConstructorCallExpression ctorCall) {
-                return ctorCall.getType();
-            }
-
-            // Typed declaration (e.g. "String x = ...") → use the declared type
-            ClassNode originType = varExpr.getOriginType();
-            if (originType != null
-                    && !"java.lang.Object".equals(originType.getName())) {
-                return originType;
-            }
-
-            // Fallback: use the initializer expression's inferred type
-            if (initializer != null) {
-                return initializer.getType();
+            ClassNode resolvedType = resolveDeclaredVariableType(stmt, varName);
+            if (resolvedType != null) {
+                return resolvedType;
             }
         }
         return null;
+    }
+
+    private ClassNode resolveDeclaredVariableType(Statement stmt, String varName) {
+        if (!(stmt instanceof ExpressionStatement exprStmt)) {
+            return null;
+        }
+        if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) {
+            return null;
+        }
+
+        Expression left = decl.getLeftExpression();
+        if (!(left instanceof VariableExpression variableExpression) || !varName.equals(variableExpression.getName())) {
+            return null;
+        }
+
+        Expression initializer = decl.getRightExpression();
+        if (initializer instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+
+        ClassNode originType = variableExpression.getOriginType();
+        if (originType != null && !JAVA_LANG_OBJECT.equals(originType.getName())) {
+            return originType;
+        }
+
+        return initializer != null ? initializer.getType() : null;
     }
 
     private ClassNode resolveClassMemberExpressionType(ClassNode classNode, String exprName) {
@@ -2564,14 +2701,6 @@ public class CompletionProvider {
         return null;
     }
 
-    /**
-     * Resolve an interface/trait ClassNode reference to a JDT IType in the project.
-     */
-    private IType resolveTraitType(ClassNode ifaceRef, ClassNode owner,
-                                    ModuleNode module, IJavaProject project) {
-        return resolveTraitType(ifaceRef, owner, module, project, null);
-    }
-
     private IType resolveTraitType(ClassNode ifaceRef, ClassNode owner,
                                     ModuleNode module, IJavaProject project,
                                     TypeResolutionContext typeResolutionContext) {
@@ -2606,11 +2735,6 @@ public class CompletionProvider {
         return null;
     }
 
-    private IType resolveTraitTypeByFqn(ClassNode ifaceRef, IJavaProject project)
-            throws JavaModelException {
-        return resolveTraitTypeByFqn(ifaceRef, project, null);
-    }
-
     private IType resolveTraitTypeByFqn(ClassNode ifaceRef, IJavaProject project,
             TypeResolutionContext typeResolutionContext)
             throws JavaModelException {
@@ -2618,12 +2742,6 @@ public class CompletionProvider {
         return (fqn != null && fqn.contains("."))
                 ? findTypeCached(project, fqn, typeResolutionContext)
                 : null;
-    }
-
-    private IType resolveTraitTypeByOwnerPackage(String ifaceSimple, String ownerPkg,
-                                                 IJavaProject project)
-            throws JavaModelException {
-        return resolveTraitTypeByOwnerPackage(ifaceSimple, ownerPkg, project, null);
     }
 
     private IType resolveTraitTypeByOwnerPackage(String ifaceSimple, String ownerPkg,
@@ -2720,45 +2838,7 @@ public class CompletionProvider {
         final String[] firstFqn = new String[1];
 
         try {
-            IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
-                    new IJavaElement[] { project },
-                    IJavaSearchScope.SOURCES
-                            | IJavaSearchScope.APPLICATION_LIBRARIES
-                            | IJavaSearchScope.REFERENCED_PROJECTS);
-
-            JdtSearchSupport.searchAllTypeNames(
-                    null,
-                    SearchPattern.R_PATTERN_MATCH,
-                    simpleName.toCharArray(),
-                    SearchPattern.R_EXACT_MATCH,
-                    IJavaSearchConstants.TYPE,
-                    scope,
-                    new TypeNameRequestor() {
-                        @Override
-                        public void acceptType(int modifiers, char[] packageName,
-                                               char[] simpleTypeName,
-                                               char[][] enclosingTypeNames, String path) {
-                            String foundSimpleName = new String(simpleTypeName);
-                            if (!simpleName.equals(foundSimpleName)) {
-                                return;
-                            }
-
-                            String pkg = new String(packageName);
-                            String fqn = pkg.isEmpty() ? foundSimpleName : pkg + "." + foundSimpleName;
-
-                            if (firstFqn[0] == null) {
-                                firstFqn[0] = fqn;
-                            }
-
-                            if (normalizedPreferredPackage != null
-                                    && !normalizedPreferredPackage.isEmpty()
-                                    && normalizedPreferredPackage.equals(pkg)) {
-                                preferredFqn[0] = fqn;
-                            }
-                        }
-                    },
-                    IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
-                    null);
+            searchExactTypeNames(project, simpleName, normalizedPreferredPackage, preferredFqn, firstFqn);
 
             String chosen = (preferredFqn[0] != null) ? preferredFqn[0] : firstFqn[0];
             IType resolved = (chosen != null)
@@ -2774,6 +2854,51 @@ public class CompletionProvider {
 
         cacheResolvedType(typeResolutionContext, cacheKey, null);
         return null;
+    }
+
+    private void searchExactTypeNames(
+            IJavaProject project,
+            String simpleName,
+            String normalizedPreferredPackage,
+            String[] preferredFqn,
+            String[] firstFqn) throws org.eclipse.core.runtime.CoreException {
+        IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
+                new IJavaElement[] { project },
+                IJavaSearchScope.SOURCES
+                        | IJavaSearchScope.APPLICATION_LIBRARIES
+                        | IJavaSearchScope.REFERENCED_PROJECTS);
+
+        JdtSearchSupport.searchAllTypeNames(
+                null,
+                SearchPattern.R_PATTERN_MATCH,
+                simpleName.toCharArray(),
+                SearchPattern.R_EXACT_MATCH,
+                IJavaSearchConstants.TYPE,
+                scope,
+                new TypeNameRequestor() {
+                    @Override
+                    public void acceptType(int modifiers, char[] packageName,
+                                           char[] simpleTypeName,
+                                           char[][] enclosingTypeNames, String path) {
+                        String foundSimpleName = new String(simpleTypeName);
+                        if (!simpleName.equals(foundSimpleName)) {
+                            return;
+                        }
+
+                        String pkg = new String(packageName);
+                        String fqn = pkg.isEmpty() ? foundSimpleName : pkg + "." + foundSimpleName;
+                        if (firstFqn[0] == null) {
+                            firstFqn[0] = fqn;
+                        }
+                        if (normalizedPreferredPackage != null
+                                && !normalizedPreferredPackage.isEmpty()
+                                && normalizedPreferredPackage.equals(pkg)) {
+                            preferredFqn[0] = fqn;
+                        }
+                    }
+                },
+                IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH,
+                null);
     }
 
     // =========================================================================
@@ -2811,46 +2936,17 @@ public class CompletionProvider {
             IJavaProject project = findWorkingProject(workingCopy);
             if (project == null) return items;
 
-            // ---- Cache lookup (only valid for warmed projects) ----
             String projectName = project.getElementName();
             String cacheKey = projectName + ":" + (annotationOnly ? "@" : "") + prefix;
-            if (warmedProjects.contains(projectName)) {
-                CachedTypeNames cached = typeNameCache.get(cacheKey);
-                if (cached != null && !cached.isExpired()) {
-                    return new ArrayList<>(cached.items());
-                }
+            List<CompletionItem> cachedItems = getCachedTypeCompletions(projectName, cacheKey);
+            if (!cachedItems.isEmpty()) {
+                return cachedItems;
             }
 
-            Set<String> existingImports = getExistingImports(uri, content);
-            String currentPackage = getCurrentPackageName(content);
-            int importInsertLine = findImportInsertLine(content);
-            Set<String> seenSimpleNames = new HashSet<>();
-                TypeSearchContext searchContext = new TypeSearchContext(
-                    annotationOnly, currentPackage, existingImports, importInsertLine);
-
-            if (annotationOnly) {
-                addImportedAnnotationCompletions(
-                        project, existingImports, prefix, items, seenSimpleNames, typeResolutionContext);
-            }
-
-            if (Thread.currentThread().isInterrupted()) {
-                return items;
-            }
-            searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                    searchContext, items, IJavaSearchScope.SOURCES, "5_", typeResolutionContext);
-            if (Thread.currentThread().isInterrupted()) {
-                return items;
-            }
-            if (!shouldSkipLibraryTypeSearch(items, annotationOnly)) {
-                searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                        searchContext, items, IJavaSearchScope.APPLICATION_LIBRARIES, "6_",
-                        typeResolutionContext);
-            }
-
+            searchProjectTypes(project, uri, content, prefix, annotationOnly, typeResolutionContext, items);
             GroovyLanguageServerPlugin.logInfo("[completion] Type search for '"
                     + prefix + "': " + items.size() + " results");
 
-            // Cache results if this project's index is fully warmed
             if (warmedProjects.contains(projectName)) {
                 typeNameCache.put(cacheKey,
                         new CachedTypeNames(new ArrayList<>(items), System.currentTimeMillis()));
@@ -2862,6 +2958,70 @@ public class CompletionProvider {
         }
 
         return items;
+    }
+
+    private List<CompletionItem> getCachedTypeCompletions(String projectName, String cacheKey) {
+        if (!warmedProjects.contains(projectName)) {
+            return Collections.emptyList();
+        }
+        CachedTypeNames cached = typeNameCache.get(cacheKey);
+        return cached != null && !cached.isExpired()
+                ? new ArrayList<>(cached.items())
+                : Collections.emptyList();
+    }
+
+    private void searchProjectTypes(
+            IJavaProject project,
+            String uri,
+            String content,
+            String prefix,
+            boolean annotationOnly,
+            TypeResolutionContext typeResolutionContext,
+            List<CompletionItem> items) throws org.eclipse.core.runtime.CoreException {
+        TypeSearchContext searchContext = createTypeSearchContext(uri, content, annotationOnly);
+        Set<String> seenSimpleNames = new HashSet<>();
+
+        if (annotationOnly) {
+            addImportedAnnotationCompletions(
+                    project,
+                    searchContext.existingImports,
+                    prefix,
+                    items,
+                    seenSimpleNames,
+                    typeResolutionContext);
+        }
+
+        if (Thread.currentThread().isInterrupted()) {
+            return;
+        }
+        searchTypeNames(project, new TypeSearchRequest(
+                prefix,
+                annotationOnly,
+                seenSimpleNames,
+                searchContext,
+                items,
+                IJavaSearchScope.SOURCES,
+                "5_",
+                typeResolutionContext));
+        if (Thread.currentThread().isInterrupted() || shouldSkipLibraryTypeSearch(items, annotationOnly)) {
+            return;
+        }
+        searchTypeNames(project, new TypeSearchRequest(
+                prefix,
+                annotationOnly,
+                seenSimpleNames,
+                searchContext,
+                items,
+                IJavaSearchScope.APPLICATION_LIBRARIES,
+                "6_",
+                typeResolutionContext));
+    }
+
+    private TypeSearchContext createTypeSearchContext(String uri, String content, boolean annotationOnly) {
+        Set<String> existingImports = getExistingImports(uri, content);
+        String currentPackage = getCurrentPackageName(content);
+        int importInsertLine = findImportInsertLine(content);
+        return new TypeSearchContext(annotationOnly, currentPackage, existingImports, importInsertLine);
     }
 
     private boolean shouldSkipLibraryTypeSearch(List<CompletionItem> items, boolean annotationOnly) {
@@ -2892,32 +3052,20 @@ public class CompletionProvider {
         return true;
     }
 
-    private void searchTypeNames(IJavaProject project, String prefix, boolean annotationOnly,
-                                 Set<String> seenSimpleNames, TypeSearchContext searchContext,
-                                 List<CompletionItem> items,
-                                 int scopeMask, String sortPrefix) throws org.eclipse.core.runtime.CoreException {
-        searchTypeNames(project, prefix, annotationOnly, seenSimpleNames,
-                searchContext, items, scopeMask, sortPrefix, null);
-    }
-
-    private void searchTypeNames(IJavaProject project, String prefix, boolean annotationOnly,
-                                 Set<String> seenSimpleNames, TypeSearchContext searchContext,
-                                 List<CompletionItem> items,
-                                 int scopeMask, String sortPrefix,
-                                 TypeResolutionContext typeResolutionContext)
+    private void searchTypeNames(IJavaProject project, TypeSearchRequest request)
             throws org.eclipse.core.runtime.CoreException {
-        if (items.size() >= MAX_TYPE_RESULTS || Thread.currentThread().isInterrupted()) {
+        if (request.items().size() >= MAX_TYPE_RESULTS || Thread.currentThread().isInterrupted()) {
             return;
         }
 
         IJavaSearchScope scope = SearchEngine.createJavaSearchScope(
-                new IJavaElement[]{project}, scopeMask);
-        IProgressMonitor searchMonitor = createSearchMonitor(() -> items.size() >= MAX_TYPE_RESULTS);
+                new IJavaElement[]{project}, request.scopeMask());
+        IProgressMonitor searchMonitor = createSearchMonitor(() -> request.items().size() >= MAX_TYPE_RESULTS);
         JdtSearchSupport.searchAllTypeNames(
                 null,
                 SearchPattern.R_PATTERN_MATCH,
-                (prefix.isEmpty() ? "*" : prefix).toCharArray(),
-                prefix.isEmpty() ? SearchPattern.R_PATTERN_MATCH : SearchPattern.R_PREFIX_MATCH,
+                (request.prefix().isEmpty() ? "*" : request.prefix()).toCharArray(),
+                request.prefix().isEmpty() ? SearchPattern.R_PATTERN_MATCH : SearchPattern.R_PREFIX_MATCH,
                 IJavaSearchConstants.TYPE,
                 scope,
                 new TypeNameRequestor() {
@@ -2925,7 +3073,7 @@ public class CompletionProvider {
                     public void acceptType(int modifiers, char[] packageName,
                                            char[] simpleTypeName,
                                            char[][] enclosingTypeNames, String path) {
-                        if (items.size() >= MAX_TYPE_RESULTS || Thread.currentThread().isInterrupted()) {
+                        if (request.items().size() >= MAX_TYPE_RESULTS || Thread.currentThread().isInterrupted()) {
                             return;
                         }
 
@@ -2933,10 +3081,10 @@ public class CompletionProvider {
                         String pkg = new String(packageName);
                         String fqn = pkg.isEmpty() ? simpleName : pkg + "." + simpleName;
 
-                        if (isSearchResultEligible(simpleName, fqn, modifiers, annotationOnly,
-                                project, seenSimpleNames, typeResolutionContext)) {
-                            items.add(buildTypeSearchItem(simpleName, pkg, modifiers,
-                                    fqn, searchContext, sortPrefix));
+                        if (isSearchResultEligible(simpleName, fqn, modifiers, request.annotationOnly(),
+                                project, request.seenSimpleNames(), request.typeResolutionContext())) {
+                            request.items().add(buildTypeSearchItem(simpleName, pkg, modifiers,
+                                    fqn, request.searchContext(), request.sortPrefix()));
                         }
                     }
                 },
@@ -2945,28 +3093,7 @@ public class CompletionProvider {
     }
 
     private IProgressMonitor createSearchMonitor(java.util.function.BooleanSupplier additionalCancelCondition) {
-        return new IProgressMonitor() {
-            private volatile boolean cancelled = false;
-
-            @Override public void beginTask(String name, int totalWork) {}
-            @Override public void done() {}
-            @Override public void internalWorked(double work) {}
-            @Override public void setTaskName(String name) {}
-            @Override public void subTask(String name) {}
-            @Override public void worked(int work) {}
-
-            @Override
-            public boolean isCanceled() {
-                return cancelled
-                        || Thread.currentThread().isInterrupted()
-                        || (additionalCancelCondition != null && additionalCancelCondition.getAsBoolean());
-            }
-
-            @Override
-            public void setCanceled(boolean value) {
-                cancelled = value;
-            }
-        };
+        return new SearchProgressMonitor(additionalCancelCondition);
     }
 
     private CompletionItem buildTypeSearchItem(String simpleName, String pkg, int modifiers,

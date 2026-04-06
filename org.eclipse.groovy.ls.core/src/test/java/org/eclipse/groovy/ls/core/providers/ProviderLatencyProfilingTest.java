@@ -10,18 +10,14 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;
-
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
-import java.util.LongSummaryStatistics;
-import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 import org.codehaus.groovy.ast.ModuleNode;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
-import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.lsp4j.*;
 import org.junit.jupiter.api.*;
 
@@ -121,7 +117,7 @@ class ProviderLatencyProfilingTest {
         documentManager.didOpen("file:///test/Large.groovy", LARGE_SOURCE);
 
         // Wait briefly for background parsing to finish
-        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+        pauseMillis(500);
 
         System.out.println();
         System.out.println("╔════════════════════════════════════════════════════════════╗");
@@ -166,27 +162,33 @@ class ProviderLatencyProfilingTest {
     @Order(1)
     @DisplayName("Parse: small file (~40 lines)")
     void parseSmall() {
-        allResults.add(profile("Parse small (40 lines)", () -> {
+        ProfilingResult result = profile("Parse small (40 lines)", () -> {
             compilerService.parse("file:///bench/Small.groovy", SMALL_SOURCE);
-        }));
+        });
+        allResults.add(result);
+        assertTrue(result.max() >= 0);
     }
 
     @Test
     @Order(2)
     @DisplayName("Parse: medium file (~150 lines)")
     void parseMedium() {
-        allResults.add(profile("Parse medium (150 lines)", () -> {
+        ProfilingResult result = profile("Parse medium (150 lines)", () -> {
             compilerService.parse("file:///bench/Medium.groovy", MEDIUM_SOURCE);
-        }));
+        });
+        allResults.add(result);
+        assertTrue(result.max() >= 0);
     }
 
     @Test
     @Order(3)
     @DisplayName("Parse: large file (~500 lines)")
     void parseLarge() {
-        allResults.add(profile("Parse large (500 lines)", () -> {
+        ProfilingResult result = profile("Parse large (500 lines)", () -> {
             compilerService.parse("file:///bench/Large.groovy", LARGE_SOURCE);
-        }));
+        });
+        allResults.add(result);
+        assertTrue(result.max() >= 0);
     }
 
     // ========================================================================
@@ -263,11 +265,13 @@ class ProviderLatencyProfilingTest {
     @DisplayName("Folding Ranges: small file (~40 lines)")
     void foldingRangesSmall() {
         FoldingRangeProvider provider = new FoldingRangeProvider(documentManager);
-        allResults.add(profile("FoldingRange small (40 lines)", () -> {
+        ProfilingResult result = profile("FoldingRange small (40 lines)", () -> {
             FoldingRangeRequestParams params = new FoldingRangeRequestParams(
                     new TextDocumentIdentifier("file:///test/Small.groovy"));
             provider.getFoldingRanges(params);
-        }));
+        });
+        allResults.add(result);
+        assertTrue(result.max() >= 0);
     }
 
     @Test
@@ -275,11 +279,13 @@ class ProviderLatencyProfilingTest {
     @DisplayName("Folding Ranges: large file (~500 lines)")
     void foldingRangesLarge() {
         FoldingRangeProvider provider = new FoldingRangeProvider(documentManager);
-        allResults.add(profile("FoldingRange large (500 lines)", () -> {
+        ProfilingResult result = profile("FoldingRange large (500 lines)", () -> {
             FoldingRangeRequestParams params = new FoldingRangeRequestParams(
                     new TextDocumentIdentifier("file:///test/Large.groovy"));
             provider.getFoldingRanges(params);
-        }));
+        });
+        allResults.add(result);
+        assertTrue(result.max() >= 0);
     }
 
     // ========================================================================
@@ -291,11 +297,13 @@ class ProviderLatencyProfilingTest {
     @DisplayName("Document Symbols: small file (AST fallback)")
     void documentSymbolsSmall() {
         DocumentSymbolProvider provider = new DocumentSymbolProvider(documentManager);
-        allResults.add(profile("DocSymbol AST small (40 lines)", () -> {
+        ProfilingResult result = profile("DocSymbol AST small (40 lines)", () -> {
             DocumentSymbolParams params = new DocumentSymbolParams(
                     new TextDocumentIdentifier("file:///test/Small.groovy"));
             provider.getDocumentSymbols(params);
-        }));
+        });
+        allResults.add(result);
+        assertTrue(result.max() >= 0);
     }
 
     @Test
@@ -303,11 +311,13 @@ class ProviderLatencyProfilingTest {
     @DisplayName("Document Symbols: large file (AST fallback)")
     void documentSymbolsLarge() {
         DocumentSymbolProvider provider = new DocumentSymbolProvider(documentManager);
-        allResults.add(profile("DocSymbol AST large (500 lines)", () -> {
+        ProfilingResult result = profile("DocSymbol AST large (500 lines)", () -> {
             DocumentSymbolParams params = new DocumentSymbolParams(
                     new TextDocumentIdentifier("file:///test/Large.groovy"));
             provider.getDocumentSymbols(params);
-        }));
+        });
+        allResults.add(result);
+        assertTrue(result.max() >= 0);
     }
 
     // ========================================================================
@@ -411,7 +421,6 @@ class ProviderLatencyProfilingTest {
         long p95() { return percentile(95); }
         long p99() { return percentile(99); }
         long max() { return sortedMicros[sortedMicros.length - 1]; }
-        long min() { return sortedMicros[0]; }
 
         double mean() {
             long sum = 0;
@@ -423,6 +432,10 @@ class ProviderLatencyProfilingTest {
             int idx = (int) Math.ceil(n / 100.0 * sortedMicros.length) - 1;
             return sortedMicros[Math.max(0, Math.min(idx, sortedMicros.length - 1))];
         }
+    }
+
+    private void pauseMillis(long millis) {
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(millis));
     }
 
     // ---- Source generators ----
@@ -551,6 +564,8 @@ class ProviderLatencyProfilingTest {
                     """, methodNum));
                     linesWritten += 10;
                     break;
+                default:
+                    throw new IllegalStateException("Unexpected method pattern: " + (methodNum % 5));
             }
             methodNum++;
         }

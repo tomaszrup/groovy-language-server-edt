@@ -61,6 +61,7 @@ import org.xml.sax.SAXException;
  * (closures, builders, etc.) are handled gracefully — the formatter preserves
  * what it cannot parse rather than mangling it.
  */
+@SuppressWarnings("unused")
 public class FormattingProvider {
 
     private static final String BUNDLED_DEFAULT_PROFILE_RESOURCE =
@@ -265,16 +266,19 @@ public class FormattingProvider {
     }
 
     private void loadBundledDefaultProfile() {
+        Map<String, String> loaded = bundledDefaultFallbackOptions();
         try (InputStream stream = FormattingProvider.class
                 .getResourceAsStream(BUNDLED_DEFAULT_PROFILE_RESOURCE)) {
             if (stream == null) {
+                profileOptions = loaded;
+                loadedProfilePath = "classpath:" + BUNDLED_DEFAULT_PROFILE_RESOURCE;
                 GroovyLanguageServerPlugin.logWarning(
                         "Bundled formatter profile resource not found: "
                                 + BUNDLED_DEFAULT_PROFILE_RESOURCE);
                 return;
             }
 
-            Map<String, String> loaded = loadEclipseFormatterProfile(stream);
+            loaded.putAll(loadEclipseFormatterProfile(stream));
             if (!loaded.isEmpty()) {
                 profileOptions = loaded;
                 loadedProfilePath = "classpath:" + BUNDLED_DEFAULT_PROFILE_RESOURCE;
@@ -292,6 +296,13 @@ public class FormattingProvider {
                             + BUNDLED_DEFAULT_PROFILE_RESOURCE,
                     e);
         }
+    }
+
+    private Map<String, String> bundledDefaultFallbackOptions() {
+        Map<String, String> defaults = new HashMap<>();
+        defaults.put(DefaultCodeFormatterConstants.FORMATTER_TAB_CHAR, JavaCore.SPACE);
+        defaults.put(DefaultCodeFormatterConstants.FORMATTER_LINE_SPLIT, "120");
+        return defaults;
     }
 
     // ================================================================
@@ -568,55 +579,83 @@ public class FormattingProvider {
      */
     private void loadWorkspaceFormatterPrefs(Map<String, String> options, String documentUri) {
         try {
-            if (documentUri == null) return;
-
-            URI uri = URI.create(documentUri);
-            if (!"file".equals(uri.getScheme())) {
+            File settings = findWorkspaceFormatterPrefs(resolveDocumentDirectory(documentUri));
+            if (settings == null) {
                 return;
             }
-            File docFile = new File(uri);
-            File dir = docFile.getParentFile();
 
-            // Walk up to find .settings/org.eclipse.jdt.core.prefs
-            while (dir != null) {
-                File settings = new File(dir, ".settings/org.eclipse.jdt.core.prefs");
-                if (settings.exists() && settings.isFile()) {
-                    String settingsPath = settings.getAbsolutePath();
-                    long lastModified = settings.lastModified();
-
-                    // Re-use cached prefs if file hasn't changed
-                    if (settingsPath.equals(cachedWorkspacePrefsPath)
-                            && lastModified == cachedWorkspacePrefsLastModified
-                            && cachedWorkspacePrefs != null) {
-                        options.putAll(cachedWorkspacePrefs);
-                        return;
-                    }
-
-                    // Parse and cache
-                    java.util.Properties props = new java.util.Properties();
-                    try (FileInputStream fis = new FileInputStream(settings)) {
-                        props.load(fis);
-                    }
-                    Map<String, String> parsed = new HashMap<>();
-                    for (String key : props.stringPropertyNames()) {
-                        if (key.startsWith("org.eclipse.jdt.core.formatter.")) {
-                            parsed.put(key, props.getProperty(key));
-                        }
-                    }
-                    cachedWorkspacePrefsPath = settingsPath;
-                    cachedWorkspacePrefsLastModified = lastModified;
-                    cachedWorkspacePrefs = parsed;
-                    options.putAll(parsed);
-
-                    GroovyLanguageServerPlugin.logInfo(
-                            "Loaded workspace formatter prefs from: " + settings.getPath());
-                    return;
-                }
-                dir = dir.getParentFile();
+            if (loadCachedWorkspacePrefs(settings, options)) {
+                return;
             }
+
+            Map<String, String> parsed = parseWorkspaceFormatterPrefs(settings);
+            cacheWorkspacePrefs(settings, parsed);
+            options.putAll(parsed);
+
+            GroovyLanguageServerPlugin.logInfo(
+                    "Loaded workspace formatter prefs from: " + settings.getPath());
         } catch (Exception e) {
             // Silently ignore — workspace prefs are optional
         }
+    }
+
+    private File resolveDocumentDirectory(String documentUri) {
+        if (documentUri == null) {
+            return null;
+        }
+
+        URI uri = URI.create(documentUri);
+        if (!"file".equals(uri.getScheme())) {
+            return null;
+        }
+
+        return new File(uri).getParentFile();
+    }
+
+    private File findWorkspaceFormatterPrefs(File dir) {
+        File currentDir = dir;
+        while (currentDir != null) {
+            File settings = new File(currentDir, ".settings/org.eclipse.jdt.core.prefs");
+            if (settings.exists() && settings.isFile()) {
+                return settings;
+            }
+            currentDir = currentDir.getParentFile();
+        }
+        return null;
+    }
+
+    private boolean loadCachedWorkspacePrefs(File settings, Map<String, String> options) {
+        String settingsPath = settings.getAbsolutePath();
+        long lastModified = settings.lastModified();
+        if (!settingsPath.equals(cachedWorkspacePrefsPath)
+                || lastModified != cachedWorkspacePrefsLastModified
+                || cachedWorkspacePrefs == null) {
+            return false;
+        }
+
+        options.putAll(cachedWorkspacePrefs);
+        return true;
+    }
+
+    private Map<String, String> parseWorkspaceFormatterPrefs(File settings) throws IOException {
+        java.util.Properties props = new java.util.Properties();
+        try (FileInputStream fis = new FileInputStream(settings)) {
+            props.load(fis);
+        }
+
+        Map<String, String> parsed = new HashMap<>();
+        for (String key : props.stringPropertyNames()) {
+            if (key.startsWith("org.eclipse.jdt.core.formatter.")) {
+                parsed.put(key, props.getProperty(key));
+            }
+        }
+        return parsed;
+    }
+
+    private void cacheWorkspacePrefs(File settings, Map<String, String> parsed) {
+        cachedWorkspacePrefsPath = settings.getAbsolutePath();
+        cachedWorkspacePrefsLastModified = settings.lastModified();
+        cachedWorkspacePrefs = parsed;
     }
 
     // ================================================================

@@ -60,6 +60,7 @@ import org.eclipse.lsp4j.Range;
  * Uses JDT's {@link ICompilationUnit#codeSelect(int, int)} to resolve the element
  * at the cursor, then navigates to its declaration source location.
  */
+@SuppressWarnings("unused")
 public class DefinitionProvider {
 
     private static final class SourceLookupContext {
@@ -75,12 +76,18 @@ public class DefinitionProvider {
     private static final String EXT_JAVA = ".java";
     private static final String EXT_GROOVY = ".groovy";
     private static final String STATIC_PREFIX = "static ";
+        private static final String JAVA_LANG_OBJECT = "java.lang.Object";
+        private static final String[] AUTO_IMPORTED_PACKAGES = {
+            "java.lang.", "java.util.", "java.io.",
+            "groovy.lang.", "groovy.util.", "java.math."
+        };
 
     /**
      * Tracks the project that last successfully resolved a definition so that
      * {@link #navigateViaJdtProject} can try it first on the next call.
      */
-    private volatile IProject currentDefinitionProject;
+        private final java.util.concurrent.atomic.AtomicReference<IProject> currentDefinitionProject =
+            new java.util.concurrent.atomic.AtomicReference<>();
 
     public DefinitionProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -807,24 +814,7 @@ public class DefinitionProvider {
         }
         String importLine = trimmed.substring(7).replace(";", "").trim();
         if (importLine.startsWith(STATIC_PREFIX)) {
-            // Handle static imports: "import static org.junit.Assert.assertEquals"
-            String staticPart = importLine.substring(STATIC_PREFIX.length()).trim();
-            // Check if simpleName matches the member name (last segment)
-            if (staticPart.endsWith("." + simpleName)) {
-                int lastDot = staticPart.lastIndexOf('.');
-                if (lastDot > 0) {
-                    return staticPart.substring(0, lastDot);
-                }
-            }
-            // Check if simpleName matches the class name
-            int lastDot = staticPart.lastIndexOf('.');
-            if (lastDot > 0) {
-                String classPart = staticPart.substring(0, lastDot);
-                if (classPart.endsWith("." + simpleName) || classPart.equals(simpleName)) {
-                    return classPart;
-                }
-            }
-            return null;
+            return resolveStaticImportLine(importLine, simpleName);
         }
         if (importLine.endsWith("." + simpleName)) {
             return importLine;
@@ -837,6 +827,23 @@ public class DefinitionProvider {
             }
         }
         return null;
+    }
+
+    private String resolveStaticImportLine(String importLine, String simpleName) {
+        String staticPart = importLine.substring(STATIC_PREFIX.length()).trim();
+        int lastDot = staticPart.lastIndexOf('.');
+        if (lastDot <= 0) {
+            return null;
+        }
+
+        if (staticPart.endsWith("." + simpleName)) {
+            return staticPart.substring(0, lastDot);
+        }
+
+        String classPart = staticPart.substring(0, lastDot);
+        return classPart.endsWith("." + simpleName) || classPart.equals(simpleName)
+                ? classPart
+                : null;
     }
 
     private String resolveFromContext(String[] lines, String packageName, String simpleName) {
@@ -895,33 +902,20 @@ public class DefinitionProvider {
     }
 
     private boolean canResolveSourceUncached(String fqn, SourceLookupContext sourceLookupContext) {
-        // Use JDT's indexed type search — covers JDK, workspace source, and
-        // binary types on the classpath.  Much faster than manual filesystem
-        // scanning or opening src.zip.
-
-        // Try the project that last resolved successfully first
-        IProject remembered = currentDefinitionProject;
-        if (remembered != null && remembered.isOpen()) {
-            try {
-                org.eclipse.jdt.core.IJavaProject jp = JavaCore.create(remembered);
-                if (jp != null && jp.exists() && findTypeCached(jp, fqn, sourceLookupContext) != null) {
-                    return true;
-                }
-            } catch (Exception e) { /* ignore */ }
+        IProject remembered = currentDefinitionProject.get();
+        if (canResolveInProject(remembered, fqn, sourceLookupContext)) {
+            return true;
         }
 
-        // Check remaining projects
         try {
             IProject[] projects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
             for (IProject project : projects) {
-                if (!project.isOpen() || project.equals(remembered)) continue;
-                org.eclipse.jdt.core.IJavaProject javaProject = JavaCore.create(project);
-                if (javaProject != null && javaProject.exists()) {
-                    IType type = findTypeCached(javaProject, fqn, sourceLookupContext);
-                    if (type != null) {
-                        currentDefinitionProject = project;
-                        return true;
-                    }
+                if (project.equals(remembered)) {
+                    continue;
+                }
+                if (canResolveInProject(project, fqn, sourceLookupContext)) {
+                    currentDefinitionProject.set(project);
+                    return true;
                 }
             }
         } catch (Exception e) {
@@ -929,6 +923,23 @@ public class DefinitionProvider {
         }
 
         return false;
+    }
+
+    private boolean canResolveInProject(
+            IProject project,
+            String fqn,
+            SourceLookupContext sourceLookupContext) {
+        if (project == null || !project.isOpen()) {
+            return false;
+        }
+        try {
+            org.eclipse.jdt.core.IJavaProject javaProject = JavaCore.create(project);
+            return javaProject != null
+                    && javaProject.exists()
+                    && findTypeCached(javaProject, fqn, sourceLookupContext) != null;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
@@ -962,7 +973,7 @@ public class DefinitionProvider {
             SourceLookupContext sourceLookupContext) {
         try {
             // Try the project that last succeeded first to avoid iterating all 50+.
-            IProject remembered = currentDefinitionProject;
+            IProject remembered = currentDefinitionProject.get();
             if (remembered != null && remembered.isOpen()) {
                 Location loc = navigateViaProject(remembered, fqn, simpleName, sourceLookupContext);
                 if (loc != null) return loc;
@@ -973,7 +984,7 @@ public class DefinitionProvider {
                 if (!project.isOpen() || project.equals(remembered)) continue;
                 Location loc = navigateViaProject(project, fqn, simpleName, sourceLookupContext);
                 if (loc != null) {
-                    currentDefinitionProject = project;
+                    currentDefinitionProject.set(project);
                     return loc;
                 }
             }
@@ -1303,140 +1314,199 @@ public class DefinitionProvider {
                                               String word, String uri,
                                               SourceLookupContext sourceLookupContext) {
         try {
-            // Check if preceded by a dot
-            int wordStart = offset;
-            while (wordStart > 0 && Character.isJavaIdentifierPart(content.charAt(wordStart - 1))) {
-                wordStart--;
-            }
-            if (wordStart <= 0 || content.charAt(wordStart - 1) != '.') {
+            int dotPos = dotPositionBeforeWord(content, offset);
+            if (dotPos < 0) {
                 return null;
             }
 
-            // Find a JDT project for type resolution
             ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
             if (workingCopy == null) return null;
 
             org.eclipse.jdt.core.IJavaProject project = workingCopy.getJavaProject();
             if (project == null || !project.exists()) return null;
 
-            // Extract the full dotted chain before the cursor word.
-            // E.g., for "SomeClass.InnerClass.STATIC_MEMBER" with cursor on
-            // STATIC_MEMBER, extract ["SomeClass", "InnerClass"] as receiver parts.
-            int dotPos = wordStart - 1;
-            List<String> receiverParts = new ArrayList<>();
-            int pos = dotPos;
-            while (pos >= 0) {
-                int partEnd = pos; // just before the dot (or start of word)
-                int partStart = partEnd - 1;
-                while (partStart >= 0 && Character.isJavaIdentifierPart(content.charAt(partStart))) {
-                    partStart--;
-                }
-                partStart++;
-                if (partStart < partEnd) {
-                    receiverParts.add(0, content.substring(partStart, partEnd));
-                    // Check if there's another dot before this part
-                    if (partStart > 0 && content.charAt(partStart - 1) == '.') {
-                        pos = partStart - 2;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            IType receiverType = null;
-
-            if (!receiverParts.isEmpty()) {
-                String firstPart = receiverParts.get(0);
-                GroovyLanguageServerPlugin.logInfo("[definition-ast] Dot call: receiverParts="
-                        + receiverParts + " word='" + word + "'");
-
-                // Resolve the first part as a type
-                ClassNode receiverClassNode = resolveReceiverClassNode(ast, firstPart);
-                if (receiverClassNode != null) {
-                    receiverType = resolveClassNodeToIType(
-                            receiverClassNode, ast, project, sourceLookupContext);
-                }
-
-                // Walk remaining parts as inner classes/types
-                if (receiverType != null) {
-                    for (int i = 1; i < receiverParts.size(); i++) {
-                        IType innerType = receiverType.getType(receiverParts.get(i));
-                        if (innerType != null && innerType.exists()) {
-                            receiverType = innerType;
-                        } else {
-                            receiverType = null;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Fallback: AST-based resolution for complex receivers like "new Foo().method()"
-            if (receiverType == null) {
-                receiverType = resolveReceiverTypeFromAst(
-                        ast, project, offset, word, content, sourceLookupContext);
-            }
-
+            IType receiverType = resolveDotCallReceiverType(
+                    ast, content, offset, dotPos, word, project, sourceLookupContext);
             if (receiverType == null) return null;
-            Map<String, String> contentCache = new HashMap<>();
-            Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
-            contentCache.put(uri, content);
-            lineIndexCache.put(uri, PositionUtils.buildLineIndex(content));
 
-            // If word starts with uppercase, it might be an inner class reference
-            // (e.g., SomeClass.InnerClass)
-            if (!word.isEmpty() && Character.isUpperCase(word.charAt(0))) {
-                IType innerType = receiverType.getType(word);
-                if (innerType != null && innerType.exists()) {
-                    Location loc = toLocation(innerType, contentCache, lineIndexCache);
-                    if (loc != null) return loc;
-                }
-            }
-
-            // Find the method and navigate to it
-            for (org.eclipse.jdt.core.IMethod method : receiverType.getMethods()) {
-                if (word.equals(method.getElementName())) {
-                    Location loc = toLocation(method, contentCache, lineIndexCache);
-                    if (loc != null) return loc;
-                }
-            }
-
-            // Check fields (e.g., SomeClass.STATIC_MEMBER or SomeClass.InnerClass.FIELD)
-            for (org.eclipse.jdt.core.IField field : receiverType.getFields()) {
-                if (word.equals(field.getElementName())) {
-                    Location loc = toLocation(field, contentCache, lineIndexCache);
-                    if (loc != null) return loc;
-                }
-            }
-
-            // Check supertypes
-            org.eclipse.jdt.core.ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(receiverType);
-            if (hierarchy != null) {
-                for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
-                    for (org.eclipse.jdt.core.IMethod method : superType.getMethods()) {
-                        if (word.equals(method.getElementName())) {
-                            Location loc = toLocation(method, contentCache, lineIndexCache);
-                            if (loc != null) return loc;
-                        }
-                    }
-                    for (org.eclipse.jdt.core.IField field : superType.getFields()) {
-                        if (word.equals(field.getElementName())) {
-                            Location loc = toLocation(field, contentCache, lineIndexCache);
-                            if (loc != null) return loc;
-                        }
-                    }
-                }
-            }
-
-            Location generatedAccessorLoc = resolveGeneratedAccessorLocation(
-                    receiverType, word, contentCache, lineIndexCache);
-            if (generatedAccessorLoc != null) {
-                return generatedAccessorLoc;
-            }
+            return resolveMemberLocation(receiverType, word, uri, content);
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[definition-ast] resolveAstDotMethodCall failed", e);
+        }
+        return null;
+    }
+
+    private int dotPositionBeforeWord(String content, int offset) {
+        int wordStart = offset;
+        while (wordStart > 0 && Character.isJavaIdentifierPart(content.charAt(wordStart - 1))) {
+            wordStart--;
+        }
+        return wordStart > 0 && content.charAt(wordStart - 1) == '.' ? wordStart - 1 : -1;
+    }
+
+    private IType resolveDotCallReceiverType(
+            ModuleNode ast,
+            String content,
+            int offset,
+            int dotPos,
+            String word,
+            org.eclipse.jdt.core.IJavaProject project,
+            SourceLookupContext sourceLookupContext) {
+        List<String> receiverParts = extractReceiverParts(content, dotPos);
+        if (!receiverParts.isEmpty()) {
+            GroovyLanguageServerPlugin.logInfo("[definition-ast] Dot call: receiverParts="
+                    + receiverParts + " word='" + word + "'");
+            IType receiverType = resolveReceiverTypeFromParts(receiverParts, ast, project, sourceLookupContext);
+            if (receiverType != null) {
+                return receiverType;
+            }
+        }
+        return resolveReceiverTypeFromAst(ast, project, offset, word, content, sourceLookupContext);
+    }
+
+    private List<String> extractReceiverParts(String content, int dotPos) {
+        List<String> receiverParts = new ArrayList<>();
+        int pos = dotPos;
+        while (pos >= 0) {
+            int partStart = findIdentifierStart(content, pos - 1);
+            if (partStart >= pos) {
+                return receiverParts;
+            }
+            receiverParts.add(0, content.substring(partStart, pos));
+            pos = partStart > 0 && content.charAt(partStart - 1) == '.' ? partStart - 2 : -1;
+        }
+        return receiverParts;
+    }
+
+    private int findIdentifierStart(String content, int position) {
+        int partStart = position;
+        while (partStart >= 0 && Character.isJavaIdentifierPart(content.charAt(partStart))) {
+            partStart--;
+        }
+        return partStart + 1;
+    }
+
+    private IType resolveReceiverTypeFromParts(
+            List<String> receiverParts,
+            ModuleNode ast,
+            org.eclipse.jdt.core.IJavaProject project,
+            SourceLookupContext sourceLookupContext) {
+        ClassNode receiverClassNode = resolveReceiverClassNode(ast, receiverParts.get(0));
+        if (receiverClassNode == null) {
+            return null;
+        }
+
+        IType receiverType = resolveClassNodeToIType(receiverClassNode, ast, project, sourceLookupContext);
+        if (receiverType == null) {
+            return null;
+        }
+
+        for (int i = 1; i < receiverParts.size(); i++) {
+            IType innerType = receiverType.getType(receiverParts.get(i));
+            if (innerType == null || !innerType.exists()) {
+                return null;
+            }
+            receiverType = innerType;
+        }
+        return receiverType;
+    }
+
+    private Location resolveMemberLocation(
+            IType receiverType,
+            String word,
+            String uri,
+            String content) throws JavaModelException {
+        Map<String, String> contentCache = new HashMap<>();
+        Map<String, PositionUtils.LineIndex> lineIndexCache = new HashMap<>();
+        contentCache.put(uri, content);
+        lineIndexCache.put(uri, PositionUtils.buildLineIndex(content));
+
+        Location directLocation = resolveDirectMemberLocation(receiverType, word, contentCache, lineIndexCache);
+        if (directLocation != null) {
+            return directLocation;
+        }
+
+        Location hierarchyLocation = resolveHierarchyMemberLocation(receiverType, word, contentCache, lineIndexCache);
+        if (hierarchyLocation != null) {
+            return hierarchyLocation;
+        }
+
+        return resolveGeneratedAccessorLocation(receiverType, word, contentCache, lineIndexCache);
+    }
+
+    private Location resolveDirectMemberLocation(
+            IType receiverType,
+            String word,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) throws JavaModelException {
+        if (!word.isEmpty() && Character.isUpperCase(word.charAt(0))) {
+            IType innerType = receiverType.getType(word);
+            if (innerType != null && innerType.exists()) {
+                Location location = toLocation(innerType, contentCache, lineIndexCache);
+                if (location != null) {
+                    return location;
+                }
+            }
+        }
+
+        Location methodLocation = resolveDeclaredMethodLocation(receiverType, word, contentCache, lineIndexCache);
+        if (methodLocation != null) {
+            return methodLocation;
+        }
+        return resolveDeclaredFieldLocation(receiverType, word, contentCache, lineIndexCache);
+    }
+
+    private Location resolveDeclaredMethodLocation(
+            IType receiverType,
+            String word,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) throws JavaModelException {
+        for (org.eclipse.jdt.core.IMethod method : receiverType.getMethods()) {
+            if (word.equals(method.getElementName())) {
+                Location location = toLocation(method, contentCache, lineIndexCache);
+                if (location != null) {
+                    return location;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Location resolveDeclaredFieldLocation(
+            IType receiverType,
+            String word,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) throws JavaModelException {
+        for (org.eclipse.jdt.core.IField field : receiverType.getFields()) {
+            if (word.equals(field.getElementName())) {
+                Location location = toLocation(field, contentCache, lineIndexCache);
+                if (location != null) {
+                    return location;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Location resolveHierarchyMemberLocation(
+            IType receiverType,
+            String word,
+            Map<String, String> contentCache,
+            Map<String, PositionUtils.LineIndex> lineIndexCache) throws JavaModelException {
+        org.eclipse.jdt.core.ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(receiverType);
+        if (hierarchy == null) {
+            return null;
+        }
+
+        for (IType superType : hierarchy.getAllSupertypes(receiverType)) {
+            Location methodLocation = resolveDeclaredMethodLocation(superType, word, contentCache, lineIndexCache);
+            if (methodLocation != null) {
+                return methodLocation;
+            }
+            Location fieldLocation = resolveDeclaredFieldLocation(superType, word, contentCache, lineIndexCache);
+            if (fieldLocation != null) {
+                return fieldLocation;
+            }
         }
         return null;
     }
@@ -1508,7 +1578,7 @@ public class DefinitionProvider {
 
         Expression objectExpr = found.getObjectExpression();
         ClassNode receiverClassNode = resolveObjectExpressionType(objectExpr, ast);
-        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+        if (receiverClassNode == null || JAVA_LANG_OBJECT.equals(receiverClassNode.getName())) {
             return null;
         }
 
@@ -1526,25 +1596,7 @@ public class DefinitionProvider {
             return ctorCall.getType();
         }
         if (objectExpr instanceof VariableExpression varExpr) {
-            String varName = varExpr.getName();
-            if ("this".equals(varName)) return null;
-            // Check local variable declarations in the AST
-            for (ClassNode classNode : ast.getClasses()) {
-                if (classNode.getLineNumber() < 0) continue;
-                for (MethodNode method : classNode.getMethods()) {
-                    ClassNode type = resolveLocalVarTypeInBlock(getBlock(method), varName);
-                    if (type != null) return type;
-                }
-            }
-            org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = ast.getStatementBlock();
-            if (stmtBlock != null) {
-                ClassNode type = resolveLocalVarTypeInBlock(stmtBlock, varName);
-                if (type != null) return type;
-            }
-            ClassNode exprType = varExpr.getType();
-            if (exprType != null && !"java.lang.Object".equals(exprType.getName())) {
-                return exprType;
-            }
+            return resolveVariableExpressionType(ast, varExpr);
         }
         if (objectExpr instanceof ClassExpression classExpr) {
             return classExpr.getType();
@@ -1552,15 +1604,47 @@ public class DefinitionProvider {
         return null;
     }
 
+    private ClassNode resolveVariableExpressionType(ModuleNode ast, VariableExpression varExpr) {
+        String varName = varExpr.getName();
+        if ("this".equals(varName)) {
+            return null;
+        }
+        ClassNode localType = findAstLocalVariableType(ast, varName);
+        if (localType != null) {
+            return localType;
+        }
+        ClassNode exprType = varExpr.getType();
+        return isUsefulAstType(exprType) ? exprType : null;
+    }
+
+    private ClassNode findAstLocalVariableType(ModuleNode ast, String varName) {
+        for (ClassNode classNode : ast.getClasses()) {
+            if (classNode.getLineNumber() < 0) {
+                continue;
+            }
+            for (MethodNode method : classNode.getMethods()) {
+                ClassNode type = resolveLocalVarTypeInBlock(getBlock(method), varName);
+                if (type != null) {
+                    return type;
+                }
+            }
+        }
+        org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = ast.getStatementBlock();
+        return stmtBlock != null ? resolveLocalVarTypeInBlock(stmtBlock, varName) : null;
+    }
+
+    private boolean isUsefulAstType(ClassNode classNode) {
+        return classNode != null && !JAVA_LANG_OBJECT.equals(classNode.getName());
+    }
+
     /**
      * Walk the AST to find a MethodCallExpression at the given offset with the given method name.
      */
     private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
                                                          String methodName, String content) {
-        // Convert offset to 1-based line/column for AST node matching
         Position pos = offsetToPosition(content, offset);
-        int targetLine = pos.getLine() + 1;  // AST uses 1-based lines
-        int targetCol = pos.getCharacter() + 1;  // AST uses 1-based columns
+        int targetLine = pos.getLine() + 1;
+        int targetCol = pos.getCharacter() + 1;
 
         final MethodCallExpression[] result = new MethodCallExpression[1];
 
@@ -1573,38 +1657,64 @@ public class DefinitionProvider {
             @Override
             public void visitMethodCallExpression(MethodCallExpression call) {
                 if (result[0] != null) return;
-                String name = call.getMethodAsString();
-                if (methodName.equals(name)) {
-                    Expression methodExpr = call.getMethod();
-                    int mLine = methodExpr.getLineNumber();
-                    int mCol = methodExpr.getColumnNumber();
-                    int mLastCol = methodExpr.getLastColumnNumber();
-                    if (mLine == targetLine && targetCol >= mCol && targetCol <= mLastCol) {
-                        result[0] = call;
-                        return;
-                    }
+                if (matchesMethodCallAtPosition(call, methodName, targetLine, targetCol)) {
+                    result[0] = call;
+                    return;
                 }
                 super.visitMethodCallExpression(call);
             }
         };
 
-        for (ClassNode classNode : module.getClasses()) {
-            if (result[0] != null) break;
-            visitor.visitClass(classNode);
-        }
-
-        // Also check module-level statements (Groovy scripts)
-        if (result[0] == null) {
-            org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = module.getStatementBlock();
-            if (stmtBlock != null) {
-                for (Statement stmt : stmtBlock.getStatements()) {
-                    if (result[0] != null) break;
-                    stmt.visit(visitor);
-                }
-            }
-        }
+        visitClassesUntilFound(module, visitor, result);
+        visitModuleStatementsUntilFound(module, visitor, result);
 
         return result[0];
+    }
+
+    private void visitClassesUntilFound(
+            ModuleNode module,
+            ClassCodeVisitorSupport visitor,
+            MethodCallExpression[] result) {
+        for (ClassNode classNode : module.getClasses()) {
+            if (result[0] != null) {
+                return;
+            }
+            visitor.visitClass(classNode);
+        }
+    }
+
+    private void visitModuleStatementsUntilFound(
+            ModuleNode module,
+            ClassCodeVisitorSupport visitor,
+            MethodCallExpression[] result) {
+        if (result[0] != null) {
+            return;
+        }
+        org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = module.getStatementBlock();
+        if (stmtBlock == null) {
+            return;
+        }
+        for (Statement stmt : stmtBlock.getStatements()) {
+            if (result[0] != null) {
+                return;
+            }
+            stmt.visit(visitor);
+        }
+    }
+
+    private boolean matchesMethodCallAtPosition(
+            MethodCallExpression call,
+            String methodName,
+            int targetLine,
+            int targetCol) {
+        if (!methodName.equals(call.getMethodAsString())) {
+            return false;
+        }
+        Expression methodExpr = call.getMethod();
+        int methodLine = methodExpr.getLineNumber();
+        int methodColumn = methodExpr.getColumnNumber();
+        int methodLastColumn = methodExpr.getLastColumnNumber();
+        return methodLine == targetLine && targetCol >= methodColumn && targetCol <= methodLastColumn;
     }
 
     /**
@@ -1612,43 +1722,47 @@ public class DefinitionProvider {
      * Handles constructor calls, local variables, fields/properties.
      */
     private ClassNode resolveReceiverClassNode(ModuleNode ast, String receiverName) {
-        // Check if it's a type name (uppercase)
         if (!receiverName.isEmpty() && Character.isUpperCase(receiverName.charAt(0))) {
-            for (ClassNode classNode : ast.getClasses()) {
-                if (receiverName.equals(classNode.getNameWithoutPackage())) {
-                    return classNode;
-                }
-            }
-            // Could be an imported type — return a ClassNode placeholder
-            for (org.codehaus.groovy.ast.ImportNode imp : ast.getImports()) {
-                ClassNode impType = imp.getType();
-                if (impType != null && receiverName.equals(impType.getNameWithoutPackage())) {
-                    return impType;
-                }
+            ClassNode typeNode = resolveNamedTypeNode(ast, receiverName);
+            if (typeNode != null) {
+                return typeNode;
             }
         }
 
-        // Check local variable declarations
+        ClassNode localType = findAstLocalVariableType(ast, receiverName);
+        if (localType != null) {
+            return localType;
+        }
+
+        return resolveFieldOrPropertyType(ast, receiverName);
+    }
+
+    private ClassNode resolveNamedTypeNode(ModuleNode ast, String receiverName) {
         for (ClassNode classNode : ast.getClasses()) {
-            if (classNode.getLineNumber() < 0) continue;
-            for (MethodNode method : classNode.getMethods()) {
-                ClassNode type = resolveLocalVarTypeInBlock(getBlock(method), receiverName);
-                if (type != null) return type;
+            if (receiverName.equals(classNode.getNameWithoutPackage())) {
+                return classNode;
             }
         }
-        org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = ast.getStatementBlock();
-        if (stmtBlock != null) {
-            ClassNode type = resolveLocalVarTypeInBlock(stmtBlock, receiverName);
-            if (type != null) return type;
+        for (org.codehaus.groovy.ast.ImportNode imp : ast.getImports()) {
+            ClassNode impType = imp.getType();
+            if (impType != null && receiverName.equals(impType.getNameWithoutPackage())) {
+                return impType;
+            }
         }
+        return null;
+    }
 
-        // Check fields/properties
+    private ClassNode resolveFieldOrPropertyType(ModuleNode ast, String receiverName) {
         for (ClassNode classNode : ast.getClasses()) {
             for (FieldNode field : classNode.getFields()) {
-                if (receiverName.equals(field.getName())) return field.getType();
+                if (receiverName.equals(field.getName())) {
+                    return field.getType();
+                }
             }
             for (PropertyNode prop : classNode.getProperties()) {
-                if (receiverName.equals(prop.getName())) return prop.getType();
+                if (receiverName.equals(prop.getName())) {
+                    return prop.getType();
+                }
             }
         }
 
@@ -1664,22 +1778,33 @@ public class DefinitionProvider {
                                                   String varName) {
         if (block == null) return null;
         for (org.codehaus.groovy.ast.stmt.Statement stmt : block.getStatements()) {
-            if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) continue;
-            if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) continue;
-            org.codehaus.groovy.ast.expr.Expression left = decl.getLeftExpression();
-            if (!(left instanceof org.codehaus.groovy.ast.expr.VariableExpression varExpr)) continue;
-            if (!varName.equals(varExpr.getName())) continue;
-
-            org.codehaus.groovy.ast.expr.Expression init = decl.getRightExpression();
-            if (init instanceof org.codehaus.groovy.ast.expr.ConstructorCallExpression ctorCall) {
-                return ctorCall.getType();
-            }
-            ClassNode originType = varExpr.getOriginType();
-            if (originType != null && !"java.lang.Object".equals(originType.getName())) {
-                return originType;
+            ClassNode declaredType = resolveDeclaredVariableType(stmt, varName);
+            if (declaredType != null) {
+                return declaredType;
             }
         }
         return null;
+    }
+
+    private ClassNode resolveDeclaredVariableType(org.codehaus.groovy.ast.stmt.Statement stmt, String varName) {
+        if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) {
+            return null;
+        }
+        if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) {
+            return null;
+        }
+        org.codehaus.groovy.ast.expr.Expression left = decl.getLeftExpression();
+        if (!(left instanceof org.codehaus.groovy.ast.expr.VariableExpression varExpr)
+                || !varName.equals(varExpr.getName())) {
+            return null;
+        }
+
+        org.codehaus.groovy.ast.expr.Expression init = decl.getRightExpression();
+        if (init instanceof org.codehaus.groovy.ast.expr.ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+        ClassNode originType = varExpr.getOriginType();
+        return originType != null && !JAVA_LANG_OBJECT.equals(originType.getName()) ? originType : null;
     }
 
     private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module,
@@ -1695,52 +1820,85 @@ public class DefinitionProvider {
             String typeName = typeNode.getName();
             if (typeName == null || typeName.isEmpty()) return null;
 
-            if (typeName.contains(".")) {
-                IType type = findTypeCached(project, typeName, sourceLookupContext);
-                if (type != null) return type;
-                // Groovy AST uses '$' for inner classes, but JDT findType
-                // expects '.' — try replacing '$' with '.'
-                if (typeName.contains("$")) {
-                    type = findTypeCached(project, typeName.replace('$', '.'), sourceLookupContext);
-                    if (type != null) return type;
-                }
-            }
+            IType type = resolveQualifiedClassNode(typeName, project, sourceLookupContext);
+            if (type != null) return type;
 
-            // Check imports
-            for (org.codehaus.groovy.ast.ImportNode imp : module.getImports()) {
-                ClassNode impType = imp.getType();
-                if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
-                    IType type = findTypeCached(project, impType.getName(), sourceLookupContext);
-                    if (type != null) return type;
-                }
-            }
+            type = resolveImportedClassNode(module, typeName, project, sourceLookupContext);
+            if (type != null) return type;
 
-            // Star imports
-            for (org.codehaus.groovy.ast.ImportNode starImport : module.getStarImports()) {
-                String pkgName = starImport.getPackageName();
-                if (pkgName != null) {
-                    IType type = findTypeCached(project, pkgName + typeName, sourceLookupContext);
-                    if (type != null) return type;
-                }
-            }
+            type = resolveModulePackageType(module, typeName, project, sourceLookupContext);
+            if (type != null) return type;
 
-            // Module package
-            String pkg = module.getPackageName();
-            if (pkg != null && !pkg.isEmpty()) {
-                if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
-                IType type = findTypeCached(project, pkg + "." + typeName, sourceLookupContext);
-                if (type != null) return type;
-            }
-
-            // Auto-import packages
-            String[] autoPackages = {"java.lang.", "java.util.", "java.io.",
-                    "groovy.lang.", "groovy.util.", "java.math."};
-            for (String autoPkg : autoPackages) {
-                IType type = findTypeCached(project, autoPkg + typeName, sourceLookupContext);
-                if (type != null) return type;
-            }
+            return resolveAutoImportedType(typeName, project, sourceLookupContext);
         } catch (JavaModelException e) {
             // ignore
+        }
+        return null;
+    }
+
+    private IType resolveQualifiedClassNode(
+            String typeName,
+            org.eclipse.jdt.core.IJavaProject project,
+            SourceLookupContext sourceLookupContext) throws JavaModelException {
+        if (!typeName.contains(".")) {
+            return null;
+        }
+        IType type = findTypeCached(project, typeName, sourceLookupContext);
+        if (type != null || !typeName.contains("$")) {
+            return type;
+        }
+        return findTypeCached(project, typeName.replace('$', '.'), sourceLookupContext);
+    }
+
+    private IType resolveImportedClassNode(
+            ModuleNode module,
+            String typeName,
+            org.eclipse.jdt.core.IJavaProject project,
+            SourceLookupContext sourceLookupContext) throws JavaModelException {
+        for (org.codehaus.groovy.ast.ImportNode imp : module.getImports()) {
+            ClassNode impType = imp.getType();
+            if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
+                IType type = findTypeCached(project, impType.getName(), sourceLookupContext);
+                if (type != null) {
+                    return type;
+                }
+            }
+        }
+        for (org.codehaus.groovy.ast.ImportNode starImport : module.getStarImports()) {
+            String pkgName = starImport.getPackageName();
+            if (pkgName == null) {
+                continue;
+            }
+            IType type = findTypeCached(project, pkgName + typeName, sourceLookupContext);
+            if (type != null) {
+                return type;
+            }
+        }
+        return null;
+    }
+
+    private IType resolveModulePackageType(
+            ModuleNode module,
+            String typeName,
+            org.eclipse.jdt.core.IJavaProject project,
+            SourceLookupContext sourceLookupContext) throws JavaModelException {
+        String pkg = module.getPackageName();
+        if (pkg == null || pkg.isEmpty()) {
+            return null;
+        }
+        String normalizedPackage = pkg.endsWith(".") ? pkg.substring(0, pkg.length() - 1) : pkg;
+        return findTypeCached(project, normalizedPackage + "." + typeName, sourceLookupContext);
+    }
+
+    private IType resolveAutoImportedType(
+            String typeName,
+            org.eclipse.jdt.core.IJavaProject project,
+            SourceLookupContext sourceLookupContext) throws JavaModelException {
+        for (String autoPkg : AUTO_IMPORTED_PACKAGES) {
+            IType type = findTypeCached(project, autoPkg + typeName, sourceLookupContext);
+            if (type != null) {
+                return type;
+            }
         }
         return null;
     }
@@ -1772,17 +1930,28 @@ public class DefinitionProvider {
                                          String varName, String uri) {
         if (block == null) return null;
         for (org.codehaus.groovy.ast.stmt.Statement stmt : block.getStatements()) {
-            if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) continue;
-            if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) continue;
-            org.codehaus.groovy.ast.expr.Expression left = decl.getLeftExpression();
-            if (!(left instanceof org.codehaus.groovy.ast.expr.VariableExpression varExpr)) continue;
-            if (!varName.equals(varExpr.getName())) continue;
-
-            if (varExpr.getLineNumber() >= 1) {
-                return astNodeToLocation(uri, varExpr);
+            org.codehaus.groovy.ast.expr.VariableExpression declaration = findDeclaredVariable(stmt, varName);
+            if (declaration != null && declaration.getLineNumber() >= 1) {
+                return astNodeToLocation(uri, declaration);
             }
         }
         return null;
+    }
+
+    private org.codehaus.groovy.ast.expr.VariableExpression findDeclaredVariable(
+            org.codehaus.groovy.ast.stmt.Statement stmt,
+            String varName) {
+        if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) {
+            return null;
+        }
+        if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) {
+            return null;
+        }
+        org.codehaus.groovy.ast.expr.Expression left = decl.getLeftExpression();
+        return left instanceof org.codehaus.groovy.ast.expr.VariableExpression varExpr
+                && varName.equals(varExpr.getName())
+                ? varExpr
+                : null;
     }
 
     /**
@@ -1792,28 +1961,30 @@ public class DefinitionProvider {
      */
     private Location resolveStaticImportMember(ModuleNode ast, String word,
             SourceLookupContext sourceLookupContext) {
-        // Check named static imports
         for (ImportNode imp : ast.getStaticImports().values()) {
             String fieldName = imp.getFieldName();
             if (fieldName != null && fieldName.equals(word)) {
-                ClassNode type = imp.getType();
-                if (type != null) {
-                    Location loc = navigateToFqn(
-                            type.getName(), type.getNameWithoutPackage(), sourceLookupContext);
-                    if (loc != null) return loc;
+                Location location = navigateImportType(imp, sourceLookupContext);
+                if (location != null) {
+                    return location;
                 }
             }
         }
-        // Check static star imports
         for (ImportNode imp : ast.getStaticStarImports().values()) {
-            ClassNode type = imp.getType();
-            if (type != null) {
-                Location loc = navigateToFqn(
-                        type.getName(), type.getNameWithoutPackage(), sourceLookupContext);
-                if (loc != null) return loc;
+            Location location = navigateImportType(imp, sourceLookupContext);
+            if (location != null) {
+                return location;
             }
         }
         return null;
+    }
+
+    private Location navigateImportType(ImportNode importNode, SourceLookupContext sourceLookupContext) {
+        ClassNode type = importNode.getType();
+        if (type == null) {
+            return null;
+        }
+        return navigateToFqn(type.getName(), type.getNameWithoutPackage(), sourceLookupContext);
     }
 
     private Location scanAllClassesForSymbol(ModuleNode ast, String word, String uri) {
@@ -2077,7 +2248,7 @@ public class DefinitionProvider {
 
     private void appendStubSuperclass(StringBuilder sb, IType type) throws JavaModelException {
         String superclass = type.getSuperclassName();
-        if (superclass != null && !"Object".equals(superclass) && !"java.lang.Object".equals(superclass)) {
+        if (superclass != null && !"Object".equals(superclass) && !JAVA_LANG_OBJECT.equals(superclass)) {
             sb.append(" extends ").append(superclass);
         }
     }
@@ -2132,7 +2303,7 @@ public class DefinitionProvider {
         sb.append(" { /* compiled code */ }\n");
     }
 
-    private void appendStubParameters(StringBuilder sb, org.eclipse.jdt.core.IMethod method) throws JavaModelException {
+    private void appendStubParameters(StringBuilder sb, org.eclipse.jdt.core.IMethod method) {
         String[] paramNames = JdtParameterNameResolver.resolve(method);
         String[] paramTypes = method.getParameterTypes();
         for (int i = 0; i < paramTypes.length; i++) {

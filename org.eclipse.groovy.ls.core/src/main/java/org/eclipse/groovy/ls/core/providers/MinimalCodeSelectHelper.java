@@ -56,10 +56,12 @@ import org.eclipse.jdt.core.Signature;
  *   <li>Field/property declarations (cursor on field name → IField)</li>
  * </ul>
  */
+@SuppressWarnings("unused")
 public class MinimalCodeSelectHelper implements ICodeSelectHelper {
 
     private static final String LOG_FIELDS = " fields=";
     private static final String LOG_METHODS = " methods=";
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
     private static final String PKG_GROOVY_LANG = "groovy.lang.";
     private static final String PKG_GROOVY_UTIL = "groovy.util.";
     private static final String PKG_JAVA_LANG = "java.lang.";
@@ -86,110 +88,136 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
     @Override
     public IJavaElement[] select(GroovyCompilationUnit unit, int offset, int length) {
         try {
-            ModuleNode module = unit.getModuleNode();
-            if (module == null) {
+            SelectionContext context = createSelectionContext(unit, offset);
+            if (context == null) {
                 return new IJavaElement[0];
             }
 
-            IJavaProject javaProject = unit.getJavaProject();
-            if (javaProject == null) {
-                return new IJavaElement[0];
-            }
+            GroovyLanguageServerPlugin.logInfo(
+                    "[codeSelect] Resolving word '" + context.word() + "' at offset " + offset);
 
-            // Extract the word at the cursor position
-            String source = getUnitSource(unit);
-            if (source == null) {
-                return new IJavaElement[0];
-            }
-            String sourceUri = resolveUnitSourceUri(unit);
-
-            String word = extractWordAt(source, offset);
-            if (word == null || word.isEmpty()) {
-                return new IJavaElement[0];
-            }
-
-            GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolving word '" + word + "' at offset " + offset);
-
-            List<IJavaElement> results = new ArrayList<>();
-
-            // 1. Check import statements — most precise resolution
-            String fqnFromImport = resolveFromImports(module, word);
-            if (fqnFromImport != null) {
-                IType type = ScopedTypeLookupSupport.findType(javaProject, fqnFromImport, sourceUri);
-                if (type != null) {
-                    // If the word doesn't match the type name, it's a static import member
-                    if (!type.getElementName().equals(word)) {
-                        IJavaElement member = findStaticMemberInType(type, word);
-                        if (member != null) {
-                            results.add(member);
-                            GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved static import member: " + word + " in " + fqnFromImport);
-                            return results.toArray(new IJavaElement[0]);
-                        }
-                    }
-                    results.add(type);
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved via import: " + fqnFromImport);
-                    return results.toArray(new IJavaElement[0]);
-                }
-            }
-
-            // 2. Check if cursor is on a class declaration or type reference in the AST
-            //    Skip for words starting with lowercase — they are method/field/variable names,
-            //    not type references, so the full AST walk would be wasted work.
-            boolean startsLowerCase = Character.isLowerCase(word.charAt(0));
-            if (!startsLowerCase) {
-                String fqnFromAST = resolveTypeFromAST(module, word);
-                if (fqnFromAST != null) {
-                    IType type = ScopedTypeLookupSupport.findType(javaProject, fqnFromAST, sourceUri);
-                    if (type != null) {
-                        results.add(type);
-                        GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved type from AST: " + fqnFromAST);
-                        return results.toArray(new IJavaElement[0]);
-                    }
-                }
-            }
-
-            // 3. Check if cursor is on a method/field declaration within the current file
-            IJavaElement localElement = resolveLocalDeclaration(unit, module, word, offset, source);
-            if (localElement != null) {
-                results.add(localElement);
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved local declaration: " + localElement.getElementName());
-                return results.toArray(new IJavaElement[0]);
-            }
-
-            // 3b. Check if cursor is on a method call after a dot (e.g., "expr.value()")
-            //     Resolve the receiver expression type and find the method in it.
-            IJavaElement dotCallElement = resolveDotMethodCall(module, javaProject, source, offset, word, sourceUri);
-            if (dotCallElement != null) {
-                results.add(dotCallElement);
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved dot method call: " + dotCallElement.getElementName());
-                return results.toArray(new IJavaElement[0]);
-            }
-
-            // 3c. Check if the word is a local variable reference (e.g., "value" in "value.xxx")
-            //     Resolve the variable's initializer type and return it.
-            IJavaElement localVarType = resolveLocalVariableType(module, javaProject, word, sourceUri);
-            if (localVarType != null) {
-                results.add(localVarType);
-                GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved local variable type: " + localVarType.getElementName());
-                return results.toArray(new IJavaElement[0]);
-            }
-
-            // 4. Last resort — try to find a type by simple name using imports as context
-            //    Only for uppercase-starting words (type names); lowercase words won't match types.
-            if (!startsLowerCase) {
-                IType typeFromSearch = searchTypeBySimpleName(javaProject, module, word, sourceUri);
-                if (typeFromSearch != null) {
-                    results.add(typeFromSearch);
-                    GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved by type search: " + typeFromSearch.getFullyQualifiedName());
-                    return results.toArray(new IJavaElement[0]);
-                }
-            }
-
+            IJavaElement resolved = resolveSelectedElement(unit, context);
+            return resolved == null ? new IJavaElement[0] : new IJavaElement[] {resolved};
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[codeSelect] Failed", e);
         }
 
         return new IJavaElement[0];
+    }
+
+    private SelectionContext createSelectionContext(GroovyCompilationUnit unit, int offset) {
+        ModuleNode module = unit.getModuleNode();
+        IJavaProject javaProject = unit.getJavaProject();
+        String source = getUnitSource(unit);
+        if (module == null || javaProject == null || source == null) {
+            return null;
+        }
+
+        String word = extractWordAt(source, offset);
+        if (word == null || word.isEmpty()) {
+            return null;
+        }
+
+        return new SelectionContext(module, javaProject, source, resolveUnitSourceUri(unit), word, offset,
+                Character.isLowerCase(word.charAt(0)));
+    }
+
+    private IJavaElement resolveSelectedElement(GroovyCompilationUnit unit, SelectionContext context)
+            throws JavaModelException {
+        IJavaElement importElement = resolveImportedElement(context);
+        if (importElement != null) {
+            return importElement;
+        }
+
+        IJavaElement astType = resolveAstTypeElement(context);
+        if (astType != null) {
+            return astType;
+        }
+
+        IJavaElement localDeclaration = resolveLocalDeclaration(unit, context.module(), context.word(),
+                context.offset(), context.source());
+        if (localDeclaration != null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[codeSelect] Resolved local declaration: " + localDeclaration.getElementName());
+            return localDeclaration;
+        }
+
+        IJavaElement dotCallElement = resolveDotMethodCall(context.module(), context.javaProject(), context.source(),
+                context.offset(), context.word(), context.sourceUri());
+        if (dotCallElement != null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[codeSelect] Resolved dot method call: " + dotCallElement.getElementName());
+            return dotCallElement;
+        }
+
+        IJavaElement localVarType = resolveLocalVariableType(context.module(), context.javaProject(), context.word(),
+                context.sourceUri());
+        if (localVarType != null) {
+            GroovyLanguageServerPlugin.logInfo(
+                    "[codeSelect] Resolved local variable type: " + localVarType.getElementName());
+            return localVarType;
+        }
+
+        return resolveTypeSearchElement(context);
+    }
+
+    private IJavaElement resolveImportedElement(SelectionContext context) throws JavaModelException {
+        String fqnFromImport = resolveFromImports(context.module(), context.word());
+        if (fqnFromImport == null) {
+            return null;
+        }
+
+        IType type = ScopedTypeLookupSupport.findType(context.javaProject(), fqnFromImport, context.sourceUri());
+        if (type == null) {
+            return null;
+        }
+
+        if (!type.getElementName().equals(context.word())) {
+            IJavaElement member = findStaticMemberInType(type, context.word());
+            if (member != null) {
+                GroovyLanguageServerPlugin.logInfo(
+                        "[codeSelect] Resolved static import member: " + context.word() + " in " + fqnFromImport);
+                return member;
+            }
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved via import: " + fqnFromImport);
+        return type;
+    }
+
+    private IJavaElement resolveAstTypeElement(SelectionContext context) throws JavaModelException {
+        if (context.startsLowerCase()) {
+            return null;
+        }
+
+        String fqnFromAST = resolveTypeFromAST(context.module(), context.word());
+        if (fqnFromAST == null) {
+            return null;
+        }
+
+        IType type = ScopedTypeLookupSupport.findType(context.javaProject(), fqnFromAST, context.sourceUri());
+        if (type == null) {
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo("[codeSelect] Resolved type from AST: " + fqnFromAST);
+        return type;
+    }
+
+    private IJavaElement resolveTypeSearchElement(SelectionContext context) {
+        if (context.startsLowerCase()) {
+            return null;
+        }
+
+        IType typeFromSearch = searchTypeBySimpleName(context.javaProject(), context.module(), context.word(),
+                context.sourceUri());
+        if (typeFromSearch == null) {
+            return null;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[codeSelect] Resolved by type search: " + typeFromSearch.getFullyQualifiedName());
+        return typeFromSearch;
     }
 
     private String resolveUnitSourceUri(GroovyCompilationUnit unit) {
@@ -211,45 +239,52 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      * Check if the word matches any import. Returns the FQN if found.
      */
     private String resolveFromImports(ModuleNode module, String word) {
-        // Check regular imports
+        String regularImport = resolveRegularImport(module, word);
+        if (regularImport != null) {
+            return regularImport;
+        }
+
+        String staticImport = resolveStaticImport(module, word);
+        return staticImport != null ? staticImport : resolveStaticStarImport(module, word);
+    }
+
+    private String resolveRegularImport(ModuleNode module, String word) {
         for (ImportNode imp : module.getImports()) {
             ClassNode type = imp.getType();
-            if (type != null) {
-                String simpleName = type.getNameWithoutPackage();
-                // Handle aliased imports
-                String alias = imp.getAlias();
-                if (alias != null && alias.equals(word)) {
-                    return type.getName();
-                }
-                if (simpleName.equals(word)) {
-                    return type.getName();
-                }
+            if (type == null) {
+                continue;
+            }
+
+            String alias = imp.getAlias();
+            if ((alias != null && alias.equals(word)) || type.getNameWithoutPackage().equals(word)) {
+                return type.getName();
             }
         }
+        return null;
+    }
 
-        // Check static imports (e.g., import static org.junit.Assert.assertEquals)
+    private String resolveStaticImport(ModuleNode module, String word) {
         for (ImportNode imp : module.getStaticImports().values()) {
             ClassNode type = imp.getType();
-            if (type == null) continue;
-            // Match by class name (cursor on the class part of the import line)
-            if (type.getNameWithoutPackage().equals(word)) {
-                return type.getName();
+            if (type == null) {
+                continue;
             }
-            // Match by member name (cursor on the member at a usage site)
+
             String fieldName = imp.getFieldName();
-            if (fieldName != null && fieldName.equals(word)) {
+            if (type.getNameWithoutPackage().equals(word) || (fieldName != null && fieldName.equals(word))) {
                 return type.getName();
             }
         }
+        return null;
+    }
 
-        // Check static star imports (e.g., import static org.junit.Assert.*)
+    private String resolveStaticStarImport(ModuleNode module, String word) {
         for (ImportNode imp : module.getStaticStarImports().values()) {
             ClassNode type = imp.getType();
             if (type != null && type.getNameWithoutPackage().equals(word)) {
                 return type.getName();
             }
         }
-
         return null;
     }
 
@@ -1024,7 +1059,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
     }
 
     private int offsetToLine(String source, int offset) {
-        int safeOffset = Math.max(0, Math.min(offset, source.length()));
+        int safeOffset = Math.clamp(offset, 0, source.length());
         int line = 1;
         for (int i = 0; i < safeOffset; i++) {
             if (source.charAt(i) == '\n') {
@@ -1038,7 +1073,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      * Convert a 0-based offset to a 1-based column number (matching Groovy AST conventions).
      */
     private int offsetToColumn(String source, int offset) {
-        int safeOffset = Math.max(0, Math.min(offset, source.length()));
+        int safeOffset = Math.clamp(offset, 0, source.length());
         int col = 1;
         for (int i = safeOffset - 1; i >= 0; i--) {
             if (source.charAt(i) == '\n') break;
@@ -1104,7 +1139,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             }
 
             // Find the method in the receiver type
-            IMethod method = findMethodByNameInHierarchy(receiverType, word, project);
+            IMethod method = findMethodByNameInHierarchy(receiverType, word);
             if (method != null) {
                 GroovyLanguageServerPlugin.logInfo("[codeSelect] Found method '" + word
                         + "' in " + receiverType.getFullyQualifiedName());
@@ -1175,8 +1210,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
                 return resolveMemberSignatureType(field.getTypeSignature(), receiverType);
             }
 
-            IMethod method = findMethodByNameInHierarchy(receiverType, memberName,
-                    receiverType.getJavaProject() != null ? receiverType.getJavaProject() : project);
+                IMethod method = findMethodByNameInHierarchy(receiverType, memberName);
             if (method != null) {
                 return resolveMemberSignatureType(method.getReturnType(), receiverType);
             }
@@ -1221,13 +1255,9 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             return null;
         }
 
-        IType[] memberTypes = receiverType.getTypes();
-        if (memberTypes != null) {
-            for (IType memberType : memberTypes) {
-                if (simpleName.equals(memberType.getElementName())) {
-                    return memberType;
-                }
-            }
+        IType memberType = findMemberType(receiverType, simpleName);
+        if (memberType != null) {
+            return memberType;
         }
 
         IType direct = receiverType.getType(simpleName);
@@ -1240,20 +1270,32 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             return null;
         }
 
-        String binaryFqn = receiverType.getFullyQualifiedName('$');
-        if (binaryFqn != null && !binaryFqn.isBlank()) {
-            IType found = javaProject.findType(binaryFqn + "$" + simpleName);
-            if (found != null) {
-                return found;
+        IType binaryType = findNestedProjectType(javaProject, receiverType.getFullyQualifiedName('$'), "$", simpleName);
+        return binaryType != null
+                ? binaryType
+                : findNestedProjectType(javaProject, receiverType.getFullyQualifiedName(), ".", simpleName);
+    }
+
+    private IType findMemberType(IType receiverType, String simpleName) throws JavaModelException {
+        IType[] memberTypes = receiverType.getTypes();
+        if (memberTypes == null) {
+            return null;
+        }
+
+        for (IType memberType : memberTypes) {
+            if (simpleName.equals(memberType.getElementName())) {
+                return memberType;
             }
         }
-
-        String dottedFqn = receiverType.getFullyQualifiedName();
-        if (dottedFqn != null && !dottedFqn.isBlank()) {
-            return javaProject.findType(dottedFqn + "." + simpleName);
-        }
-
         return null;
+    }
+
+    private IType findNestedProjectType(IJavaProject javaProject, String receiverFqn, String separator,
+            String simpleName) throws JavaModelException {
+        if (receiverFqn == null || receiverFqn.isBlank()) {
+            return null;
+        }
+        return javaProject.findType(receiverFqn + separator + simpleName);
     }
 
     /**
@@ -1278,8 +1320,8 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             return jdtReceiverType;
         }
 
-        ClassNode receiverClassNode = resolveObjectExpressionType(objectExpr, module);
-        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+        ClassNode receiverClassNode = helpfulClassNode(resolveObjectExpressionType(objectExpr, module));
+        if (receiverClassNode == null) {
             return null;
         }
 
@@ -1308,11 +1350,11 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             String varName = varExpr.getName();
             if ("this".equals(varName)) return null;
             ClassNode varType = resolveLocalVariableClassNode(module, varName);
-            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+            if (!isUnhelpfulClassNode(varType)) {
                 return varType;
             }
             ClassNode exprType = varExpr.getType();
-            if (exprType != null && !"java.lang.Object".equals(exprType.getName())) {
+            if (!isUnhelpfulClassNode(exprType)) {
                 return exprType;
             }
         }
@@ -1329,44 +1371,65 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
     private IType resolveObjectExpressionIType(Expression objectExpr, ModuleNode module, IJavaProject project,
             String sourceUri) {
         try {
-            if (objectExpr instanceof ConstructorCallExpression ctorCall) {
-                return resolveClassNodeToIType(ctorCall.getType(), module, project, sourceUri);
-            }
-            if (objectExpr instanceof MethodCallExpression nestedCall) {
-                return resolveMethodCallReturnIType(nestedCall, module, project, sourceUri);
-            }
-            if (objectExpr instanceof PropertyExpression propertyExpression) {
-                IType ownerType = resolveObjectExpressionIType(propertyExpression.getObjectExpression(), module, project,
-                        sourceUri);
-                if (ownerType == null) {
-                    return null;
-                }
-                return resolveQualifiedMemberType(ownerType, propertyExpression.getPropertyAsString(), project);
+            IType directType = resolveDirectObjectExpressionIType(objectExpr, module, project, sourceUri);
+            if (directType != null) {
+                return directType;
             }
             if (objectExpr instanceof VariableExpression varExpr) {
-                String receiverVarName = varExpr.getName();
-                if (!"this".equals(receiverVarName)) {
-                    ClassNode varType = resolveLocalVariableClassNode(module, receiverVarName);
-                    if (varType != null && !"java.lang.Object".equals(varType.getName())) {
-                        IType resolved = resolveClassNodeToIType(varType, module, project, sourceUri);
-                        if (resolved != null) {
-                            return resolved;
-                        }
-                    }
-                }
-
-                ClassNode exprType = varExpr.getType();
-                if (exprType != null && !"java.lang.Object".equals(exprType.getName())) {
-                    return resolveClassNodeToIType(exprType, module, project, sourceUri);
-                }
-            }
-            if (objectExpr instanceof ClassExpression classExpr) {
-                return resolveClassNodeToIType(classExpr.getType(), module, project, sourceUri);
+                return resolveVariableExpressionIType(varExpr, module, project, sourceUri);
             }
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError("[codeSelect] resolveObjectExpressionIType failed", e);
         }
         return null;
+    }
+
+        private IType resolveDirectObjectExpressionIType(Expression objectExpr, ModuleNode module, IJavaProject project,
+            String sourceUri) {
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            return resolveClassNodeToIType(ctorCall.getType(), module, project, sourceUri);
+        }
+        if (objectExpr instanceof MethodCallExpression nestedCall) {
+            return resolveMethodCallReturnIType(nestedCall, module, project, sourceUri);
+        }
+        if (objectExpr instanceof PropertyExpression propertyExpression) {
+            return resolvePropertyExpressionIType(propertyExpression, module, project, sourceUri);
+        }
+        if (objectExpr instanceof ClassExpression classExpr) {
+            return resolveClassNodeToIType(classExpr.getType(), module, project, sourceUri);
+        }
+        return null;
+    }
+
+        private IType resolvePropertyExpressionIType(PropertyExpression propertyExpression, ModuleNode module,
+            IJavaProject project, String sourceUri) {
+        IType ownerType = resolveObjectExpressionIType(propertyExpression.getObjectExpression(), module, project,
+                sourceUri);
+        return ownerType == null ? null
+                : resolveQualifiedMemberType(ownerType, propertyExpression.getPropertyAsString(), project);
+    }
+
+        private IType resolveVariableExpressionIType(VariableExpression varExpr, ModuleNode module, IJavaProject project,
+            String sourceUri) {
+        String receiverVarName = varExpr.getName();
+        if (!"this".equals(receiverVarName)) {
+            IType localVariableType = resolveLocalVariableIType(module, receiverVarName, project, sourceUri);
+            if (localVariableType != null) {
+                return localVariableType;
+            }
+        }
+
+        return resolveClassNodeIType(varExpr.getType(), module, project, sourceUri);
+    }
+
+    private IType resolveLocalVariableIType(ModuleNode module, String varName, IJavaProject project, String sourceUri) {
+        ClassNode varType = resolveLocalVariableClassNode(module, varName);
+        return resolveClassNodeIType(varType, module, project, sourceUri);
+    }
+
+    private IType resolveClassNodeIType(ClassNode classNode, ModuleNode module, IJavaProject project,
+            String sourceUri) {
+        return isUnhelpfulClassNode(classNode) ? null : resolveClassNodeToIType(classNode, module, project, sourceUri);
     }
 
     private IType resolveMethodCallReturnIType(MethodCallExpression methodCall, ModuleNode module, IJavaProject project) {
@@ -1384,7 +1447,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
             IType receiverType = resolveObjectExpressionIType(methodCall.getObjectExpression(), module, project, sourceUri);
             if (receiverType == null) {
                 ClassNode receiverClassNode = resolveObjectExpressionType(methodCall.getObjectExpression(), module);
-                if (receiverClassNode != null && !"java.lang.Object".equals(receiverClassNode.getName())) {
+                if (!isUnhelpfulClassNode(receiverClassNode)) {
                     receiverType = resolveClassNodeToIType(receiverClassNode, module, project, sourceUri);
                 }
             }
@@ -1392,7 +1455,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
                 return null;
             }
 
-            IMethod method = findMethodByNameInHierarchy(receiverType, methodName, project);
+            IMethod method = findMethodByNameInHierarchy(receiverType, methodName);
             if (method == null) {
                 return null;
             }
@@ -1410,7 +1473,6 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      */
     private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
                                                          String methodName, String source) {
-        // Convert offset to 1-based line/column for AST node matching
         int targetLine = offsetToLine(source, offset);
         int targetCol = offsetToColumn(source, offset);
 
@@ -1424,40 +1486,60 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
 
             @Override
             public void visitMethodCallExpression(MethodCallExpression call) {
-                if (result[0] != null) return; // already found
-                String name = call.getMethodAsString();
-                if (methodName.equals(name)) {
-                    // Check if the method name expression is on the same line/column
-                    Expression methodExpr = call.getMethod();
-                    int mLine = methodExpr.getLineNumber();
-                    int mCol = methodExpr.getColumnNumber();
-                    int mLastCol = methodExpr.getLastColumnNumber();
-                    if (mLine == targetLine && targetCol >= mCol && targetCol <= mLastCol) {
-                        result[0] = call;
-                        return;
-                    }
+                if (result[0] != null) {
+                    return;
+                }
+                if (matchesMethodCallAtPosition(call, methodName, targetLine, targetCol)) {
+                    result[0] = call;
+                    return;
                 }
                 super.visitMethodCallExpression(call);
             }
         };
 
-        for (ClassNode classNode : module.getClasses()) {
-            if (result[0] != null) break;
-            visitor.visitClass(classNode);
-        }
-
-        // Also check module-level statements (Groovy scripts)
+        visitClassMethodCalls(module, visitor, result);
         if (result[0] == null) {
-            org.codehaus.groovy.ast.stmt.BlockStatement stmtBlock = module.getStatementBlock();
-            if (stmtBlock != null) {
-                for (Statement stmt : stmtBlock.getStatements()) {
-                    if (result[0] != null) break;
-                    stmt.visit(visitor);
-                }
-            }
+            visitScriptMethodCalls(module, visitor, result);
         }
 
         return result[0];
+    }
+
+    private boolean matchesMethodCallAtPosition(MethodCallExpression call, String methodName, int targetLine,
+            int targetCol) {
+        if (!methodName.equals(call.getMethodAsString())) {
+            return false;
+        }
+
+        Expression methodExpr = call.getMethod();
+        int methodLine = methodExpr.getLineNumber();
+        int methodCol = methodExpr.getColumnNumber();
+        int lastMethodCol = methodExpr.getLastColumnNumber();
+        return methodLine == targetLine && targetCol >= methodCol && targetCol <= lastMethodCol;
+    }
+
+    private void visitClassMethodCalls(ModuleNode module, ClassCodeVisitorSupport visitor,
+            MethodCallExpression[] result) {
+        for (ClassNode classNode : module.getClasses()) {
+            if (result[0] != null) {
+                break;
+            }
+            visitor.visitClass(classNode);
+        }
+    }
+
+    private void visitScriptMethodCalls(ModuleNode module, ClassCodeVisitorSupport visitor,
+            MethodCallExpression[] result) {
+        BlockStatement stmtBlock = module.getStatementBlock();
+        if (stmtBlock == null) {
+            return;
+        }
+        for (Statement stmt : stmtBlock.getStatements()) {
+            if (result[0] != null) {
+                break;
+            }
+            stmt.visit(visitor);
+        }
     }
 
     /**
@@ -1465,19 +1547,18 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      */
     private IType resolveExpressionType(ModuleNode module, IJavaProject project, String name) {
         try {
-            // 1. Check if it's a type name (uppercase)
             if (!name.isEmpty() && Character.isUpperCase(name.charAt(0))) {
                 IType type = resolveClassNameToType(module, project, name);
-                if (type != null) return type;
+                if (type != null) {
+                    return type;
+                }
             }
 
-            // 2. Check if it's a local variable — resolve its initializer type
             ClassNode varType = resolveLocalVariableClassNode(module, name);
-            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+            if (!isUnhelpfulClassNode(varType)) {
                 return resolveClassNodeToIType(varType, module, project);
             }
 
-            // 3. Check if it's a field/property in any class
             for (ClassNode classNode : module.getClasses()) {
                 ClassNode memberType = resolveClassMemberType(classNode, name);
                 if (memberType != null) {
@@ -1519,23 +1600,33 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      */
     private ClassNode resolveLocalVariableClassNode(ModuleNode module, String varName) {
         for (ClassNode classNode : module.getClasses()) {
-            if (classNode.getLineNumber() < 0) continue;
-
-            for (MethodNode method : classNode.getMethods()) {
-                ClassNode type = resolveLocalVarInBlock(getMethodBlock(method), varName, module);
-                if (type != null) return type;
-            }
-            for (ConstructorNode ctor : classNode.getDeclaredConstructors()) {
-                ClassNode type = resolveLocalVarInBlock(getMethodBlock(ctor), varName, module);
-                if (type != null) return type;
+            ClassNode classVariableType = resolveClassVariableType(classNode, varName, module);
+            if (classVariableType != null) {
+                return classVariableType;
             }
         }
 
-        // Also check script-level (module statement block)
         BlockStatement stmtBlock = module.getStatementBlock();
-        if (stmtBlock != null) {
-            ClassNode type = resolveLocalVarInBlock(stmtBlock, varName, module);
-            if (type != null) return type;
+        return stmtBlock == null ? null : resolveLocalVarInBlock(stmtBlock, varName, module);
+    }
+
+    private ClassNode resolveClassVariableType(ClassNode classNode, String varName, ModuleNode module) {
+        if (classNode.getLineNumber() < 0) {
+            return null;
+        }
+
+        ClassNode methodVariableType = resolveMethodVariableType(classNode.getMethods(), varName, module);
+        return methodVariableType != null
+                ? methodVariableType
+                : resolveMethodVariableType(classNode.getDeclaredConstructors(), varName, module);
+    }
+
+    private ClassNode resolveMethodVariableType(List<? extends MethodNode> methods, String varName, ModuleNode module) {
+        for (MethodNode method : methods) {
+            ClassNode type = resolveLocalVarInBlock(getMethodBlock(method), varName, module);
+            if (type != null) {
+                return type;
+            }
         }
         return null;
     }
@@ -1581,12 +1672,12 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
 
         // Typed declaration (e.g., "String x = ...")
         ClassNode originType = varExpr.getOriginType();
-        if (originType != null && !"java.lang.Object".equals(originType.getName())) {
+        if (originType != null && !JAVA_LANG_OBJECT.equals(originType.getName())) {
             return originType;
         }
 
         ClassNode initType = initializer.getType();
-        if (initType != null && !"java.lang.Object".equals(initType.getName())) {
+        if (initType != null && !JAVA_LANG_OBJECT.equals(initType.getName())) {
             return initType;
         }
         return null;
@@ -1598,75 +1689,83 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
      * Handles: {@code new Foo().bar()}, {@code someVar.bar()}, {@code Foo.staticBar()}.
      */
     private ClassNode resolveMethodCallReturnType(MethodCallExpression methodCall, ModuleNode module) {
-        Expression objectExpr = methodCall.getObjectExpression();
         String methodName = methodCall.getMethodAsString();
-        if (methodName == null) return null;
-
-        ClassNode receiverClassNode = null;
-
-        // Receiver is a constructor: new Foo().bar()
-        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
-            receiverClassNode = ctorCall.getType();
-        }
-        // Receiver is another method call: foo().bar()
-        else if (objectExpr instanceof MethodCallExpression nestedCall) {
-            receiverClassNode = resolveMethodCallReturnType(nestedCall, module);
-        }
-        // Receiver is a variable: someVar.bar()
-        else if (objectExpr instanceof VariableExpression varExpr) {
-            String receiverVarName = varExpr.getName();
-            if ("this".equals(receiverVarName)) {
-                return null; // Let other resolution handle 'this'
-            }
-            receiverClassNode = resolveLocalVariableClassNode(module, receiverVarName);
-            if (receiverClassNode == null) {
-                // Maybe it's a class name for static call
-                ClassNode varType = varExpr.getType();
-                if (varType != null && !"java.lang.Object".equals(varType.getName())) {
-                    receiverClassNode = varType;
-                }
-            }
-        }
-
-        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
+        if (methodName == null) {
             return null;
         }
 
-        // Now look up the method's return type via the receiver type's ClassNode
-        // First try using methods defined on the ClassNode (for Groovy types in the same file)
+        ClassNode receiverClassNode = helpfulClassNode(resolveReceiverClassNode(methodCall.getObjectExpression(), module));
+        if (receiverClassNode == null) {
+            return null;
+        }
+
         for (MethodNode mn : receiverClassNode.getMethods()) {
             if (methodName.equals(mn.getName())) {
                 ClassNode returnType = mn.getReturnType();
-                if (returnType != null && !"java.lang.Object".equals(returnType.getName())) {
+                if (!isUnhelpfulClassNode(returnType)) {
                     return returnType;
                 }
             }
         }
-
-        // ClassNode methods weren't helpful — leave it to JDT resolution in the caller
-        // Return the receiver type as a marker that we at least know the receiver
         return null;
+    }
+
+    private ClassNode resolveReceiverClassNode(Expression objectExpr, ModuleNode module) {
+        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+        if (objectExpr instanceof MethodCallExpression nestedCall) {
+            return resolveMethodCallReturnType(nestedCall, module);
+        }
+        if (objectExpr instanceof VariableExpression varExpr) {
+            return resolveVariableReceiverClassNode(varExpr, module);
+        }
+        return null;
+    }
+
+    private ClassNode resolveVariableReceiverClassNode(VariableExpression varExpr, ModuleNode module) {
+        String receiverVarName = varExpr.getName();
+        if ("this".equals(receiverVarName)) {
+            return null;
+        }
+
+        ClassNode receiverClassNode = resolveLocalVariableClassNode(module, receiverVarName);
+        return receiverClassNode != null ? receiverClassNode : helpfulClassNode(varExpr.getType());
     }
 
     /**
      * Find a method by name in the type hierarchy (type + supertypes).
      */
-    private IMethod findMethodByNameInHierarchy(IType type, String name, IJavaProject project) 
+    private IMethod findMethodByNameInHierarchy(IType type, String name) 
             throws JavaModelException {
-        // First check in the type itself
         IMethod method = findMethodByName(type, name);
-        if (method != null) return method;
+        if (method != null) {
+            return method;
+        }
 
-        // Check supertypes
         ITypeHierarchy hierarchy = TypeHierarchyCache.getSupertypeHierarchy(type);
         if (hierarchy != null) {
             IType[] supers = hierarchy.getAllSupertypes(type);
             for (IType superType : supers) {
                 method = findMethodByName(superType, name);
-                if (method != null) return method;
+                if (method != null) {
+                    return method;
+                }
             }
         }
         return null;
+    }
+
+    private boolean isUnhelpfulClassNode(ClassNode classNode) {
+        return helpfulClassNode(classNode) == null;
+    }
+
+    private ClassNode helpfulClassNode(ClassNode classNode) {
+        return classNode == null || JAVA_LANG_OBJECT.equals(classNode.getName()) ? null : classNode;
+    }
+
+    private record SelectionContext(ModuleNode module, IJavaProject javaProject, String source, String sourceUri,
+            String word, int offset, boolean startsLowerCase) {
     }
 
     /**
@@ -1703,7 +1802,7 @@ public class MinimalCodeSelectHelper implements ICodeSelectHelper {
 
         try {
             ClassNode varType = resolveLocalVariableClassNode(module, word);
-            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
+            if (varType != null && !JAVA_LANG_OBJECT.equals(varType.getName())) {
                 IType jdtType = resolveClassNodeToIType(varType, module, project, sourceUri);
                 if (jdtType != null) {
                     GroovyLanguageServerPlugin.logInfo("[codeSelect] Local variable '" + word

@@ -11,13 +11,11 @@ package org.eclipse.groovy.ls.core.providers;
 
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.Set;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
@@ -111,9 +109,13 @@ public class SemanticTokensProvider {
     public static final int TYPE_TYPE_KEYWORD    = 20;
 
     private final DocumentManager documentManager;
+    private final SemanticTokenEncodingSupport encodingSupport;
+    private final SemanticTokensFallbackSupport fallbackSupport;
 
     public SemanticTokensProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
+        this.encodingSupport = new SemanticTokenEncodingSupport();
+        this.fallbackSupport = new SemanticTokensFallbackSupport();
     }
 
     /**
@@ -174,47 +176,50 @@ public class SemanticTokensProvider {
             return new SemanticTokens(Collections.emptyList());
         }
 
-        // Try to get the Groovy AST — first from JDT, then from standalone compiler
-        ModuleNode moduleNode = null;
-
         ICompilationUnit workingCopy = allowWorkingCopy ? documentManager.getWorkingCopy(uri) : null;
+        ModuleNode moduleNode = resolvePrimaryModule(uri, workingCopy);
+        List<Integer> primaryTokens = tryVisitModule(moduleNode, content, range, uri);
+        if (!primaryTokens.isEmpty()) {
+            return new SemanticTokens(supplementTokensIfNeeded(primaryTokens, workingCopy, uri, content, range));
+        }
+
+        return computeFallbackTokens(uri, range, content);
+    }
+
+    private ModuleNode resolvePrimaryModule(String uri, ICompilationUnit workingCopy) {
         if (workingCopy != null) {
-            // Try via groovy-eclipse's GroovyCompilationUnit
-            moduleNode = getModuleNode(workingCopy);
-        }
-
-        if (moduleNode == null) {
-            // Fallback: use cached Groovy AST if available (avoids on-demand parsing)
-            moduleNode = documentManager.getCachedGroovyAST(uri);
-        }
-
-        // First attempt: try to produce tokens from the JDT/cached module
-        List<Integer> tokens = tryVisitModule(moduleNode, content, range, uri);
-        if (tokens != null && !tokens.isEmpty()) {
-            if (Thread.currentThread().isInterrupted()) {
-                return new SemanticTokens(Collections.emptyList());
+            ModuleNode moduleNode = getModuleNode(workingCopy);
+            if (moduleNode != null) {
+                return moduleNode;
             }
-            if (workingCopy != null && shouldSupplementTraitTokens(content)) {
-                ModuleNode fallback = getStandaloneAST(uri, content);
-                List<Integer> supplemental = tryVisitModule(fallback, content, range, uri + " [standalone]");
-                if (supplemental != null && !supplemental.isEmpty()) {
-                    tokens = mergeTokenData(tokens, supplemental);
-                }
-            }
-            return new SemanticTokens(tokens);
+        }
+        return documentManager.getCachedGroovyAST(uri);
+    }
+
+    private List<Integer> supplementTokensIfNeeded(List<Integer> primaryTokens,
+            ICompilationUnit workingCopy,
+            String uri,
+            String content,
+            org.eclipse.lsp4j.Range range) {
+        if (Thread.currentThread().isInterrupted() || workingCopy == null || !shouldSupplementTraitTokens(content)) {
+            return primaryTokens;
         }
 
-        // JDT/cached module produced nothing useful — try standalone compiler
-        // with error-line-blanking to recover structure.
+        ModuleNode fallback = getStandaloneAST(uri, content);
+        List<Integer> supplemental = tryVisitModule(fallback, content, range, uri + " [standalone]");
+        return supplemental.isEmpty() ? primaryTokens : mergeTokenData(primaryTokens, supplemental);
+    }
+
+    private SemanticTokens computeFallbackTokens(String uri, org.eclipse.lsp4j.Range range, String content) {
         GroovyLanguageServerPlugin.logInfo(
-                "[semantic] AST produced no tokens for " + uri
-                        + ", trying standalone compiler fallback");
+                "[semantic] AST produced no tokens for " + uri + ", trying standalone compiler fallback");
         if (Thread.currentThread().isInterrupted()) {
             return new SemanticTokens(Collections.emptyList());
         }
+
         ModuleNode fallback = getStandaloneAST(uri, content);
-        tokens = tryVisitModule(fallback, content, range, uri);
-        if (tokens != null && !tokens.isEmpty()) {
+        List<Integer> tokens = tryVisitModule(fallback, content, range, uri);
+        if (!tokens.isEmpty()) {
             return new SemanticTokens(tokens);
         }
 
@@ -228,82 +233,7 @@ public class SemanticTokensProvider {
     }
 
     private List<Integer> mergeTokenData(List<Integer> primary, List<Integer> supplemental) {
-        Map<String, AbsoluteToken> merged = new HashMap<>();
-        for (AbsoluteToken token : decodeTokenData(primary)) {
-            merged.put(spanKey(token), token);
-        }
-        for (AbsoluteToken token : decodeTokenData(supplemental)) {
-            merged.putIfAbsent(spanKey(token), token);
-        }
-
-        List<AbsoluteToken> ordered = new ArrayList<>(merged.values());
-        ordered.sort(Comparator
-                .comparingInt((AbsoluteToken token) -> token.line)
-                .thenComparingInt(token -> token.column)
-                .thenComparingInt(token -> token.length)
-                .thenComparingInt(token -> token.tokenType)
-                .thenComparingInt(token -> token.modifiers));
-        return encodeTokenData(ordered);
-    }
-
-    private String spanKey(AbsoluteToken token) {
-        return token.line + ":" + token.column + ":" + token.length;
-    }
-
-    private List<AbsoluteToken> decodeTokenData(List<Integer> encoded) {
-        List<AbsoluteToken> decoded = new ArrayList<>();
-        int previousLine = 0;
-        int previousColumn = 0;
-        for (int i = 0; i + 4 < encoded.size(); i += 5) {
-            int deltaLine = encoded.get(i);
-            int deltaColumn = encoded.get(i + 1);
-            int length = encoded.get(i + 2);
-            int tokenType = encoded.get(i + 3);
-            int modifiers = encoded.get(i + 4);
-
-            int line = previousLine + deltaLine;
-            int column = deltaLine == 0 ? previousColumn + deltaColumn : deltaColumn;
-            decoded.add(new AbsoluteToken(line, column, length, tokenType, modifiers));
-            previousLine = line;
-            previousColumn = column;
-        }
-        return decoded;
-    }
-
-    private List<Integer> encodeTokenData(List<AbsoluteToken> tokens) {
-        List<Integer> encoded = new ArrayList<>(tokens.size() * 5);
-        int previousLine = 0;
-        int previousColumn = 0;
-        boolean first = true;
-        for (AbsoluteToken token : tokens) {
-            int deltaLine = first ? token.line : token.line - previousLine;
-            int deltaColumn = first || deltaLine != 0 ? token.column : token.column - previousColumn;
-            encoded.add(deltaLine);
-            encoded.add(deltaColumn);
-            encoded.add(token.length);
-            encoded.add(token.tokenType);
-            encoded.add(token.modifiers);
-            previousLine = token.line;
-            previousColumn = token.column;
-            first = false;
-        }
-        return encoded;
-    }
-
-    private static final class AbsoluteToken {
-        private final int line;
-        private final int column;
-        private final int length;
-        private final int tokenType;
-        private final int modifiers;
-
-        private AbsoluteToken(int line, int column, int length, int tokenType, int modifiers) {
-            this.line = line;
-            this.column = column;
-            this.length = length;
-            this.tokenType = tokenType;
-            this.modifiers = modifiers;
-        }
+        return encodingSupport.mergeTokenData(primary, supplemental);
     }
 
     /**
@@ -315,7 +245,7 @@ public class SemanticTokensProvider {
         if (moduleNode == null
                 || moduleNode.getClasses() == null
                 || moduleNode.getClasses().isEmpty()) {
-            return null;
+            return Collections.emptyList();
         }
         try {
             SemanticTokensVisitor visitor = new SemanticTokensVisitor(content, range, documentManager);
@@ -326,7 +256,7 @@ public class SemanticTokensProvider {
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
                     "Semantic tokens visitor failed for " + uri, e);
-            return null;
+            return Collections.emptyList();
         }
     }
 
@@ -365,132 +295,90 @@ public class SemanticTokensProvider {
      *
      */
     private ModuleNode getStandaloneAST(String uri, String content) {
-        try {
-            GroovyCompilerService compilerService = documentManager.getCompilerService();
-
-            // First try: parse the content as-is
-            GroovyCompilerService.ParseResult firstResult = compilerService.parse(uri, content);
-            if (firstResult.hasAST()) {
-                ModuleNode module = firstResult.getModuleNode();
-                int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
-                GroovyLanguageServerPlugin.logInfo(
-                        "[semantic] Standalone compiler fallback for " + uri + " classes=" + classCount);
-                if (classCount > 0) {
-                    return module;
-                }
-            }
-
-            // Second try: blank out lines that have errors and re-parse
-            return tryParsePatchedContent(compilerService, uri, content, firstResult);
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError(
-                    "[semantic] Standalone compiler fallback failed for " + uri, e);
-        }
-        return null;
+        GroovyCompilerService compilerService = documentManager.getCompilerService();
+        return fallbackSupport.getStandaloneAST(compilerService, uri, content);
     }
 
-    private ModuleNode tryParsePatchedContent(GroovyCompilerService compilerService,
-                                               String uri, String content,
-                                               GroovyCompilerService.ParseResult result) {
-        String[] lines = content.split("\n", -1);
-        Set<Integer> blankedLines = new HashSet<>();
-        GroovyCompilerService.ParseResult current = result;
+    private static final class SemanticTokenEncodingSupport {
 
-        // Iteratively blank error lines (and their enclosing brace-blocks)
-        // then re-parse until we get a usable AST.
-        for (int attempt = 0; attempt < 5; attempt++) {
-            if (current.getErrors() == null || current.getErrors().isEmpty()) {
-                return null;
+        private List<Integer> mergeTokenData(List<Integer> primary, List<Integer> supplemental) {
+            Map<String, AbsoluteToken> merged = new HashMap<>();
+            for (AbsoluteToken token : decodeTokenData(primary)) {
+                merged.put(spanKey(token), token);
+            }
+            for (AbsoluteToken token : decodeTokenData(supplemental)) {
+                merged.putIfAbsent(spanKey(token), token);
             }
 
-            boolean blankedNew = false;
-            for (org.codehaus.groovy.syntax.SyntaxException error : current.getErrors()) {
-                int startLine = error.getStartLine() - 1;
-                int endLine = error.getEndLine() - 1;
-                if (endLine < startLine) {
-                    endLine = startLine;
-                }
-                int blockEnd = findClosingBrace(lines, startLine, endLine);
-                for (int i = Math.max(0, startLine); i <= Math.min(blockEnd, lines.length - 1); i++) {
-                    if (blankedLines.add(i) && !lines[i].isBlank()) {
-                        blankedNew = true;
-                    }
-                    lines[i] = "";
-                }
+            List<AbsoluteToken> ordered = new ArrayList<>(merged.values());
+            ordered.sort(Comparator
+                    .comparingInt((AbsoluteToken token) -> token.line)
+                    .thenComparingInt(token -> token.column)
+                    .thenComparingInt(token -> token.length)
+                    .thenComparingInt(token -> token.tokenType)
+                    .thenComparingInt(token -> token.modifiers));
+            return encodeTokenData(ordered);
+        }
+
+        private String spanKey(AbsoluteToken token) {
+            return token.line + ":" + token.column + ":" + token.length;
+        }
+
+        private List<AbsoluteToken> decodeTokenData(List<Integer> encoded) {
+            List<AbsoluteToken> decoded = new ArrayList<>();
+            int previousLine = 0;
+            int previousColumn = 0;
+            for (int index = 0; index + 4 < encoded.size(); index += 5) {
+                int deltaLine = encoded.get(index);
+                int deltaColumn = encoded.get(index + 1);
+                int length = encoded.get(index + 2);
+                int tokenType = encoded.get(index + 3);
+                int modifiers = encoded.get(index + 4);
+
+                int line = previousLine + deltaLine;
+                int column = deltaLine == 0 ? previousColumn + deltaColumn : deltaColumn;
+                decoded.add(new AbsoluteToken(line, column, length, tokenType, modifiers));
+                previousLine = line;
+                previousColumn = column;
             }
+            return decoded;
+        }
 
-            if (!blankedNew) {
-                // Error lines were already empty — the parser is reporting the
-                // error at the end of a dangling construct (e.g. a stray
-                // annotation). Scan backward from the error to blank the
-                // nearest non-empty line that's likely the actual cause.
-                for (org.codehaus.groovy.syntax.SyntaxException error : current.getErrors()) {
-                    for (int s = error.getStartLine() - 2; s >= 0; s--) {
-                        if (!blankedLines.contains(s) && !lines[s].isBlank()) {
-                            blankedLines.add(s);
-                            lines[s] = "";
-                            blankedNew = true;
-                            break;
-                        }
-                    }
-                    if (blankedNew) break;
-                }
-                if (!blankedNew) {
-                    return null;
-                }
+        private List<Integer> encodeTokenData(List<AbsoluteToken> tokens) {
+            List<Integer> encoded = new ArrayList<>(tokens.size() * 5);
+            int previousLine = 0;
+            int previousColumn = 0;
+            boolean first = true;
+            for (AbsoluteToken token : tokens) {
+                int deltaLine = first ? token.line : token.line - previousLine;
+                int deltaColumn = first || deltaLine != 0 ? token.column : token.column - previousColumn;
+                encoded.add(deltaLine);
+                encoded.add(deltaColumn);
+                encoded.add(token.length);
+                encoded.add(token.tokenType);
+                encoded.add(token.modifiers);
+                previousLine = token.line;
+                previousColumn = token.column;
+                first = false;
             }
+            return encoded;
+        }
 
-            String patched = String.join("\n", lines);
-            GroovyLanguageServerPlugin.logInfo(
-                    "[semantic] Trying error-line-blanked content for " + uri
-                            + " (attempt " + (attempt + 1) + ", blanked " + blankedLines.size() + " lines)");
-            current = compilerService.parse(uri + "#semantic-patched-" + attempt, patched);
+        private static final class AbsoluteToken {
+            private final int line;
+            private final int column;
+            private final int length;
+            private final int tokenType;
+            private final int modifiers;
 
-            if (current.hasAST()) {
-                ModuleNode module = current.getModuleNode();
-                int classCount = module.getClasses() != null ? module.getClasses().size() : 0;
-                GroovyLanguageServerPlugin.logInfo(
-                        "[semantic] Error-line-blanked content for " + uri + " classes=" + classCount);
-                if (classCount > 0) {
-                    return module;
-                }
+            private AbsoluteToken(int line, int column, int length, int tokenType, int modifiers) {
+                this.line = line;
+                this.column = column;
+                this.length = length;
+                this.tokenType = tokenType;
+                this.modifiers = modifiers;
             }
         }
-        return null;
-    }
-
-    /**
-     * If the error lines contain an unmatched opening brace, find the matching
-     * closing brace so the whole block can be blanked in one pass.
-     * Returns the 0-based line index of the closing brace, or {@code endLine}
-     * if no braces are involved.
-     */
-    private int findClosingBrace(String[] lines, int startLine, int endLine) {
-        int depth = 0;
-        // Count braces on the error lines themselves
-        for (int i = Math.max(0, startLine); i <= Math.min(endLine, lines.length - 1); i++) {
-            for (char ch : lines[i].toCharArray()) {
-                if (ch == '{') depth++;
-                else if (ch == '}') depth--;
-            }
-        }
-        if (depth <= 0) {
-            return endLine;
-        }
-        // Walk forward to find the matching closing braces
-        for (int i = Math.min(endLine, lines.length - 1) + 1; i < lines.length; i++) {
-            for (char ch : lines[i].toCharArray()) {
-                if (ch == '{') depth++;
-                else if (ch == '}') {
-                    depth--;
-                    if (depth == 0) {
-                        return i;
-                    }
-                }
-            }
-        }
-        // Unmatched — blank to end of file
-        return lines.length - 1;
     }
 
 }

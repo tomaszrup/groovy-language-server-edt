@@ -27,6 +27,8 @@ import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TypeDefinitionParams;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * Tests for {@link TypeDefinitionProvider}.
@@ -220,8 +222,9 @@ class TypeDefinitionProviderTest {
         java.lang.reflect.Method m = TypeDefinitionProvider.class.getDeclaredMethod("findClassLocationInFile",
                 String.class, org.codehaus.groovy.ast.ModuleNode.class, String.class);
         m.setAccessible(true);
-        // Exercise the code path; result may be null if line numbers aren't set at CONVERSION phase
-        m.invoke(provider, "Foo", module, uri);
+        Location location = (Location) m.invoke(provider, "Foo", module, uri);
+
+        assertNull(location);
     }
 
     @Test
@@ -319,10 +322,7 @@ class TypeDefinitionProviderTest {
         java.lang.reflect.Method m = TypeDefinitionProvider.class.getDeclaredMethod("toLocation",
                 org.eclipse.jdt.core.IType.class);
         m.setAccessible(true);
-        Location loc = (Location) m.invoke(provider, type);
-
-        // May return null when no resource and no sources jar
-        // The key is this doesn't throw
+        assertNull(m.invoke(provider, type));
     }
 
     @Test
@@ -541,28 +541,17 @@ class TypeDefinitionProviderTest {
     // stripArrayAndGenerics tests
     // ================================================================
 
-    @Test
-    void stripArrayAndGenericsRemovesArrayBrackets() throws Exception {
+    @ParameterizedTest
+    @CsvSource({
+            "String[],String",
+            "List<String>,List",
+            "Integer,Integer"
+    })
+    void stripArrayAndGenericsNormalizesTypeNames(String input, String expected) throws Exception {
         java.lang.reflect.Method m = TypeDefinitionProvider.class.getDeclaredMethod(
                 "stripArrayAndGenerics", String.class);
         m.setAccessible(true);
-        assertEquals("String", (String) m.invoke(provider, "String[]"));
-    }
-
-    @Test
-    void stripArrayAndGenericsStripsAngleBrackets() throws Exception {
-        java.lang.reflect.Method m = TypeDefinitionProvider.class.getDeclaredMethod(
-                "stripArrayAndGenerics", String.class);
-        m.setAccessible(true);
-        assertEquals("List", (String) m.invoke(provider, "List<String>"));
-    }
-
-    @Test
-    void stripArrayAndGenericsHandlesPlainType() throws Exception {
-        java.lang.reflect.Method m = TypeDefinitionProvider.class.getDeclaredMethod(
-                "stripArrayAndGenerics", String.class);
-        m.setAccessible(true);
-        assertEquals("Integer", (String) m.invoke(provider, "Integer"));
+        assertEquals(expected, (String) m.invoke(provider, input));
     }
 
     private Location invokeToLocation(org.eclipse.jdt.core.IType type) throws Exception {

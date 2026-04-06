@@ -11,6 +11,7 @@ package org.eclipse.groovy.ls.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -837,7 +838,7 @@ class GroovyWorkspaceServiceTest {
         java.lang.reflect.Field filesField = GroovyWorkspaceService.class
                 .getDeclaredField("cachedWorkspaceGroovyFiles");
         filesField.setAccessible(true);
-        filesField.set(service, List.of(cached));
+        ((java.util.concurrent.atomic.AtomicReference<List<Path>>) filesField.get(service)).set(List.of(cached));
 
         java.lang.reflect.Field timestampField = GroovyWorkspaceService.class
                 .getDeclaredField("workspaceGroovyFilesCacheTimestampMs");
@@ -855,7 +856,10 @@ class GroovyWorkspaceServiceTest {
         java.lang.reflect.Field filesField = GroovyWorkspaceService.class
                 .getDeclaredField("cachedWorkspaceGroovyFiles");
         filesField.setAccessible(true);
-        filesField.set(service, List.of(Path.of("/tmp/Cached.groovy")));
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.atomic.AtomicReference<List<Path>> cachedWorkspaceGroovyFiles =
+                (java.util.concurrent.atomic.AtomicReference<List<Path>>) filesField.get(service);
+        cachedWorkspaceGroovyFiles.set(List.of(Path.of("/tmp/Cached.groovy")));
 
         java.lang.reflect.Field timestampField = GroovyWorkspaceService.class
                 .getDeclaredField("workspaceGroovyFilesCacheTimestampMs");
@@ -864,7 +868,7 @@ class GroovyWorkspaceServiceTest {
 
         invoke("invalidateWorkspaceGroovyFilesCache", new Class<?>[] {}, new Object[] {});
 
-        assertEquals(List.of(), filesField.get(service));
+                assertEquals(List.of(), cachedWorkspaceGroovyFiles.get());
         assertEquals(0L, timestampField.getLong(service));
     }
 
@@ -1013,10 +1017,9 @@ class GroovyWorkspaceServiceTest {
     void buildWillRenameWorkspaceEditReturnsNullForEmptyFiles() throws Exception {
         org.eclipse.lsp4j.RenameFilesParams params = new org.eclipse.lsp4j.RenameFilesParams();
         params.setFiles(new ArrayList<>());
-        Object result = invoke("buildWillRenameWorkspaceEdit",
+        assertNull(invoke("buildWillRenameWorkspaceEdit",
                 new Class<?>[] {org.eclipse.lsp4j.RenameFilesParams.class},
-                new Object[] {params});
-        // May return null or empty WorkspaceEdit
+                new Object[] {params}));
     }
 
     // ================================================================
@@ -1441,47 +1444,43 @@ class GroovyWorkspaceServiceTest {
     // ================================================================
 
     @Test
-    void applyLogLevelSettingMissingLs() throws Exception {
+        void applyLogLevelSettingMissingLs() {
         com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
-        invoke("applyLogLevelSetting",
+        assertDoesNotThrow(() -> invoke("applyLogLevelSetting",
                 new Class<?>[] {com.google.gson.JsonObject.class},
-                new Object[] {groovy});
-        // No exception when 'ls' key missing
+                new Object[] {groovy}));
     }
 
     @Test
-    void applyLogLevelSettingNoLogLevel() throws Exception {
+        void applyLogLevelSettingNoLogLevel() {
         com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
         com.google.gson.JsonObject ls = new com.google.gson.JsonObject();
         groovy.add("ls", ls);
-        invoke("applyLogLevelSetting",
+        assertDoesNotThrow(() -> invoke("applyLogLevelSetting",
                 new Class<?>[] {com.google.gson.JsonObject.class},
-                new Object[] {groovy});
-        // No exception when logLevel not present
+                new Object[] {groovy}));
     }
 
     @Test
-    void applyLogLevelSettingWithLogLevel() throws Exception {
+        void applyLogLevelSettingWithLogLevel() {
         com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
         com.google.gson.JsonObject ls = new com.google.gson.JsonObject();
         ls.addProperty("logLevel", "DEBUG");
         groovy.add("ls", ls);
-        invoke("applyLogLevelSetting",
+        assertDoesNotThrow(() -> invoke("applyLogLevelSetting",
                 new Class<?>[] {com.google.gson.JsonObject.class},
-                new Object[] {groovy});
-        // Should not throw
+                new Object[] {groovy}));
     }
 
     @Test
-    void applyLogLevelSettingNullLogLevel() throws Exception {
+        void applyLogLevelSettingNullLogLevel() {
         com.google.gson.JsonObject groovy = new com.google.gson.JsonObject();
         com.google.gson.JsonObject ls = new com.google.gson.JsonObject();
         ls.add("logLevel", com.google.gson.JsonNull.INSTANCE);
         groovy.add("ls", ls);
-        invoke("applyLogLevelSetting",
+        assertDoesNotThrow(() -> invoke("applyLogLevelSetting",
                 new Class<?>[] {com.google.gson.JsonObject.class},
-                new Object[] {groovy});
-        // Should handle null gracefully
+                new Object[] {groovy}));
     }
 
     // ================================================================
@@ -1509,9 +1508,10 @@ class GroovyWorkspaceServiceTest {
         java.lang.reflect.Method m = GroovyWorkspaceService.class.getDeclaredMethod(
                 "addGroovyFallbackPackageEdit", String.class, String.class, Map.class);
         m.setAccessible(true);
-        // findGroovyPackageMoveFallbackEdit will try to resolve package - may produce null
-        // but code path is exercised
         m.invoke(svc, uri, "file:///src/com/other/Foo.groovy", changes);
+
+                assertTrue(changes.containsKey(uri));
+                assertTrue(changes.get(uri).stream().anyMatch(edit -> "com.other".equals(edit.getNewText())));
     }
 
     // ================================================================

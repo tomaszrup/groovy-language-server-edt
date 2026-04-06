@@ -142,7 +142,7 @@ public class GroovyCompilerService {
             GroovyLanguageServerPlugin.logError(
                     "Groovy compiler service failed for " + uri, e);
             errors.add(new SyntaxException(
-                    "Internal parse error: " + e.getMessage(), 1, 1));
+                INTERNAL_PARSE_ERROR_PREFIX + e.getMessage(), 1, 1));
         }
 
         ParseResult result = new ParseResult(moduleNode, errors);
@@ -170,7 +170,7 @@ public class GroovyCompilerService {
             GroovyLanguageServerPlugin.logError(
                     "Groovy syntax-only parse failed for " + uri, e);
             rawErrors.add(new SyntaxException(
-                    "Internal parse error: " + e.getMessage(), 1, 1));
+                INTERNAL_PARSE_ERROR_PREFIX + e.getMessage(), 1, 1));
         }
 
         List<SyntaxException> syntaxErrors = new ArrayList<>();
@@ -191,7 +191,7 @@ public class GroovyCompilerService {
         } catch (MultipleCompilationErrorsException e) {
             collectErrors(e.getErrorCollector(), errors);
         } catch (Exception e) {
-            errors.add(new SyntaxException("Parse error: " + e.getMessage(), 1, 1));
+            errors.add(new SyntaxException(PARSE_ERROR_PREFIX + e.getMessage(), 1, 1));
         }
     }
 

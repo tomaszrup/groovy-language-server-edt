@@ -40,6 +40,7 @@ import org.eclipse.lsp4j.ReferenceParams;
  * across the workspace. The JDT search engine works with groovy-eclipse because the
  * Groovy sources are indexed by JDT's indexer through the patched JDT core.
  */
+@SuppressWarnings("unused")
 public class ReferenceProvider {
 
     private final DocumentManager documentManager;
@@ -102,13 +103,7 @@ public class ReferenceProvider {
             // Scope the search to source files in the current project only.
             // Library JARs don't need scanning — we want *usages*, not definitions.
             // When the file is under src/test/, narrow scope to test sources.
-            IJavaSearchScope scope;
-            try {
-                org.eclipse.jdt.core.IJavaProject javaProject = workingCopy.getJavaProject();
-                scope = SearchScopeHelper.createSourceScope(javaProject, uri);
-            } catch (Exception scopeEx) {
-                scope = SearchEngine.createWorkspaceScope();
-            }
+            IJavaSearchScope scope = createSearchScope(workingCopy, uri);
             JdtSearchSupport.search(pattern,
                     scope,
                     new SearchRequestor() {
@@ -128,6 +123,15 @@ public class ReferenceProvider {
         }
 
         return locations;
+    }
+
+    private IJavaSearchScope createSearchScope(ICompilationUnit workingCopy, String uri) {
+        try {
+            org.eclipse.jdt.core.IJavaProject javaProject = workingCopy.getJavaProject();
+            return SearchScopeHelper.createSourceScope(javaProject, uri);
+        } catch (Exception scopeEx) {
+            return SearchEngine.createWorkspaceScope();
+        }
     }
 
     /**

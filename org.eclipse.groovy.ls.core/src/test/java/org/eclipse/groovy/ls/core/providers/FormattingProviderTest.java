@@ -399,13 +399,17 @@ class FormattingProviderTest {
     }
 
     @Test
-    void setFormatterProfilePathClearsOnEmpty() {
+    @SuppressWarnings("java:S2699")
+    void setFormatterProfilePathClearsOnEmpty() throws Exception {
         FormattingProvider provider = new FormattingProvider(new DocumentManager());
         provider.setFormatterProfilePath("");
-        // No exception, profile cleared
+
+        Map<String, String> options = invokeBuildFormatterOptions(provider, null, null);
+        assertEquals("space", options.get("org.eclipse.jdt.core.formatter.tabulation.char"));
     }
 
     @Test
+    @SuppressWarnings("java:S2699")
     void setFormatterProfilePathLoadsValidProfile() throws Exception {
         Path profile = tempDir.resolve("valid_formatter.xml");
         Files.writeString(profile, """
@@ -417,14 +421,19 @@ class FormattingProviderTest {
                 """);
         FormattingProvider provider = new FormattingProvider(new DocumentManager());
         provider.setFormatterProfilePath(profile.toString());
-        // Loaded without exception
+
+        Map<String, String> options = invokeBuildFormatterOptions(provider, null, null);
+        assertEquals("space", options.get("org.eclipse.jdt.core.formatter.tabulation.char"));
     }
 
     @Test
-    void setFormatterProfilePathHandlesNonexistent() {
+    @SuppressWarnings("java:S2699")
+    void setFormatterProfilePathHandlesNonexistent() throws Exception {
         FormattingProvider provider = new FormattingProvider(new DocumentManager());
-        // Should not throw, just log error
         provider.setFormatterProfilePath("/nonexistent/path/formatter.xml");
+
+        Map<String, String> options = invokeBuildFormatterOptions(provider, null, null);
+        assertEquals("space", options.get("org.eclipse.jdt.core.formatter.tabulation.char"));
     }
 
     // ================================================================
@@ -648,6 +657,7 @@ class FormattingProviderTest {
     // ================================================================
 
     @Test
+    @SuppressWarnings("java:S2699")
     void setFormatterProfilePathSkipsReloadForSamePath() throws Exception {
         Path profile = tempDir.resolve("same_profile.xml");
         Files.writeString(profile, """
@@ -661,10 +671,13 @@ class FormattingProviderTest {
         provider.setFormatterProfilePath(profile.toString());
         // Second call should skip reload (same path)
         provider.setFormatterProfilePath(profile.toString());
-        // No exception, same path handled
+
+        Map<String, String> options = invokeBuildFormatterOptions(provider, null, null);
+        assertEquals("tab", options.get("org.eclipse.jdt.core.formatter.tabulation.char"));
     }
 
     @Test
+    @SuppressWarnings("java:S2699")
     void setFormatterProfilePathHandlesEmptyProfileXml() throws Exception {
         Path profile = tempDir.resolve("empty_settings.xml");
         Files.writeString(profile, """
@@ -675,7 +688,9 @@ class FormattingProviderTest {
                 """);
         FormattingProvider provider = new FormattingProvider(new DocumentManager());
         provider.setFormatterProfilePath(profile.toString());
-        // No exception, empty settings handled
+
+        Map<String, String> options = invokeBuildFormatterOptions(provider, null, null);
+        assertEquals("space", options.get("org.eclipse.jdt.core.formatter.tabulation.char"));
     }
 
     @Test

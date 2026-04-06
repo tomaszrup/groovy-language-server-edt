@@ -24,9 +24,10 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Map;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 import org.eclipse.groovy.ls.core.providers.DiagnosticsProvider;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -90,9 +91,8 @@ class DocumentManagerPreviewBrowsingTest {
             manager.didClose(uri);
         }
 
-        // Wait for any background tasks that slipped through cancellation
-        // to finish (they should detect the file is closed and not leak)
-        Thread.sleep(2000);
+        assertTrue(awaitOpenStateClean(manager, 2000),
+            "Background didOpen work should settle after all preview files are closed");
 
         // Verify no working copies are leaked
         Map<String, ICompilationUnit> workingCopies = getWorkingCopies(manager);
@@ -169,7 +169,7 @@ class DocumentManagerPreviewBrowsingTest {
     // ================================================================
 
     @Test
-    void clearDiagnosticsCancelsPendingDebouncedTask() throws Exception {
+    void clearDiagnosticsCancelsPendingDebouncedTask() {
         DocumentManager dm = new DocumentManager();
         String uri = "file:///ClearPending.groovy";
         dm.didOpen(uri, "class ClearPending {}");
@@ -185,8 +185,7 @@ class DocumentManagerPreviewBrowsingTest {
         provider.clearDiagnostics(uri);
         dm.didClose(uri);
 
-        // Wait longer than the debounce delay
-        Thread.sleep(800);
+        pauseMillis(800);
 
         // The debounced task should have been cancelled — no publish should occur
         verify(client, never()).publishDiagnostics(any(PublishDiagnosticsParams.class));
@@ -214,7 +213,7 @@ class DocumentManagerPreviewBrowsingTest {
     // ================================================================
 
     @Test
-    void fullPreviewCycleDoesNotPublishDiagnosticsForClosedFile() throws Exception {
+    void fullPreviewCycleDoesNotPublishDiagnosticsForClosedFile() {
         DocumentManager dm = new DocumentManager();
         DiagnosticsProvider provider = new DiagnosticsProvider(dm);
         LanguageClient client = mock(LanguageClient.class);
@@ -235,9 +234,6 @@ class DocumentManagerPreviewBrowsingTest {
         String activeUri = "file:///StaysOpen.groovy";
         dm.didOpen(activeUri, "class StaysOpen {}");
         provider.publishDiagnosticsDebounced(activeUri);
-
-        // Wait for all debounced tasks to complete
-        Thread.sleep(1000);
 
         // Only the active file should have gotten diagnostics published
         verify(client, timeout(1500).atLeastOnce()).publishDiagnostics(
@@ -280,8 +276,8 @@ class DocumentManagerPreviewBrowsingTest {
         // Close it immediately — the background task may or may not have started
         manager.didClose(uri);
 
-        // Wait for the background task to complete (if it was in progress)
-        Thread.sleep(3000);
+        assertTrue(awaitWorkingCopyReleased(manager, uri, 3000),
+            "Working copy should be discarded once the closed-file background task settles");
 
         // Verify: the working copy must NOT exist, regardless of whether
         // the background task had started before didClose ran
@@ -313,5 +309,31 @@ class DocumentManagerPreviewBrowsingTest {
         Field field = DocumentManager.class.getDeclaredField("workingCopies");
         field.setAccessible(true);
         return (Map<String, ICompilationUnit>) field.get(manager);
+    }
+
+    private boolean awaitOpenStateClean(DocumentManager manager, long timeoutMs) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (System.nanoTime() < deadline) {
+            if (getWorkingCopies(manager).isEmpty() && getPendingOpenFutures(manager).isEmpty()) {
+                return true;
+            }
+            pauseMillis(25);
+        }
+        return getWorkingCopies(manager).isEmpty() && getPendingOpenFutures(manager).isEmpty();
+    }
+
+    private boolean awaitWorkingCopyReleased(DocumentManager manager, String uri, long timeoutMs) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (System.nanoTime() < deadline) {
+            if (manager.getWorkingCopy(uri) == null && manager.getContent(uri) == null) {
+                return true;
+            }
+            pauseMillis(25);
+        }
+        return manager.getWorkingCopy(uri) == null && manager.getContent(uri) == null;
+    }
+
+    private void pauseMillis(long millis) {
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(millis));
     }
 }

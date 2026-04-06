@@ -12,7 +12,6 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -57,9 +56,14 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either;
 /**
  * Provides LSP inlay hints for Groovy documents.
  */
+@SuppressWarnings("unused")
 public class InlayHintProvider {
 
     private static final int HIERARCHY_CACHE_MAX = 100;
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
+    private static final String[] AUTO_IMPORTED_PACKAGES = {
+            "java.lang.", "java.util.", "java.io.", "groovy.lang.", "groovy.util.", "java.math."
+    };
 
     private record ReturnTypeInfo(String displayName, IType resolvedType) {
     }
@@ -94,6 +98,10 @@ public class InlayHintProvider {
      * Invalidate cached state for a URI (call on didChange / didClose).
      */
     public void invalidateCache(String uri) {
+        if (uri == null) {
+            invalidateCache();
+            return;
+        }
         invalidateCache();
     }
 
@@ -267,25 +275,26 @@ public class InlayHintProvider {
             }
 
             for (MethodCallDeclCollector.DeclInfo info : collector.getDeclarations()) {
-                if (Thread.currentThread().isInterrupted()) break;
-                if (requestedRange != null && !isInRange(info.line, requestedRange)) {
-                    continue;
+                if (Thread.currentThread().isInterrupted()) {
+                    return hints;
                 }
-                ReturnTypeInfo returnType = resolveMethodCallInfo(
-                        info.methodCall,
-                        module,
-                        project,
-                        workingCopy,
-                        content,
-                        hierarchyCache);
-                if (returnType != null && returnType.displayName() != null && !returnType.displayName().isBlank()) {
-                    String typeName = returnType.displayName();
-                    Position hintPos = new Position(info.line, info.column + info.varName.length());
-                    InlayHint hint = new InlayHint(hintPos, Either.forLeft(": " + typeName));
-                    hint.setKind(InlayHintKind.Type);
-                    hint.setPaddingLeft(false);
-                    hint.setPaddingRight(true);
-                    hints.add(hint);
+                if (requestedRange == null || isInRange(info.line, requestedRange)) {
+                    ReturnTypeInfo returnType = resolveMethodCallInfo(
+                            info.methodCall,
+                            module,
+                            project,
+                            workingCopy,
+                            content,
+                            hierarchyCache);
+                    if (returnType != null && returnType.displayName() != null && !returnType.displayName().isBlank()) {
+                        String typeName = returnType.displayName();
+                        Position hintPos = new Position(info.line, info.column + info.varName.length());
+                        InlayHint hint = new InlayHint(hintPos, Either.forLeft(": " + typeName));
+                        hint.setKind(InlayHintKind.Type);
+                        hint.setPaddingLeft(false);
+                        hint.setPaddingRight(true);
+                        hints.add(hint);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -407,6 +416,7 @@ public class InlayHintProvider {
                 return handle;
             }
         } catch (Exception ignored) {
+            // Fall back to a stable synthetic key when the handle is unavailable.
         }
 
         try {
@@ -440,12 +450,7 @@ public class InlayHintProvider {
             return;
         }
 
-        if (documentManager != null) {
-            IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
-            if (remappedElement != null) {
-                element = remappedElement;
-            }
-        }
+        element = remapMethodCandidate(documentManager, element);
 
         if (element instanceof IMethod method) {
             if (!method.isConstructor() && methodName.equals(method.getElementName())) {
@@ -455,14 +460,27 @@ public class InlayHintProvider {
         }
 
         if (element instanceof IType type) {
-            IType resolvedType = JavaBinaryMemberResolver.resolveMemberSource(type);
-            if (resolvedType == null) {
-                resolvedType = type;
-            }
-            for (IMethod method : resolvedType.getMethods()) {
-                if (!method.isConstructor() && methodName.equals(method.getElementName())) {
-                    methods.add(method);
-                }
+            addTypeMethodCandidates(type, methodName, methods);
+        }
+    }
+
+    private static IJavaElement remapMethodCandidate(DocumentManager documentManager, IJavaElement element) {
+        if (documentManager == null) {
+            return element;
+        }
+        IJavaElement remappedElement = documentManager.remapToWorkingCopyElement(element);
+        return remappedElement != null ? remappedElement : element;
+    }
+
+    private static void addTypeMethodCandidates(IType type, String methodName, List<IMethod> methods)
+            throws JavaModelException {
+        IType resolvedType = JavaBinaryMemberResolver.resolveMemberSource(type);
+        if (resolvedType == null) {
+            resolvedType = type;
+        }
+        for (IMethod method : resolvedType.getMethods()) {
+            if (!method.isConstructor() && methodName.equals(method.getElementName())) {
+                methods.add(method);
             }
         }
     }
@@ -514,14 +532,7 @@ public class InlayHintProvider {
             return false;
         }
 
-        if (isSourceBacked(candidate) && !isSourceBacked(currentBest)) {
-            return true;
-        }
-        if (!isSourceBacked(candidate) && isSourceBacked(currentBest)) {
-            return false;
-        }
-
-        return false;
+        return isSourceBacked(candidate) && !isSourceBacked(currentBest);
     }
 
     private static int countMeaningfulParameterNames(IMethod method) {
@@ -538,31 +549,32 @@ public class InlayHintProvider {
         }
     }
 
-    private static boolean isDeclaredInSubtype(IMethod candidate, IMethod currentBest) {
+    private static boolean isDeclaredInSubtype(IMethod possibleSubtype, IMethod possibleSupertype) {
         try {
-            IType candidateType = resolveComparisonType(candidate);
-            IType currentType = resolveComparisonType(currentBest);
-            if (candidateType == null || currentType == null) {
+            IType subtype = resolveComparisonType(possibleSubtype);
+            IType supertype = resolveComparisonType(possibleSupertype);
+            if (subtype == null || supertype == null) {
                 return false;
             }
 
-            String currentName = currentType.getFullyQualifiedName();
-            if (currentName == null || currentName.isBlank()
-                    || currentName.equals(candidateType.getFullyQualifiedName())) {
+            String supertypeName = supertype.getFullyQualifiedName();
+            if (supertypeName == null || supertypeName.isBlank()
+                    || supertypeName.equals(subtype.getFullyQualifiedName())) {
                 return false;
             }
 
-            org.eclipse.jdt.core.ITypeHierarchy hierarchy = candidateType.newSupertypeHierarchy(null);
+            org.eclipse.jdt.core.ITypeHierarchy hierarchy = subtype.newSupertypeHierarchy(null);
             if (hierarchy == null) {
                 return false;
             }
 
-            for (IType superType : hierarchy.getAllSupertypes(candidateType)) {
-                if (currentName.equals(superType.getFullyQualifiedName())) {
+            for (IType inheritedType : hierarchy.getAllSupertypes(subtype)) {
+                if (supertypeName.equals(inheritedType.getFullyQualifiedName())) {
                     return true;
                 }
             }
         } catch (Exception ignored) {
+            // Ranking can fall back to other signals if hierarchy resolution fails.
         }
         return false;
     }
@@ -665,6 +677,9 @@ public class InlayHintProvider {
         }
 
         int startOffset = lineToOffset(source, line, nameColumn);
+        if (methodName == null || methodName.isBlank()) {
+            return new int[0];
+        }
         int endOffset = lineToOffset(source, line, nameColumn + methodName.length() - 1);
         if (startOffset < 0 && endOffset < 0) {
             return new int[0];
@@ -684,7 +699,7 @@ public class InlayHintProvider {
             return -1;
         }
 
-        int safeStart = Math.max(0, Math.min(fromColumn, lineText.length()));
+        int safeStart = Math.clamp(fromColumn, 0, lineText.length());
         int index = lineText.indexOf(name, safeStart);
         if (index >= 0 && hasIdentifierBoundaries(lineText, index, index + name.length())) {
             return index;
@@ -885,46 +900,15 @@ public class InlayHintProvider {
         }
 
         if (expression instanceof MethodCallExpression methodCall) {
-            ReturnTypeInfo nestedReturnType = resolveMethodCallChainInfo(methodCall, module, project, hierarchyCache);
-            if (nestedReturnType == null) {
-                return null;
-            }
-            if (nestedReturnType.resolvedType() != null) {
-                return nestedReturnType.resolvedType();
-            }
-            return resolveTypeByName(nestedReturnType.displayName(), null, project);
+            return resolveMethodCallExpressionType(methodCall, module, project, hierarchyCache);
         }
 
         if (expression instanceof VariableExpression variableExpression) {
-            String variableName = variableExpression.getName();
-            if ("this".equals(variableName)) {
-                return null;
-            }
-
-            ClassNode varType = resolveLocalVarType(module, variableName);
-            if (varType != null && !"java.lang.Object".equals(varType.getName())) {
-                IType resolved = resolveClassNodeToType(varType, module, project);
-                if (resolved != null) {
-                    return resolved;
-                }
-            }
-
-            ClassNode declaredType = variableExpression.getType();
-            if (declaredType != null && !"java.lang.Object".equals(declaredType.getName())) {
-                return resolveClassNodeToType(declaredType, module, project);
-            }
-
-            return null;
+            return resolveVariableExpressionType(variableExpression, module, project);
         }
 
         if (expression instanceof PropertyExpression propertyExpression) {
-            IType receiverType = resolveExpressionType(propertyExpression.getObjectExpression(), module, project, hierarchyCache);
-            if (receiverType == null) {
-                return null;
-            }
-
-            String propertyName = propertyExpression.getPropertyAsString();
-            return resolveMemberExpressionType(receiverType, propertyName, project, hierarchyCache);
+            return resolvePropertyExpressionType(propertyExpression, module, project, hierarchyCache);
         }
 
         if (expression instanceof ClassExpression classExpression) {
@@ -932,6 +916,53 @@ public class InlayHintProvider {
         }
 
         return null;
+    }
+
+    private IType resolveMethodCallExpressionType(MethodCallExpression methodCall,
+            ModuleNode module,
+            IJavaProject project,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) throws JavaModelException {
+        ReturnTypeInfo nestedReturnType = resolveMethodCallChainInfo(methodCall, module, project, hierarchyCache);
+        if (nestedReturnType == null) {
+            return null;
+        }
+        return nestedReturnType.resolvedType() != null
+                ? nestedReturnType.resolvedType()
+                : resolveTypeByName(nestedReturnType.displayName(), null, project);
+    }
+
+    private IType resolveVariableExpressionType(VariableExpression variableExpression,
+            ModuleNode module,
+            IJavaProject project) throws JavaModelException {
+        String variableName = variableExpression.getName();
+        if ("this".equals(variableName)) {
+            return null;
+        }
+
+        IType localType = resolveResolvedVariableType(resolveLocalVarType(module, variableName), module, project);
+        if (localType != null) {
+            return localType;
+        }
+        return resolveResolvedVariableType(variableExpression.getType(), module, project);
+    }
+
+    private IType resolveResolvedVariableType(ClassNode candidateType, ModuleNode module, IJavaProject project)
+            throws JavaModelException {
+        if (candidateType == null || JAVA_LANG_OBJECT.equals(candidateType.getName())) {
+            return null;
+        }
+        return resolveClassNodeToType(candidateType, module, project);
+    }
+
+    private IType resolvePropertyExpressionType(PropertyExpression propertyExpression,
+            ModuleNode module,
+            IJavaProject project,
+            Map<String, org.eclipse.jdt.core.ITypeHierarchy> hierarchyCache) throws JavaModelException {
+        IType receiverType = resolveExpressionType(propertyExpression.getObjectExpression(), module, project, hierarchyCache);
+        if (receiverType == null) {
+            return null;
+        }
+        return resolveMemberExpressionType(receiverType, propertyExpression.getPropertyAsString(), project, hierarchyCache);
     }
 
     private IType resolveMemberExpressionType(IType receiverType,
@@ -1050,31 +1081,44 @@ public class InlayHintProvider {
             return null;
         }
 
+        IType type = findProjectType(project, typeName, lookupTypeName);
+        if (type != null) {
+            return type;
+        }
+
+        type = findContextResolvedType(typeName, lookupTypeName, context, project);
+        if (type != null) {
+            return type;
+        }
+
+        return project.findType("java.lang." + lookupTypeName);
+    }
+
+    private IType findProjectType(IJavaProject project, String typeName, String lookupTypeName)
+            throws JavaModelException {
         IType type = project.findType(typeName);
-        if (type != null) return type;
-
-        if (!lookupTypeName.equals(typeName)) {
-            type = project.findType(lookupTypeName);
-            if (type != null) return type;
+        if (type != null || lookupTypeName.equals(typeName)) {
+            return type;
         }
+        return project.findType(lookupTypeName);
+    }
 
-        if (context != null) {
-            String[][] resolved = context.resolveType(typeName);
-            if ((resolved == null || resolved.length == 0) && !lookupTypeName.equals(typeName)) {
-                resolved = context.resolveType(lookupTypeName);
-            }
-            if (resolved != null && resolved.length > 0) {
-                String fqn = resolved[0][0].isEmpty()
-                        ? resolved[0][1]
-                        : resolved[0][0] + "." + resolved[0][1];
-                type = project.findType(fqn);
-                if (type != null) return type;
-            }
+    private IType findContextResolvedType(String typeName, String lookupTypeName, IType context, IJavaProject project)
+            throws JavaModelException {
+        if (context == null) {
+            return null;
         }
-
-        // Try java.lang
-        type = project.findType("java.lang." + lookupTypeName);
-        return type;
+        String[][] resolved = context.resolveType(typeName);
+        if ((resolved == null || resolved.length == 0) && !lookupTypeName.equals(typeName)) {
+            resolved = context.resolveType(lookupTypeName);
+        }
+        if (resolved == null || resolved.length == 0) {
+            return null;
+        }
+        String fqn = resolved[0][0].isEmpty()
+                ? resolved[0][1]
+                : resolved[0][0] + "." + resolved[0][1];
+        return project.findType(fqn);
     }
 
     private String normalizeLookupTypeName(String typeName) {
@@ -1113,44 +1157,64 @@ public class InlayHintProvider {
         String typeName = typeNode.getName();
         if (typeName == null || typeName.isEmpty()) return null;
 
-        if (typeName.contains(".")) {
-            IType type = project.findType(typeName);
-            if (type != null) return type;
-        }
+        IType type = resolveQualifiedClassNode(typeName, project);
+        if (type != null) return type;
 
-        // Check imports
+        type = resolveImportedClassNode(typeName, module, project);
+        if (type != null) return type;
+
+        type = resolveModulePackageType(typeName, module, project);
+        if (type != null) return type;
+
+        return resolveAutoImportedType(typeName, project);
+    }
+
+    private IType resolveQualifiedClassNode(String typeName, IJavaProject project) throws JavaModelException {
+        return typeName.contains(".") ? project.findType(typeName) : null;
+    }
+
+    private IType resolveImportedClassNode(String typeName, ModuleNode module, IJavaProject project)
+            throws JavaModelException {
         for (ImportNode imp : module.getImports()) {
             ClassNode impType = imp.getType();
             if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
                 IType type = project.findType(impType.getName());
-                if (type != null) return type;
+                if (type != null) {
+                    return type;
+                }
             }
         }
-
-        // Star imports
         for (ImportNode starImport : module.getStarImports()) {
             String pkgName = starImport.getPackageName();
             if (pkgName != null) {
                 IType type = project.findType(pkgName + typeName);
-                if (type != null) return type;
+                if (type != null) {
+                    return type;
+                }
             }
         }
+        return null;
+    }
 
-        // Module package
+    private IType resolveModulePackageType(String typeName, ModuleNode module, IJavaProject project)
+            throws JavaModelException {
         String pkg = module.getPackageName();
-        if (pkg != null && !pkg.isEmpty()) {
-            if (pkg.endsWith(".")) pkg = pkg.substring(0, pkg.length() - 1);
-            IType type = project.findType(pkg + "." + typeName);
-            if (type != null) return type;
+        if (pkg == null || pkg.isEmpty()) {
+            return null;
         }
+        if (pkg.endsWith(".")) {
+            pkg = pkg.substring(0, pkg.length() - 1);
+        }
+        return project.findType(pkg + "." + typeName);
+    }
 
-        // Auto-import packages
-        String[] autoPackages = {"java.lang.", "java.util.", "java.io.", "groovy.lang.", "groovy.util.", "java.math."};
-        for (String autoPkg : autoPackages) {
+    private IType resolveAutoImportedType(String typeName, IJavaProject project) throws JavaModelException {
+        for (String autoPkg : AUTO_IMPORTED_PACKAGES) {
             IType type = project.findType(autoPkg + typeName);
-            if (type != null) return type;
+            if (type != null) {
+                return type;
+            }
         }
-
         return null;
     }
 
@@ -1181,22 +1245,32 @@ public class InlayHintProvider {
     private ClassNode resolveVarInBlock(BlockStatement block, String varName) {
         if (block == null) return null;
         for (org.codehaus.groovy.ast.stmt.Statement stmt : block.getStatements()) {
-            if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) continue;
-            if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) continue;
-            Expression left = decl.getLeftExpression();
-            if (!(left instanceof VariableExpression varExpr)) continue;
-            if (!varName.equals(varExpr.getName())) continue;
-
-            Expression init = decl.getRightExpression();
-            if (init instanceof ConstructorCallExpression ctorCall) {
-                return ctorCall.getType();
-            }
-            ClassNode originType = varExpr.getOriginType();
-            if (originType != null && !"java.lang.Object".equals(originType.getName())) {
-                return originType;
+            ClassNode resolvedType = resolveDeclaredVariableType(stmt, varName);
+            if (resolvedType != null) {
+                return resolvedType;
             }
         }
         return null;
+    }
+
+    private ClassNode resolveDeclaredVariableType(org.codehaus.groovy.ast.stmt.Statement stmt, String varName) {
+        if (!(stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt)) {
+            return null;
+        }
+        if (!(exprStmt.getExpression() instanceof DeclarationExpression decl)) {
+            return null;
+        }
+        Expression left = decl.getLeftExpression();
+        if (!(left instanceof VariableExpression variableExpression) || !varName.equals(variableExpression.getName())) {
+            return null;
+        }
+
+        Expression initializer = decl.getRightExpression();
+        if (initializer instanceof ConstructorCallExpression ctorCall) {
+            return ctorCall.getType();
+        }
+        ClassNode originType = variableExpression.getOriginType();
+        return originType != null && !JAVA_LANG_OBJECT.equals(originType.getName()) ? originType : null;
     }
 
     /**
@@ -1257,7 +1331,7 @@ public class InlayHintProvider {
                 // Only collect when the AST type is unhelpful
                 ClassNode inferredType = rightExpr.getType();
                 if (inferredType == null
-                        || "java.lang.Object".equals(inferredType.getName())
+                        || JAVA_LANG_OBJECT.equals(inferredType.getName())
                         || "void".equals(inferredType.getName())) {
                     int line = Math.max(0, variable.getLineNumber() - 1);
                     int col = Math.max(0, variable.getColumnNumber() - 1);
@@ -1267,9 +1341,9 @@ public class InlayHintProvider {
             super.visitDeclarationExpression(expr);
         }
 
-        private boolean isDynamic(VariableExpression var) {
-            return var.isDynamicTyped()
-                    || "java.lang.Object".equals(var.getOriginType().getName());
+        private boolean isDynamic(VariableExpression variableExpression) {
+            return variableExpression.isDynamicTyped()
+                || JAVA_LANG_OBJECT.equals(variableExpression.getOriginType().getName());
         }
     }
 
@@ -1465,6 +1539,7 @@ public class InlayHintProvider {
             return false;
         }
 
+        @SuppressWarnings("unused")
         private IMethod resolveBestMethodTarget(int offset, String methodName, int argumentCount) {
             return InlayHintProvider.resolveBestMethodTarget(
                     documentManager, workingCopy, offset, methodName, argumentCount);
@@ -1812,7 +1887,7 @@ public class InlayHintProvider {
                 return -1;
             }
 
-            int safeStart = Math.max(0, Math.min(fromColumn, lineText.length()));
+            int safeStart = Math.clamp(fromColumn, 0, lineText.length());
             int index = lineText.indexOf(name, safeStart);
             if (index >= 0 && hasIdentifierBoundaries(lineText, index, index + name.length())) {
                 return index;

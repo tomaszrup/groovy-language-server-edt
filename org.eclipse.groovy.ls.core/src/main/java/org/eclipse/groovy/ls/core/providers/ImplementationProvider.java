@@ -139,13 +139,8 @@ public class ImplementationProvider {
     /**
      * Convert a JDT {@link SearchMatch} to an LSP {@link Location}.
      */
-    @SuppressWarnings("unused")
-    private Location toLocation(SearchMatch match) {
+    Location toLocation(SearchMatch match) {
         return toLocation(match, new HashMap<>(), new HashMap<>());
-    }
-
-    private Location toLocation(SearchMatch match, Map<String, String> contentCache) {
-        return toLocation(match, contentCache, new HashMap<>());
     }
 
     private Location toLocation(SearchMatch match,
@@ -177,11 +172,6 @@ public class ImplementationProvider {
             GroovyLanguageServerPlugin.logError("Failed to convert implementation match to location", e);
             return null;
         }
-    }
-
-    @SuppressWarnings("unused")
-    private String readContent(String targetUri, org.eclipse.core.resources.IResource resource) {
-        return readContent(targetUri, resource, new HashMap<>());
     }
 
     private String readContent(String targetUri,

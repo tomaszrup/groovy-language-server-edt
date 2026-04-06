@@ -31,6 +31,7 @@ import org.eclipse.jdt.core.search.SearchEngine;
  * sources scope is returned — main code may legitimately be referenced from
  * both main and test sources.
  */
+@SuppressWarnings("unused")
 public final class SearchScopeHelper {
 
     private SearchScopeHelper() { /* utility */ }

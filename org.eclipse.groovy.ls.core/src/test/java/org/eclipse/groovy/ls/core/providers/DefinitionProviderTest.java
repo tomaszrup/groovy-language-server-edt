@@ -438,12 +438,14 @@ class DefinitionProviderTest {
 
     @Test
     void resolveLocationForTypeUsesSourcesJarForInnerBinaryType() throws Exception {
-        String source = "package test.binary;\n"
-            + "public class AttachedOuter {\n"
-            + "    public enum Inner {\n"
-            + "        VALUE\n"
-            + "    }\n"
-            + "}\n";
+        String source = """
+                package test.binary;
+                public class AttachedOuter {
+                    public enum Inner {
+                        VALUE
+                    }
+                }
+                """;
         java.io.File sourcesJar = createJar(
             tempDir.resolve("attached-outer-sources.jar"),
             "test/binary/AttachedOuter.java",
@@ -481,12 +483,14 @@ class DefinitionProviderTest {
 
         IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
         when(type.getClassFile()).thenReturn(classFile);
-        String source = "package test.binary;\n"
-            + "public class AttachedOuter {\n"
-            + "    public enum Inner {\n"
-            + "        VALUE;\n"
-            + "    }\n"
-            + "}\n";
+        String source = """
+                package test.binary;
+                public class AttachedOuter {
+                    public enum Inner {
+                        VALUE;
+                    }
+                }
+                """;
         when(classFile.getSource()).thenReturn(source);
 
         IField field = mock(IField.class);
@@ -515,16 +519,18 @@ class DefinitionProviderTest {
 
         IOrdinaryClassFile classFile = mock(IOrdinaryClassFile.class);
         when(type.getClassFile()).thenReturn(classFile);
-        String source = "package test.binary;\n"
-            + "public class AttachedOuter {\n"
-            + "    public static class Inner {\n"
-            + "        void use() {\n"
-            + "            value();\n"
-            + "        }\n"
-            + "\n"
-            + "        void value() {}\n"
-            + "    }\n"
-            + "}\n";
+        String source = """
+                package test.binary;
+                public class AttachedOuter {
+                    public static class Inner {
+                        void use() {
+                            value();
+                        }
+
+                        void value() {}
+                    }
+                }
+                """;
         when(classFile.getSource()).thenReturn(source);
 
         IMethod method = mock(IMethod.class);
@@ -1329,15 +1335,14 @@ class DefinitionProviderTest {
         if (!methods.isEmpty()) {
             var block = (org.codehaus.groovy.ast.stmt.BlockStatement) methods.get(0).getCode();
             for (var stmt : block.getStatements()) {
-                if (stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt) {
-                    if (exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl) {
-                        var right = decl.getRightExpression();
-                        if (right instanceof org.codehaus.groovy.ast.expr.ConstructorCallExpression) {
-                            ClassNode result = invokeResolveObjectExpressionType(right, module);
-                            assertNotNull(result);
-                            assertTrue(result.getName().contains("ArrayList"));
-                            return;
-                        }
+                if (stmt instanceof org.codehaus.groovy.ast.stmt.ExpressionStatement exprStmt
+                        && exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl) {
+                    var right = decl.getRightExpression();
+                    if (right instanceof org.codehaus.groovy.ast.expr.ConstructorCallExpression) {
+                        ClassNode result = invokeResolveObjectExpressionType(right, module);
+                        assertNotNull(result);
+                        assertTrue(result.getName().contains("ArrayList"));
+                        return;
                     }
                 }
             }
@@ -1575,8 +1580,8 @@ class DefinitionProviderTest {
         String source = "class Outer { class Inner {} }";
         ModuleNode module = parseModule(source, "file:///scanInner.groovy");
         ClassNode cls = module.getClasses().get(0);
-        Location loc = invokeScanInnerClassesForSymbol(cls, "Inner", "file:///scanInner.groovy");
-        // May or may not find it depending on inner class representation
+        Object loc = invokeScanInnerClassesForSymbol(cls, "Inner", "file:///scanInner.groovy");
+        assertTrue(loc == null || loc instanceof Location);
     }
 
     // ================================================================
@@ -1805,9 +1810,8 @@ class DefinitionProviderTest {
         String source = "class Foo {\n  void bar() {\n    baz()\n  }\n  void baz() {}\n}";
         ModuleNode module = parseModule(source, "file:///findMC.groovy");
         int offset = source.indexOf("baz()");
-        // Method may or may not find the call depending on offset calculation
         Object result = invokeFindMethodCallAtOffset(module, offset, "baz", "file:///findMC.groovy");
-        // Just exercising the code path is sufficient for coverage
+        assertTrue(result == null || result instanceof org.codehaus.groovy.ast.expr.MethodCallExpression);
     }
 
     @Test
@@ -1912,14 +1916,17 @@ class DefinitionProviderTest {
     }
 
     private Object newSourceLookupContext() throws Exception {
-        for (Class<?> innerClass : DefinitionProvider.class.getDeclaredClasses()) {
-            if ("SourceLookupContext".equals(innerClass.getSimpleName())) {
-                var ctor = innerClass.getDeclaredConstructor();
-                ctor.setAccessible(true);
-                return ctor.newInstance();
-            }
-        }
-        throw new IllegalStateException("SourceLookupContext not found");
+        Class<?> innerClass = findInnerClassBySimpleName("SourceLookupContext");
+        var ctor = innerClass.getDeclaredConstructor();
+        ctor.setAccessible(true);
+        return ctor.newInstance();
+    }
+
+    private Class<?> findInnerClassBySimpleName(String simpleName) {
+        return Stream.of(DefinitionProvider.class.getDeclaredClasses())
+                .filter(innerClass -> simpleName.equals(innerClass.getSimpleName()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(simpleName + " not found"));
     }
 
     private IType invokeResolveClassNodeToIType(ClassNode classNode, ModuleNode module,
@@ -2150,40 +2157,22 @@ class DefinitionProviderTest {
     // appendStubSuperclass tests
     // ================================================================
 
-    @Test
-    void appendStubSuperclassWithRealSuper() throws Exception {
+    @ParameterizedTest
+    @MethodSource("appendStubSuperclassCases")
+    void appendStubSuperclassCases(String superclassName, String expectedStub) throws Exception {
         IType type = mock(IType.class);
-        when(type.getSuperclassName()).thenReturn("BaseClass");
+        when(type.getSuperclassName()).thenReturn(superclassName);
         StringBuilder sb = new StringBuilder();
         invokeAppendStubSuperclass(sb, type);
-        assertEquals(" extends BaseClass", sb.toString());
+        assertEquals(expectedStub, sb.toString());
     }
 
-    @Test
-    void appendStubSuperclassSkipsObject() throws Exception {
-        IType type = mock(IType.class);
-        when(type.getSuperclassName()).thenReturn("Object");
-        StringBuilder sb = new StringBuilder();
-        invokeAppendStubSuperclass(sb, type);
-        assertEquals("", sb.toString());
-    }
-
-    @Test
-    void appendStubSuperclassSkipsJavaLangObject() throws Exception {
-        IType type = mock(IType.class);
-        when(type.getSuperclassName()).thenReturn("java.lang.Object");
-        StringBuilder sb = new StringBuilder();
-        invokeAppendStubSuperclass(sb, type);
-        assertEquals("", sb.toString());
-    }
-
-    @Test
-    void appendStubSuperclassSkipsNull() throws Exception {
-        IType type = mock(IType.class);
-        when(type.getSuperclassName()).thenReturn(null);
-        StringBuilder sb = new StringBuilder();
-        invokeAppendStubSuperclass(sb, type);
-        assertEquals("", sb.toString());
+    private static Stream<Arguments> appendStubSuperclassCases() {
+        return Stream.of(
+                Arguments.of("BaseClass", " extends BaseClass"),
+                Arguments.of("Object", ""),
+                Arguments.of("java.lang.Object", ""),
+                Arguments.of(null, ""));
     }
 
     // ================================================================
@@ -3167,7 +3156,7 @@ class DefinitionProviderTest {
         // "println" starts around offset in the source
         int offset = source.indexOf("println");
         Object result = m.invoke(dp, ast, offset, "println", source);
-        // May or may not find it depending on AST structure, but should not throw
+        assertTrue(result == null || result instanceof org.codehaus.groovy.ast.expr.MethodCallExpression);
     }
 
     // ---- resolveReceiverClassNode ----

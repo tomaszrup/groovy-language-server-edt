@@ -55,6 +55,7 @@ import org.eclipse.lsp4j.services.WorkspaceService;
  * <p>
  * Handles workspace symbol search, configuration changes, and watched file events.
  */
+@SuppressWarnings("unused")
 public class GroovyWorkspaceService implements WorkspaceService {
 
     private static final String JSON_GROOVY = "groovy";
@@ -64,12 +65,15 @@ public class GroovyWorkspaceService implements WorkspaceService {
     private static final int MAX_WORKSPACE_SYMBOL_RESULTS = 200;
     private static final long WORKSPACE_GROOVY_FILES_CACHE_TTL_MS = 30_000;
     private static final String IMPORT_PREFIX = "import ";
+    private static final String PACKAGE_PREFIX = "package ";
+    private static final String IMPORT_STATEMENT_PREFIX_REGEX = "(?m)^\\s*import\\s+";
     private static final Pattern PACKAGE_DECLARATION_PATTERN = Pattern.compile(
             "(?m)^\\s*package\\s+([\\w.]+)\\s*;?\\s*$");
 
     private final GroovyLanguageServer server;
     private final DocumentManager documentManager;
-    private volatile List<Path> cachedWorkspaceGroovyFiles = List.of();
+        private final java.util.concurrent.atomic.AtomicReference<List<Path>> cachedWorkspaceGroovyFiles =
+            new java.util.concurrent.atomic.AtomicReference<>(List.of());
     private volatile long workspaceGroovyFilesCacheTimestampMs;
     private final Object workspaceGroovyFilesCacheLock = new Object();
 
@@ -253,7 +257,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
         GroovyLanguageServerPlugin.logInfo("Watched files changed: " + params.getChanges().size() + " changes");
         CompletableFuture.runAsync(() -> handleWatchedFileChanges(params))
                 .exceptionally(e -> {
-                    GroovyLanguageServerPlugin.logError("Watched file changes handler failed", (Exception) e);
+                    GroovyLanguageServerPlugin.logError("Watched file changes handler failed", asException(e));
                     return null;
                 });
     }
@@ -621,44 +625,24 @@ public class GroovyWorkspaceService implements WorkspaceService {
         }
 
         // 3. Update references and imports in other workspace files
-        updateWorkspaceReferencesWithoutJdt(
-                oldUri, oldTypeName, newTypeName,
+        RenameFallbackContext context = new RenameFallbackContext(
+                oldTypeName, newTypeName,
                 oldPackageName, newPackageName,
                 oldFqn, newFqn,
-                typeNameChanged, packageChanged,
-                changes);
+                typeNameChanged, packageChanged);
+        updateWorkspaceReferencesWithoutJdt(oldUri, context, changes);
     }
 
     private void updateWorkspaceReferencesWithoutJdt(
             String oldUri,
-            String oldTypeName, String newTypeName,
-            String oldPackageName, String newPackageName,
-            String oldFqn, String newFqn,
-            boolean typeNameChanged, boolean packageChanged,
+            RenameFallbackContext context,
             Map<String, List<TextEdit>> changes) {
         List<Path> workspaceGroovyFiles = collectWorkspaceGroovyFiles();
 
         int fileCount = 0;
         for (Path filePath : workspaceGroovyFiles) {
             String fileUri = DocumentManager.normalizeUri(filePath.toUri().toString());
-            if (Objects.equals(fileUri, oldUri)) {
-                continue;
-            }
-
-            String content = getSourceText(fileUri);
-            if (content == null || content.isBlank()) {
-                continue;
-            }
-
-            List<TextEdit> fileEdits = buildFallbackFileEdits(
-                    content,
-                    oldTypeName, newTypeName,
-                    oldPackageName, newPackageName,
-                    oldFqn, newFqn,
-                    typeNameChanged, packageChanged);
-
-            if (!fileEdits.isEmpty()) {
-                changes.computeIfAbsent(fileUri, k -> new ArrayList<>()).addAll(fileEdits);
+            if (!Objects.equals(fileUri, oldUri) && addWorkspaceFallbackEdits(fileUri, context, changes)) {
                 fileCount++;
             }
         }
@@ -668,80 +652,97 @@ public class GroovyWorkspaceService implements WorkspaceService {
                         + " files, edited " + fileCount);
     }
 
+    private boolean addWorkspaceFallbackEdits(String fileUri, RenameFallbackContext context,
+            Map<String, List<TextEdit>> changes) {
+        String content = getSourceText(fileUri);
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+
+        List<TextEdit> fileEdits = buildFallbackFileEdits(content, context);
+        if (fileEdits.isEmpty()) {
+            return false;
+        }
+
+        changes.computeIfAbsent(fileUri, k -> new ArrayList<>()).addAll(fileEdits);
+        return true;
+    }
+
     List<TextEdit> buildFallbackFileEdits(
             String content,
-            String oldTypeName, String newTypeName,
-            String oldPackageName, String newPackageName,
-            String oldFqn, String newFqn,
-            boolean typeNameChanged, boolean packageChanged) {
+            RenameFallbackContext context) {
         List<TextEdit> edits = new ArrayList<>();
 
         String filePackage = extractPackageName(content);
-        boolean wasInSamePackage = Objects.equals(filePackage, oldPackageName);
-        boolean nowInSamePackage = Objects.equals(filePackage, newPackageName);
-
-        boolean hasOldImport = hasExactImport(content, oldFqn);
-        boolean hasStarImportForOldPkg = !oldPackageName.isEmpty()
-                && hasStarImport(content, oldPackageName);
-
-        // Determine if this file currently has access to the type via simple name
-        boolean canAccessBySimpleName = hasOldImport || wasInSamePackage || hasStarImportForOldPkg;
-
-        // Check for conflicting imports (different type with same simple name)
-        if (!hasOldImport && hasConflictingImport(content, oldTypeName, oldFqn)) {
-            canAccessBySimpleName = false;
-        }
-
-        boolean usesSimpleName = canAccessBySimpleName && content.contains(oldTypeName);
-        boolean usesFqn = content.contains(oldFqn);
-
-        if (!usesSimpleName && !usesFqn && !hasOldImport) {
+        FallbackFileUsage usage = analyzeFallbackFileUsage(content, filePackage, context);
+        if (!usage.needsEdits()) {
             return edits;
         }
 
-        // 1. Handle import changes
-        if (hasOldImport) {
-            if (nowInSamePackage && !typeNameChanged) {
-                TextEdit removeEdit = createImportRemovalEdit(content, oldFqn);
+        addFallbackImportEdits(content, edits, usage, context);
+
+        if (context.typeNameChanged() && usage.usesSimpleName()) {
+            addSimpleNameReplacements(content, context.oldTypeName(), context.newTypeName(), edits);
+        }
+
+        if (usage.usesFqn() && !Objects.equals(context.oldFqn(), context.newFqn())) {
+            addFqnReplacements(content, context.oldFqn(), context.newFqn(), edits);
+        }
+
+        return edits;
+    }
+
+    private FallbackFileUsage analyzeFallbackFileUsage(String content, String filePackage,
+            RenameFallbackContext context) {
+        boolean wasInSamePackage = Objects.equals(filePackage, context.oldPackageName());
+        boolean nowInSamePackage = Objects.equals(filePackage, context.newPackageName());
+        boolean hasOldImport = hasExactImport(content, context.oldFqn());
+        boolean hasStarImportForOldPkg = !context.oldPackageName().isEmpty()
+                && hasStarImport(content, context.oldPackageName());
+        boolean hasConflictingImport = !hasOldImport
+                && hasConflictingImport(content, context.oldTypeName(), context.oldFqn());
+
+        boolean canAccessBySimpleName = !hasConflictingImport
+                && (hasOldImport || wasInSamePackage || hasStarImportForOldPkg);
+        boolean usesSimpleName = canAccessBySimpleName && content.contains(context.oldTypeName());
+        boolean usesFqn = content.contains(context.oldFqn());
+        return new FallbackFileUsage(hasOldImport, nowInSamePackage, usesSimpleName, usesFqn);
+    }
+
+    private void addFallbackImportEdits(String content, List<TextEdit> edits, FallbackFileUsage usage,
+            RenameFallbackContext context) {
+        if (usage.hasOldImport()) {
+            if (usage.nowInSamePackage() && !context.typeNameChanged()) {
+                TextEdit removeEdit = createImportRemovalEdit(content, context.oldFqn());
                 if (removeEdit != null) {
                     edits.add(removeEdit);
                 }
             } else {
-                TextEdit replaceEdit = createImportReplaceEdit(content, oldFqn, newFqn);
+                TextEdit replaceEdit = createImportReplaceEdit(content, context.oldFqn(), context.newFqn());
                 if (replaceEdit != null) {
                     edits.add(replaceEdit);
                 }
             }
-        } else if (usesSimpleName && packageChanged && !nowInSamePackage) {
-            if (!hasExactImport(content, newFqn)) {
-                edits.add(createImportInsertEdit(content, newFqn));
-            }
+            return;
         }
 
-        // 2. Rename simple name references (only when type name changes)
-        if (typeNameChanged && usesSimpleName) {
-            addSimpleNameReplacements(content, oldTypeName, newTypeName, edits);
+        if (usage.usesSimpleName() && context.packageChanged() && !usage.nowInSamePackage()
+                && !hasExactImport(content, context.newFqn())) {
+            edits.add(createImportInsertEdit(content, context.newFqn()));
         }
-
-        // 3. Update fully-qualified name references
-        if (usesFqn && !Objects.equals(oldFqn, newFqn)) {
-            addFqnReplacements(content, oldFqn, newFqn, edits);
-        }
-
-        return edits;
     }
 
     private List<Path> collectWorkspaceGroovyFiles() {
         long now = System.currentTimeMillis();
         if (workspaceGroovyFilesCacheTimestampMs > 0
                 && now - workspaceGroovyFilesCacheTimestampMs <= WORKSPACE_GROOVY_FILES_CACHE_TTL_MS) {
-            return cachedWorkspaceGroovyFiles;
+            return cachedWorkspaceGroovyFiles.get();
         }
 
         synchronized (workspaceGroovyFilesCacheLock) {
             if (workspaceGroovyFilesCacheTimestampMs > 0
                     && now - workspaceGroovyFilesCacheTimestampMs <= WORKSPACE_GROOVY_FILES_CACHE_TTL_MS) {
-                return cachedWorkspaceGroovyFiles;
+                return cachedWorkspaceGroovyFiles.get();
             }
 
             List<Path> groovyFiles = new ArrayList<>();
@@ -749,7 +750,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             try {
                 ResourcesPlugin.getWorkspace().getRoot().accept(resource -> {
                     if (resource.getType() == IResource.FILE
-                            && "groovy".equals(resource.getFileExtension())
+                            && JSON_GROOVY.equals(resource.getFileExtension())
                             && resource.getLocationURI() != null) {
                         try {
                             groovyFiles.add(Paths.get(resource.getLocationURI()));
@@ -768,14 +769,14 @@ public class GroovyWorkspaceService implements WorkspaceService {
                 collectGroovyFilesFromFileSystem(groovyFiles);
             }
 
-            cachedWorkspaceGroovyFiles = List.copyOf(groovyFiles);
+            cachedWorkspaceGroovyFiles.set(List.copyOf(groovyFiles));
             workspaceGroovyFilesCacheTimestampMs = System.currentTimeMillis();
-            return cachedWorkspaceGroovyFiles;
+            return cachedWorkspaceGroovyFiles.get();
         }
     }
 
     private void invalidateWorkspaceGroovyFilesCache() {
-        cachedWorkspaceGroovyFiles = List.of();
+        cachedWorkspaceGroovyFiles.set(List.of());
         workspaceGroovyFilesCacheTimestampMs = 0L;
     }
 
@@ -788,8 +789,8 @@ public class GroovyWorkspaceService implements WorkspaceService {
         if (rootPath == null) {
             return;
         }
-        try {
-            Files.walk(rootPath, 20)
+        try (java.util.stream.Stream<Path> workspacePaths = Files.walk(rootPath, 20)) {
+            workspacePaths
                     .filter(Files::isRegularFile)
                     .filter(p -> p.toString().endsWith(".groovy"))
                     .filter(p -> !isInsideBuildOrOutputDir(p))
@@ -880,13 +881,13 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     boolean hasStarImport(String content, String packageName) {
         Pattern starPattern = Pattern.compile(
-                "(?m)^\\s*import\\s+" + Pattern.quote(packageName) + "\\.\\*(?=\\s|;|$)");
+            IMPORT_STATEMENT_PREFIX_REGEX + Pattern.quote(packageName) + "\\.\\*(?=\\s|;|$)");
         return starPattern.matcher(content).find();
     }
 
     boolean hasConflictingImport(String content, String simpleName, String excludeFqn) {
         Pattern importPattern = Pattern.compile(
-                "(?m)^\\s*import\\s+([\\w.]+\\." + Pattern.quote(simpleName) + ")(?=\\s|;|$)");
+            IMPORT_STATEMENT_PREFIX_REGEX + "([\\w.]+\\." + Pattern.quote(simpleName) + ")(?=\\s|;|$)");
         Matcher matcher = importPattern.matcher(content);
         while (matcher.find()) {
             String importedFqn = matcher.group(1);
@@ -908,7 +909,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             lineEnd = content.length();
         }
         String line = content.substring(lineStart, lineEnd).trim();
-        return line.startsWith("package ");
+        return line.startsWith(PACKAGE_PREFIX);
     }
 
     static boolean isInsideBuildOrOutputDir(Path path) {
@@ -958,7 +959,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
                 GroovyLanguageServerPlugin.logError("Failed to refresh diagnostics after file rename", e);
             }
         }).exceptionally(e -> {
-            GroovyLanguageServerPlugin.logError("File rename handler failed", (Exception) e);
+            GroovyLanguageServerPlugin.logError("File rename handler failed", asException(e));
             return null;
         });
     }
@@ -1474,7 +1475,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     private boolean hasExactImport(String content, String qualifiedTypeName) {
         Pattern importPattern = Pattern.compile(
-                "(?m)^\\s*import\\s+" + Pattern.quote(qualifiedTypeName) + "(?=\\s|;|$)");
+                IMPORT_STATEMENT_PREFIX_REGEX + Pattern.quote(qualifiedTypeName) + "(?=\\s|;|$)");
         return importPattern.matcher(content).find();
     }
 
@@ -1493,7 +1494,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
     private TextEdit createImportRemovalEdit(String content, String qualifiedName) {
         Pattern importPattern = Pattern.compile(
-                "(?m)^\\s*import\\s+" + Pattern.quote(qualifiedName) + "(?=\\s|;|$)");
+                IMPORT_STATEMENT_PREFIX_REGEX + Pattern.quote(qualifiedName) + "(?=\\s|;|$)");
         Matcher matcher = importPattern.matcher(content);
         if (!matcher.find()) {
             return null;
@@ -1529,7 +1530,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
 
         for (int i = 0; i < lines.length; i++) {
             String trimmed = lines[i].trim();
-            if (trimmed.startsWith("package ")) {
+            if (trimmed.startsWith(PACKAGE_PREFIX)) {
                 packageLine = i;
             }
             if (trimmed.startsWith(IMPORT_PREFIX)) {
@@ -1585,7 +1586,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
         }
 
         Position start = new Position(0, 0);
-        return new TextEdit(new Range(start, start), "package " + newPackageName + "\n\n");
+        return new TextEdit(new Range(start, start), PACKAGE_PREFIX + newPackageName + "\n\n");
     }
 
     private Map<String, List<TextEdit>> buildWorkspaceTypeRenameEdits(
@@ -1617,7 +1618,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
             return editsByUri;
         } catch (Exception e) {
             GroovyLanguageServerPlugin.logError(
-                    "Workspace file rename search failed for " + targetType.getFullyQualifiedName(), e);
+                    "Workspace file rename search failed for " + safeTypeName(targetType), e);
             return Map.of();
         }
     }
@@ -1740,7 +1741,7 @@ public class GroovyWorkspaceService implements WorkspaceService {
     private Position offsetToPosition(String content, int offset) {
         int line = 0;
         int column = 0;
-        int safeOffset = Math.max(0, Math.min(offset, content.length()));
+        int safeOffset = Math.clamp(offset, 0, content.length());
         for (int i = 0; i < safeOffset; i++) {
             if (content.charAt(i) == '\n') {
                 line++;
@@ -1750,6 +1751,32 @@ public class GroovyWorkspaceService implements WorkspaceService {
             }
         }
         return new Position(line, column);
+    }
+
+    private Exception asException(Throwable throwable) {
+        return throwable instanceof Exception exception ? exception : new RuntimeException(throwable);
+    }
+
+    private String safeTypeName(IType targetType) {
+        return targetType == null ? "<unknown>" : targetType.getFullyQualifiedName();
+    }
+
+    record RenameFallbackContext(
+            String oldTypeName,
+            String newTypeName,
+            String oldPackageName,
+            String newPackageName,
+            String oldFqn,
+            String newFqn,
+            boolean typeNameChanged,
+            boolean packageChanged) {
+    }
+
+    private record FallbackFileUsage(boolean hasOldImport, boolean nowInSamePackage,
+            boolean usesSimpleName, boolean usesFqn) {
+        private boolean needsEdits() {
+            return hasOldImport || usesSimpleName || usesFqn;
+        }
     }
 
     /**

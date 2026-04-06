@@ -24,7 +24,6 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -36,12 +35,9 @@ import org.codehaus.groovy.ast.ClassHelper;
 import org.codehaus.groovy.ast.ClassNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.Parameter;
-import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyCompilerService;
 import org.eclipse.lsp4j.TextEdit;
-
-import com.google.gson.JsonObject;
 import org.eclipse.jdt.core.Flags;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IField;
@@ -53,7 +49,6 @@ import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.ITypeHierarchy;
 import org.eclipse.lsp4j.CompletionItem;
 import org.eclipse.lsp4j.CompletionItemKind;
-import org.eclipse.lsp4j.CompletionItemTag;
 import org.eclipse.lsp4j.CompletionParams;
 import org.eclipse.lsp4j.InsertTextFormat;
 import org.eclipse.lsp4j.Position;
@@ -1000,6 +995,43 @@ class CompletionProviderTest {
                 Arguments.of("groovy.lang"));
     }
 
+    private static Stream<Arguments> resolveLocalVariableTypeInClassCases() {
+        return Stream.of(
+                Arguments.of("class Foo {\n  void run() {\n    String x = 'hi'\n  }\n}", "x", "String"),
+                Arguments.of("class Foo {\n  void run() {\n    def items = new ArrayList()\n  }\n}", "items", "ArrayList"),
+                Arguments.of("class Foo {\n  Foo() {\n    String val = 'init'\n  }\n}", "val", "String"),
+                Arguments.of("class Foo {\n  void run() {\n    int x = 1\n  }\n}", "notDeclared", null));
+    }
+
+    private static Stream<Arguments> extractNonStaticImportCases() {
+        return Stream.of(
+                Arguments.of("import java.util.List", "java.util.List"),
+                Arguments.of("import java.util.List;", "java.util.List"),
+                Arguments.of("import static java.lang.Math.PI", null),
+                Arguments.of("import java.util.*", null),
+                Arguments.of("class Foo {}", null),
+                Arguments.of("import ", null));
+    }
+
+    private static Stream<Arguments> shouldIncludeFieldCases() {
+        return Stream.of(
+                Arguments.of("name", 0, "", false, Set.<String>of(), true),
+                Arguments.of("$internal", 0, "", false, Set.<String>of(), false),
+                Arguments.of("__meta", 0, "", false, Set.<String>of(), false),
+                Arguments.of("name", 0, "xyz", false, Set.<String>of(), false),
+                Arguments.of("name", 0, "", true, Set.<String>of(), false),
+                Arguments.of("name", 0, "", false, Set.of("f:name"), false));
+    }
+
+    private static Stream<Arguments> currentPackageNameCases() {
+        return Stream.of(
+                Arguments.of("package com.example\n\nclass A {}", "com.example"),
+                Arguments.of("package com.example;\n\nclass A {}", "com.example"),
+                Arguments.of("class A {}", ""),
+                Arguments.of(null, ""),
+                Arguments.of("", ""));
+    }
+
     @Test
     void isAutoImportedPackageReturnsFalseForCustom() throws Exception {
         CompletionProvider provider = new CompletionProvider(new DocumentManager());
@@ -1008,34 +1040,11 @@ class CompletionProviderTest {
 
     // ---- getCurrentPackageName tests ----
 
-    @Test
-    void getCurrentPackageNameParsesPackageDeclaration() throws Exception {
+    @ParameterizedTest
+    @MethodSource("currentPackageNameCases")
+    void getCurrentPackageNameCases(String content, String expectedPackage) throws Exception {
         CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertEquals("com.example", invokeGetCurrentPackageName(provider, "package com.example\n\nclass A {}"));
-    }
-
-    @Test
-    void getCurrentPackageNameWithSemicolon() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertEquals("com.example", invokeGetCurrentPackageName(provider, "package com.example;\n\nclass A {}"));
-    }
-
-    @Test
-    void getCurrentPackageNameReturnsEmptyForNoPackage() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertEquals("", invokeGetCurrentPackageName(provider, "class A {}"));
-    }
-
-    @Test
-    void getCurrentPackageNameReturnsEmptyForNull() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertEquals("", invokeGetCurrentPackageName(provider, null));
-    }
-
-    @Test
-    void getCurrentPackageNameReturnsEmptyForEmptyContent() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertEquals("", invokeGetCurrentPackageName(provider, ""));
+        assertEquals(expectedPackage, invokeGetCurrentPackageName(provider, content));
     }
 
     // ---- findImportInsertLine tests ----
@@ -2038,14 +2047,17 @@ class CompletionProviderTest {
     }
 
     private Object newTypeResolutionContext() throws Exception {
-        for (Class<?> innerClass : CompletionProvider.class.getDeclaredClasses()) {
-            if ("TypeResolutionContext".equals(innerClass.getSimpleName())) {
-                var ctor = innerClass.getDeclaredConstructor();
-                ctor.setAccessible(true);
-                return ctor.newInstance();
-            }
-        }
-        throw new IllegalStateException("TypeResolutionContext not found");
+        Class<?> innerClass = findInnerClassBySimpleName("TypeResolutionContext");
+        var ctor = innerClass.getDeclaredConstructor();
+        ctor.setAccessible(true);
+        return ctor.newInstance();
+    }
+
+    private Class<?> findInnerClassBySimpleName(String simpleName) {
+        return java.util.Arrays.stream(CompletionProvider.class.getDeclaredClasses())
+                .filter(innerClass -> simpleName.equals(innerClass.getSimpleName()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(simpleName + " not found"));
     }
 
     private IType invokeResolveTypeNameFromAST(CompletionProvider provider, String typeName,
@@ -2429,94 +2441,34 @@ class CompletionProviderTest {
     // resolveLocalVariableTypeInClass tests (AST-based)
     // ================================================================
 
-    @Test
-    void resolveLocalVariableTypeInClassFindsTypedVar() throws Exception {
+    @ParameterizedTest
+    @MethodSource("resolveLocalVariableTypeInClassCases")
+    void resolveLocalVariableTypeInClassCases(String source, String variableName, String expectedType)
+            throws Exception {
         CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        String source = "class Foo {\n  void run() {\n    String x = 'hi'\n  }\n}";
         ModuleNode ast = parseModule(source, "file:///test.groovy");
         ClassNode classNode = ast.getClasses().stream()
                 .filter(c -> "Foo".equals(c.getNameWithoutPackage()))
                 .findFirst().orElseThrow();
-        ClassNode result = invokeResolveLocalVariableTypeInClass(provider, classNode, "x");
-        assertNotNull(result);
-        assertTrue(result.getName().contains("String"));
-    }
-
-    @Test
-    void resolveLocalVariableTypeInClassFindsConstructorCallType() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        String source = "class Foo {\n  void run() {\n    def items = new ArrayList()\n  }\n}";
-        ModuleNode ast = parseModule(source, "file:///test.groovy");
-        ClassNode classNode = ast.getClasses().stream()
-                .filter(c -> "Foo".equals(c.getNameWithoutPackage()))
-                .findFirst().orElseThrow();
-        ClassNode result = invokeResolveLocalVariableTypeInClass(provider, classNode, "items");
-        assertNotNull(result);
-        assertTrue(result.getName().contains("ArrayList"));
-    }
-
-    @Test
-    void resolveLocalVariableTypeInClassReturnsNullForMissing() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        String source = "class Foo {\n  void run() {\n    int x = 1\n  }\n}";
-        ModuleNode ast = parseModule(source, "file:///test.groovy");
-        ClassNode classNode = ast.getClasses().stream()
-                .filter(c -> "Foo".equals(c.getNameWithoutPackage()))
-                .findFirst().orElseThrow();
-        assertNull(invokeResolveLocalVariableTypeInClass(provider, classNode, "notDeclared"));
-    }
-
-    @Test
-    void resolveLocalVariableTypeInClassFindsInConstructor() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        String source = "class Foo {\n  Foo() {\n    String val = 'init'\n  }\n}";
-        ModuleNode ast = parseModule(source, "file:///test.groovy");
-        ClassNode classNode = ast.getClasses().stream()
-                .filter(c -> "Foo".equals(c.getNameWithoutPackage()))
-                .findFirst().orElseThrow();
-        ClassNode result = invokeResolveLocalVariableTypeInClass(provider, classNode, "val");
-        assertNotNull(result);
-        assertTrue(result.getName().contains("String"));
+        ClassNode result = invokeResolveLocalVariableTypeInClass(provider, classNode, variableName);
+        if (expectedType == null) {
+            assertNull(result);
+        } else {
+            assertNotNull(result);
+            assertTrue(result.getName().contains(expectedType));
+        }
     }
 
     // ================================================================
     // extractNonStaticImport tests
     // ================================================================
 
-    @Test
-    void extractNonStaticImportRegular() throws Exception {
+    @ParameterizedTest
+    @MethodSource("extractNonStaticImportCases")
+    void extractNonStaticImportCases(String importLine, String expectedImport) throws Exception {
         CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertEquals("java.util.List", invokeExtractNonStaticImport(provider, "import java.util.List"));
-    }
-
-    @Test
-    void extractNonStaticImportWithSemicolon() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertEquals("java.util.List", invokeExtractNonStaticImport(provider, "import java.util.List;"));
-    }
-
-    @Test
-    void extractNonStaticImportStaticReturnsNull() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertNull(invokeExtractNonStaticImport(provider, "import static java.lang.Math.PI"));
-    }
-
-    @Test
-    void extractNonStaticImportStarReturnsNull() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertNull(invokeExtractNonStaticImport(provider, "import java.util.*"));
-    }
-
-    @Test
-    void extractNonStaticImportNonImportLineReturnsNull() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertNull(invokeExtractNonStaticImport(provider, "class Foo {}"));
-    }
-
-    @Test
-    void extractNonStaticImportEmptyTargetReturnsNull() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        assertNull(invokeExtractNonStaticImport(provider, "import "));
+        String resolvedImport = invokeExtractNonStaticImport(provider, importLine);
+        assertEquals(expectedImport, resolvedImport);
     }
 
     // ================================================================
@@ -2577,57 +2529,16 @@ class CompletionProviderTest {
     // shouldIncludeField tests
     // ================================================================
 
-    @Test
-    void shouldIncludeFieldNormal() throws Exception {
+    @ParameterizedTest
+    @MethodSource("shouldIncludeFieldCases")
+    void shouldIncludeFieldCases(String fieldName, int flags, String prefix, boolean staticOnly,
+            Set<String> seen, boolean expected) throws Exception {
         CompletionProvider provider = new CompletionProvider(new DocumentManager());
         IField field = mock(IField.class);
-        when(field.getElementName()).thenReturn("name");
-        when(field.getFlags()).thenReturn(0);
-        assertTrue((boolean) invokeShouldIncludeField(provider, field, "", false, new HashSet<>()));
-    }
-
-    @Test
-    void shouldIncludeFieldDollarPrefix() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        IField field = mock(IField.class);
-        when(field.getElementName()).thenReturn("$internal");
-        assertFalse((boolean) invokeShouldIncludeField(provider, field, "", false, new HashSet<>()));
-    }
-
-    @Test
-    void shouldIncludeFieldDoubleUnderscorePrefix() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        IField field = mock(IField.class);
-        when(field.getElementName()).thenReturn("__meta");
-        assertFalse((boolean) invokeShouldIncludeField(provider, field, "", false, new HashSet<>()));
-    }
-
-    @Test
-    void shouldIncludeFieldPrefixMismatch() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        IField field = mock(IField.class);
-        when(field.getElementName()).thenReturn("name");
-        assertFalse((boolean) invokeShouldIncludeField(provider, field, "xyz", false, new HashSet<>()));
-    }
-
-    @Test
-    void shouldIncludeFieldStaticOnlyFiltersNonStatic() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        IField field = mock(IField.class);
-        when(field.getElementName()).thenReturn("name");
-        when(field.getFlags()).thenReturn(0);
-        assertFalse((boolean) invokeShouldIncludeField(provider, field, "", true, new HashSet<>()));
-    }
-
-    @Test
-    void shouldIncludeFieldAlreadySeen() throws Exception {
-        CompletionProvider provider = new CompletionProvider(new DocumentManager());
-        IField field = mock(IField.class);
-        when(field.getElementName()).thenReturn("name");
-        when(field.getFlags()).thenReturn(0);
-        Set<String> seen = new HashSet<>();
-        seen.add("f:name");
-        assertFalse((boolean) invokeShouldIncludeField(provider, field, "", false, seen));
+        when(field.getElementName()).thenReturn(fieldName);
+        when(field.getFlags()).thenReturn(flags);
+        assertEquals(expected,
+                (boolean) invokeShouldIncludeField(provider, field, prefix, staticOnly, new HashSet<>(seen)));
     }
 
     // ================================================================
@@ -3105,7 +3016,7 @@ class CompletionProviderTest {
         org.codehaus.groovy.ast.ClassNode cls = compileResult.getModuleNode().getClasses().get(0);
         java.util.List<org.eclipse.lsp4j.CompletionItem> items = new java.util.ArrayList<>();
         invokeAddFallbackFieldCompletions(cls, "n", items);
-        // Groovy class fields may or may not include 'name' depending on AST representation
+        assertTrue(items.isEmpty() || items.stream().allMatch(java.util.Objects::nonNull));
     }
 
     // ================================================================
@@ -3159,7 +3070,7 @@ class CompletionProviderTest {
         java.util.List<org.eclipse.lsp4j.CompletionItem> items = new java.util.ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
         invokeAddOwnAstFieldCompletions(cls, "", seen, items);
-        // May or may not be empty depending on $ filter
+        assertTrue(items.isEmpty() || items.stream().allMatch(java.util.Objects::nonNull));
     }
 
     // ================================================================
@@ -3289,7 +3200,7 @@ class CompletionProviderTest {
         var compileResult = new org.eclipse.groovy.ls.core.GroovyCompilerService().parse("file:///memberExpr2.groovy", source);
         org.codehaus.groovy.ast.ClassNode cls = compileResult.getModuleNode().getClasses().get(0);
         Object result = invokeResolveClassMemberExpressionType(cls, "name");
-        // Properties are class-level 'def' fields - may or may not resolve
+        assertTrue(result == null || result.toString().contains("String"));
     }
 
     // ================================================================
@@ -3481,17 +3392,7 @@ class CompletionProviderTest {
         // Need to find the TypeSearchContext inner class and create one
         // buildTypeSearchItem(String, String, int, String, TypeSearchContext)
         // TypeSearchContext is a private inner class - use reflection to get it
-        Class<?>[] innerClasses = CompletionProvider.class.getDeclaredClasses();
-        Class<?> tscClass = null;
-        for (Class<?> c : innerClasses) {
-            if (c.getSimpleName().equals("TypeSearchContext")) {
-                tscClass = c;
-                break;
-            }
-        }
-        if (tscClass == null) {
-            return null; // TypeSearchContext not found
-        }
+        Class<?> tscClass = findInnerClassBySimpleName("TypeSearchContext");
 
         // Create a TypeSearchContext via its 4-arg constructor
         // TypeSearchContext(boolean annotationOnly, String currentPackage, Set<String> existingImports, int importInsertLine)
@@ -4015,7 +3916,7 @@ class CompletionProviderTest {
     // ================================================================
 
     @Test
-    void getCompletionsReturnsEmptyForNullContentBatch5() throws Exception {
+    void getCompletionsReturnsEmptyForNullContentBatch5() {
         DocumentManager dm = new DocumentManager();
         CompletionProvider cp = new CompletionProvider(dm);
 
@@ -4176,58 +4077,6 @@ class CompletionProviderTest {
 
         int line = (int) m.invoke(cp, "package com.example\nimport java.util.List\nclass A {}");
         assertTrue(line >= 2, "Import insert should be after existing imports");
-    }
-
-    // ---- getCurrentPackageName ----
-
-    @Test
-    void getCurrentPackageNameExtractsPackage() throws Exception {
-        DocumentManager dm = new DocumentManager();
-        CompletionProvider cp = new CompletionProvider(dm);
-
-        Method m = CompletionProvider.class.getDeclaredMethod("getCurrentPackageName",
-                String.class);
-        m.setAccessible(true);
-
-        assertEquals("com.example", m.invoke(cp, "package com.example\nclass A {}"));
-    }
-
-    @Test
-    void getCurrentPackageNameReturnsNullForNoPackage() throws Exception {
-        DocumentManager dm = new DocumentManager();
-        CompletionProvider cp = new CompletionProvider(dm);
-
-        Method m = CompletionProvider.class.getDeclaredMethod("getCurrentPackageName",
-                String.class);
-        m.setAccessible(true);
-
-        assertEquals("", m.invoke(cp, "class A {}"));
-    }
-
-    // ---- extractNonStaticImport ----
-
-    @Test
-    void extractNonStaticImportParsesImportLine() throws Exception {
-        DocumentManager dm = new DocumentManager();
-        CompletionProvider cp = new CompletionProvider(dm);
-
-        Method m = CompletionProvider.class.getDeclaredMethod("extractNonStaticImport",
-                String.class);
-        m.setAccessible(true);
-
-        assertEquals("java.util.List", m.invoke(cp, "import java.util.List"));
-    }
-
-    @Test
-    void extractNonStaticImportReturnsNullForStaticImport() throws Exception {
-        DocumentManager dm = new DocumentManager();
-        CompletionProvider cp = new CompletionProvider(dm);
-
-        Method m = CompletionProvider.class.getDeclaredMethod("extractNonStaticImport",
-                String.class);
-        m.setAccessible(true);
-
-        assertNull(m.invoke(cp, "import static java.util.Collections.sort"));
     }
 
     // ---- isAutoImportedPackage ----

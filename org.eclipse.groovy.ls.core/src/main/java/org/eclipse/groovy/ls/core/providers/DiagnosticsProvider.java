@@ -42,6 +42,7 @@ import org.eclipse.lsp4j.services.LanguageClient;
  * a {@code .groovy} file, it reports problems as {@link IProblem} instances.
  * We convert these to LSP {@link Diagnostic} objects and publish them to the client.
  */
+@SuppressWarnings("unused")
 public class DiagnosticsProvider {
 
     private static final String INTERNAL_PARSE_ERROR_PREFIX = "Internal parse error: ";
@@ -81,6 +82,7 @@ public class DiagnosticsProvider {
     private static final String GENERAL_CONVERSION_ERROR_PREFIX =
             "Groovy:General error during conversion:";
     private static final String NO_SUCH_CLASS_PREFIX = "No such class: ";
+        private static final String TYPE_MESSAGE_PREFIX = "The type ";
     private static final String TRANSFORM_LOADER_FRAGMENT =
             "JDTClassNode.getTypeClass() cannot locate it using transform loader";
     private static final String DIAGNOSTIC_SOURCE_GROOVY = "groovy";
@@ -173,7 +175,7 @@ public class DiagnosticsProvider {
     // On a 4-CPU container this yields 3 permits, leaving headroom for other work.
     private final java.util.concurrent.Semaphore reconcileSemaphore =
             new java.util.concurrent.Semaphore(
-                    Math.max(2, Math.min(6, Runtime.getRuntime().availableProcessors() - 1)));
+                (int) Math.clamp(Runtime.getRuntime().availableProcessors() - 1L, 2L, 6L));
 
     public DiagnosticsProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -519,118 +521,23 @@ public class DiagnosticsProvider {
         // offset→position conversion from O(fileLength) to O(log lines).
         PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
 
-        // When no classpath is available for this project, use the standalone
-        // compiler instead of JDT. During startup that path stays filtered to
-        // syntax-only issues; after initialization it can surface unresolved
-        // type failures as part of the long-lived fallback behavior.
-        java.util.function.Predicate<String> checker = classpathAvailableForUri.get();
-        boolean hasClasspath = checker == null || checker.test(uri);
-        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
-        StandaloneCompilerMode compilerMode = standaloneCompilerMode(uri, initComplete);
+        DiagnosticCollectionContext context = createDiagnosticContext(uri);
         GroovyLanguageServerPlugin.logInfo(
                 "[classpath-check] uri=" + uri
-                + " checkerPresent=" + (checker != null)
-                + " hasClasspath=" + hasClasspath);
+                + " checkerPresent=" + context.checkerPresent()
+                + " hasClasspath=" + context.hasClasspath());
 
-        GroovyCompilerService.ParseResult cachedParse =
-                documentManager.getCompilerService().getCachedResult(uri);
-        if (cachedParse != null && hasSyntaxErrors(cachedParse, compilerMode)) {
-            collectFromParseResult(cachedParse, diagnostics, compilerMode);
-            if (!hasClasspath && initComplete) {
-                diagnostics.add(createNoClasspathWarning(content));
-            }
+        if (collectCachedSyntaxDiagnostics(context, content, diagnostics)) {
             return diagnostics;
         }
 
-        if (!hasClasspath) {
-            GroovyLanguageServerPlugin.logInfo(
-                    "[classpath-check] No classpath for " + uri + " → syntax-only mode");
-            try {
-                collectFromGroovyCompiler(uri, diagnostics, compilerMode);
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError(
-                    "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
-            }
-            // Only show the "Classpath is not configured" warning after the
-            // first workspace build has completed.  Before that point the
-            // missing classpath is expected and the warning would be a
-            // false alarm for files that were already open when the server
-            // started.
-            if (initComplete) {
-                diagnostics.add(createNoClasspathWarning(content));
-            }
+        if (collectStandaloneFallbackDiagnostics(uri, context, content, diagnostics)) {
             return diagnostics;
         }
 
-        // When a build is in progress, the workspace lock is held and any
-        // JDT reconcile() call would block this thread indefinitely. Use the
-        // standalone compiler instead. During startup this remains filtered;
-        // after initialization it preserves the normal standalone fallback
-        // diagnostics until the post-build JDT pass runs.
-        boolean buildRunning = buildInProgressSupplier.get().getAsBoolean();
-        if (buildRunning) {
-            GroovyLanguageServerPlugin.logInfo(
-                    "[diag-trace] Build in progress → syntax-only diagnostics for " + uri);
-            try {
-                collectFromGroovyCompiler(uri, diagnostics, compilerMode);
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError(
-                    "Failed to collect syntax diagnostics (build in progress) for " + uri, e);
-            }
-            return diagnostics;
-        }
+        collectClasspathDiagnostics(uri, context.compilerMode(), diagnostics, lineIndex);
 
-        try {
-            // Approach 1: Get problems from the working copy reconciliation.
-            // Use a semaphore to prevent all threads from blocking in reconcile()
-            // simultaneously — excess requests fall through to the faster
-            // standalone Groovy compiler instead of queueing.
-            ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-            if (workingCopy != null) {
-                boolean gotPermit = reconcileSemaphore.tryAcquire();
-                if (gotPermit) {
-                    try {
-                        collectFromWorkingCopy(workingCopy, diagnostics, content, lineIndex);
-
-                        // Also get problems from resource markers (for saved files)
-                        URI fileUri = toFileLocationUri(uri);
-                        IFile[] files = fileUri != null
-                            ? ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri)
-                            : new IFile[0];
-                        if (files.length > 0) {
-                            collectFromMarkers(files[0], diagnostics, content, lineIndex);
-                        }
-                    } finally {
-                        reconcileSemaphore.release();
-                    }
-                } else {
-                    // All reconcile slots are busy — fall back to standalone
-                    // diagnostics for now. This file will get full JDT
-                    // diagnostics on the next change or when
-                    // publishDiagnosticsForOpenDocuments() runs after a build.
-                    GroovyLanguageServerPlugin.logInfo(
-                            "[diag-trace] Reconcile slots busy, syntax-only for " + uri);
-                    collectFromGroovyCompiler(uri, diagnostics, compilerMode);
-                }
-            } else {
-                // Fallback: use the standalone compiler for long-lived
-                // diagnostics when no JDT working copy is available.
-                collectFromGroovyCompiler(uri, diagnostics, compilerMode);
-            }
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("Failed to collect diagnostics for " + uri, e);
-        }
-
-        // Always check for unused imports via AST analysis
-        try {
-            ModuleNode ast = documentManager.getGroovyAST(uri);
-            if (ast != null && content != null) {
-                List<Diagnostic> unusedImports = UnusedImportDetector.detectUnusedImports(ast, content);
-                diagnostics.addAll(unusedImports);
-            }
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError("Unused import detection failed for " + uri, e);
-        }
+        collectUnusedImportDiagnostics(uri, content, diagnostics);
 
         // NOTE: Unused declaration detection (UnusedDeclarationDetector) is
         // intentionally NOT run here — it is deferred to a secondary pass in
@@ -639,6 +546,118 @@ public class DiagnosticsProvider {
         // scans.  See publishDiagnostics() Phase 2.
 
         return diagnostics;
+    }
+
+    private DiagnosticCollectionContext createDiagnosticContext(String uri) {
+        java.util.function.Predicate<String> checker = classpathAvailableForUri.get();
+        boolean hasClasspath = checker == null || checker.test(uri);
+        boolean initComplete = initializationCompleteSupplier.get().getAsBoolean();
+        StandaloneCompilerMode compilerMode = standaloneCompilerMode(uri, initComplete);
+        GroovyCompilerService.ParseResult cachedParse = documentManager.getCompilerService().getCachedResult(uri);
+        return new DiagnosticCollectionContext(hasClasspath, initComplete, compilerMode, cachedParse,
+                checker != null);
+    }
+
+    private boolean collectCachedSyntaxDiagnostics(DiagnosticCollectionContext context, String content,
+            List<Diagnostic> diagnostics) {
+        if (context.cachedParse() == null || !hasSyntaxErrors(context.cachedParse(), context.compilerMode())) {
+            return false;
+        }
+
+        collectFromParseResult(context.cachedParse(), diagnostics, context.compilerMode());
+        addNoClasspathWarningIfNeeded(context, content, diagnostics);
+        return true;
+    }
+
+    private boolean collectStandaloneFallbackDiagnostics(String uri, DiagnosticCollectionContext context,
+            String content, List<Diagnostic> diagnostics) {
+        if (context.hasClasspath()) {
+            return false;
+        }
+
+        GroovyLanguageServerPlugin.logInfo(
+                "[classpath-check] No classpath for " + uri + " → syntax-only mode");
+        try {
+            collectFromGroovyCompiler(uri, diagnostics, context.compilerMode());
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to collect syntax diagnostics (no classpath) for " + uri, e);
+        }
+        addNoClasspathWarningIfNeeded(context, content, diagnostics);
+        return true;
+    }
+
+    private void addNoClasspathWarningIfNeeded(DiagnosticCollectionContext context, String content,
+            List<Diagnostic> diagnostics) {
+        if (!context.hasClasspath() && context.initComplete()) {
+            diagnostics.add(createNoClasspathWarning(content));
+        }
+    }
+
+    private void collectUnusedImportDiagnostics(String uri, String content, List<Diagnostic> diagnostics) {
+        try {
+            ModuleNode ast = documentManager.getGroovyAST(uri);
+            if (ast != null) {
+                diagnostics.addAll(UnusedImportDetector.detectUnusedImports(ast, content));
+            }
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Unused import detection failed for " + uri, e);
+        }
+    }
+
+    private void collectClasspathDiagnostics(String uri, StandaloneCompilerMode compilerMode,
+            List<Diagnostic> diagnostics, PositionUtils.LineIndex lineIndex) {
+        if (buildInProgressSupplier.get().getAsBoolean()) {
+            collectBuildInProgressDiagnostics(uri, compilerMode, diagnostics);
+            return;
+        }
+
+        try {
+            ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+            if (workingCopy == null) {
+                collectFromGroovyCompiler(uri, diagnostics, compilerMode);
+                return;
+            }
+
+            if (reconcileSemaphore.tryAcquire()) {
+                try {
+                    collectFromWorkingCopy(workingCopy, diagnostics, lineIndex);
+                    collectMarkerDiagnostics(uri, diagnostics, lineIndex);
+                } finally {
+                    reconcileSemaphore.release();
+                }
+                return;
+            }
+
+            GroovyLanguageServerPlugin.logInfo(
+                    "[diag-trace] Reconcile slots busy, syntax-only for " + uri);
+            collectFromGroovyCompiler(uri, diagnostics, compilerMode);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("Failed to collect diagnostics for " + uri, e);
+        }
+    }
+
+    private void collectBuildInProgressDiagnostics(String uri, StandaloneCompilerMode compilerMode,
+            List<Diagnostic> diagnostics) {
+        GroovyLanguageServerPlugin.logInfo(
+                "[diag-trace] Build in progress → syntax-only diagnostics for " + uri);
+        try {
+            collectFromGroovyCompiler(uri, diagnostics, compilerMode);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError(
+                    "Failed to collect syntax diagnostics (build in progress) for " + uri, e);
+        }
+    }
+
+    private void collectMarkerDiagnostics(String uri, List<Diagnostic> diagnostics,
+            PositionUtils.LineIndex lineIndex) {
+        URI fileUri = toFileLocationUri(uri);
+        IFile[] files = fileUri != null
+                ? ResourcesPlugin.getWorkspace().getRoot().findFilesForLocationURI(fileUri)
+                : new IFile[0];
+        if (files.length > 0) {
+            collectFromMarkers(files[0], diagnostics, lineIndex);
+        }
     }
 
     private List<Diagnostic> collectSyntaxDiagnostics(String uri) {
@@ -721,8 +740,8 @@ public class DiagnosticsProvider {
     /**
      * Collect problems from a JDT working copy that has been reconciled.
      */
-    private void collectFromWorkingCopy(ICompilationUnit workingCopy, List<Diagnostic> diagnostics,
-            String content, PositionUtils.LineIndex lineIndex) {
+        private void collectFromWorkingCopy(ICompilationUnit workingCopy, List<Diagnostic> diagnostics,
+            PositionUtils.LineIndex lineIndex) {
         try {
             if (Thread.currentThread().isInterrupted()) {
                 return;
@@ -796,8 +815,8 @@ public class DiagnosticsProvider {
     /**
      * Collect problems from Eclipse resource markers.
      */
-    private void collectFromMarkers(IFile file, List<Diagnostic> diagnostics,
-            String content, PositionUtils.LineIndex lineIndex) {
+        private void collectFromMarkers(IFile file, List<Diagnostic> diagnostics,
+            PositionUtils.LineIndex lineIndex) {
         try {
             IMarker[] markers = file.findMarkers(IMarker.PROBLEM, true, IResource.DEPTH_ZERO);
             IJavaProject javaProject = JavaCore.create(file.getProject());
@@ -850,7 +869,7 @@ public class DiagnosticsProvider {
         // with the same name as the declared class, causing a spurious duplicate.
         if (problemId == TYPE_COLLISION_PROBLEM_ID
                 || (message != null
-                        && message.startsWith("The type ")
+                    && message.startsWith(TYPE_MESSAGE_PREFIX)
                         && message.endsWith(" is already defined"))) {
             return true;
         }
@@ -920,11 +939,11 @@ public class DiagnosticsProvider {
             return false;
         }
         // Extract the type name between "The type " and " cannot be resolved"
-        int start = message.indexOf("The type ");
+        int start = message.indexOf(TYPE_MESSAGE_PREFIX);
         if (start < 0) {
             return false;
         }
-        start += "The type ".length();
+        start += TYPE_MESSAGE_PREFIX.length();
         int end = message.indexOf(" cannot be resolved", start);
         if (end < 0) {
             return false;
@@ -1256,6 +1275,11 @@ public class DiagnosticsProvider {
             return message.substring(INTERNAL_PARSE_ERROR_PREFIX.length());
         }
         return message;
+    }
+
+    private record DiagnosticCollectionContext(boolean hasClasspath, boolean initComplete,
+            StandaloneCompilerMode compilerMode, GroovyCompilerService.ParseResult cachedParse,
+            boolean checkerPresent) {
     }
 
     /**

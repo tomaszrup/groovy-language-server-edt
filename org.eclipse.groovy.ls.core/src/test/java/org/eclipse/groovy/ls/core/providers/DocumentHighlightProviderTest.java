@@ -10,7 +10,6 @@
 package org.eclipse.groovy.ls.core.providers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -295,10 +294,11 @@ class DocumentHighlightProviderTest {
         m.setAccessible(true);
         // normalizeUri might return null for null input
         try {
-            String result = (String) m.invoke(provider, (Object) null);
-            // If it doesn't throw, it either returns null or some default
+            Object normalized = m.invoke(provider, (Object) null);
+            assertTrue(normalized == null || normalized instanceof String);
         } catch (java.lang.reflect.InvocationTargetException e) {
             // Expected for null input
+            assertNotNull(e.getCause());
         }
     }
 }

@@ -58,6 +58,7 @@ import org.eclipse.lsp4j.Position;
  * under the cursor, then formats type signatures, documentation, and source info
  * as Markdown content for the hover popup.
  */
+@SuppressWarnings("unused")
 public class HoverProvider {
 
     private final DocumentManager documentManager;
@@ -83,6 +84,9 @@ public class HoverProvider {
     private static final String FENCE_CLOSE = "\n```\n";
     private static final String EXTENDS_KW = " extends ";
     private static final String FENCE_CLOSE_BARE = "\n```";
+    private static final String DECLARED_IN_PREFIX = "\n*Declared in* `";
+    private static final String DECLARED_IN_SUFFIX = "`\n";
+    private static final String JAVA_LANG_OBJECT = "java.lang.Object";
 
     public HoverProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
@@ -167,7 +171,7 @@ public class HoverProvider {
         return new Hover(markup);
     }
 
-    private IJavaElement selectBestElement(IJavaElement[] elements) throws JavaModelException {
+    private IJavaElement selectBestElement(IJavaElement[] elements) {
         if (elements == null || elements.length == 0) {
             return null;
         }
@@ -214,10 +218,10 @@ public class HoverProvider {
             return true;
         }
 
-        if (isDeclaredInSubtype(candidate, currentBest)) {
+        if (isDeclaredInSubtype(currentBest, candidate)) {
             return true;
         }
-        if (isDeclaredInSubtype(currentBest, candidate)) {
+        if (isDeclaredInSubtype(candidate, currentBest)) {
             return false;
         }
 
@@ -228,20 +232,13 @@ public class HoverProvider {
             return false;
         }
 
-        if (isSourceBacked(candidate) && !isSourceBacked(currentBest)) {
-            return true;
-        }
-        if (!isSourceBacked(candidate) && isSourceBacked(currentBest)) {
-            return false;
-        }
-
-        return false;
+        return isSourceBacked(candidate) && !isSourceBacked(currentBest);
     }
 
-    private boolean isDeclaredInSubtype(IMethod candidate, IMethod currentBest) {
+    private boolean isDeclaredInSubtype(IMethod supertypeMethod, IMethod subtypeMethod) {
         try {
-            IType candidateType = resolveComparisonType(candidate);
-            IType currentType = resolveComparisonType(currentBest);
+            IType currentType = resolveComparisonType(supertypeMethod);
+            IType candidateType = resolveComparisonType(subtypeMethod);
             if (candidateType == null || currentType == null) {
                 return false;
             }
@@ -263,6 +260,7 @@ public class HoverProvider {
                 }
             }
         } catch (Exception ignored) {
+            // Comparison falls back to non-subtype ordering when hierarchy lookup fails.
         }
         return false;
     }
@@ -330,7 +328,7 @@ public class HoverProvider {
             return null;
         }
 
-        IType receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, content, lineIndex, uri);
+        IType receiverType = resolveReceiverTypeFromAst(ast, project, offset, word, lineIndex, uri);
         if (receiverType == null) {
             return null;
         }
@@ -354,8 +352,8 @@ public class HoverProvider {
         return null;
     }
 
-    private String buildRecordAccessorHover(IType receiverType,
-            JavaRecordSourceSupport.RecordComponentInfo component) throws JavaModelException {
+        private String buildRecordAccessorHover(IType receiverType,
+            JavaRecordSourceSupport.RecordComponentInfo component) {
         StringBuilder sb = new StringBuilder(GROOVY_FENCE_OPEN);
         sb.append(simplifyTypeName(component.type())).append(' ');
         sb.append(component.name()).append("()");
@@ -363,7 +361,7 @@ public class HoverProvider {
 
         String declaringType = receiverType.getFullyQualifiedName();
         if (declaringType != null && !declaringType.isBlank()) {
-            sb.append("\n*Declared in* `").append(declaringType).append("`\n");
+            sb.append(DECLARED_IN_PREFIX).append(declaringType).append(DECLARED_IN_SUFFIX);
         }
 
         return sb.toString();
@@ -448,7 +446,7 @@ public class HoverProvider {
 
     private void appendSuperclass(StringBuilder sb, String superclass) {
         if (superclass != null && !"Object".equals(superclass)
-                && !"java.lang.Object".equals(superclass)) {
+            && !JAVA_LANG_OBJECT.equals(superclass)) {
             sb.append(EXTENDS_KW).append(simpleName(superclass));
         }
     }
@@ -485,12 +483,14 @@ public class HoverProvider {
 
         IType declaringType = method.getDeclaringType();
         if (declaringType != null) {
-            sb.append("\n*Declared in* `").append(declaringType.getFullyQualifiedName()).append("`\n");
+            sb.append(DECLARED_IN_PREFIX)
+                    .append(declaringType.getFullyQualifiedName())
+                    .append(DECLARED_IN_SUFFIX);
         }
         return sb.toString();
     }
 
-    private void appendMethodParameters(StringBuilder sb, IMethod method) throws JavaModelException {
+    private void appendMethodParameters(StringBuilder sb, IMethod method) {
         sb.append('(');
         String[] paramTypes = method.getParameterTypes();
         String[] paramNames = JdtParameterNameResolver.resolve(method);
@@ -538,7 +538,9 @@ public class HoverProvider {
 
         IType declaringType = field.getDeclaringType();
         if (declaringType != null) {
-            sb.append("\n*Declared in* `").append(declaringType.getFullyQualifiedName()).append("`\n");
+            sb.append(DECLARED_IN_PREFIX)
+                    .append(declaringType.getFullyQualifiedName())
+                    .append(DECLARED_IN_SUFFIX);
         }
         return sb.toString();
     }
@@ -808,73 +810,7 @@ public class HoverProvider {
 
     private ConstructorCallExpression findConstructorCallAtOffset(
             ModuleNode module, int offset, String typeName, PositionUtils.LineIndex lineIndex) {
-        Position pos = lineIndex.offsetToPosition(offset);
-        int targetLine = pos.getLine() + 1;
-        int targetCol = pos.getCharacter() + 1;
-
-        final ConstructorCallExpression[] result = new ConstructorCallExpression[1];
-        ClassCodeVisitorSupport visitor = new ClassCodeVisitorSupport() {
-            @Override
-            protected SourceUnit getSourceUnit() {
-                return module.getContext();
-            }
-
-            @Override
-            public void visitConstructorCallExpression(ConstructorCallExpression call) {
-                if (result[0] != null || call.getType() == null) {
-                    return;
-                }
-                if (!typeName.equals(call.getType().getNameWithoutPackage())) {
-                    super.visitConstructorCallExpression(call);
-                    return;
-                }
-
-                int line = call.getLineNumber();
-                int col = call.getColumnNumber();
-                int lastLine = call.getLastLineNumber();
-                int lastCol = call.getLastColumnNumber();
-                if (isWithinRange(targetLine, targetCol, line, col, lastLine, lastCol)) {
-                    result[0] = call;
-                    return;
-                }
-                super.visitConstructorCallExpression(call);
-            }
-        };
-
-        for (ClassNode classNode : module.getClasses()) {
-            if (result[0] != null) {
-                break;
-            }
-            visitor.visitClass(classNode);
-        }
-
-        if (result[0] == null) {
-            BlockStatement stmtBlock = module.getStatementBlock();
-            if (stmtBlock != null) {
-                for (Statement stmt : stmtBlock.getStatements()) {
-                    if (result[0] != null) {
-                        break;
-                    }
-                    stmt.visit(visitor);
-                }
-            }
-        }
-
-        return result[0];
-    }
-
-    private boolean isWithinRange(
-            int targetLine, int targetCol, int line, int col, int lastLine, int lastCol) {
-        if (line <= 0 || col <= 0 || lastLine <= 0 || lastCol <= 0) {
-            return false;
-        }
-        if (targetLine < line || targetLine > lastLine) {
-            return false;
-        }
-        if (targetLine == line && targetCol < col) {
-            return false;
-        }
-        return targetLine != lastLine || targetCol <= lastCol;
+        return HoverAstSupport.findConstructorCallAtOffset(module, offset, typeName, lineIndex);
     }
 
     private ClassNode findDeclaredClassNode(ModuleNode module, ClassNode typeNode) {
@@ -1061,7 +997,7 @@ public class HoverProvider {
         }
         sb.append(classNode.getName());
         ClassNode superClass = classNode.getSuperClass();
-        if (superClass != null && !"java.lang.Object".equals(superClass.getName())) {
+        if (superClass != null && !JAVA_LANG_OBJECT.equals(superClass.getName())) {
             sb.append(EXTENDS_KW).append(superClass.getNameWithoutPackage());
         }
         ClassNode[] interfaces = classNode.getInterfaces();
@@ -1152,220 +1088,38 @@ public class HoverProvider {
     private IType resolveReceiverTypeFromAst(ModuleNode ast, IJavaProject project,
             int offset, String methodName, String content) {
         return resolveReceiverTypeFromAst(
-            ast, project, offset, methodName, content, PositionUtils.buildLineIndex(content), null);
+            ast, project, offset, methodName, PositionUtils.buildLineIndex(content), null);
     }
 
     private IType resolveReceiverTypeFromAst(ModuleNode ast,
             IJavaProject project,
             int offset,
             String methodName,
-            String content,
             PositionUtils.LineIndex lineIndex) {
-        return resolveReceiverTypeFromAst(ast, project, offset, methodName, content, lineIndex, null);
+        return resolveReceiverTypeFromAst(ast, project, offset, methodName, lineIndex, null);
     }
 
     private IType resolveReceiverTypeFromAst(ModuleNode ast,
             IJavaProject project,
             int offset,
             String methodName,
-            String content,
             PositionUtils.LineIndex lineIndex,
             String sourceUri) {
-        MethodCallExpression found = findMethodCallAtOffset(ast, offset, methodName, content, lineIndex);
-        if (found == null) {
-            return null;
-        }
-
-        Expression objectExpr = found.getObjectExpression();
-        ClassNode receiverClassNode = resolveObjectExpressionType(objectExpr, ast);
-        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
-            return null;
-        }
-
-        return resolveClassNodeToIType(receiverClassNode, ast, project, sourceUri);
+        return HoverAstSupport.resolveReceiverTypeFromAst(
+                ast, project, offset, methodName, lineIndex, sourceUri);
     }
 
     private MethodCallExpression findMethodCallAtOffset(ModuleNode module, int offset,
             String methodName, String content) {
         return findMethodCallAtOffset(
-                module, offset, methodName, content, PositionUtils.buildLineIndex(content));
+            module, offset, methodName, PositionUtils.buildLineIndex(content));
     }
 
     private MethodCallExpression findMethodCallAtOffset(ModuleNode module,
             int offset,
             String methodName,
-            String content,
             PositionUtils.LineIndex lineIndex) {
-        Position pos = lineIndex.offsetToPosition(offset);
-        int targetLine = pos.getLine() + 1;
-        int targetCol = pos.getCharacter() + 1;
-
-        final MethodCallExpression[] result = new MethodCallExpression[1];
-
-        ClassCodeVisitorSupport visitor = new ClassCodeVisitorSupport() {
-            @Override
-            protected SourceUnit getSourceUnit() {
-                return module.getContext();
-            }
-
-            @Override
-            public void visitMethodCallExpression(MethodCallExpression call) {
-                if (result[0] != null) {
-                    return;
-                }
-                String name = call.getMethodAsString();
-                if (methodName.equals(name)) {
-                    Expression methodExpr = call.getMethod();
-                    int mLine = methodExpr.getLineNumber();
-                    int mCol = methodExpr.getColumnNumber();
-                    int mLastCol = methodExpr.getLastColumnNumber();
-                    if (mLine == targetLine && targetCol >= mCol && targetCol <= mLastCol) {
-                        result[0] = call;
-                        return;
-                    }
-                }
-                super.visitMethodCallExpression(call);
-            }
-        };
-
-        for (ClassNode classNode : module.getClasses()) {
-            if (result[0] != null) {
-                break;
-            }
-            visitor.visitClass(classNode);
-        }
-
-        if (result[0] == null) {
-            BlockStatement stmtBlock = module.getStatementBlock();
-            if (stmtBlock != null) {
-                for (Statement stmt : stmtBlock.getStatements()) {
-                    if (result[0] != null) {
-                        break;
-                    }
-                    stmt.visit(visitor);
-                }
-            }
-        }
-
-        return result[0];
-    }
-
-    private ClassNode resolveObjectExpressionType(Expression objectExpr, ModuleNode ast) {
-        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
-            return ctorCall.getType();
-        }
-        if (objectExpr instanceof VariableExpression varExpr) {
-            String varName = varExpr.getName();
-            if ("this".equals(varName)) {
-                return null;
-            }
-            for (ClassNode classNode : ast.getClasses()) {
-                if (classNode.getLineNumber() < 0) {
-                    continue;
-                }
-                for (MethodNode method : classNode.getMethods()) {
-                    ClassNode type = resolveLocalVarTypeInBlock(getBlock(method), varName, ast);
-                    if (type != null) {
-                        return type;
-                    }
-                }
-            }
-            BlockStatement stmtBlock = ast.getStatementBlock();
-            if (stmtBlock != null) {
-                ClassNode type = resolveLocalVarTypeInBlock(stmtBlock, varName, ast);
-                if (type != null) {
-                    return type;
-                }
-            }
-            ClassNode exprType = varExpr.getType();
-            if (exprType != null && !"java.lang.Object".equals(exprType.getName())) {
-                return exprType;
-            }
-        }
-        if (objectExpr instanceof MethodCallExpression nestedCall) {
-            return resolveMethodCallReturnType(nestedCall, ast);
-        }
-        return null;
-    }
-
-    private ClassNode resolveMethodCallReturnType(MethodCallExpression methodCall, ModuleNode module) {
-        Expression objectExpr = methodCall.getObjectExpression();
-        String methodName = methodCall.getMethodAsString();
-        if (methodName == null) {
-            return null;
-        }
-
-        ClassNode receiverClassNode = null;
-        if (objectExpr instanceof ConstructorCallExpression ctorCall) {
-            receiverClassNode = ctorCall.getType();
-        } else if (objectExpr instanceof MethodCallExpression nestedCall) {
-            receiverClassNode = resolveMethodCallReturnType(nestedCall, module);
-        } else if (objectExpr instanceof VariableExpression varExpr) {
-            String receiverVarName = varExpr.getName();
-            if (!"this".equals(receiverVarName)) {
-                receiverClassNode = resolveLocalVarTypeInBlock(module.getStatementBlock(), receiverVarName, module);
-                if (receiverClassNode == null) {
-                    receiverClassNode = varExpr.getType();
-                }
-            }
-        }
-
-        if (receiverClassNode == null || "java.lang.Object".equals(receiverClassNode.getName())) {
-            return null;
-        }
-
-        for (MethodNode method : receiverClassNode.getMethods()) {
-            if (methodName.equals(method.getName())) {
-                ClassNode returnType = method.getReturnType();
-                if (returnType != null && !"java.lang.Object".equals(returnType.getName())) {
-                    return returnType;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    private BlockStatement getBlock(MethodNode method) {
-        Statement code = method.getCode();
-        return code instanceof BlockStatement block ? block : null;
-    }
-
-    private ClassNode resolveLocalVarTypeInBlock(BlockStatement block, String varName, ModuleNode module) {
-        if (block == null) {
-            return null;
-        }
-        for (Statement stmt : block.getStatements()) {
-            if (!(stmt instanceof ExpressionStatement exprStmt)) {
-                continue;
-            }
-            if (!(exprStmt.getExpression() instanceof org.codehaus.groovy.ast.expr.DeclarationExpression decl)) {
-                continue;
-            }
-            Expression left = decl.getLeftExpression();
-            if (!(left instanceof VariableExpression varExpr) || !varName.equals(varExpr.getName())) {
-                continue;
-            }
-
-            Expression init = decl.getRightExpression();
-            if (init instanceof ConstructorCallExpression ctorCall) {
-                return ctorCall.getType();
-            }
-            if (init instanceof MethodCallExpression methodCall) {
-                return resolveMethodCallReturnType(methodCall, module);
-            }
-
-            ClassNode originType = varExpr.getOriginType();
-            if (originType != null && !"java.lang.Object".equals(originType.getName())) {
-                return originType;
-            }
-
-            ClassNode initType = init.getType();
-            if (initType != null && !"java.lang.Object".equals(initType.getName())) {
-                return initType;
-            }
-        }
-        return null;
+        return HoverAstSupport.findMethodCallAtOffset(module, offset, methodName, lineIndex);
     }
 
     private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module, IJavaProject project) {
@@ -1374,65 +1128,7 @@ public class HoverProvider {
 
     private IType resolveClassNodeToIType(ClassNode typeNode, ModuleNode module, IJavaProject project,
             String sourceUri) {
-        if (typeNode == null || project == null) {
-            return null;
-        }
-        try {
-            String typeName = typeNode.getName();
-            if (typeName == null || typeName.isEmpty()) {
-                return null;
-            }
-
-            if (typeName.contains(".")) {
-                IType type = ScopedTypeLookupSupport.findType(project, typeName, sourceUri);
-                if (type != null) {
-                    return type;
-                }
-            }
-
-            for (ImportNode imp : module.getImports()) {
-                ClassNode impType = imp.getType();
-                if (impType != null && typeName.equals(impType.getNameWithoutPackage())) {
-                    IType type = ScopedTypeLookupSupport.findType(project, impType.getName(), sourceUri);
-                    if (type != null) {
-                        return type;
-                    }
-                }
-            }
-
-            for (ImportNode starImport : module.getStarImports()) {
-                String pkgName = starImport.getPackageName();
-                if (pkgName != null) {
-                    IType type = ScopedTypeLookupSupport.findType(project, pkgName + typeName, sourceUri);
-                    if (type != null) {
-                        return type;
-                    }
-                }
-            }
-
-            String pkg = module.getPackageName();
-            if (pkg != null && !pkg.isEmpty()) {
-                if (pkg.endsWith(".")) {
-                    pkg = pkg.substring(0, pkg.length() - 1);
-                }
-                IType type = ScopedTypeLookupSupport.findType(project, pkg + "." + typeName, sourceUri);
-                if (type != null) {
-                    return type;
-                }
-            }
-
-            String[] autoPackages = {"java.lang.", "java.util.", "java.io.",
-                    "groovy.lang.", "groovy.util.", "java.math."};
-            for (String autoPkg : autoPackages) {
-                IType type = ScopedTypeLookupSupport.findType(project, autoPkg + typeName, sourceUri);
-                if (type != null) {
-                    return type;
-                }
-            }
-        } catch (JavaModelException e) {
-            return null;
-        }
-        return null;
+        return HoverAstSupport.resolveClassNodeToIType(typeNode, module, project, sourceUri);
     }
 
     private Position offsetToPosition(String content, int offset) {

@@ -46,6 +46,8 @@ public class UnusedDeclarationDetector {
     public static final String DIAG_CODE_UNUSED_DECLARATION = "groovy.unusedDeclaration";
 
     private static final String DIAGNOSTIC_SOURCE = "groovy";
+    private static final String SPOCK_SPECIFICATION = "Specification";
+    private static final String SPOCK_SPECIFICATION_FQN = "spock.lang.Specification";
 
     /**
      * Annotation simple names that mark a method as a test entry point.
@@ -70,7 +72,7 @@ public class UnusedDeclarationDetector {
         "Disabled",
         "Suite",
         "RunWith",
-        "Specification",  // Spock
+        SPOCK_SPECIFICATION,  // Spock
         "Unroll",         // Spock
     };
 
@@ -218,47 +220,78 @@ public class UnusedDeclarationDetector {
             boolean includeMethods)
             throws JavaModelException {
 
-        if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) return;
-
-        // Check the type itself — but skip if it's in a test class context
-        if (!isTestType(type)) {
-            Boolean unreferenced = isUnreferenced(type, uri, documentManager);
-            searchBudget[0]--;
-            if (Boolean.TRUE.equals(unreferenced)) {
-                Diagnostic diag = createUnusedDiagnostic(type, content);
-                if (diag != null) {
-                    diagnostics.add(diag);
-                }
-            }
-        } else {
-            searchBudget[0]--;
+        if (shouldStopUnusedSearch(searchBudget)) {
+            return;
         }
 
-        // Check methods
+        collectUnusedTypeDeclaration(type, content, uri, documentManager, diagnostics, searchBudget);
         if (includeMethods) {
-            boolean frameworkType = isFrameworkManagedType(type);
-            for (IMethod method : type.getMethods()) {
-                if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
-                if (shouldSkipMethod(method, frameworkType)) {
-                    continue;
-                }
+            collectUnusedMethodDeclarations(type, content, uri, documentManager, diagnostics, searchBudget);
+        }
+        collectUnusedInnerTypeDeclarations(type, content, uri, documentManager, diagnostics, searchBudget,
+                includeMethods);
+    }
+
+    private static void collectUnusedTypeDeclaration(
+            IType type, String content, String uri,
+            DocumentManager documentManager,
+            List<Diagnostic> diagnostics,
+            int[] searchBudget) {
+        if (isTestType(type)) {
+            searchBudget[0]--;
+            return;
+        }
+
+        Boolean unreferenced = isUnreferenced(type, uri, documentManager);
+        searchBudget[0]--;
+        addUnusedDiagnosticIfNeeded(type, content, diagnostics, unreferenced);
+    }
+
+    private static void collectUnusedMethodDeclarations(
+            IType type, String content, String uri,
+            DocumentManager documentManager,
+            List<Diagnostic> diagnostics,
+            int[] searchBudget) throws JavaModelException {
+        boolean frameworkType = isFrameworkManagedType(type);
+        for (IMethod method : type.getMethods()) {
+            if (shouldStopUnusedSearch(searchBudget)) {
+                break;
+            }
+            if (!shouldSkipMethod(method, frameworkType)) {
                 Boolean unreferenced = isUnreferenced(method, uri, documentManager);
                 searchBudget[0]--;
-                if (Boolean.TRUE.equals(unreferenced)) {
-                    Diagnostic diag = createUnusedDiagnostic(method, content);
-                    if (diag != null) {
-                        diagnostics.add(diag);
-                    }
-                }
+                addUnusedDiagnosticIfNeeded(method, content, diagnostics, unreferenced);
             }
         }
+    }
 
-        // Recurse into inner types
+    private static void collectUnusedInnerTypeDeclarations(
+            IType type, String content, String uri,
+            DocumentManager documentManager,
+            List<Diagnostic> diagnostics,
+            int[] searchBudget,
+            boolean includeMethods) throws JavaModelException {
         for (IType innerType : type.getTypes()) {
-            if (searchBudget[0] <= 0 || Thread.currentThread().isInterrupted()) break;
+            if (shouldStopUnusedSearch(searchBudget)) {
+                break;
+            }
             collectUnusedDeclarations(
                     innerType, content, uri, documentManager, diagnostics, searchBudget, includeMethods);
         }
+    }
+
+    private static void addUnusedDiagnosticIfNeeded(IJavaElement element, String content,
+            List<Diagnostic> diagnostics, Boolean unreferenced) {
+        if (Boolean.TRUE.equals(unreferenced)) {
+            Diagnostic diag = createUnusedDiagnostic(element, content);
+            if (diag != null) {
+                diagnostics.add(diag);
+            }
+        }
+    }
+
+    private static boolean shouldStopUnusedSearch(int[] searchBudget) {
+        return searchBudget[0] <= 0 || Thread.currentThread().isInterrupted();
     }
 
     private static boolean hasMoreMethodCandidatesThanSearchBudget(IType[] types) throws JavaModelException {
@@ -393,8 +426,8 @@ public class UnusedDeclarationDetector {
                         || superclassName.equals("junit.framework.TestCase")
                         || superclassName.equals("GroovyTestCase")
                         || superclassName.equals("groovy.test.GroovyTestCase")
-                        || superclassName.equals("Specification")
-                        || superclassName.equals("spock.lang.Specification"))) {
+                        || superclassName.equals(SPOCK_SPECIFICATION)
+                        || superclassName.equals(SPOCK_SPECIFICATION_FQN))) {
                 return true;
             }
 
@@ -424,8 +457,8 @@ public class UnusedDeclarationDetector {
         try {
             String superclassName = type.getSuperclassName();
             return superclassName != null
-                    && (superclassName.equals("Specification")
-                        || superclassName.equals("spock.lang.Specification"));
+                    && (superclassName.equals(SPOCK_SPECIFICATION)
+                        || superclassName.equals(SPOCK_SPECIFICATION_FQN));
         } catch (Exception e) {
             return false;
         }
@@ -569,9 +602,5 @@ public class UnusedDeclarationDetector {
                     "Failed to create unused diagnostic for " + element.getElementName(), e);
             return null;
         }
-    }
-
-    private static Position offsetToPosition(String content, int offset) {
-        return PositionUtils.offsetToPosition(content, offset);
     }
 }

@@ -21,6 +21,7 @@ import org.codehaus.groovy.ast.FieldNode;
 import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
 import org.codehaus.groovy.ast.PropertyNode;
+import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
@@ -59,6 +60,7 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either3;
  *   <li>Field rename: also renames corresponding getters/setters</li>
  * </ul>
  */
+@SuppressWarnings("unused")
 public class RenameProvider {
 
     private final DocumentManager documentManager;
@@ -93,41 +95,53 @@ public class RenameProvider {
         String uri = params.getTextDocument().getUri();
         Position position = params.getPosition();
 
-        // Try JDT first
-        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
-        if (workingCopy != null) {
-            try {
-                String content = documentManager.getContent(uri);
-                if (content != null) {
-                    int offset = positionToOffset(content, position);
-                    IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
-                    if (elements != null && elements.length > 0) {
-                        String word = extractWordAt(content, offset);
-                        if (word != null && !word.isEmpty()) {
-                            Range range = wordRangeAt(content, offset, word);
-                            PrepareRenameResult result = new PrepareRenameResult(range, word);
-                            return Either3.forSecond(result);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                GroovyLanguageServerPlugin.logError("prepareRename JDT failed for " + uri, e);
-            }
+        PrepareRenameResult jdtResult = prepareRenameFromJdt(uri, position);
+        if (jdtResult != null) {
+            return Either3.forSecond(jdtResult);
         }
 
-        // AST fallback — accept rename of any known identifier
+        PrepareRenameResult astResult = prepareRenameFromAst(uri, position);
+        return astResult == null ? null : Either3.forSecond(astResult);
+    }
+
+    private PrepareRenameResult prepareRenameFromJdt(String uri, Position position) {
+        ICompilationUnit workingCopy = documentManager.getWorkingCopy(uri);
+        if (workingCopy == null) {
+            return null;
+        }
+        try {
+            String content = documentManager.getContent(uri);
+            if (content == null) {
+                return null;
+            }
+            int offset = positionToOffset(content, position);
+            IJavaElement[] elements = documentManager.cachedCodeSelect(workingCopy, offset);
+            if (elements == null || elements.length == 0) {
+                return null;
+            }
+            return buildPrepareRenameResult(content, offset);
+        } catch (Exception e) {
+            GroovyLanguageServerPlugin.logError("prepareRename JDT failed for " + uri, e);
+            return null;
+        }
+    }
+
+    private PrepareRenameResult prepareRenameFromAst(String uri, Position position) {
         String content = documentManager.getContent(uri);
         if (content == null) {
             return null;
         }
         int offset = positionToOffset(content, position);
+        return buildPrepareRenameResult(content, offset);
+    }
+
+    private PrepareRenameResult buildPrepareRenameResult(String content, int offset) {
         String word = extractWordAt(content, offset);
         if (word == null || word.isEmpty()) {
             return null;
         }
         Range range = wordRangeAt(content, offset, word);
-        PrepareRenameResult result = new PrepareRenameResult(range, word);
-        return Either3.forSecond(result);
+        return new PrepareRenameResult(range, word);
     }
 
     /**
@@ -435,15 +449,7 @@ public class RenameProvider {
                     SearchPattern pattern = SearchPattern.createPattern(
                             method, IJavaSearchConstants.ALL_OCCURRENCES);
                     if (pattern != null) {
-                        IJavaSearchScope ctorScope;
-                        try {
-                            org.eclipse.jdt.core.IJavaProject proj = type.getJavaProject();
-                            ctorScope = proj != null
-                                    ? SearchEngine.createJavaSearchScope(new IJavaElement[]{proj}, IJavaSearchScope.SOURCES)
-                                    : SearchEngine.createWorkspaceScope();
-                        } catch (Exception e) {
-                            ctorScope = SearchEngine.createWorkspaceScope();
-                        }
+                        IJavaSearchScope ctorScope = createSourceScope(type);
                         JdtSearchSupport.search(pattern,
                                 ctorScope,
                                 new SearchRequestor() {
@@ -495,21 +501,14 @@ public class RenameProvider {
     private void renameAccessorIfExists(IType type, String oldAccessorName, String newAccessorName,
                                          Map<String, List<TextEdit>> editsByUri,
                                          Map<String, String> contentCache,
-                                         Map<String, PositionUtils.LineIndex> lineIndexCache) throws Exception {
+                         Map<String, PositionUtils.LineIndex> lineIndexCache)
+            throws CoreException {
         for (IMethod method : type.getMethods()) {
             if (method.getElementName().equals(oldAccessorName)) {
                 SearchPattern pattern = SearchPattern.createPattern(
                         method, IJavaSearchConstants.ALL_OCCURRENCES);
                 if (pattern != null) {
-                    IJavaSearchScope methodScope;
-                    try {
-                        org.eclipse.jdt.core.IJavaProject proj = type.getJavaProject();
-                        methodScope = proj != null
-                                ? SearchEngine.createJavaSearchScope(new IJavaElement[]{proj}, IJavaSearchScope.SOURCES)
-                                : SearchEngine.createWorkspaceScope();
-                    } catch (Exception e) {
-                        methodScope = SearchEngine.createWorkspaceScope();
-                    }
+                    IJavaSearchScope methodScope = createSourceScope(type);
                     JdtSearchSupport.search(pattern,
                             methodScope,
                             new SearchRequestor() {
@@ -522,6 +521,17 @@ public class RenameProvider {
                 }
                 break; // Found the accessor, no need to check further
             }
+        }
+    }
+
+    private IJavaSearchScope createSourceScope(IType type) {
+        try {
+            org.eclipse.jdt.core.IJavaProject proj = type.getJavaProject();
+            return proj != null
+                    ? SearchEngine.createJavaSearchScope(new IJavaElement[] {proj}, IJavaSearchScope.SOURCES)
+                    : SearchEngine.createWorkspaceScope();
+        } catch (Exception e) {
+            return SearchEngine.createWorkspaceScope();
         }
     }
 

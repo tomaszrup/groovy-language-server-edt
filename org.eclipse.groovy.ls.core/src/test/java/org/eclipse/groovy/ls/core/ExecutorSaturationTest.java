@@ -11,7 +11,6 @@ package org.eclipse.groovy.ls.core;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 import java.lang.reflect.Field;
@@ -20,10 +19,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 import org.eclipse.groovy.ls.core.providers.*;
 import org.eclipse.lsp4j.*;
-import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.junit.jupiter.api.*;
 
 /**
@@ -71,21 +70,14 @@ class ExecutorSaturationTest {
         field.set(target, value);
     }
 
-    @SuppressWarnings("unchecked")
-    private <T> T getField(Object target, String fieldName) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return (T) field.get(target);
-    }
-
     /**
      * Create a {@link HoverProvider} mock that sleeps for {@code delayMs}
      * before returning a dummy {@link Hover}.
      */
-    private HoverProvider slowHoverProvider(long delayMs) throws Exception {
+    private HoverProvider slowHoverProvider(long delayMs) {
         HoverProvider mock = mock(HoverProvider.class);
         when(mock.getHover(any())).thenAnswer(inv -> {
-            Thread.sleep(delayMs);
+            pauseMillis(delayMs);
             return new Hover(new MarkupContent("plaintext", "ok"));
         });
         return mock;
@@ -95,14 +87,14 @@ class ExecutorSaturationTest {
      * Create a {@link SemanticTokensProvider} mock that sleeps for
      * {@code delayMs} before returning empty tokens.
      */
-    private SemanticTokensProvider slowSemanticTokensProvider(long delayMs) throws Exception {
+    private SemanticTokensProvider slowSemanticTokensProvider(long delayMs) {
         SemanticTokensProvider mock = mock(SemanticTokensProvider.class);
         when(mock.getSemanticTokensFull(any())).thenAnswer(inv -> {
-            Thread.sleep(delayMs);
+            pauseMillis(delayMs);
             return new SemanticTokens(new ArrayList<>());
         });
         when(mock.getSemanticTokensRange(any())).thenAnswer(inv -> {
-            Thread.sleep(delayMs);
+            pauseMillis(delayMs);
             return new SemanticTokens(new ArrayList<>());
         });
         return mock;
@@ -112,10 +104,10 @@ class ExecutorSaturationTest {
      * Create a {@link FoldingRangeProvider} mock that sleeps for
      * {@code delayMs} before returning an empty list.
      */
-    private FoldingRangeProvider slowFoldingRangeProvider(long delayMs) throws Exception {
+    private FoldingRangeProvider slowFoldingRangeProvider(long delayMs) {
         FoldingRangeProvider mock = mock(FoldingRangeProvider.class);
         when(mock.getFoldingRanges(any())).thenAnswer(inv -> {
-            Thread.sleep(delayMs);
+            pauseMillis(delayMs);
             return new ArrayList<FoldingRange>();
         });
         return mock;
@@ -125,10 +117,10 @@ class ExecutorSaturationTest {
      * Create a {@link CodeLensProvider} mock that sleeps for
      * {@code delayMs} before returning an empty list.
      */
-    private CodeLensProvider slowCodeLensProvider(long delayMs) throws Exception {
+    private CodeLensProvider slowCodeLensProvider(long delayMs) {
         CodeLensProvider mock = mock(CodeLensProvider.class);
         when(mock.getCodeLenses(any())).thenAnswer(inv -> {
-            Thread.sleep(delayMs);
+            pauseMillis(delayMs);
             return new ArrayList<CodeLens>();
         });
         return mock;
@@ -138,10 +130,10 @@ class ExecutorSaturationTest {
      * Create a {@link CodeLensProvider} mock whose resolve step sleeps for
      * {@code delayMs} before returning the same lens.
      */
-    private CodeLensProvider slowCodeLensResolveProvider(long delayMs) throws Exception {
+    private CodeLensProvider slowCodeLensResolveProvider(long delayMs) {
         CodeLensProvider mock = mock(CodeLensProvider.class);
         when(mock.resolveCodeLens(any(CodeLens.class))).thenAnswer(inv -> {
-            Thread.sleep(delayMs);
+            pauseMillis(delayMs);
             return inv.getArgument(0);
         });
         return mock;
@@ -151,13 +143,17 @@ class ExecutorSaturationTest {
      * Create a {@link InlayHintProvider} mock that sleeps for
      * {@code delayMs} before returning an empty list.
      */
-    private InlayHintProvider slowInlayHintProvider(long delayMs) throws Exception {
+    private InlayHintProvider slowInlayHintProvider(long delayMs) {
         InlayHintProvider mock = mock(InlayHintProvider.class);
         when(mock.getInlayHints(any(InlayHintParams.class))).thenAnswer(inv -> {
-            Thread.sleep(delayMs);
+            pauseMillis(delayMs);
             return new ArrayList<InlayHint>();
         });
         return mock;
+    }
+
+    private void pauseMillis(long delayMs) {
+        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(delayMs));
     }
 
     /**
@@ -380,6 +376,7 @@ class ExecutorSaturationTest {
     @DisplayName("Escalation: full diagnostics — fast pool(4, 64), delay=300ms")
     void escalatingConcurrencyFindsSaturationPoint() throws Exception {
         GroovyTextDocumentService service = createService();
+        service.configureRequestPool(REAL_POOL_SIZE, REAL_QUEUE_CAPACITY);
         setField(service, "hoverProvider", slowHoverProvider(300));
 
         // 4+64=68 is the theoretical max capacity for the fast pool
@@ -475,7 +472,7 @@ class ExecutorSaturationTest {
                     satLabel);
 
             // Brief cooldown between levels
-            Thread.sleep(500);
+            pauseMillis(500);
         }
 
         System.out.println("╚═════════════╩═════════╩══════════╩══════════╩══════════════╩══════════════╩══════════╩════════════════╝");
@@ -490,6 +487,9 @@ class ExecutorSaturationTest {
             System.out.println(">> No saturation detected at any tested concurrency level.");
         }
         System.out.println();
+
+        assertTrue(saturationPoint > 0,
+            "Escalating concurrency should reveal a saturation point for the configured fast pool");
     }
 
     // ========================================================================
@@ -537,7 +537,11 @@ class ExecutorSaturationTest {
 
         // Wait for phase 1 to drain too (some may have been rejected)
         for (CompletableFuture<Hover> f : phase1) {
-            try { f.get(30, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            try {
+                f.get(30, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // Some phase-1 requests are expected to fail under the smaller initial pool.
+            }
         }
     }
 
@@ -625,7 +629,7 @@ class ExecutorSaturationTest {
                 return null;
             }));
 
-            Thread.sleep(intervalMs);
+            pauseMillis(intervalMs);
         }
 
         // Wait for all in-flight requests to finish
@@ -686,6 +690,7 @@ class ExecutorSaturationTest {
             try {
                 future.get(10, TimeUnit.SECONDS);
             } catch (Exception ignored) {
+                // Resolve completions may be rejected or time out under the constrained queue.
             }
         }
     }
@@ -709,9 +714,9 @@ class ExecutorSaturationTest {
 
         // Simulate a slow codeSelect (100ms)
         org.eclipse.jdt.core.IJavaElement mockElement = mock(org.eclipse.jdt.core.IJavaElement.class);
-        when(mockUnit.codeSelect(eq(42), eq(0))).thenAnswer(inv -> {
+        when(mockUnit.codeSelect(42, 0)).thenAnswer(inv -> {
             codeSelectCount.incrementAndGet();
-            Thread.sleep(100);
+            pauseMillis(100);
             return new org.eclipse.jdt.core.IJavaElement[]{mockElement};
         });
 
@@ -732,7 +737,7 @@ class ExecutorSaturationTest {
         assertEquals(1, codeSelectCount.get(), "Second call should hit cache");
 
         // Third call with DIFFERENT offset: cache miss → real codeSelect
-        when(mockUnit.codeSelect(eq(99), eq(0))).thenAnswer(inv -> {
+        when(mockUnit.codeSelect(99, 0)).thenAnswer(inv -> {
             codeSelectCount.incrementAndGet();
             return new org.eclipse.jdt.core.IJavaElement[]{mockElement};
         });
@@ -753,7 +758,7 @@ class ExecutorSaturationTest {
         var codeSelectCount = new AtomicInteger(0);
         org.eclipse.jdt.core.ICompilationUnit mockUnit = mock(org.eclipse.jdt.core.ICompilationUnit.class);
         org.eclipse.jdt.core.IJavaElement mockElement = mock(org.eclipse.jdt.core.IJavaElement.class);
-        when(mockUnit.codeSelect(eq(42), eq(0))).thenAnswer(inv -> {
+        when(mockUnit.codeSelect(42, 0)).thenAnswer(inv -> {
             codeSelectCount.incrementAndGet();
             return new org.eclipse.jdt.core.IJavaElement[]{mockElement};
         });
@@ -789,7 +794,7 @@ class ExecutorSaturationTest {
         var codeSelectCount = new AtomicInteger(0);
         org.eclipse.jdt.core.ICompilationUnit mockUnit = mock(org.eclipse.jdt.core.ICompilationUnit.class);
         org.eclipse.jdt.core.IJavaElement mockElement = mock(org.eclipse.jdt.core.IJavaElement.class);
-        when(mockUnit.codeSelect(eq(42), eq(0))).thenAnswer(inv -> {
+        when(mockUnit.codeSelect(42, 0)).thenAnswer(inv -> {
             codeSelectCount.incrementAndGet();
             return new org.eclipse.jdt.core.IJavaElement[]{mockElement};
         });
@@ -806,7 +811,7 @@ class ExecutorSaturationTest {
         assertEquals(1, codeSelectCount.get());
 
         // Wait for TTL to expire (internal TTL is 5000ms, we wait 5100ms)
-        Thread.sleep(5_100);
+        pauseMillis(5_100);
 
         // After TTL expiry: cache miss → real codeSelect
         dm.cachedCodeSelect(mockUnit, 42);

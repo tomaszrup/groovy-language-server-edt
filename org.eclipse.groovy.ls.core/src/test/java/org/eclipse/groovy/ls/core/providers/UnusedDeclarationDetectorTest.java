@@ -18,7 +18,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
-import java.util.Collections;
 import java.util.List;
 
 import org.eclipse.groovy.ls.core.DocumentManager;
@@ -27,10 +26,11 @@ import org.eclipse.jdt.core.IAnnotation;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.ISourceRange;
-import org.eclipse.jdt.core.ISourceReference;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.lsp4j.Diagnostic;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * Tests for helper methods in {@link UnusedDeclarationDetector},
@@ -66,48 +66,24 @@ class UnusedDeclarationDetectorTest {
 
     // ----- isTestMethod with Spock feature methods -----
 
-    @Test
-    void isTestMethodReturnsTrueForStringNamedMethodInSpockSpec() throws Exception {
-        IType declaringType = mockType("Specification", null);
-        IMethod method = mockMethod("value returns epsilon", declaringType, new IAnnotation[0]);
-        assertTrue(invokeIsTestMethod(method));
-    }
-
-    @Test
-    void isTestMethodReturnsTrueForSpockSetupMethod() throws Exception {
-        IType declaringType = mockType("spock.lang.Specification", null);
-        IMethod method = mockMethod("setup", declaringType, new IAnnotation[0]);
-        assertTrue(invokeIsTestMethod(method));
-    }
-
-    @Test
-    void isTestMethodReturnsTrueForSpockCleanupMethod() throws Exception {
-        IType declaringType = mockType("spock.lang.Specification", null);
-        IMethod method = mockMethod("cleanup", declaringType, new IAnnotation[0]);
-        assertTrue(invokeIsTestMethod(method));
-    }
-
-    @Test
-    void isTestMethodReturnsTrueForSpockHelperMethod() throws Exception {
-        IType declaringType = mockType("Specification", null);
-        IMethod method = mockMethod("helperMethod", declaringType, new IAnnotation[0]);
-        assertTrue(invokeIsTestMethod(method));
-    }
-
-    @Test
-    void isTestMethodReturnsFalseForRegularMethodInNonTestClass() throws Exception {
-        IType declaringType = mockType("Object", null);
-        // Non-test class, non-test directory
-        when(declaringType.getResource()).thenReturn(null);
-        IMethod method = mockMethod("someMethod", declaringType, new IAnnotation[0]);
-        assertFalse(invokeIsTestMethod(method));
-    }
-
-    @Test
-    void isTestMethodReturnsTrueForTestPrefixedMethodInTestCase() throws Exception {
-        IType declaringType = mockType("TestCase", null);
-        IMethod method = mockMethod("testSomething", declaringType, new IAnnotation[0]);
-        assertTrue(invokeIsTestMethod(method));
+    @ParameterizedTest
+    @CsvSource({
+            "Specification,'value returns epsilon',true",
+            "spock.lang.Specification,setup,true",
+            "spock.lang.Specification,cleanup,true",
+            "Specification,helperMethod,true",
+            "Object,someMethod,false",
+            "TestCase,testSomething,true"
+    })
+    void isTestMethodRecognizesSupportedConventions(String declaringTypeName,
+            String methodName,
+            boolean expected) throws Exception {
+        IType declaringType = mockType(declaringTypeName, null);
+        if (!expected) {
+            when(declaringType.getResource()).thenReturn(null);
+        }
+        IMethod method = mockMethod(methodName, declaringType, new IAnnotation[0]);
+        assertEquals(expected, invokeIsTestMethod(method));
     }
 
     // ----- isMainMethod -----
@@ -146,39 +122,19 @@ class UnusedDeclarationDetectorTest {
 
     // ----- isTestAnnotation -----
 
-    @Test
-    void isTestAnnotationMatchesJunit5Test() throws Exception {
+    @ParameterizedTest
+    @CsvSource({
+            "Test,true",
+            "ParameterizedTest,true",
+            "BeforeEach,true",
+            "org.junit.jupiter.api.Test,true",
+            "Override,false"
+    })
+    void isTestAnnotationRecognizesTestFrameworkMarkers(String annotationName, boolean expected)
+            throws Exception {
         IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("Test");
-        assertTrue(invokeIsTestAnnotation(annotation));
-    }
-
-    @Test
-    void isTestAnnotationMatchesParameterizedTest() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("ParameterizedTest");
-        assertTrue(invokeIsTestAnnotation(annotation));
-    }
-
-    @Test
-    void isTestAnnotationMatchesBeforeEach() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("BeforeEach");
-        assertTrue(invokeIsTestAnnotation(annotation));
-    }
-
-    @Test
-    void isTestAnnotationMatchesFqnPrefix() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("org.junit.jupiter.api.Test");
-        assertTrue(invokeIsTestAnnotation(annotation));
-    }
-
-    @Test
-    void isTestAnnotationReturnsFalseForRegularAnnotation() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("Override");
-        assertFalse(invokeIsTestAnnotation(annotation));
+        when(annotation.getElementName()).thenReturn(annotationName);
+        assertEquals(expected, invokeIsTestAnnotation(annotation));
     }
 
     @Test
@@ -565,83 +521,31 @@ class UnusedDeclarationDetectorTest {
     // isFrameworkManagedType tests
     // ================================================================
 
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForComponent() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("Component");
+    @ParameterizedTest
+    @CsvSource({
+            "Component,true",
+            "Service,true",
+            "Repository,true",
+            "Controller,true",
+            "RestController,true",
+            "Configuration,true",
+            "SpringBootApplication,true",
+            "org.springframework.stereotype.Component,true",
+            "Plain,false"
+    })
+    void isFrameworkManagedTypeRecognizesSpringManagedTypes(String annotationName, boolean expected)
+            throws Exception {
         IType type = mock(IType.class);
+        if (!expected) {
+            when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
+            assertFalse(invokeIsFrameworkManagedType(type));
+            return;
+        }
+
+        IAnnotation annotation = mock(IAnnotation.class);
+        when(annotation.getElementName()).thenReturn(annotationName);
         when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
         assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForService() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("Service");
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
-        assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForRepository() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("Repository");
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
-        assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForController() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("Controller");
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
-        assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForRestController() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("RestController");
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
-        assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForConfiguration() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("Configuration");
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
-        assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForSpringBootApplication() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("SpringBootApplication");
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
-        assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsTrueForFqnPrefix() throws Exception {
-        IAnnotation annotation = mock(IAnnotation.class);
-        when(annotation.getElementName()).thenReturn("org.springframework.stereotype.Component");
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[] { annotation });
-        assertTrue(invokeIsFrameworkManagedType(type));
-    }
-
-    @Test
-    void isFrameworkManagedTypeReturnsFalseForPlainClass() throws Exception {
-        IType type = mock(IType.class);
-        when(type.getAnnotations()).thenReturn(new IAnnotation[0]);
-        assertFalse(invokeIsFrameworkManagedType(type));
     }
 
     @Test

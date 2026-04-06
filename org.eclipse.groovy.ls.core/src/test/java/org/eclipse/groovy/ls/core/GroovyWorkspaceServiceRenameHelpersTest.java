@@ -19,10 +19,14 @@ import static org.mockito.Mockito.mock;
 import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.stream.Stream;
 
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.TextEdit;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -473,50 +477,24 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
     // ---- inferPackageFromPath ----
 
-    @Test
-    void inferPackageFromPathDetectsMainGroovySourceRoot() {
+        @ParameterizedTest
+        @MethodSource("inferPackageFromPathCases")
+        void inferPackageFromPathResolvesExpectedPackage(String uri, String fallbackPackage, String expectedPackage) {
         GroovyWorkspaceService service = createService();
-        String uri = "file:///project/src/main/groovy/com/example/demo/MyClass.groovy";
 
-        String result = service.inferPackageFromPath(uri, "fallback");
-        assertEquals("com.example.demo", result);
+                String result = service.inferPackageFromPath(uri, fallbackPackage);
+                assertEquals(expectedPackage, result);
     }
 
-    @Test
-    void inferPackageFromPathDetectsTestJavaSourceRoot() {
-        GroovyWorkspaceService service = createService();
-        String uri = "file:///project/src/test/java/org/foo/TestClass.groovy";
-
-        String result = service.inferPackageFromPath(uri, "fallback");
-        assertEquals("org.foo", result);
-    }
-
-    @Test
-    void inferPackageFromPathDefaultPackageAtSourceRoot() {
-        GroovyWorkspaceService service = createService();
-        String uri = "file:///project/src/main/groovy/MyClass.groovy";
-
-        String result = service.inferPackageFromPath(uri, "fallback");
-        assertEquals("", result);
-    }
-
-    @Test
-    void inferPackageFromPathFallsBackWhenNoSourceRoot() {
-        GroovyWorkspaceService service = createService();
-        String uri = "file:///random/path/MyClass.groovy";
-
-        String result = service.inferPackageFromPath(uri, "old.pkg");
-        assertEquals("old.pkg", result);
-    }
-
-    @Test
-    void inferPackageFromPathHandlesSrcShortRoot() {
-        GroovyWorkspaceService service = createService();
-        String uri = "file:///project/src/com/example/MyClass.groovy";
-
-        String result = service.inferPackageFromPath(uri, "fallback");
-        assertEquals("com.example", result);
-    }
+        private static Stream<Arguments> inferPackageFromPathCases() {
+                return Stream.of(
+                                Arguments.of("file:///project/src/main/groovy/com/example/demo/MyClass.groovy", "fallback",
+                                                "com.example.demo"),
+                                Arguments.of("file:///project/src/test/java/org/foo/TestClass.groovy", "fallback", "org.foo"),
+                                Arguments.of("file:///project/src/main/groovy/MyClass.groovy", "fallback", ""),
+                                Arguments.of("file:///random/path/MyClass.groovy", "old.pkg", "old.pkg"),
+                                Arguments.of("file:///project/src/com/example/MyClass.groovy", "fallback", "com.example"));
+        }
 
         @Test
         void inferPackageFromPathFallsBackForNonFileUri() {
@@ -644,10 +622,11 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyClass",
-                "com.example.foo", "com.example.bar",
-                "com.example.foo.MyClass", "com.example.bar.MyClass",
-                false, true);
+                renameFallbackContext(
+                        "MyClass", "MyClass",
+                        "com.example.foo", "com.example.bar",
+                        "com.example.foo.MyClass", "com.example.bar.MyClass",
+                        false, true));
 
         // Should have import replacement
         assertTrue(edits.stream().anyMatch(e -> e.getNewText().contains("com.example.bar.MyClass")),
@@ -662,10 +641,11 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyClass",
-                "com.example.foo", "com.example.bar",
-                "com.example.foo.MyClass", "com.example.bar.MyClass",
-                false, true);
+                renameFallbackContext(
+                        "MyClass", "MyClass",
+                        "com.example.foo", "com.example.bar",
+                        "com.example.foo.MyClass", "com.example.bar.MyClass",
+                        false, true));
 
         // Should add import since type moved to different package
         assertTrue(edits.stream().anyMatch(e -> e.getNewText().contains("import com.example.bar.MyClass")),
@@ -679,10 +659,11 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyNewClass",
-                "com.example.foo", "com.example.foo",
-                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
-                true, false);
+                renameFallbackContext(
+                        "MyClass", "MyNewClass",
+                        "com.example.foo", "com.example.foo",
+                        "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                        true, false));
 
         long simpleNameEdits = edits.stream()
                 .filter(e -> "MyNewClass".equals(e.getNewText()))
@@ -697,10 +678,11 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyClass",
-                "com.example.foo", "com.example.bar",
-                "com.example.foo.MyClass", "com.example.bar.MyClass",
-                false, true);
+                renameFallbackContext(
+                        "MyClass", "MyClass",
+                        "com.example.foo", "com.example.bar",
+                        "com.example.foo.MyClass", "com.example.bar.MyClass",
+                        false, true));
 
         assertTrue(edits.stream().anyMatch(e -> "com.example.bar.MyClass".equals(e.getNewText())),
                 "Should update fully-qualified reference");
@@ -713,10 +695,11 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyNewClass",
-                "com.example.foo", "com.example.foo",
-                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
-                true, false);
+                renameFallbackContext(
+                        "MyClass", "MyNewClass",
+                        "com.example.foo", "com.example.foo",
+                        "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                        true, false));
 
         assertTrue(edits.isEmpty(), "Should produce no edits for files without references");
     }
@@ -728,10 +711,11 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyClass",
-                "com.example.foo", "com.example.bar",
-                "com.example.foo.MyClass", "com.example.bar.MyClass",
-                false, true);
+                renameFallbackContext(
+                        "MyClass", "MyClass",
+                        "com.example.foo", "com.example.bar",
+                        "com.example.foo.MyClass", "com.example.bar.MyClass",
+                        false, true));
 
         assertTrue(edits.stream().anyMatch(e -> "".equals(e.getNewText())),
                 "Should remove import when type moves to same package as file");
@@ -745,10 +729,11 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyNewClass",
-                "com.example.foo", "com.example.foo",
-                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
-                true, false);
+                renameFallbackContext(
+                        "MyClass", "MyNewClass",
+                        "com.example.foo", "com.example.foo",
+                        "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                        true, false));
 
         assertTrue(edits.isEmpty(),
                 "Should not rename simple names when conflicting import exists");
@@ -761,15 +746,36 @@ class GroovyWorkspaceServiceRenameHelpersTest {
 
         List<TextEdit> edits = service.buildFallbackFileEdits(
                 content,
-                "MyClass", "MyNewClass",
-                "com.example.foo", "com.example.foo",
-                "com.example.foo.MyClass", "com.example.foo.MyNewClass",
-                true, false);
+                renameFallbackContext(
+                        "MyClass", "MyNewClass",
+                        "com.example.foo", "com.example.foo",
+                        "com.example.foo.MyClass", "com.example.foo.MyNewClass",
+                        true, false));
 
         // Should update import and rename simple name (not in import line)
         assertTrue(edits.stream().anyMatch(e -> e.getNewText().contains("com.example.foo.MyNewClass")),
                 "Should update import FQN");
         assertTrue(edits.stream().anyMatch(e -> "MyNewClass".equals(e.getNewText())),
                 "Should rename simple name reference");
+    }
+
+    private GroovyWorkspaceService.RenameFallbackContext renameFallbackContext(
+            String oldTypeName,
+            String newTypeName,
+            String oldPackageName,
+            String newPackageName,
+            String oldFqn,
+            String newFqn,
+            boolean typeNameChanged,
+            boolean packageChanged) {
+        return new GroovyWorkspaceService.RenameFallbackContext(
+                oldTypeName,
+                newTypeName,
+                oldPackageName,
+                newPackageName,
+                oldFqn,
+                newFqn,
+                typeNameChanged,
+                packageChanged);
     }
 }

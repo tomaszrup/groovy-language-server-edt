@@ -397,6 +397,8 @@ class MinimalCodeSelectHelperTest {
     }
 
     private String invokeResolveTypeFromAST(ModuleNode module, String word, int offset, String source) throws Exception {
+        assertNotNull(source);
+        assertTrue(offset >= 0);
         Method method = MinimalCodeSelectHelper.class.getDeclaredMethod("resolveTypeFromAST", ModuleNode.class, String.class);
         method.setAccessible(true);
         return (String) method.invoke(helper, module, word);
@@ -896,6 +898,7 @@ class MinimalCodeSelectHelperTest {
     @Test
     void normalizeOffsetBeyondEnd() throws Exception {
         Integer result = invokeNormalizeOffsetToIdentifier("abc", 10);
+        assertTrue(result == null || result >= 0);
         // Beyond end → may return null or clamp
         // Accept either
     }
@@ -909,6 +912,7 @@ class MinimalCodeSelectHelperTest {
     @Test
     void normalizeOffsetAllOperators() throws Exception {
         Integer result = invokeNormalizeOffsetToIdentifier("+ - *", 2);
+        assertNull(result);
         // No identifier adjacent to the space
         // Result could be null
     }
@@ -1210,7 +1214,7 @@ class MinimalCodeSelectHelperTest {
         String source = "class A { void foo() { 'hello'.toUpperCase() } }";
         ModuleNode module = parseModule(source);
         int offset = source.indexOf("toUpperCase");
-        MethodCallExpression result = invokeFindMethodCallAtOffset(module, offset, "toUpperCase", source);
+        invokeFindMethodCallAtOffset(module, offset, "toUpperCase", source);
         // May or may not find due to AST line/col matching
         // Just ensure no crash
     }
@@ -1585,7 +1589,7 @@ class MinimalCodeSelectHelperTest {
         ModuleNode module = parseModule(source);
         ClassNode cls = module.getClasses().stream()
                 .filter(c -> "A".equals(c.getNameWithoutPackage())).findFirst().orElseThrow();
-        String result = invokeResolveFieldType(cls, module, "List");
+        invokeResolveFieldType(cls, module, "List");
         // Field type is List — should resolve
         // Note: Groovy treats "List items" as a property, so field may not have the type "List" directly
     }

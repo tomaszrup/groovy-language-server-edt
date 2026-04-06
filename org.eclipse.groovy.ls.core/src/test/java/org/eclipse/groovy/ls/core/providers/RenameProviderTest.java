@@ -33,6 +33,8 @@ import org.eclipse.lsp4j.TextDocumentIdentifier;
 import org.eclipse.lsp4j.TextEdit;
 import org.eclipse.lsp4j.WorkspaceEdit;
 import org.eclipse.lsp4j.jsonrpc.messages.Either3;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.api.Test;
 
 class RenameProviderTest {
@@ -398,27 +400,17 @@ class RenameProviderTest {
     // capitalize tests
     // ================================================================
 
-    @Test
-    void capitalizeNormalString() throws Exception {
-        DocumentManager dm = new DocumentManager();
-        RenameProvider provider = new RenameProvider(dm);
+    @ParameterizedTest
+    @CsvSource({
+            "abc, Abc",
+            "'', ''",
+            "a, A",
+            "Hello, Hello"
+    })
+    void capitalizeVariants(String input, String expected) throws Exception {
         Method m = RenameProvider.class.getDeclaredMethod("capitalize", String.class);
         m.setAccessible(true);
-        assertEquals("Abc", m.invoke(null, "abc"));
-    }
-
-    @Test
-    void capitalizeEmptyString() throws Exception {
-        Method m = RenameProvider.class.getDeclaredMethod("capitalize", String.class);
-        m.setAccessible(true);
-        assertEquals("", m.invoke(null, ""));
-    }
-
-    @Test
-    void capitalizeSingleChar() throws Exception {
-        Method m = RenameProvider.class.getDeclaredMethod("capitalize", String.class);
-        m.setAccessible(true);
-        assertEquals("A", m.invoke(null, "a"));
+        assertEquals(expected, m.invoke(null, input));
     }
 
     // ================================================================
@@ -469,7 +461,7 @@ class RenameProviderTest {
         m.setAccessible(true);
         TextEdit edit = new TextEdit(new Range(new Position(2, 5), new Position(2, 8)), "newName");
         boolean result = (boolean) m.invoke(provider, List.of(edit), 3, 0);
-        assertNotNull(result);
+        assertFalse(result);
     }
 
     // ================================================================
@@ -657,13 +649,6 @@ class RenameProviderTest {
         assertNull(m.invoke(null, (String) null));
     }
 
-    @Test
-    void capitalizeAlreadyCapitalized() throws Exception {
-        Method m = RenameProvider.class.getDeclaredMethod("capitalize", String.class);
-        m.setAccessible(true);
-        assertEquals("Hello", m.invoke(null, "Hello"));
-    }
-
     // ================================================================
     // hasEditAt tests
     // ================================================================
@@ -834,7 +819,7 @@ class RenameProviderTest {
     // ================================================================
 
     @Test
-    void prepareRenameFindsWordInAstFallback() throws Exception {
+    void prepareRenameFindsWordInAstFallback() {
         DocumentManager dm = new DocumentManager();
         String uri = "file:///prepRename.groovy";
         dm.didOpen(uri, "class Foo { String bar }");
@@ -852,7 +837,7 @@ class RenameProviderTest {
     }
 
     @Test
-    void prepareRenameReturnsNullForNoContent() throws Exception {
+    void prepareRenameReturnsNullForNoContent() {
         DocumentManager dm = new DocumentManager();
         RenameProvider provider = new RenameProvider(dm);
 
@@ -865,7 +850,7 @@ class RenameProviderTest {
     }
 
     @Test
-    void prepareRenameReturnsNullForNoWord() throws Exception {
+    void prepareRenameReturnsNullForNoWord() {
         DocumentManager dm = new DocumentManager();
         String uri = "file:///prepRename2.groovy";
         dm.didOpen(uri, "   "); // only whitespace
@@ -931,7 +916,7 @@ class RenameProviderTest {
     // ================================================================
 
     @Test
-    void renameUsesAstFallbackWhenNoJdt() throws Exception {
+    void renameUsesAstFallbackWhenNoJdt() {
         DocumentManager dm = new DocumentManager();
         String uri = "file:///renamePub.groovy";
         String source = "class Foo { String bar\n  def test() { bar } }";

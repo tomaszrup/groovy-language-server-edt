@@ -12,12 +12,6 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.codehaus.groovy.ast.ClassNode;
-import org.codehaus.groovy.ast.FieldNode;
-import org.codehaus.groovy.ast.MethodNode;
-import org.codehaus.groovy.ast.ModuleNode;
-import org.codehaus.groovy.ast.Parameter;
-import org.codehaus.groovy.ast.PropertyNode;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -46,9 +40,11 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either;
 public class DocumentSymbolProvider {
 
     private final DocumentManager documentManager;
+    private final DocumentSymbolAstSupport astSupport;
 
     public DocumentSymbolProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
+        this.astSupport = new DocumentSymbolAstSupport(documentManager);
     }
 
     /**
@@ -72,11 +68,10 @@ public class DocumentSymbolProvider {
         }
 
         try {
-            PositionUtils.LineIndex lineIndex = PositionUtils.buildLineIndex(content);
             // Walk all types declared in this compilation unit
             IType[] types = workingCopy.getTypes();
             for (IType type : types) {
-                DocumentSymbol typeSymbol = toDocumentSymbol(type, content, lineIndex);
+                DocumentSymbol typeSymbol = toDocumentSymbol(type, content);
                 if (typeSymbol != null) {
                     result.add(Either.forRight(typeSymbol));
                 }
@@ -92,15 +87,9 @@ public class DocumentSymbolProvider {
      * Convert an {@link IType} to a {@link DocumentSymbol} with nested children.
      */
     private DocumentSymbol toDocumentSymbol(IType type, String content) {
-        return toDocumentSymbol(type, content, PositionUtils.buildLineIndex(content));
-    }
-
-    private DocumentSymbol toDocumentSymbol(IType type,
-            String content,
-            PositionUtils.LineIndex lineIndex) {
         try {
-            DocumentSymbol symbol = createTypeSymbol(type, content, lineIndex);
-            symbol.setChildren(createTypeChildren(type, content, lineIndex));
+            DocumentSymbol symbol = createTypeSymbol(type, content);
+            symbol.setChildren(createTypeChildren(type, content));
             return symbol;
 
         } catch (Exception e) {
@@ -109,9 +98,7 @@ public class DocumentSymbolProvider {
         }
     }
 
-    private DocumentSymbol createTypeSymbol(IType type,
-            String content,
-            PositionUtils.LineIndex lineIndex) throws JavaModelException {
+    private DocumentSymbol createTypeSymbol(IType type, String content) throws JavaModelException {
         DocumentSymbol symbol = new DocumentSymbol();
         symbol.setName(type.getElementName());
         symbol.setKind(getTypeKind(type));
@@ -121,23 +108,20 @@ public class DocumentSymbolProvider {
             symbol.setDetail("extends " + superclass);
         }
 
-        setRanges(symbol, type, content, lineIndex);
+        setRanges(symbol, type, content);
         return symbol;
     }
 
-    private List<DocumentSymbol> createTypeChildren(IType type,
-            String content,
-            PositionUtils.LineIndex lineIndex) throws JavaModelException {
+    private List<DocumentSymbol> createTypeChildren(IType type, String content) throws JavaModelException {
         List<DocumentSymbol> children = new ArrayList<>();
-        addFieldSymbols(type, content, lineIndex, children);
-        addMethodSymbols(type, content, lineIndex, children);
-        addInnerTypeSymbols(type, content, lineIndex, children);
+        addFieldSymbols(type, content, children);
+        addMethodSymbols(type, content, children);
+        addInnerTypeSymbols(type, content, children);
         return children;
     }
 
     private void addFieldSymbols(IType type,
             String content,
-            PositionUtils.LineIndex lineIndex,
             List<DocumentSymbol> children)
             throws JavaModelException {
         for (IField field : type.getFields()) {
@@ -146,7 +130,7 @@ public class DocumentSymbolProvider {
             fieldSymbol.setKind(org.eclipse.jdt.core.Flags.isEnum(field.getFlags())
                     ? SymbolKind.EnumMember : SymbolKind.Field);
             fieldSymbol.setDetail(resolveFieldDetail(field));
-            setRanges(fieldSymbol, field, content, lineIndex);
+            setRanges(fieldSymbol, field, content);
             children.add(fieldSymbol);
         }
     }
@@ -161,7 +145,6 @@ public class DocumentSymbolProvider {
 
     private void addMethodSymbols(IType type,
             String content,
-            PositionUtils.LineIndex lineIndex,
             List<DocumentSymbol> children)
             throws JavaModelException {
         for (IMethod method : type.getMethods()) {
@@ -169,7 +152,7 @@ public class DocumentSymbolProvider {
             methodSymbol.setName(method.getElementName());
             methodSymbol.setKind(method.isConstructor() ? SymbolKind.Constructor : SymbolKind.Method);
             methodSymbol.setDetail(resolveMethodDetail(method));
-            setRanges(methodSymbol, method, content, lineIndex);
+            setRanges(methodSymbol, method, content);
             children.add(methodSymbol);
         }
     }
@@ -198,11 +181,10 @@ public class DocumentSymbolProvider {
 
     private void addInnerTypeSymbols(IType type,
             String content,
-            PositionUtils.LineIndex lineIndex,
             List<DocumentSymbol> children)
             throws JavaModelException {
         for (IType innerType : type.getTypes()) {
-            DocumentSymbol innerSymbol = toDocumentSymbol(innerType, content, lineIndex);
+            DocumentSymbol innerSymbol = toDocumentSymbol(innerType, content);
             if (innerSymbol != null) {
                 children.add(innerSymbol);
             }
@@ -213,13 +195,6 @@ public class DocumentSymbolProvider {
      * Set the range and selectionRange on a DocumentSymbol from a JDT source element.
      */
     private void setRanges(DocumentSymbol symbol, org.eclipse.jdt.core.IJavaElement element, String content) {
-        setRanges(symbol, element, content, PositionUtils.buildLineIndex(content));
-    }
-
-    private void setRanges(DocumentSymbol symbol,
-            org.eclipse.jdt.core.IJavaElement element,
-            String content,
-            PositionUtils.LineIndex lineIndex) {
         try {
             if (element instanceof ISourceReference sourceRef) {
 
@@ -228,7 +203,7 @@ public class DocumentSymbolProvider {
                 Range fullRange;
                 if (sourceRange != null && sourceRange.getOffset() >= 0
                         && sourceRange.getLength() >= 0) {
-                    fullRange = normalizeRange(toRange(lineIndex, sourceRange));
+                    fullRange = normalizeRange(toRange(content, sourceRange));
                 } else {
                     fullRange = new Range(new Position(0, 0), new Position(0, 0));
                 }
@@ -238,7 +213,7 @@ public class DocumentSymbolProvider {
                 ISourceRange nameRange = sourceRef.getNameRange();
                 if (nameRange != null && nameRange.getOffset() >= 0) {
                     symbol.setSelectionRange(clampSelectionRange(
-                            normalizeRange(toRange(lineIndex, nameRange)), fullRange));
+                            normalizeRange(toRange(content, nameRange)), fullRange));
                 } else {
                     symbol.setSelectionRange(fullRange);
                 }
@@ -258,15 +233,11 @@ public class DocumentSymbolProvider {
      * Convert a JDT source range to an LSP range.
      */
     private Range toRange(String content, ISourceRange sourceRange) {
-        return toRange(PositionUtils.buildLineIndex(content), sourceRange);
-    }
-
-    private Range toRange(PositionUtils.LineIndex lineIndex, ISourceRange sourceRange) {
         int startOffset = sourceRange.getOffset();
         int endOffset = startOffset + sourceRange.getLength();
 
-        Position start = lineIndex.offsetToPosition(startOffset);
-        Position end = lineIndex.offsetToPosition(endOffset);
+        Position start = offsetToPosition(content, startOffset);
+        Position end = offsetToPosition(content, endOffset);
 
         return new Range(start, end);
     }
@@ -316,152 +287,21 @@ public class DocumentSymbolProvider {
     /**
      * Build document symbols from the Groovy AST when JDT is not available.
      */
-        private List<Either<SymbolInformation, DocumentSymbol>> getDocumentSymbolsFromGroovyAST(
-            String uri) {
+    private List<Either<SymbolInformation, DocumentSymbol>> getDocumentSymbolsFromGroovyAST(String uri) {
         List<Either<SymbolInformation, DocumentSymbol>> result = new ArrayList<>();
-
-        ModuleNode ast = documentManager.getGroovyAST(uri);
-        if (ast == null) {
-            return result;
+        for (org.codehaus.groovy.ast.ClassNode classNode : astSupport.getVisibleClasses(uri)) {
+            result.add(Either.forRight(toDocumentSymbolFromAST(classNode)));
         }
-
-        try {
-            for (ClassNode classNode : ast.getClasses()) {
-                // Skip script class (auto-generated for scripts)
-                if (classNode.isScript() && classNode.getMethods().isEmpty()
-                        && classNode.getProperties().isEmpty()) {
-                    continue;
-                }
-
-                result.add(Either.forRight(toDocumentSymbolFromAST(classNode)));
-            }
-        } catch (Exception e) {
-            GroovyLanguageServerPlugin.logError(
-                    "Document symbols from Groovy AST failed for " + uri, e);
-        }
-
         return result;
     }
 
     /**
      * Convert a Groovy {@link ClassNode} to a {@link DocumentSymbol} with children.
      */
-    private DocumentSymbol toDocumentSymbolFromAST(ClassNode classNode) {
-        DocumentSymbol symbol = new DocumentSymbol();
-        symbol.setName(classNode.getNameWithoutPackage());
-        symbol.setKind(getAstTypeKind(classNode));
-        setAstSuperclassDetail(symbol, classNode);
+    private DocumentSymbol toDocumentSymbolFromAST(org.codehaus.groovy.ast.ClassNode classNode) {
+        DocumentSymbol symbol = astSupport.toDocumentSymbolFromAST(classNode);
         setRangesFromAST(symbol, classNode);
-        symbol.setChildren(createAstChildren(classNode));
         return symbol;
-    }
-
-    private SymbolKind getAstTypeKind(ClassNode classNode) {
-        if (GroovyTypeKindHelper.isTrait(classNode)) {
-            return SymbolKind.Struct;
-        }
-        if (classNode.isInterface()) {
-            return SymbolKind.Interface;
-        }
-        if (classNode.isEnum()) {
-            return SymbolKind.Enum;
-        }
-        return SymbolKind.Class;
-    }
-
-    private void setAstSuperclassDetail(DocumentSymbol symbol, ClassNode classNode) {
-        ClassNode superClass = classNode.getSuperClass();
-        if (superClass != null
-                && !"java.lang.Object".equals(superClass.getName())
-                && !"groovy.lang.Script".equals(superClass.getName())) {
-            symbol.setDetail("extends " + superClass.getNameWithoutPackage());
-        }
-    }
-
-    private List<DocumentSymbol> createAstChildren(ClassNode classNode) {
-        List<DocumentSymbol> children = new ArrayList<>();
-        addAstPropertySymbols(classNode, children);
-        addAstFieldSymbols(classNode, children);
-        addAstMethodSymbols(classNode, children);
-        addAstInnerTypeSymbols(classNode, children);
-        return children;
-    }
-
-    private void addAstPropertySymbols(ClassNode classNode, List<DocumentSymbol> children) {
-        for (PropertyNode prop : classNode.getProperties()) {
-            DocumentSymbol propSymbol = new DocumentSymbol();
-            propSymbol.setName(prop.getName());
-            propSymbol.setKind(SymbolKind.Property);
-            propSymbol.setDetail(prop.getType().getNameWithoutPackage());
-            setRangesFromAST(propSymbol, prop.getField());
-            children.add(propSymbol);
-        }
-    }
-
-    private void addAstFieldSymbols(ClassNode classNode, List<DocumentSymbol> children) {
-        for (FieldNode field : classNode.getFields()) {
-            if (isVisibleNonPropertyField(classNode, field)) {
-                DocumentSymbol fieldSymbol = new DocumentSymbol();
-                fieldSymbol.setName(field.getName());
-                fieldSymbol.setKind(classNode.isEnum() && field.isEnum()
-                        ? SymbolKind.EnumMember : SymbolKind.Field);
-                fieldSymbol.setDetail(field.getType().getNameWithoutPackage());
-                setRangesFromAST(fieldSymbol, field);
-                children.add(fieldSymbol);
-            }
-        }
-    }
-
-    private void addAstMethodSymbols(ClassNode classNode, List<DocumentSymbol> children) {
-        for (MethodNode method : classNode.getMethods()) {
-            if (isVisibleAstMethod(method)) {
-                DocumentSymbol methodSymbol = createAstMethodSymbol(method);
-                setRangesFromAST(methodSymbol, method);
-                children.add(methodSymbol);
-            }
-        }
-    }
-
-    private boolean isVisibleAstMethod(MethodNode method) {
-        return !method.getName().startsWith("<") && !method.isSynthetic();
-    }
-
-    private DocumentSymbol createAstMethodSymbol(MethodNode method) {
-        DocumentSymbol methodSymbol = new DocumentSymbol();
-        methodSymbol.setName(method.getName());
-        methodSymbol.setKind(method.getName().equals("<init>")
-                ? SymbolKind.Constructor : SymbolKind.Method);
-        methodSymbol.setDetail(buildAstMethodDetail(method));
-        return methodSymbol;
-    }
-
-    private String buildAstMethodDetail(MethodNode method) {
-        StringBuilder detail = new StringBuilder("(");
-        Parameter[] params = method.getParameters();
-        for (int i = 0; i < params.length; i++) {
-            if (i > 0) {
-                detail.append(", ");
-            }
-            detail.append(params[i].getType().getNameWithoutPackage());
-            String displayName = ParameterNameSupport.displayName(params[i].getName());
-            if (displayName != null) {
-                detail.append(' ').append(displayName);
-            }
-        }
-        detail.append("): ").append(method.getReturnType().getNameWithoutPackage());
-        return detail.toString();
-    }
-
-    private void addAstInnerTypeSymbols(ClassNode classNode, List<DocumentSymbol> children) {
-        java.util.Iterator<org.codehaus.groovy.ast.InnerClassNode> innerIter =
-                classNode.getInnerClasses();
-        while (innerIter.hasNext()) {
-            ClassNode inner = innerIter.next();
-            DocumentSymbol innerSymbol = toDocumentSymbolFromAST(inner);
-            if (innerSymbol != null) {
-                children.add(innerSymbol);
-            }
-        }
     }
 
     /**
@@ -469,33 +309,7 @@ public class DocumentSymbolProvider {
      */
     private void setRangesFromAST(DocumentSymbol symbol,
             org.codehaus.groovy.ast.ASTNode node) {
-        if (node == null) {
-            Range defaultRange = new Range(new Position(0, 0), new Position(0, 0));
-            symbol.setRange(defaultRange);
-            symbol.setSelectionRange(defaultRange);
-            return;
-        }
-
-        int startLine = Math.max(0, node.getLineNumber() - 1);
-        int startCol = Math.max(0, node.getColumnNumber() - 1);
-        int endLine = Math.max(startLine, node.getLastLineNumber() - 1);
-        int endCol = Math.max(0, node.getLastColumnNumber() - 1);
-
-        // Guard against invalid ranges where end is before start
-        if (endLine == startLine && endCol < startCol) {
-            endCol = startCol;
-        }
-
-        Range fullRange = new Range(
-                new Position(startLine, startCol),
-                new Position(endLine, endCol));
-        symbol.setRange(fullRange);
-
-        // Selection range: just the name area (approximate: start of the node)
-        Range nameRange = new Range(
-                new Position(startLine, startCol),
-                new Position(startLine, startCol + symbol.getName().length()));
-        symbol.setSelectionRange(clampSelectionRange(nameRange, fullRange));
+        astSupport.setRangesFromAST(symbol, node);
     }
 
     /**
@@ -544,17 +358,4 @@ public class DocumentSymbolProvider {
         return Integer.compare(a.getCharacter(), b.getCharacter());
     }
 
-    private boolean isVisibleNonPropertyField(ClassNode classNode, FieldNode field) {
-        String fieldName = field.getName();
-        if (fieldName.startsWith("$") || fieldName.startsWith("__")) {
-            return false;
-        }
-
-        for (PropertyNode prop : classNode.getProperties()) {
-            if (fieldName.equals(prop.getName())) {
-                return false;
-            }
-        }
-        return true;
-    }
 }

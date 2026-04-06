@@ -12,10 +12,7 @@ package org.eclipse.groovy.ls.core.providers;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.codehaus.groovy.ast.ClassNode;
-import org.codehaus.groovy.ast.MethodNode;
 import org.codehaus.groovy.ast.ModuleNode;
-import org.codehaus.groovy.ast.Parameter;
 import org.eclipse.groovy.ls.core.DocumentManager;
 import org.eclipse.groovy.ls.core.GroovyLanguageServerPlugin;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -42,9 +39,11 @@ import org.eclipse.lsp4j.SignatureInformation;
 public class SignatureHelpProvider {
 
     private final DocumentManager documentManager;
+    private final SignatureHelpAstSupport astSupport;
 
     public SignatureHelpProvider(DocumentManager documentManager) {
         this.documentManager = documentManager;
+        this.astSupport = new SignatureHelpAstSupport();
     }
 
     /**
@@ -88,13 +87,6 @@ public class SignatureHelpProvider {
                     "Signature help JDT failed for " + uri + ", falling back to AST", e);
             return null;
         }
-    }
-
-    private SignatureContext resolveSignatureContext(String content, Position position) {
-        return resolveSignatureContext(
-                content,
-                position,
-                content != null ? PositionUtils.buildLineIndex(content) : null);
     }
 
     private SignatureContext resolveSignatureContext(String content,
@@ -335,44 +327,7 @@ public class SignatureHelpProvider {
     }
 
     private List<SignatureInformation> collectAstSignatures(ModuleNode ast, String methodName) {
-        List<SignatureInformation> signatures = new ArrayList<>();
-        for (ClassNode classNode : ast.getClasses()) {
-            addAstConstructorSignatures(signatures, classNode, methodName);
-            addAstMethodSignatures(signatures, classNode, methodName);
-        }
-        return signatures;
-    }
-
-    private void addAstConstructorSignatures(List<SignatureInformation> signatures,
-            ClassNode classNode,
-            String methodName) {
-        if (!classNode.getNameWithoutPackage().equals(methodName)) {
-            return;
-        }
-
-        int beforeCount = signatures.size();
-        for (MethodNode constructor : classNode.getDeclaredConstructors()) {
-            SignatureInformation signature = astMethodToSignature(constructor);
-            signatures.add(signature);
-        }
-
-        if (signatures.size() == beforeCount) {
-            SignatureInformation defaultConstructor = new SignatureInformation();
-            defaultConstructor.setLabel(classNode.getNameWithoutPackage() + "()");
-            defaultConstructor.setParameters(new ArrayList<>());
-            signatures.add(defaultConstructor);
-        }
-    }
-
-    private void addAstMethodSignatures(List<SignatureInformation> signatures,
-            ClassNode classNode,
-            String methodName) {
-        for (MethodNode method : classNode.getMethods()) {
-            if (methodName.equals(method.getName())) {
-                SignatureInformation signature = astMethodToSignature(method);
-                signatures.add(signature);
-            }
-        }
+        return astSupport.collectAstSignatures(ast, methodName);
     }
 
     private SignatureHelp createSignatureHelp(List<SignatureInformation> signatures, int activeParameter) {
@@ -395,42 +350,6 @@ public class SignatureHelpProvider {
             this.methodNameEnd = methodNameEnd;
             this.activeParameter = activeParameter;
         }
-    }
-
-    /**
-     * Convert a Groovy AST MethodNode to an LSP SignatureInformation.
-     */
-    private SignatureInformation astMethodToSignature(MethodNode method) {
-        StringBuilder label = new StringBuilder();
-        label.append(method.getName()).append('(');
-
-        Parameter[] params = method.getParameters();
-        List<ParameterInformation> paramInfos = new ArrayList<>();
-
-        for (int i = 0; i < params.length; i++) {
-            String typeName = params[i].getType().getNameWithoutPackage();
-            String paramName = ParameterNameSupport.displayName(params[i].getName());
-            String paramLabel = paramName != null ? typeName + " " + paramName : typeName;
-
-            if (i > 0) label.append(", ");
-            label.append(paramLabel);
-
-            ParameterInformation paramInfo = new ParameterInformation();
-            paramInfo.setLabel(paramLabel);
-            paramInfos.add(paramInfo);
-        }
-
-        label.append(')');
-
-        // Add return type
-        if (!method.isStaticConstructor() && method.getReturnType() != null) {
-            label.append(": ").append(method.getReturnType().getNameWithoutPackage());
-        }
-
-        SignatureInformation sig = new SignatureInformation();
-        sig.setLabel(label.toString());
-        sig.setParameters(paramInfos);
-        return sig;
     }
 
     /**
