@@ -1373,7 +1373,7 @@ public class DefinitionProvider {
                 return receiverParts;
             }
             receiverParts.add(0, content.substring(partStart, pos));
-            pos = partStart > 0 && content.charAt(partStart - 1) == '.' ? partStart - 2 : -1;
+            pos = partStart > 0 && content.charAt(partStart - 1) == '.' ? partStart - 1 : -1;
         }
         return receiverParts;
     }

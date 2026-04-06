@@ -44,6 +44,10 @@ import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.core.search.IJavaSearchConstants;
+import org.eclipse.jdt.core.search.IJavaSearchScope;
+import org.eclipse.jdt.core.search.SearchEngine;
+import org.eclipse.jdt.core.search.TypeNameMatch;
 import org.eclipse.lsp4j.CodeAction;
 import org.eclipse.lsp4j.CodeActionContext;
 import org.eclipse.lsp4j.CodeActionKind;
@@ -61,6 +65,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.MockedStatic;
+
+import com.google.gson.JsonObject;
 
 class CodeActionProviderTest {
 
@@ -1381,6 +1387,136 @@ class CodeActionProviderTest {
                 List.of(CodeActionProvider.SOURCE_KIND_ADD_MISSING_IMPORTS), List.of());
         assertNotNull(allActions);
         dm.didClose(uri);
+    }
+
+    @Test
+    void resolveCodeActionAddsImportEditFromJsonObjectData() {
+        String uri = "file:///ResolveCodeActionJsonObject.groovy";
+        String content = "package sample\n\nclass Demo {}\n";
+
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        CodeActionProvider provider = new CodeActionProvider(dm, new DiagnosticsProvider(dm));
+
+        JsonObject data = new JsonObject();
+        data.addProperty("resolve", CodeActionProvider.RESOLVE_KIND_ADD_IMPORT);
+        data.addProperty("uri", uri);
+        data.addProperty("fqn", "java.time.LocalDate");
+
+        CodeAction action = new CodeAction("Add import");
+        action.setData(data);
+
+        CodeAction resolved = provider.resolveCodeAction(action);
+
+        assertNotNull(resolved.getEdit());
+        List<TextEdit> edits = resolved.getEdit().getChanges().get(uri);
+        assertNotNull(edits);
+        assertEquals(1, edits.size());
+        assertEquals("import java.time.LocalDate\n", edits.get(0).getNewText());
+        assertEquals(2, edits.get(0).getRange().getStart().getLine());
+
+        dm.didClose(uri);
+    }
+
+    @Test
+    void resolveCodeActionParsesStringifiedJsonDataAndIgnoresUnknownResolveKind() {
+        String uri = "file:///ResolveCodeActionStringData.groovy";
+        String content = "class Demo {}\n";
+
+        DocumentManager dm = new DocumentManager();
+        dm.didOpen(uri, content);
+        CodeActionProvider provider = new CodeActionProvider(dm, new DiagnosticsProvider(dm));
+
+        CodeAction unresolved = new CodeAction("No-op");
+        unresolved.setData("{\"resolve\":\"other\",\"uri\":\"" + uri + "\",\"fqn\":\"java.time.LocalDate\"}");
+
+        CodeAction result = provider.resolveCodeAction(unresolved);
+
+        assertNull(result.getEdit());
+        dm.didClose(uri);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void searchClasspathForTypeFiltersSyntheticResultsAndCachesByProject() throws Exception {
+        DocumentManager dm = new DocumentManager();
+        DiagnosticsProvider dp = new DiagnosticsProvider(dm);
+        CodeActionProvider provider = new CodeActionProvider(dm, dp);
+
+        IWorkspace workspace = mock(IWorkspace.class);
+        IWorkspaceRoot root = mock(IWorkspaceRoot.class);
+        IFile file = mock(IFile.class);
+        IProject project = mock(IProject.class);
+        IJavaProject javaProject = mock(IJavaProject.class);
+        IJavaSearchScope scope = mock(IJavaSearchScope.class);
+        TypeNameMatch visible = mock(TypeNameMatch.class);
+        TypeNameMatch synthetic = mock(TypeNameMatch.class);
+
+        when(workspace.getRoot()).thenReturn(root);
+        when(root.findFilesForLocationURI(org.mockito.ArgumentMatchers.any())).thenReturn(new IFile[] { file });
+        when(file.getProject()).thenReturn(project);
+        when(project.isOpen()).thenReturn(true);
+        when(javaProject.exists()).thenReturn(true);
+        when(javaProject.getElementName()).thenReturn("DemoProject");
+        when(visible.getFullyQualifiedName()).thenReturn("java.time.LocalDate");
+        when(synthetic.getFullyQualifiedName()).thenReturn("java.time.LocalDate$Companion");
+
+        try (MockedStatic<ResourcesPlugin> rsMock = org.mockito.Mockito.mockStatic(ResourcesPlugin.class);
+             MockedStatic<JavaCore> jcMock = org.mockito.Mockito.mockStatic(JavaCore.class);
+             MockedStatic<SearchEngine> searchEngineMock = org.mockito.Mockito.mockStatic(SearchEngine.class);
+             MockedStatic<JdtSearchSupport> searchSupportMock = org.mockito.Mockito.mockStatic(JdtSearchSupport.class)) {
+
+            rsMock.when(ResourcesPlugin::getWorkspace).thenReturn(workspace);
+            jcMock.when(() -> JavaCore.create(project)).thenReturn(javaProject);
+            searchEngineMock.when(() -> SearchEngine.createJavaSearchScope(
+                    org.mockito.ArgumentMatchers.any(IJavaProject[].class),
+                    org.mockito.ArgumentMatchers.eq(IJavaSearchScope.SOURCES
+                            | IJavaSearchScope.APPLICATION_LIBRARIES
+                            | IJavaSearchScope.SYSTEM_LIBRARIES
+                            | IJavaSearchScope.REFERENCED_PROJECTS)))
+                    .thenReturn(scope);
+            searchSupportMock.when(() -> JdtSearchSupport.searchAllTypeNames(
+                    org.mockito.ArgumentMatchers.isNull(),
+                    org.mockito.ArgumentMatchers.eq(org.eclipse.jdt.core.search.SearchPattern.R_EXACT_MATCH),
+                    org.mockito.ArgumentMatchers.any(char[].class),
+                    org.mockito.ArgumentMatchers.eq(org.eclipse.jdt.core.search.SearchPattern.R_EXACT_MATCH
+                            | org.eclipse.jdt.core.search.SearchPattern.R_CASE_SENSITIVE),
+                    org.mockito.ArgumentMatchers.eq(IJavaSearchConstants.TYPE),
+                    org.mockito.ArgumentMatchers.eq(scope),
+                    org.mockito.ArgumentMatchers.any(org.eclipse.jdt.core.search.TypeNameMatchRequestor.class),
+                    org.mockito.ArgumentMatchers.eq(IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH),
+                    org.mockito.ArgumentMatchers.any()))
+                    .thenAnswer(invocation -> {
+                        org.eclipse.jdt.core.search.TypeNameMatchRequestor requestor = invocation.getArgument(6);
+                        requestor.acceptTypeNameMatch(visible);
+                        requestor.acceptTypeNameMatch(synthetic);
+                        return null;
+                    });
+
+            List<String> first = (List<String>) invoke(provider,
+                    "searchClasspathForType",
+                    new Class<?>[] { String.class, String.class },
+                    new Object[] { "LocalDate", "file:///test.groovy" });
+            List<String> second = (List<String>) invoke(provider,
+                    "searchClasspathForType",
+                    new Class<?>[] { String.class, String.class },
+                    new Object[] { "LocalDate", "file:///test.groovy" });
+
+            assertEquals(List.of("java.time.LocalDate"), first);
+            assertEquals(first, second);
+            searchSupportMock.verify(() -> JdtSearchSupport.searchAllTypeNames(
+                    org.mockito.ArgumentMatchers.isNull(),
+                    org.mockito.ArgumentMatchers.eq(org.eclipse.jdt.core.search.SearchPattern.R_EXACT_MATCH),
+                    org.mockito.ArgumentMatchers.any(char[].class),
+                    org.mockito.ArgumentMatchers.eq(org.eclipse.jdt.core.search.SearchPattern.R_EXACT_MATCH
+                            | org.eclipse.jdt.core.search.SearchPattern.R_CASE_SENSITIVE),
+                    org.mockito.ArgumentMatchers.eq(IJavaSearchConstants.TYPE),
+                    org.mockito.ArgumentMatchers.eq(scope),
+                    org.mockito.ArgumentMatchers.any(org.eclipse.jdt.core.search.TypeNameMatchRequestor.class),
+                    org.mockito.ArgumentMatchers.eq(IJavaSearchConstants.FORCE_IMMEDIATE_SEARCH),
+                    org.mockito.ArgumentMatchers.any()),
+                    org.mockito.Mockito.times(1));
+        }
     }
 
     // ================================================================

@@ -13,11 +13,40 @@ import {
     inferProjectPathFromEntries,
     isJdtWorkspaceUri,
     normalizeFsPath,
-    pathStartsWith,
     prioritizeTargetsByOpenDocumentProjects,
-    uriToFsPath,
 } from './utils';
+import {
+    buildGradleClasspathInitScript,
+    extractEntriesFromSettings,
+    extractGradleClasspathEntries,
+    findGradleWrapper,
+    GRADLE_CLASSPATH_LINE_PREFIX,
+    isJdkEntry,
+    resolveProjectPathFromUri,
+} from './classpathUtils';
+import {
+    recordClasspathNotificationFingerprint,
+    type ClasspathNotificationPayload,
+} from './classpathNotifications';
+import {
+    buildJavaProjectTargets,
+    collectKnownTargetPaths,
+    createWorkspaceFolderFallbackTarget,
+} from './classpathTargets';
+import {
+    buildInitializationOptionsFromSettings,
+    findCorruptCriticalPluginJar,
+    findLauncherJar as findLauncherJarInServerDir,
+    getJavaExecutable as getJavaExecutableFromHome,
+    parseJavaMajorVersion,
+    resolveJavaHomeFromEnvironment,
+    resolveServerDirFromExtensionPath,
+} from './serverRuntimeUtils';
 import { prepareWritableConfigDir } from './serverConfig';
+import {
+    buildGroovyDidChangeConfigurationNotification,
+    shouldForwardGroovyConfigurationChange,
+} from './groovyConfiguration';
 import {
     InitialClasspathStartupTracker,
     type PendingStartupClasspathTargetHandle,
@@ -28,7 +57,7 @@ import {
     getInitialClasspathImportRefreshAction,
     getInitialClasspathRetryAction,
 } from './startupRetryPolicy';
-import { detectWorkspaceRestoreCorruption } from './workspaceRecovery';
+import { prepareWorkspaceDataDir } from './workspaceData';
 import {
     LanguageClient,
     LanguageClientOptions,
@@ -42,13 +71,6 @@ let outputChannel: OutputChannel;
 let statusBarItem: StatusBarItem;
 let isRestarting = false;
 let activeServerSession: ServerSessionScope | undefined;
-
-interface ClasspathNotificationPayload {
-    projectUri: string;
-    projectPath?: string;
-    entries: string[];
-    hasJarEntries: boolean;
-}
 
 type JavaClasspathTarget = StartupClasspathTarget;
 
@@ -150,21 +172,13 @@ class StartupTrace {
     }
 }
 
-interface WorkspaceDataPreparation {
-    dataDir: string;
-    resetWorkspace: boolean;
-}
-
 let startupTrace: StartupTrace | undefined;
 
 /** Scheme for virtual source documents from JARs/JDK. */
 const GROOVY_SOURCE_SCHEME = 'groovy-source';
-const GRADLE_CLASSPATH_LINE_PREFIX = 'GROOVY_LS_CP::';
 const REPRESENTATIVE_SOURCE_GLOB = '{src/main/java/**/*.java,src/main/groovy/**/*.groovy,src/test/java/**/*.java,src/test/groovy/**/*.groovy}';
 const BUILD_DESCRIPTOR_GLOB = '{**/build.gradle,**/build.gradle.kts,**/settings.gradle,**/settings.gradle.kts,**/pom.xml}';
 const MINIMUM_JAVA_MAJOR = 21;
-const WORKSPACE_DATA_VERSION = 2;
-const WORKSPACE_DATA_STATE_FILE = 'groovy_ws_state.json';
 
 /**
  * Cached project root map to avoid repeatedly scanning the workspace for
@@ -267,29 +281,6 @@ function getOpenGroovyDocumentUris(): string[] {
         .map(document => document.uri.toString());
 }
 
-function resolveProjectPathFromUri(
-    uriValue: string,
-    projectRootMap: Map<string, string>
-): string | undefined {
-    const fsPath = uriToFsPath(uriValue);
-    if (!fsPath) return undefined;
-
-    const normalizedPath = normalizeFsPath(fsPath);
-    const exact = projectRootMap.get(normalizedPath);
-    if (exact) return exact;
-
-    let bestMatch: string | undefined;
-    for (const [projectNorm] of projectRootMap) {
-        if (pathStartsWith(normalizedPath, projectNorm)) {
-            if (!bestMatch || projectNorm.length > bestMatch.length) {
-                bestMatch = projectNorm;
-            }
-        }
-    }
-
-    return bestMatch ? projectRootMap.get(bestMatch) : undefined;
-}
-
 async function findRepresentativeSourceUri(projectPath: string): Promise<string | undefined> {
     const normalizedProjectPath = normalizeFsPath(projectPath);
     if (representativeSourceUriCache.has(normalizedProjectPath)) {
@@ -307,92 +298,6 @@ async function findRepresentativeSourceUri(projectPath: string): Promise<string 
     return sourceUri;
 }
 
-function findGradleWrapper(startDir: string): string | undefined {
-    const exeName = process.platform === 'win32' ? 'gradlew.bat' : 'gradlew';
-    let currentDir = path.resolve(startDir);
-
-    while (true) {
-        const candidate = path.join(currentDir, exeName);
-        if (fs.existsSync(candidate)) {
-            return candidate;
-        }
-
-        const parent = path.dirname(currentDir);
-        if (parent === currentDir) {
-            return undefined;
-        }
-        currentDir = parent;
-    }
-}
-
-function extractPathFromClasspathEntry(entry: any): string {
-    const rawPath = entry?.path;
-    if (typeof rawPath === 'string') {
-        if (rawPath.startsWith('file:/')) {
-            try {
-                return vscode.Uri.parse(rawPath).fsPath;
-            } catch {
-                return rawPath;
-            }
-        }
-        return rawPath;
-    }
-
-    if (rawPath && typeof rawPath.path === 'string') {
-        return rawPath.path;
-    }
-
-    if (rawPath && typeof rawPath.fsPath === 'string') {
-        return rawPath.fsPath;
-    }
-
-    return '';
-}
-
-/**
- * Check if a classpath entry is inside a JDK installation (already have JRE_CONTAINER).
- */
-function isJdkEntry(entryPath: string, javaHomeNorm: string): boolean {
-    const norm = entryPath.replaceAll('\\', '/').toLowerCase();
-    if (javaHomeNorm && norm.startsWith(javaHomeNorm)) return true;
-    // Heuristic: JDK-like paths not in dependency caches
-    if ((norm.includes('/jdk-') || norm.includes('/jdk/') || norm.includes('/jre/'))
-        && !norm.includes('.gradle/') && !norm.includes('.m2/')) {
-        return true;
-    }
-    return false;
-}
-
-/**
- * Extract JAR paths and output dirs from classpathEntries returned by
- * java.project.getSettings with the 'org.eclipse.jdt.ls.core.vm.location'
- * and 'org.eclipse.jdt.ls.core.classpathEntries' keys.
- * Each entry has: { kind: number, path: string, entryKind: number, ... }
- * kind 1=source, 2=container, 3=library, 4=output
- */
-function extractEntriesFromSettings(
-    settingsResult: any
-): { jars: string[]; outputDirs: string[] } {
-    const jars: string[] = [];
-    const outputDirs: string[] = [];
-    const entries: any[] =
-        settingsResult?.['org.eclipse.jdt.ls.core.classpathEntries'] ?? [];
-    for (const entry of entries) {
-        const p = extractPathFromClasspathEntry(entry);
-        if (!p) continue;
-        if (p.toLowerCase().endsWith('.jar')) {
-            jars.push(p);
-        } else if (entry.kind === 4 || entry.entryKind === 4) {
-            // kind=4 is output
-            outputDirs.push(p);
-        } else if (entry.kind === 3 || entry.entryKind === 3) {
-            // kind=3 is library (could be a folder lib)
-            jars.push(p);
-        }
-    }
-    return { jars, outputDirs };
-}
-
 async function resolveGradleClasspath(projectPath: string): Promise<string[]> {
     const normalizedProjectPath = path.resolve(projectPath);
     const wrapper = findGradleWrapper(normalizedProjectPath);
@@ -406,25 +311,7 @@ async function resolveGradleClasspath(projectPath: string): Promise<string[]> {
         `groovy-ls-classpath-${Date.now()}-${Math.random().toString(16).slice(2)}.gradle`
     );
 
-    const initScript = `allprojects {
-    tasks.register('groovyLsPrintClasspath') {
-        doLast {
-            ['testCompileClasspath', 'testRuntimeClasspath', 'compileClasspath', 'runtimeClasspath'].each { cfgName ->
-                def cfg = project.configurations.findByName(cfgName)
-                if (cfg != null && cfg.canBeResolved) {
-                    try {
-                        cfg.resolve().each { f ->
-                            println('${GRADLE_CLASSPATH_LINE_PREFIX}' + f.absolutePath)
-                        }
-                    } catch (Throwable ignored) {
-                        // ignore and continue with other configs
-                    }
-                }
-            }
-        }
-    }
-}
-`;
+    const initScript = buildGradleClasspathInitScript();
 
     try {
         fs.writeFileSync(initScriptPath, initScript, { encoding: 'utf8' });
@@ -459,13 +346,7 @@ async function resolveGradleClasspath(projectPath: string): Promise<string[]> {
             });
         });
 
-        const lines = stdout.split(/\r?\n/)
-            .map(line => line.trim())
-            .filter(line => line.startsWith(GRADLE_CLASSPATH_LINE_PREFIX))
-            .map(line => line.substring(GRADLE_CLASSPATH_LINE_PREFIX.length).trim())
-            .filter(line => line.length > 0 && fs.existsSync(line));
-
-        const unique = Array.from(new Set(lines));
+        const unique = extractGradleClasspathEntries(stdout, fs.existsSync, GRADLE_CLASSPATH_LINE_PREFIX);
         outputChannel.appendLine(
             `[java-ext]   Gradle fallback resolved ${unique.length} entries for ${projectPath}`
         );
@@ -737,8 +618,16 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     // Preserve the Eclipse workspace across healthy restarts so JDT and OSGi
     // caches can be reused. Invalidate only when the persisted workspace
     // schema changes or the marker is missing/corrupt.
-    const workspaceData = prepareWorkspaceDataDir(context);
+    const workspaceData = prepareWorkspaceDataDir({
+        storagePath: context.storageUri?.fsPath ?? context.globalStorageUri.fsPath,
+        log: message => outputChannel.appendLine(message),
+    });
     const dataDir = workspaceData.dataDir;
+    if (workspaceData.resetWorkspace) {
+        outputChannel.appendLine(`Reset persisted workspace data: ${dataDir} (${workspaceData.reason})`);
+    } else {
+        outputChannel.appendLine(`Reusing persisted workspace data: ${dataDir}`);
+    }
 
     // 6. Build JVM arguments
     const vmargs = workspace.getConfiguration('groovy').get<string>('ls.vmargs', '-Xmx2G');
@@ -900,33 +789,10 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     // Push initial configuration (formatter + inlay hints) to the server
     const sendGroovyConfiguration = () => {
         const config = workspace.getConfiguration('groovy');
-        client?.sendNotification('workspace/didChangeConfiguration', {
-            settings: {
-                groovy: {
-                    ls: {
-                        logLevel: config.get<string>('ls.logLevel', 'error'),
-                    },
-                    format: {
-                        settingsUrl: config.get<string>('format.settingsUrl') ?? null,
-                        enabled: config.get<boolean>('format.enabled', true),
-                    },
-                    inlayHints: {
-                        variableTypes: {
-                            enabled: config.get<boolean>('inlayHints.variableTypes.enabled', true),
-                        },
-                        parameterNames: {
-                            enabled: config.get<boolean>('inlayHints.parameterNames.enabled', true),
-                        },
-                        closureParameterTypes: {
-                            enabled: config.get<boolean>('inlayHints.closureParameterTypes.enabled', true),
-                        },
-                        methodReturnTypes: {
-                            enabled: config.get<boolean>('inlayHints.methodReturnTypes.enabled', true),
-                        },
-                    },
-                },
-            },
-        });
+        client?.sendNotification(
+            'workspace/didChangeConfiguration',
+            buildGroovyDidChangeConfigurationNotification(config)
+        );
     };
     sendGroovyConfiguration();
 
@@ -935,7 +801,7 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
         session,
         workspace.onDidChangeConfiguration((e) => {
             if (isServerSessionActive(session, client)
-                && (e.affectsConfiguration('groovy.ls.logLevel') || e.affectsConfiguration('groovy.format') || e.affectsConfiguration('groovy.inlayHints'))) {
+                && shouldForwardGroovyConfigurationChange(e)) {
                 sendGroovyConfiguration();
             }
         })
@@ -944,60 +810,6 @@ async function startLanguageServer(context: ExtensionContext): Promise<void> {
     // ---- Delegate classpath resolution to Red Hat Java extension ----
     await initJavaExtensionClasspath(session, client);
     logStartupDuration('server.launch', startPhase, 'language client ready');
-}
-
-function prepareWorkspaceDataDir(context: ExtensionContext): WorkspaceDataPreparation {
-    const workspaceStoragePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
-    const dataDir = path.join(workspaceStoragePath, 'groovy_ws');
-    const stateFile = path.join(workspaceStoragePath, WORKSPACE_DATA_STATE_FILE);
-    let resetWorkspace = false;
-    let resetReason = '';
-
-    if (fs.existsSync(stateFile)) {
-        try {
-            const state = JSON.parse(fs.readFileSync(stateFile, 'utf8')) as { version?: number };
-            if (state.version !== WORKSPACE_DATA_VERSION) {
-                resetWorkspace = true;
-                resetReason = `workspace data version ${state.version ?? 'unknown'} -> ${WORKSPACE_DATA_VERSION}`;
-            }
-        } catch {
-            resetWorkspace = true;
-            resetReason = 'invalid workspace data marker';
-        }
-    } else {
-        resetWorkspace = fs.existsSync(dataDir);
-        resetReason = 'missing workspace data marker';
-    }
-
-    if (!resetWorkspace) {
-        const corruptionReason = detectWorkspaceRestoreCorruption(dataDir);
-        if (corruptionReason) {
-            resetWorkspace = true;
-            resetReason = corruptionReason;
-        }
-    }
-
-    if (resetWorkspace && fs.existsSync(dataDir)) {
-        try {
-            fs.rmSync(dataDir, { recursive: true, force: true });
-            outputChannel.appendLine(`Reset persisted workspace data: ${dataDir} (${resetReason})`);
-        } catch (e) {
-            outputChannel.appendLine(`Warning: failed to reset workspace data: ${e}`);
-        }
-    }
-
-    fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(
-        stateFile,
-        JSON.stringify({ version: WORKSPACE_DATA_VERSION, updatedAt: new Date().toISOString() }, null, 2),
-        'utf8'
-    );
-
-    if (!resetWorkspace) {
-        outputChannel.appendLine(`Reusing persisted workspace data: ${dataDir}`);
-    }
-
-    return { dataDir, resetWorkspace };
 }
 
 /**
@@ -1303,22 +1115,6 @@ async function initJavaExtensionClasspath(
         return { delivered, resolved, remainingTargets };
     };
 
-    /** Check whether a project URI should be included based on JDT workspace and root-folder heuristics. */
-    const shouldIncludeProject = (uri: string, wsRootPath: string, nonRootCount: number): boolean => {
-        if (isJdtWorkspaceUri(uri)) {
-            outputChannel.appendLine(`[java-ext] Skipping jdt_ws Java project: ${uri}`);
-            return false;
-        }
-        try {
-            const projPath = normalizeFsPath(vscode.Uri.parse(uri).fsPath);
-            if (projPath === wsRootPath && nonRootCount > 0) {
-                outputChannel.appendLine(`[java-ext] Skipping root workspace folder (has ${nonRootCount} subprojects): ${uri}`);
-                return false;
-            }
-        } catch { /* ignore parse errors */ }
-        return true;
-    };
-
     /** Scan projectRootMap for projects not already known and add them as targets. */
     const addBuildFileScanTargets = async (
         targets: JavaClasspathTarget[],
@@ -1376,28 +1172,18 @@ async function initJavaExtensionClasspath(
 
             const wsRootPath = workspace.workspaceFolders?.[0]?.uri.fsPath
                 ?.replaceAll('\\', '/').replace(/\/$/, '').toLowerCase() ?? '';
+            const javaProjectTargetResult = buildJavaProjectTargets(projectUris, projectRootMap, wsRootPath);
+            for (const uri of javaProjectTargetResult.skippedJdtWorkspaceUris) {
+                outputChannel.appendLine(`[java-ext] Skipping jdt_ws Java project: ${uri}`);
+            }
+            for (const uri of javaProjectTargetResult.skippedRootWorkspaceUris) {
+                outputChannel.appendLine(
+                    `[java-ext] Skipping root workspace folder (has ${javaProjectTargetResult.nonRootProjectCount} subprojects): ${uri}`
+                );
+            }
 
-            const nonRootCount = projectUris.filter(uri => {
-                if (isJdtWorkspaceUri(uri)) return false;
-                try { return normalizeFsPath(vscode.Uri.parse(uri).fsPath) !== wsRootPath; }
-                catch { return true; }
-            }).length;
-
-            const javaProjects = projectUris.filter(uri => shouldIncludeProject(uri, wsRootPath, nonRootCount));
-
-            const targets: JavaClasspathTarget[] = javaProjects.map(uri => ({
-                requestUri: uri,
-                projectUri: uri,
-                projectPath: resolveProjectPathFromUri(uri, projectRootMap),
-                source: 'java.project.getAll',
-            }));
-
-            const knownPaths = new Set(targets.map(target => {
-                try {
-                    if (target.projectPath) return normalizeFsPath(target.projectPath);
-                    return normalizeFsPath(vscode.Uri.parse(target.projectUri).fsPath);
-                } catch { return ''; }
-            }));
+            const targets: JavaClasspathTarget[] = [...javaProjectTargetResult.targets];
+            const knownPaths = collectKnownTargetPaths(targets);
 
             await addBuildFileScanTargets(targets, knownPaths, projectRootMap, wsRootPath);
             const prioritizedTargets = prioritizeTargetsByOpenDocumentProjects(
@@ -1438,12 +1224,11 @@ async function initJavaExtensionClasspath(
             if (!isActive()) {
                 return 0;
             }
-            targets.push({
-                requestUri: representativeUri ?? folder.uri.toString(),
-                projectUri: folder.uri.toString(),
-                projectPath: folder.uri.fsPath,
-                source: 'workspace-folder-fallback',
-            });
+            targets.push(createWorkspaceFolderFallbackTarget(
+                folder.uri.toString(),
+                folder.uri.fsPath,
+                representativeUri
+            ));
         }
         const prioritizedTargets = prioritizeTargetsByOpenDocumentProjects(
             targets,
@@ -1721,44 +1506,13 @@ async function initJavaExtensionClasspath(
  * Resolve the Java home directory from settings or environment.
  */
 function resolveJavaHome(): string | undefined {
-    // 1. Check VS Code setting
-    const configuredHome = workspace.getConfiguration('groovy').get<string>('java.home');
-    if (configuredHome && fs.existsSync(configuredHome)) {
-        return configuredHome;
-    }
-
-    // 2. Check JAVA_HOME environment variable
-    const envHome = process.env['JAVA_HOME'];
-    if (envHome && fs.existsSync(envHome)) {
-        return envHome;
-    }
-
-    // 3. Try to find java on PATH
-    const pathJava = process.env['PATH']?.split(path.delimiter)
-        .find(dir => {
-            const javaBin = path.join(dir, process.platform === 'win32' ? 'java.exe' : 'java');
-            return fs.existsSync(javaBin);
-        });
-
-    if (pathJava) {
-        const javaBinPath = path.join(pathJava, process.platform === 'win32' ? 'java.exe' : 'java');
-        // Resolve symlinks to find the real location
-        let resolvedBin: string;
-        try {
-            resolvedBin = fs.realpathSync(javaBinPath);
-        } catch {
-            resolvedBin = javaBinPath;
-        }
-        // Walk up from bin/ to get java home
-        const binDir = path.dirname(resolvedBin);
-        const home = path.dirname(binDir);
-        if (fs.existsSync(path.join(home, 'bin'))) {
-            return home;
-        }
-        return binDir; // fallback
-    }
-
-    return undefined;
+    return resolveJavaHomeFromEnvironment({
+        configuredHome: workspace.getConfiguration('groovy').get<string>('java.home'),
+        envHome: process.env['JAVA_HOME'],
+        pathValue: process.env['PATH'],
+        platform: process.platform,
+        fileSystem: fs,
+    });
 }
 
 async function resolveJavaExecutableOrShowError(): Promise<string | undefined> {
@@ -1799,73 +1553,36 @@ async function resolveJavaExecutableOrShowError(): Promise<string | undefined> {
  * Get the full path to the java executable.
  */
 function getJavaExecutable(javaHome: string): string {
-    const exe = process.platform === 'win32' ? 'java.exe' : 'java';
-    const binJava = path.join(javaHome, 'bin', exe);
-    if (fs.existsSync(binJava)) {
-        return binJava;
-    }
-    // Maybe javaHome IS the bin directory
-    return path.join(javaHome, exe);
+    return getJavaExecutableFromHome(javaHome, process.platform, fs.existsSync);
 }
 
 function validateCriticalPluginJars(serverDir: string): boolean {
-    const pluginsDir = path.join(serverDir, 'plugins');
-    const criticalJars = fs.readdirSync(pluginsDir).filter(
-        name => name.endsWith('.jar') && (
-            name.startsWith('org.eclipse.jdt.core_') ||
-            name.startsWith('org.eclipse.jdt.groovy.core_') ||
-            name.startsWith('org.eclipse.groovy.ls.core_') ||
-            name.startsWith('org.codehaus.groovy_')
-        )
-    );
-    const minJarSize = 50_000;
-
-    for (const jar of criticalJars) {
-        const jarPath = path.join(pluginsDir, jar);
-        try {
-            const stat = fs.statSync(jarPath);
-            if (stat.size >= minJarSize) {
-                continue;
-            }
-
-            const sizeKB = (stat.size / 1024).toFixed(1);
-            outputChannel.appendLine(`WARNING: ${jar} appears corrupt (${sizeKB} KB — expected several MB)`);
-            updateStatusBar('Error', `Corrupt JAR: ${jar}`);
-            window.showErrorMessage(
-                `Groovy Language Server: ${jar} appears corrupt (only ${sizeKB} KB). ` +
-                'Please rebuild the server with: ./gradlew :org.eclipse.groovy.ls.product:assembleProduct'
-            );
-            return false;
-        } catch {
-            // Best effort only — let Equinox report any deeper JAR issue.
-        }
+    const corruptJar = findCorruptCriticalPluginJar(serverDir, fs);
+    if (!corruptJar) {
+        return true;
     }
 
-    return true;
+    const sizeKB = (corruptJar.size / 1024).toFixed(1);
+    outputChannel.appendLine(
+        `WARNING: ${corruptJar.jarName} appears corrupt (${sizeKB} KB — expected several MB)`
+    );
+    updateStatusBar('Error', `Corrupt JAR: ${corruptJar.jarName}`);
+    window.showErrorMessage(
+        `Groovy Language Server: ${corruptJar.jarName} appears corrupt (only ${sizeKB} KB). ` +
+        'Please rebuild the server with: ./gradlew :org.eclipse.groovy.ls.product:assembleProduct'
+    );
+    return false;
 }
 
 function buildInitializationOptions(): Record<string, unknown> | undefined {
     const config = workspace.getConfiguration('groovy');
-    const initOptions: Record<string, unknown> = {
+    const initOptions = buildInitializationOptionsFromSettings({
         delegatedClasspathStartup: cachedJavaApi !== null,
-    };
-    const requestPoolSize = config.get<number>('ls.requestPoolSize', 0);
-    const requestQueueSize = config.get<number>('ls.requestQueueSize', 64);
-    const backgroundPoolSize = config.get<number>('ls.backgroundPoolSize', 0);
-    const backgroundQueueSize = config.get<number>('ls.backgroundQueueSize', 128);
-
-    if (requestPoolSize > 0) {
-        initOptions.lspRequestPoolSize = requestPoolSize;
-    }
-    if (requestQueueSize !== 64) {
-        initOptions.lspRequestQueueSize = requestQueueSize;
-    }
-    if (backgroundPoolSize > 0) {
-        initOptions.lspBackgroundPoolSize = backgroundPoolSize;
-    }
-    if (backgroundQueueSize !== 128) {
-        initOptions.lspBackgroundQueueSize = backgroundQueueSize;
-    }
+        requestPoolSize: config.get<number>('ls.requestPoolSize', 0),
+        requestQueueSize: config.get<number>('ls.requestQueueSize', 64),
+        backgroundPoolSize: config.get<number>('ls.backgroundPoolSize', 0),
+        backgroundQueueSize: config.get<number>('ls.backgroundQueueSize', 128),
+    });
 
     return Object.keys(initOptions).length > 0 ? initOptions : undefined;
 }
@@ -1874,18 +1591,9 @@ function sendClasspathUpdateNotification(
     languageClient: LanguageClient,
     payload: ClasspathNotificationPayload
 ): boolean {
-    const projectKey = payload.projectUri || payload.projectPath || 'unknown-project';
-    const fingerprint = JSON.stringify({
-        projectPath: payload.projectPath ?? '',
-        entries: [...payload.entries].sort(),
-        hasJarEntries: payload.hasJarEntries,
-    });
-
-    if (sentClasspathFingerprints.get(projectKey) === fingerprint) {
+    if (!recordClasspathNotificationFingerprint(sentClasspathFingerprints, payload)) {
         return false;
     }
-
-    sentClasspathFingerprints.set(projectKey, fingerprint);
     languageClient.sendNotification('groovy/classpathUpdate', payload);
     return true;
 }
@@ -1915,19 +1623,9 @@ async function getJavaMajorVersion(javaExecutable: string): Promise<number | und
         });
 
         const versionText = `${stdout}\n${stderr}`;
-        const match = /version\s+"([^"]+)"/i.exec(versionText);
-        if (!match) {
+        const majorVersion = parseJavaMajorVersion(versionText);
+        if (majorVersion === undefined) {
             outputChannel.appendLine('[java] Unable to parse java -version output; continuing without a strict version gate.');
-            return undefined;
-        }
-
-        const rawVersion = match[1];
-        const majorToken = rawVersion.startsWith('1.')
-            ? rawVersion.split('.')[1]
-            : rawVersion.split(/[.+-]/)[0];
-        const majorVersion = Number.parseInt(majorToken, 10);
-        if (Number.isNaN(majorVersion)) {
-            outputChannel.appendLine(`[java] Unable to parse Java major version from: ${rawVersion}`);
             return undefined;
         }
 
@@ -1943,32 +1641,69 @@ async function getJavaMajorVersion(javaExecutable: string): Promise<number | und
  * Looks for server/ relative to the extension root.
  */
 function resolveServerDir(context: ExtensionContext): string | undefined {
-    const candidates = [
-        path.join(context.extensionPath, 'server'),
-        path.join(context.extensionPath, '..', 'org.eclipse.groovy.ls.product', 'build', 'product'),
-        path.join(context.extensionPath, '..', 'org.eclipse.groovy.ls.product', 'target', 'repository'),
-    ];
-
-    for (const candidate of candidates) {
-        const pluginsDir = path.join(candidate, 'plugins');
-        if (fs.existsSync(pluginsDir)) {
-            return candidate;
-        }
-    }
-
-    return undefined;
+    return resolveServerDirFromExtensionPath(context.extensionPath, fs.existsSync);
 }
 
 /**
  * Find the Equinox launcher JAR in the server's plugins directory.
  */
 function findLauncherJar(serverDir: string): string | undefined {
-    const pluginsDir = path.join(serverDir, 'plugins');
-    if (!fs.existsSync(pluginsDir)) {
-        return undefined;
-    }
-
-    const entries = fs.readdirSync(pluginsDir);
-    const launcher = entries.find(name => name.startsWith('org.eclipse.equinox.launcher_') && name.endsWith('.jar'));
-    return launcher ? path.join(pluginsDir, launcher) : undefined;
+    return findLauncherJarInServerDir(serverDir, fs.existsSync, fs.readdirSync);
 }
+
+export const __testing = {
+    setOutputChannel(value: OutputChannel): void {
+        outputChannel = value;
+    },
+    setStatusBarItem(value: StatusBarItem): void {
+        statusBarItem = value;
+    },
+    setClient(value: LanguageClient | undefined): void {
+        client = value;
+    },
+    getClient(): LanguageClient | undefined {
+        return client;
+    },
+    setActiveServerSession(value: ServerSessionScope | undefined): void {
+        activeServerSession = value;
+    },
+    getActiveServerSession(): ServerSessionScope | undefined {
+        return activeServerSession;
+    },
+    setCachedJavaApi(value: any): void {
+        cachedJavaApi = value;
+    },
+    setIsRestarting(value: boolean): void {
+        isRestarting = value;
+    },
+    clearSentClasspathFingerprints(): void {
+        sentClasspathFingerprints.clear();
+    },
+    createServerSessionScope,
+    addSessionDisposables,
+    isServerSessionActive,
+    disposeServerSessionScope,
+    stopLanguageServer,
+    beginStartupTrace,
+    markStartupPhase,
+    logStartupDuration,
+    collectProjectRootMap,
+    invalidateProjectRootMapCache,
+    getOpenGroovyDocumentUris,
+    findRepresentativeSourceUri,
+    resolveGradleClasspath,
+    updateStatusBar,
+    activateJavaExtension,
+    startLanguageServer,
+    initJavaExtensionClasspath,
+    resolveJavaHome,
+    resolveJavaExecutableOrShowError,
+    getJavaExecutable,
+    validateCriticalPluginJars,
+    buildInitializationOptions,
+    sendClasspathUpdateNotification,
+    toError,
+    getJavaMajorVersion,
+    resolveServerDir,
+    findLauncherJar,
+};

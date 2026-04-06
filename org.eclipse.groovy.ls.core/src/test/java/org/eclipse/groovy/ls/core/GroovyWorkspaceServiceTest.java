@@ -16,9 +16,12 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -34,6 +37,7 @@ import org.eclipse.lsp4j.SymbolKind;
 import org.eclipse.lsp4j.TextEdit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import com.google.gson.JsonObject;
 
@@ -871,6 +875,96 @@ class GroovyWorkspaceServiceTest {
                 assertEquals(List.of(), cachedWorkspaceGroovyFiles.get());
         assertEquals(0L, timestampField.getLong(service));
     }
+
+        @Test
+        @SuppressWarnings("unchecked")
+        void collectWorkspaceGroovyFilesFallsBackToFileSystemAndSkipsBuildOutput(@TempDir Path tempDir) throws Exception {
+                Path sourceFile = tempDir.resolve("src/main/groovy/demo/App.groovy");
+                Path buildFile = tempDir.resolve("build/generated/Skip.groovy");
+                Files.createDirectories(sourceFile.getParent());
+                Files.createDirectories(buildFile.getParent());
+                Files.writeString(sourceFile, "package demo\nclass App {}\n");
+                Files.writeString(buildFile, "class Skip {}\n");
+
+                Field serverField = GroovyWorkspaceService.class.getDeclaredField("server");
+                serverField.setAccessible(true);
+                GroovyLanguageServer server = (GroovyLanguageServer) serverField.get(service);
+
+                Field workspaceRootField = GroovyLanguageServer.class.getDeclaredField("workspaceRoot");
+                workspaceRootField.setAccessible(true);
+                workspaceRootField.set(server, sourceFile.getParent().getParent().getParent().getParent().toUri().toString());
+
+                List<Path> result = (List<Path>) invoke("collectWorkspaceGroovyFiles",
+                                new Class<?>[] {}, new Object[] {});
+
+                assertTrue(result.contains(sourceFile));
+                assertFalse(result.contains(buildFile));
+        }
+
+        @Test
+        void didChangeConfigurationDelegatesFormatterAndInlayHintSettings() throws Exception {
+                GroovyLanguageServer server = new GroovyLanguageServer();
+                GroovyTextDocumentService textDocumentService = mock(GroovyTextDocumentService.class);
+
+                Field textDocumentServiceField = GroovyLanguageServer.class.getDeclaredField("textDocumentService");
+                textDocumentServiceField.setAccessible(true);
+                textDocumentServiceField.set(server, textDocumentService);
+
+                GroovyWorkspaceService workspaceService = new GroovyWorkspaceService(server, new DocumentManager());
+
+                JsonObject variableTypes = new JsonObject();
+                variableTypes.addProperty("enabled", true);
+                JsonObject parameterNames = new JsonObject();
+                parameterNames.addProperty("enabled", false);
+                JsonObject closureParameterTypes = new JsonObject();
+                closureParameterTypes.addProperty("enabled", true);
+                JsonObject methodReturnTypes = new JsonObject();
+                methodReturnTypes.addProperty("enabled", false);
+
+                JsonObject inlayHints = new JsonObject();
+                inlayHints.add("variableTypes", variableTypes);
+                inlayHints.add("parameterNames", parameterNames);
+                inlayHints.add("closureParameterTypes", closureParameterTypes);
+                inlayHints.add("methodReturnTypes", methodReturnTypes);
+
+                JsonObject format = new JsonObject();
+                format.addProperty("settingsUrl", "file:///tmp/formatter.xml");
+
+                JsonObject groovy = new JsonObject();
+                groovy.add("format", format);
+                groovy.add("inlayHints", inlayHints);
+
+                JsonObject settings = new JsonObject();
+                settings.add("groovy", groovy);
+
+                workspaceService.didChangeConfiguration(new org.eclipse.lsp4j.DidChangeConfigurationParams(settings));
+
+                verify(textDocumentService).updateFormatterProfile("file:///tmp/formatter.xml");
+                org.mockito.ArgumentCaptor<InlayHintSettings> settingsCaptor =
+                        org.mockito.ArgumentCaptor.forClass(InlayHintSettings.class);
+                verify(textDocumentService).updateInlayHintSettings(settingsCaptor.capture());
+                InlayHintSettings captured = settingsCaptor.getValue();
+                assertTrue(captured.isVariableTypesEnabled());
+                assertFalse(captured.isParameterNamesEnabled());
+                assertTrue(captured.isClosureParameterTypesEnabled());
+                assertFalse(captured.isMethodReturnTypesEnabled());
+        }
+
+        @Test
+        void didChangeConfigurationIgnoresNonJsonSettings() throws Exception {
+                GroovyLanguageServer server = new GroovyLanguageServer();
+                GroovyTextDocumentService textDocumentService = mock(GroovyTextDocumentService.class);
+
+                Field textDocumentServiceField = GroovyLanguageServer.class.getDeclaredField("textDocumentService");
+                textDocumentServiceField.setAccessible(true);
+                textDocumentServiceField.set(server, textDocumentService);
+
+                GroovyWorkspaceService workspaceService = new GroovyWorkspaceService(server, new DocumentManager());
+                workspaceService.didChangeConfiguration(new org.eclipse.lsp4j.DidChangeConfigurationParams("not-json"));
+
+                verify(textDocumentService, org.mockito.Mockito.never()).updateFormatterProfile(org.mockito.ArgumentMatchers.any());
+                verify(textDocumentService, org.mockito.Mockito.never()).updateInlayHintSettings(org.mockito.ArgumentMatchers.any());
+        }
 
     // ---- Helpers ----
 

@@ -497,6 +497,59 @@ class GroovyLanguageServerTest {
         assertTrue((Boolean) getDeclaredFieldValue(result, "hasJarEntries"));
     }
 
+        @Test
+        void applyInitializationOptionsReconfiguresRequestAndBackgroundPools() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        JsonObject options = new JsonObject();
+        options.addProperty("lspRequestPoolSize", 7);
+        options.addProperty("lspRequestQueueSize", 33);
+        options.addProperty("lspBackgroundPoolSize", 5);
+        options.addProperty("lspBackgroundQueueSize", 77);
+        options.addProperty("delegatedClasspathStartup", true);
+
+        invokePrivate(server, "applyInitializationOptions",
+            new Class<?>[] { Object.class }, new Object[] { options });
+
+        Object service = getField(server, "textDocumentService");
+        java.util.concurrent.ThreadPoolExecutor fastExecutor =
+            (java.util.concurrent.ThreadPoolExecutor) getDeclaredFieldValue(service, "lspRequestExecutor");
+        java.util.concurrent.ThreadPoolExecutor backgroundExecutor =
+            (java.util.concurrent.ThreadPoolExecutor) getDeclaredFieldValue(service, "lspBackgroundExecutor");
+
+        assertEquals(7, fastExecutor.getCorePoolSize());
+        assertEquals(33, fastExecutor.getQueue().remainingCapacity());
+        assertEquals(5, backgroundExecutor.getCorePoolSize());
+        assertEquals(77, backgroundExecutor.getQueue().remainingCapacity());
+        assertTrue((Boolean) getField(server, "delegatedClasspathStartupExpected"));
+
+        server.shutdown().join();
+        }
+
+        @Test
+        void applyInitializationOptionsSupportsJsonElementAndIgnoresInvalidValues() throws Exception {
+        GroovyLanguageServer server = new GroovyLanguageServer();
+        Object service = getField(server, "textDocumentService");
+        java.util.concurrent.ThreadPoolExecutor originalFastExecutor =
+            (java.util.concurrent.ThreadPoolExecutor) getDeclaredFieldValue(service, "lspRequestExecutor");
+        java.util.concurrent.ThreadPoolExecutor originalBackgroundExecutor =
+            (java.util.concurrent.ThreadPoolExecutor) getDeclaredFieldValue(service, "lspBackgroundExecutor");
+
+        JsonObject options = new JsonObject();
+        options.addProperty("lspRequestPoolSize", 0);
+        options.addProperty("lspRequestQueueSize", -1);
+        options.addProperty("lspBackgroundPoolSize", 0);
+        options.addProperty("lspBackgroundQueueSize", -1);
+
+        invokePrivate(server, "applyInitializationOptions",
+            new Class<?>[] { Object.class }, new Object[] { com.google.gson.JsonParser.parseString(options.toString()) });
+
+        assertEquals(originalFastExecutor, getDeclaredFieldValue(service, "lspRequestExecutor"));
+        assertEquals(originalBackgroundExecutor, getDeclaredFieldValue(service, "lspBackgroundExecutor"));
+        assertFalse((Boolean) getField(server, "delegatedClasspathStartupExpected"));
+
+        server.shutdown().join();
+        }
+
     // ================================================================
     // areDiagnosticsEnabled / isBuildInProgress / hasClasspathForProject tests
     // ================================================================

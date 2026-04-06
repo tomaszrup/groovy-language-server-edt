@@ -56,6 +56,51 @@ describe('serverConfig', () => {
         assert.equal(fs.readFileSync(path.join(second.configDir, 'config.ini'), 'utf8'), 'osgi.bundles=beta\n');
         assert.equal(fs.existsSync(path.join(second.configDir, 'runtime.cache')), false);
     });
+
+    it('refreshes the writable config when the extension version changes', () => {
+        const serverDir = createServerDir(tempDir, 'osgi.bundles=alpha\n');
+        const storagePath = path.join(tempDir, 'storage');
+
+        prepareWritableConfigDir({
+            serverDir,
+            storagePath,
+            platform: 'linux',
+            extensionVersion: '1.2.12',
+        });
+
+        const result = prepareWritableConfigDir({
+            serverDir,
+            storagePath,
+            platform: 'linux',
+            extensionVersion: '1.2.13',
+        });
+
+        assert.equal(result.resetConfig, true);
+        assert.equal(result.reason, 'extension version 1.2.12 -> 1.2.13');
+    });
+
+    it('refreshes the writable config when the state marker is invalid', () => {
+        const serverDir = createServerDir(tempDir, 'osgi.bundles=alpha\n');
+        const storagePath = path.join(tempDir, 'storage');
+
+        prepareWritableConfigDir({
+            serverDir,
+            storagePath,
+            platform: 'linux',
+            extensionVersion: '1.2.12',
+        });
+        fs.writeFileSync(path.join(storagePath, 'groovy_config_state.json'), '{invalid json', 'utf8');
+
+        const result = prepareWritableConfigDir({
+            serverDir,
+            storagePath,
+            platform: 'linux',
+            extensionVersion: '1.2.12',
+        });
+
+        assert.equal(result.resetConfig, true);
+        assert.equal(result.reason, 'invalid Equinox config marker');
+    });
 });
 
 function createServerDir(rootDir: string, configIni: string): string {

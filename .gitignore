@@ -11,6 +11,8 @@
 vscode-extension/node_modules/
 vscode-extension/dist/
 vscode-extension/out/
+vscode-extension/coverage/
+vscode-extension/.coverage-out/
 vscode-extension/server/
 vscode-extension/*.vsix
 vscode-extension/.playwright-cache/
