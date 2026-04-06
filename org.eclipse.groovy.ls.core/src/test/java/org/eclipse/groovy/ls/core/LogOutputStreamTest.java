@@ -11,7 +11,6 @@ package org.eclipse.groovy.ls.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 
 import org.junit.jupiter.api.Test;
@@ -20,29 +19,25 @@ class LogOutputStreamTest {
 
     @Test
     void writeIgnoresCarriageReturnAndFlushClearsBuffer() throws Exception {
-        LogOutputStream stream = new LogOutputStream(LogOutputStream.Level.INFO);
         byte[] bytes = "hello\r\nworld".getBytes(StandardCharsets.UTF_8);
 
-        stream.write(bytes, 0, bytes.length);
-        stream.flush();
+        try (LogOutputStream stream = new LogOutputStream(LogOutputStream.Level.INFO)) {
+            stream.write(bytes, 0, bytes.length);
+            stream.flush();
 
-        assertEquals("", getBuffer(stream));
+            assertEquals("", stream.getBufferedText());
+        }
     }
 
     @Test
     void writeWithOffsetOnlyAppendsSelectedRange() throws Exception {
-        LogOutputStream stream = new LogOutputStream(LogOutputStream.Level.ERROR);
         byte[] bytes = "XXabcYY".getBytes(StandardCharsets.UTF_8);
 
-        stream.write(bytes, 2, 3);
+        try (LogOutputStream stream = new LogOutputStream(LogOutputStream.Level.ERROR)) {
+            stream.write(bytes, 2, 3);
 
-        assertEquals("abc", getBuffer(stream));
-    }
-
-    private String getBuffer(LogOutputStream stream) throws Exception {
-        Field field = LogOutputStream.class.getDeclaredField("buffer");
-        field.setAccessible(true);
-        return field.get(stream).toString();
+            assertEquals("abc", stream.getBufferedText());
+        }
     }
 }
 

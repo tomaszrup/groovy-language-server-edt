@@ -10,7 +10,6 @@
 package org.eclipse.groovy.ls.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -21,16 +20,13 @@ import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 
 import org.eclipse.groovy.ls.core.providers.DiagnosticsProvider;
-import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.services.LanguageClient;
 import org.junit.jupiter.api.Test;
@@ -66,13 +62,13 @@ class DocumentManagerPreviewBrowsingTest {
         manager.didOpen(uri, "class A {}");
 
         // The pending future should exist immediately after didOpen
-        Map<String, Future<?>> pending = getPendingOpenFutures(manager);
-        String normalizedUri = DocumentManager.normalizeUri(uri);
+        Future<?> pending = manager.getPendingOpenFuture(uri);
 
         // didClose should cancel and remove it
         manager.didClose(uri);
 
-        assertFalse(pending.containsKey(normalizedUri),
+        assertNotNull(pending);
+        assertNull(manager.getPendingOpenFuture(uri),
                 "Pending open future should be removed on didClose");
         assertNull(manager.getContent(uri),
                 "Content should be cleared on didClose");
@@ -95,15 +91,14 @@ class DocumentManagerPreviewBrowsingTest {
             "Background didOpen work should settle after all preview files are closed");
 
         // Verify no working copies are leaked
-        Map<String, ICompilationUnit> workingCopies = getWorkingCopies(manager);
-        assertTrue(workingCopies.isEmpty(),
+        assertEquals(0, manager.getWorkingCopyCount(),
                 "No working copies should remain after all files are closed, "
-                + "but found: " + workingCopies.size());
+            + "but found: " + manager.getWorkingCopyCount());
 
         // Verify no pending futures are leaked
-        Map<String, Future<?>> pending = getPendingOpenFutures(manager);
-        assertTrue(pending.isEmpty(),
-                "No pending open futures should remain, but found: " + pending.size());
+        assertEquals(0, manager.getPendingOpenFutureCount(),
+            "No pending open futures should remain, but found: "
+            + manager.getPendingOpenFutureCount());
     }
 
     @Test
@@ -144,9 +139,7 @@ class DocumentManagerPreviewBrowsingTest {
 
         manager.didOpen(uri, "class Version1 {}");
 
-        Map<String, Future<?>> pending = getPendingOpenFutures(manager);
-        String normalizedUri = DocumentManager.normalizeUri(uri);
-        Future<?> firstFuture = pending.get(normalizedUri);
+        Future<?> firstFuture = manager.getPendingOpenFuture(uri);
 
         // Close and reopen with different content
         manager.didClose(uri);
@@ -297,29 +290,15 @@ class DocumentManagerPreviewBrowsingTest {
         return file.toUri().toString();
     }
 
-    @SuppressWarnings("unchecked")
-    private Map<String, Future<?>> getPendingOpenFutures(DocumentManager manager) throws Exception {
-        Field field = DocumentManager.class.getDeclaredField("pendingOpenFutures");
-        field.setAccessible(true);
-        return (Map<String, Future<?>>) field.get(manager);
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, ICompilationUnit> getWorkingCopies(DocumentManager manager) throws Exception {
-        Field field = DocumentManager.class.getDeclaredField("workingCopies");
-        field.setAccessible(true);
-        return (Map<String, ICompilationUnit>) field.get(manager);
-    }
-
     private boolean awaitOpenStateClean(DocumentManager manager, long timeoutMs) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         while (System.nanoTime() < deadline) {
-            if (getWorkingCopies(manager).isEmpty() && getPendingOpenFutures(manager).isEmpty()) {
+            if (manager.getWorkingCopyCount() == 0 && manager.getPendingOpenFutureCount() == 0) {
                 return true;
             }
             pauseMillis(25);
         }
-        return getWorkingCopies(manager).isEmpty() && getPendingOpenFutures(manager).isEmpty();
+        return manager.getWorkingCopyCount() == 0 && manager.getPendingOpenFutureCount() == 0;
     }
 
     private boolean awaitWorkingCopyReleased(DocumentManager manager, String uri, long timeoutMs) {

@@ -36,6 +36,10 @@ public class LogOutputStream extends OutputStream {
         this.level = level;
     }
 
+    String getBufferedText() {
+        return buffer.toString();
+    }
+
     @Override
     public void write(int b) throws IOException {
         if (b == '\n') {

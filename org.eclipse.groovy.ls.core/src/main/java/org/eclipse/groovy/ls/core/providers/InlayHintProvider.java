@@ -133,6 +133,10 @@ public class InlayHintProvider {
         }
     }
 
+    public InlayHintSettings getCurrentSettings() {
+        return currentSettings.get();
+    }
+
     /**
      * Compute inlay hints for the given document range using the current settings.
      */

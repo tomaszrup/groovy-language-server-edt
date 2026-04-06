@@ -22,6 +22,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
 import java.util.function.Consumer;
 
 import org.eclipse.jdt.core.IJavaElement;
@@ -122,7 +125,7 @@ public class DocumentManager {
      * creation + initial reconcile). Uses a bounded pool so that rapid
      * file previewing doesn't exhaust the shared ForkJoinPool.
      */
-    private final java.util.concurrent.ExecutorService didOpenExecutor =
+    private volatile ExecutorService didOpenExecutor =
             java.util.concurrent.Executors.newFixedThreadPool(
                     Math.max(2, Math.min(3, Runtime.getRuntime().availableProcessors() - 1)), r -> {
                 Thread t = new Thread(r, "groovy-ls-didOpen");
@@ -282,7 +285,7 @@ public class DocumentManager {
     /**
      * Convert a file URI (any encoding variant) to a local file path.
      */
-    private static String uriToFilePath(String uri) {
+    static String uriToFilePath(String uri) {
         // Try standard URI parsing first (works for properly encoded URIs)
         try {
             URI parsed = new URI(uri);
@@ -413,7 +416,7 @@ public class DocumentManager {
         }
     }
 
-    private void refreshWorkingCopy(String uri, String trigger) {
+    void refreshWorkingCopy(String uri, String trigger) {
         if (!openDocuments.containsKey(uri)) {
             GroovyLanguageServerPlugin.logInfo(
                     trigger + " background task skipped (already closed): " + uri);
@@ -643,6 +646,78 @@ public class DocumentManager {
      */
     public ICompilationUnit getWorkingCopy(String uri) {
         return workingCopies.get(normalizeUri(uri));
+    }
+
+    Map<String, ICompilationUnit> workingCopiesView() {
+        return workingCopies;
+    }
+
+    Map<String, StringBuilder> openDocumentsView() {
+        return openDocuments;
+    }
+
+    Map<String, Long> documentVersionsView() {
+        return documentVersions;
+    }
+
+    Future<?> getPendingOpenFuture(String uri) {
+        return pendingOpenFutures.get(normalizeUri(uri));
+    }
+
+    Map<String, Future<?>> pendingOpenFuturesView() {
+        return pendingOpenFutures;
+    }
+
+    int getPendingOpenFutureCount() {
+        return pendingOpenFutures.size();
+    }
+
+    int getWorkingCopyCount() {
+        return workingCopies.size();
+    }
+
+    ExecutorService getDidOpenExecutor() {
+        return didOpenExecutor;
+    }
+
+    void setDidOpenExecutor(ExecutorService executor) {
+        this.didOpenExecutor = executor;
+    }
+
+    void addClientUriMapping(String documentUri, String clientUri) {
+        clientUris.put(normalizeUri(documentUri), clientUri);
+    }
+
+    int getClientUriCount() {
+        return clientUris.size();
+    }
+
+    void addImportedProjectRoot(String projectRoot) {
+        importedProjectRoots.add(projectRoot);
+    }
+
+    int getImportedProjectRootCount() {
+        return importedProjectRoots.size();
+    }
+
+    void putCodeSelectCachePlaceholder(String key) {
+        codeSelectCache.put(key, null);
+    }
+
+    int getCodeSelectCacheSize() {
+        return codeSelectCache.size();
+    }
+
+    void putPendingStandaloneParseFuture(String documentUri, ScheduledFuture<?> future) {
+        pendingStandaloneParseFutures.put(normalizeUri(documentUri), future);
+    }
+
+    int getPendingStandaloneParseFutureCount() {
+        return pendingStandaloneParseFutures.size();
+    }
+
+    boolean hasLanguageClient() {
+        return languageClient != null;
     }
 
     /**
@@ -1106,7 +1181,7 @@ public class DocumentManager {
         return null;
     }
 
-    private int classCount(ModuleNode module) {
+    int classCount(ModuleNode module) {
         return module.getClasses() != null ? module.getClasses().size() : 0;
     }
 
@@ -1162,7 +1237,7 @@ public class DocumentManager {
      * and dynamically imports it as an Eclipse JDT project so that JDT
      * features (completion, navigation, diagnostics) become available.
      */
-    private ICompilationUnit findCompilationUnit(String uriString) {
+    ICompilationUnit findCompilationUnit(String uriString) {
         try {
             URI uri = URI.create(uriString);
             if (!"file".equals(uri.getScheme())) {
@@ -1345,7 +1420,7 @@ public class DocumentManager {
      * Returns the deepest directory that contains a build marker, or
      * {@code null} if no marker is found up to the filesystem root.
      */
-    private java.io.File detectProjectRoot(java.io.File file) {
+    java.io.File detectProjectRoot(java.io.File file) {
         java.io.File dir = file.isDirectory() ? file : file.getParentFile();
         java.io.File bestCandidate = null;
 
@@ -1490,7 +1565,7 @@ public class DocumentManager {
      * @param project    the Eclipse project (in the metadata area)
      * @param linkedRoot the linked folder pointing to the real directory
      */
-    private void configureExternalProjectClasspath(IProject project, IFolder linkedRoot) {
+    void configureExternalProjectClasspath(IProject project, IFolder linkedRoot) {
         try {
             if (linkedRoot == null) {
                 return;
@@ -1601,7 +1676,7 @@ public class DocumentManager {
      * Check if {@code srcDir} conflicts with any already-added source directory.
      * JDT does not allow nesting source folders.
      */
-    private boolean hasNestedConflict(String srcDir, Set<String> addedSrcDirs) {
+    boolean hasNestedConflict(String srcDir, Set<String> addedSrcDirs) {
         for (String existing : addedSrcDirs) {
             if (existing.startsWith(srcDir + "/") || srcDir.startsWith(existing + "/")) {
                 return true;
@@ -1613,7 +1688,7 @@ public class DocumentManager {
     /**
      * Convert an LSP {@link org.eclipse.lsp4j.Position} to a character offset.
      */
-    private int positionToOffset(CharSequence content, org.eclipse.lsp4j.Position position) {
+    int positionToOffset(CharSequence content, org.eclipse.lsp4j.Position position) {
         int line = 0;
         int offset = 0;
 

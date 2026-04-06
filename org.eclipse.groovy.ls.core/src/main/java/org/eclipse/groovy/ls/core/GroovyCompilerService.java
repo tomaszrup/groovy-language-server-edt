@@ -268,7 +268,7 @@ public class GroovyCompilerService {
         return error != null && !isClasspathDependentFailure(error.getMessage());
     }
 
-    private boolean isClasspathDependentFailure(String message) {
+    boolean isClasspathDependentFailure(String message) {
         if (message == null || message.isBlank()) {
             return false;
         }

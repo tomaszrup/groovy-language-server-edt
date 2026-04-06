@@ -23,7 +23,6 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
@@ -779,69 +778,44 @@ class DocumentManagerCoreMethodsTest {
     // ---- Helpers ----
 
     private int invokePositionToOffset(DocumentManager manager, String content, org.eclipse.lsp4j.Position position) throws Exception {
-        Method method = DocumentManager.class.getDeclaredMethod("positionToOffset", CharSequence.class, org.eclipse.lsp4j.Position.class);
-        method.setAccessible(true);
-        return (int) method.invoke(manager, new StringBuilder(content), position);
+        return manager.positionToOffset(new StringBuilder(content), position);
     }
 
     private java.io.File invokeDetectProjectRoot(DocumentManager manager, java.io.File file) throws Exception {
-        Method method = DocumentManager.class.getDeclaredMethod("detectProjectRoot", java.io.File.class);
-        method.setAccessible(true);
-        return (java.io.File) method.invoke(manager, file);
+        return manager.detectProjectRoot(file);
     }
 
     private ICompilationUnit invokeFindCompilationUnit(DocumentManager manager, String uri) throws Exception {
-        Method method = DocumentManager.class.getDeclaredMethod("findCompilationUnit", String.class);
-        method.setAccessible(true);
-        return (ICompilationUnit) method.invoke(manager, uri);
+        return manager.findCompilationUnit(uri);
     }
 
     private void invokeRefreshWorkingCopy(DocumentManager manager, String uri, String trigger)
             throws Exception {
-        Method method = DocumentManager.class.getDeclaredMethod(
-                "refreshWorkingCopy", String.class, String.class);
-        method.setAccessible(true);
-        method.invoke(manager, uri, trigger);
+        manager.refreshWorkingCopy(uri, trigger);
     }
 
-    @SuppressWarnings("unchecked")
     private java.util.Map<String, ICompilationUnit> getWorkingCopies(DocumentManager manager) throws Exception {
-        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("workingCopies");
-        field.setAccessible(true);
-        return (java.util.Map<String, ICompilationUnit>) field.get(manager);
+        return manager.workingCopiesView();
     }
 
-    @SuppressWarnings("unchecked")
     private Map<String, StringBuilder> getOpenDocuments(DocumentManager manager) throws Exception {
-        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("openDocuments");
-        field.setAccessible(true);
-        return (Map<String, StringBuilder>) field.get(manager);
+        return manager.openDocumentsView();
     }
 
-    @SuppressWarnings("unchecked")
     private Map<String, Long> getDocumentVersions(DocumentManager manager) throws Exception {
-        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("documentVersions");
-        field.setAccessible(true);
-        return (Map<String, Long>) field.get(manager);
+        return manager.documentVersionsView();
     }
 
-    @SuppressWarnings("unchecked")
     private Map<String, Future<?>> getPendingOpenFutures(DocumentManager manager) throws Exception {
-        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("pendingOpenFutures");
-        field.setAccessible(true);
-        return (Map<String, Future<?>>) field.get(manager);
+        return manager.pendingOpenFuturesView();
     }
 
     private ExecutorService getDidOpenExecutor(DocumentManager manager) throws Exception {
-        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("didOpenExecutor");
-        field.setAccessible(true);
-        return (ExecutorService) field.get(manager);
+        return manager.getDidOpenExecutor();
     }
 
     private void setDidOpenExecutor(DocumentManager manager, ExecutorService executor) throws Exception {
-        java.lang.reflect.Field field = DocumentManager.class.getDeclaredField("didOpenExecutor");
-        field.setAccessible(true);
-        field.set(manager, executor);
+        manager.setDidOpenExecutor(executor);
     }
 
     // ================================================================
@@ -849,9 +823,7 @@ class DocumentManagerCoreMethodsTest {
     // ================================================================
 
     private String invokeUriToFilePath(String uri) throws Exception {
-        Method m = DocumentManager.class.getDeclaredMethod("uriToFilePath", String.class);
-        m.setAccessible(true);
-        return (String) m.invoke(null, uri);
+        return DocumentManager.uriToFilePath(uri);
     }
 
     @Test
@@ -895,9 +867,7 @@ class DocumentManagerCoreMethodsTest {
     // ================================================================
 
     private int invokeClassCount(DocumentManager manager, ModuleNode module) throws Exception {
-        Method m = DocumentManager.class.getDeclaredMethod("classCount", ModuleNode.class);
-        m.setAccessible(true);
-        return (int) m.invoke(manager, module);
+        return manager.classCount(module);
     }
 
     @Test
@@ -942,9 +912,7 @@ class DocumentManagerCoreMethodsTest {
     // ================================================================
 
     private boolean invokeHasNestedConflict(DocumentManager manager, String srcDir, java.util.Set<String> addedSrcDirs) throws Exception {
-        Method m = DocumentManager.class.getDeclaredMethod("hasNestedConflict", String.class, java.util.Set.class);
-        m.setAccessible(true);
-        return (boolean) m.invoke(manager, srcDir, addedSrcDirs);
+        return manager.hasNestedConflict(srcDir, addedSrcDirs);
     }
 
     @Test
@@ -1079,39 +1047,23 @@ class DocumentManagerCoreMethodsTest {
     }
 
     @Test
-    @SuppressWarnings({ "rawtypes", "unchecked" })
     void disposeClearsAuxiliaryCachesAndClientState() throws Exception {
         DocumentManager dm = new DocumentManager();
 
-        java.lang.reflect.Field clientUrisField = DocumentManager.class.getDeclaredField("clientUris");
-        clientUrisField.setAccessible(true);
-        ((java.util.Map) clientUrisField.get(dm)).put("file:///aux.groovy", "file:///aux.groovy");
-
-        java.lang.reflect.Field importedProjectRootsField = DocumentManager.class.getDeclaredField("importedProjectRoots");
-        importedProjectRootsField.setAccessible(true);
-        ((java.util.Set) importedProjectRootsField.get(dm)).add("/tmp/project");
-
-        java.lang.reflect.Field codeSelectCacheField = DocumentManager.class.getDeclaredField("codeSelectCache");
-        codeSelectCacheField.setAccessible(true);
-        ((java.util.Map) codeSelectCacheField.get(dm)).put("file:///aux.groovy#1:1", null);
-
-        java.lang.reflect.Field pendingStandaloneParseFuturesField =
-                DocumentManager.class.getDeclaredField("pendingStandaloneParseFutures");
-        pendingStandaloneParseFuturesField.setAccessible(true);
-        ((java.util.Map) pendingStandaloneParseFuturesField.get(dm)).put(
-                "file:///aux.groovy", mock(java.util.concurrent.ScheduledFuture.class));
-
-        java.lang.reflect.Field languageClientField = DocumentManager.class.getDeclaredField("languageClient");
-        languageClientField.setAccessible(true);
-        languageClientField.set(dm, mock(LanguageClient.class));
+        dm.addClientUriMapping("file:///aux.groovy", "file:///aux.groovy");
+        dm.addImportedProjectRoot("/tmp/project");
+        dm.putCodeSelectCachePlaceholder("file:///aux.groovy#1:1");
+        dm.putPendingStandaloneParseFuture(
+            "file:///aux.groovy", mock(java.util.concurrent.ScheduledFuture.class));
+        dm.setLanguageClient(mock(LanguageClient.class));
 
         dm.dispose();
 
-        assertTrue(((java.util.Map<?, ?>) clientUrisField.get(dm)).isEmpty());
-        assertTrue(((java.util.Set<?>) importedProjectRootsField.get(dm)).isEmpty());
-        assertTrue(((java.util.Map<?, ?>) codeSelectCacheField.get(dm)).isEmpty());
-        assertTrue(((java.util.Map<?, ?>) pendingStandaloneParseFuturesField.get(dm)).isEmpty());
-        assertNull(languageClientField.get(dm));
+        assertEquals(0, dm.getClientUriCount());
+        assertEquals(0, dm.getImportedProjectRootCount());
+        assertEquals(0, dm.getCodeSelectCacheSize());
+        assertEquals(0, dm.getPendingStandaloneParseFutureCount());
+        assertFalse(dm.hasLanguageClient());
     }
 
     private void waitForCondition(java.util.function.BooleanSupplier condition, long timeoutMs)
@@ -1130,10 +1082,7 @@ class DocumentManagerCoreMethodsTest {
             DocumentManager manager,
             IProject project,
             IFolder linkedRoot) throws Exception {
-        Method method = DocumentManager.class.getDeclaredMethod(
-                "configureExternalProjectClasspath", IProject.class, IFolder.class);
-        method.setAccessible(true);
-        method.invoke(manager, project, linkedRoot);
+        manager.configureExternalProjectClasspath(project, linkedRoot);
     }
 
     private IClasspathEntry mockClasspathEntry(int entryKind, String path) {

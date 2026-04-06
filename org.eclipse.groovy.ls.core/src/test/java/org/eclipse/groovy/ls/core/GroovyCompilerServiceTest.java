@@ -16,7 +16,6 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -79,35 +78,24 @@ class GroovyCompilerServiceTest {
     }
 
     @Test
-    void classpathFailureDetectionTreatsQuotedUnresolvedClassAsClasspathDependent() throws Exception {
+    void classpathFailureDetectionTreatsQuotedUnresolvedClassAsClasspathDependent() {
         GroovyCompilerService service = new GroovyCompilerService();
-        Method method = GroovyCompilerService.class
-                .getDeclaredMethod("isClasspathDependentFailure", String.class);
-        method.setAccessible(true);
-
-        boolean classpathDependent = (boolean) method.invoke(
-                service,
+        boolean classpathDependent = service.isClasspathDependentFailure(
                 "unable to resolve class 'foo.Bar'");
 
         assertTrue(classpathDependent);
     }
 
     @Test
-    void classpathFailureDetectionTreatsWrappedClasspathFailuresAsClasspathDependent() throws Exception {
-    GroovyCompilerService service = new GroovyCompilerService();
-    Method method = GroovyCompilerService.class
-        .getDeclaredMethod("isClasspathDependentFailure", String.class);
-    method.setAccessible(true);
+    void classpathFailureDetectionTreatsWrappedClasspathFailuresAsClasspathDependent() {
+        GroovyCompilerService service = new GroovyCompilerService();
 
-    assertTrue((boolean) method.invoke(
-        service,
-        "Parse error: No such class: foo.Bar -- while compiling"));
-    assertTrue((boolean) method.invoke(
-        service,
-        "Parse error: Groovy:General error during conversion: startup wrapper"));
-    assertTrue((boolean) method.invoke(
-        service,
-        "Internal parse error: unable to resolve class 'foo.Bar'"));
+        assertTrue(service.isClasspathDependentFailure(
+                "Parse error: No such class: foo.Bar -- while compiling"));
+        assertTrue(service.isClasspathDependentFailure(
+                "Parse error: Groovy:General error during conversion: startup wrapper"));
+        assertTrue(service.isClasspathDependentFailure(
+                "Internal parse error: unable to resolve class 'foo.Bar'"));
     }
 
     @Test

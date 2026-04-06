@@ -1367,6 +1367,10 @@ public class GroovyTextDocumentService implements TextDocumentService {
         inlayHintProvider.updateSettingsFromObject(settings);
     }
 
+    org.eclipse.groovy.ls.core.providers.InlayHintSettings currentInlayHintSettings() {
+        return inlayHintProvider.getCurrentSettings();
+    }
+
     void publishDiagnosticsIfEnabled(String uri) {
         if (server.areDiagnosticsEnabled()) {
             String clientUri = documentManager.getClientUri(uri);

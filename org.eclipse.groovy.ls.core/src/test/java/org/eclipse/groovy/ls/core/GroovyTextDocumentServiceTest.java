@@ -633,17 +633,8 @@ class GroovyTextDocumentServiceTest {
                 new org.eclipse.groovy.ls.core.providers.InlayHintSettings(true, false, true, false);
         service.updateInlayHintSettings(settings);
 
-        // Verify the settings were delegated to the InlayHintProvider
-        java.lang.reflect.Field providerField = GroovyTextDocumentService.class.getDeclaredField("inlayHintProvider");
-        providerField.setAccessible(true);
-        org.eclipse.groovy.ls.core.providers.InlayHintProvider provider =
-                (org.eclipse.groovy.ls.core.providers.InlayHintProvider) providerField.get(service);
-        java.lang.reflect.Field settingsField = org.eclipse.groovy.ls.core.providers.InlayHintProvider.class.getDeclaredField("currentSettings");
-        settingsField.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        java.util.concurrent.atomic.AtomicReference<org.eclipse.groovy.ls.core.providers.InlayHintSettings> ref =
-                (java.util.concurrent.atomic.AtomicReference<org.eclipse.groovy.ls.core.providers.InlayHintSettings>) settingsField.get(provider);
-        org.eclipse.groovy.ls.core.providers.InlayHintSettings stored = ref.get();
+        org.eclipse.groovy.ls.core.providers.InlayHintSettings stored =
+            service.currentInlayHintSettings();
         assertNotNull(stored);
     }
 
@@ -1521,11 +1512,8 @@ class GroovyTextDocumentServiceTest {
         throw new NoSuchFieldException(fieldName);
     }
 
-    @SuppressWarnings("unchecked")
     private Map<String, org.eclipse.jdt.core.ICompilationUnit> getWorkingCopies(DocumentManager manager)
             throws Exception {
-        Field field = DocumentManager.class.getDeclaredField("workingCopies");
-        field.setAccessible(true);
-        return (Map<String, org.eclipse.jdt.core.ICompilationUnit>) field.get(manager);
+        return manager.workingCopiesView();
     }
 }

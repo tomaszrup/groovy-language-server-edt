@@ -1156,7 +1156,7 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
         return null;
     }
 
-    private String normalizePath(String path) {
+    String normalizePath(String path) {
         if (path == null || path.isBlank()) {
             return null;
         }
@@ -1194,6 +1194,30 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
 
     public String getWorkspaceRoot() {
         return workspaceRoot;
+    }
+
+    int getExitCode() {
+        return exitCode;
+    }
+
+    java.util.Map<String, String> subprojectPathToEclipseNameView() {
+        return subprojectPathToEclipseName;
+    }
+
+    java.util.Set<String> projectsWithClasspathView() {
+        return projectsWithClasspath;
+    }
+
+    void enqueuePendingClasspathUpdateForTest() {
+        pendingClasspathUpdates.add(new ClasspathUpdateRequest(
+                "file:///workspace/app",
+                "/workspace/app",
+                List.of(),
+                false));
+    }
+
+    int pendingClasspathUpdateCount() {
+        return pendingClasspathUpdates.size();
     }
 
     public boolean areDiagnosticsEnabled() {
@@ -1805,13 +1829,13 @@ public class GroovyLanguageServer implements LanguageServer, LanguageClientAware
      * Find subdirectories that contain source folders (up to 5 levels deep).
      * Depth 5 covers patterns like {@code root/modules/group/subgroup/project}.
      */
-    private List<java.io.File> findSubprojectsWithSources(java.io.File root, String[] srcDirSuffixes) {
+    List<java.io.File> findSubprojectsWithSources(java.io.File root, String[] srcDirSuffixes) {
         List<java.io.File> result = new ArrayList<>();
         scanForSubprojects(root, result, srcDirSuffixes, 0, 5);
         return deduplicateSubprojectsByPath(result);
     }
 
-    private void scanForSubprojects(java.io.File dir, List<java.io.File> result,
+    void scanForSubprojects(java.io.File dir, List<java.io.File> result,
                                      String[] srcDirSuffixes, int depth, int maxDepth) {
         if (depth >= maxDepth || dir == null || !dir.isDirectory()) return;
 

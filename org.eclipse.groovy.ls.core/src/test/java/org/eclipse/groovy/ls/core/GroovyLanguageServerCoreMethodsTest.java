@@ -19,8 +19,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
 import java.io.File;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -127,12 +125,7 @@ class GroovyLanguageServerCoreMethodsTest {
         Files.createDirectories(tempDir.resolve("build/module/src/main/groovy"));
         Files.createDirectories(tempDir.resolve("services/api/src/main/java"));
 
-        @SuppressWarnings("unchecked")
-        List<File> subprojects = (List<File>) invoke(
-                server,
-                "findSubprojectsWithSources",
-                new Class<?>[] {File.class, String[].class},
-                new Object[] {tempDir.toFile(), suffixes});
+        List<File> subprojects = server.findSubprojectsWithSources(tempDir.toFile(), suffixes);
 
         Set<String> paths = subprojects.stream()
                 .map(file -> file.getAbsolutePath().replace('\\', '/'))
@@ -153,11 +146,7 @@ class GroovyLanguageServerCoreMethodsTest {
         Files.createDirectories(root.resolve("level1/level2/src/main/groovy"));
         List<File> result = new ArrayList<>();
 
-        invoke(
-                server,
-                "scanForSubprojects",
-                new Class<?>[] {File.class, List.class, String[].class, int.class, int.class},
-                new Object[] {root.toFile(), result, suffixes, 0, 1});
+        server.scanForSubprojects(root.toFile(), result, suffixes, 0, 1);
 
         assertTrue(result.isEmpty());
     }
@@ -212,9 +201,7 @@ class GroovyLanguageServerCoreMethodsTest {
     void sendStatusDoesNotThrowWhenEndpointIsNull() {
         GroovyLanguageServer server = new GroovyLanguageServer();
 
-        assertDoesNotThrow(() -> invoke(server, "sendStatus",
-            new Class<?>[] {String.class, String.class},
-            new Object[] {"Ready", "everything is fine"}));
+        assertDoesNotThrow(() -> server.sendStatus("Ready", "everything is fine"));
     }
 
     @Test
@@ -229,9 +216,7 @@ class GroovyLanguageServerCoreMethodsTest {
     void getGroovyTextDocumentServiceReturnsImplementation() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
 
-        Object result = invoke(server, "getGroovyTextDocumentService",
-                new Class<?>[] {},
-                new Object[] {});
+        Object result = server.getGroovyTextDocumentService();
 
         assertNotNull(result);
         assertTrue(result instanceof org.eclipse.groovy.ls.core.GroovyTextDocumentService);
@@ -251,12 +236,7 @@ class GroovyLanguageServerCoreMethodsTest {
 
         Files.createDirectories(tempDir.resolve("empty-project/lib"));
 
-        @SuppressWarnings("unchecked")
-        List<File> subprojects = (List<File>) invoke(
-                server,
-                "findSubprojectsWithSources",
-                new Class<?>[] {File.class, String[].class},
-                new Object[] {tempDir.toFile(), suffixes});
+        List<File> subprojects = server.findSubprojectsWithSources(tempDir.toFile(), suffixes);
 
         assertTrue(subprojects.isEmpty());
     }
@@ -268,11 +248,7 @@ class GroovyLanguageServerCoreMethodsTest {
         List<File> result = new ArrayList<>();
 
         // Scanning null dir should return without adding entries
-        invoke(
-                server,
-                "scanForSubprojects",
-                new Class<?>[] {File.class, List.class, String[].class, int.class, int.class},
-                new Object[] {null, result, suffixes, 0, 3});
+        server.scanForSubprojects(null, result, suffixes, 0, 3);
 
         assertTrue(result.isEmpty());
     }
@@ -287,12 +263,7 @@ class GroovyLanguageServerCoreMethodsTest {
         Files.createDirectories(tempDir.resolve("node_modules/submod/src/main/groovy"));
         Files.createDirectories(tempDir.resolve("real/src/main/groovy"));
 
-        @SuppressWarnings("unchecked")
-        List<File> result = (List<File>) invoke(
-                server,
-                "findSubprojectsWithSources",
-                new Class<?>[] {File.class, String[].class},
-                new Object[] {tempDir.toFile(), suffixes});
+        List<File> result = server.findSubprojectsWithSources(tempDir.toFile(), suffixes);
 
         Set<String> names = result.stream().map(File::getName).collect(Collectors.toSet());
         assertTrue(names.contains("real"));
@@ -358,34 +329,22 @@ class GroovyLanguageServerCoreMethodsTest {
         CompletableFuture<Object> result = server.shutdown();
         assertNotNull(result);
         assertNull(result.get());
-        // Verify exitCode via reflection
-        Field exitCode = GroovyLanguageServer.class.getDeclaredField("exitCode");
-        exitCode.setAccessible(true);
-        assertEquals(0, exitCode.getInt(server));
+        assertEquals(0, server.getExitCode());
     }
 
     @Test
-    @SuppressWarnings({ "rawtypes", "unchecked" })
     void shutdownClearsClasspathTrackingState() throws Exception {
         GroovyLanguageServer server = new GroovyLanguageServer();
 
-        Field pathMapField = GroovyLanguageServer.class.getDeclaredField("subprojectPathToEclipseName");
-        pathMapField.setAccessible(true);
-        ((java.util.Map) pathMapField.get(server)).put("/workspace/app", "app");
-
-        Field projectsWithClasspathField = GroovyLanguageServer.class.getDeclaredField("projectsWithClasspath");
-        projectsWithClasspathField.setAccessible(true);
-        ((Set) projectsWithClasspathField.get(server)).add("app");
-
-        Field pendingClasspathUpdatesField = GroovyLanguageServer.class.getDeclaredField("pendingClasspathUpdates");
-        pendingClasspathUpdatesField.setAccessible(true);
-        ((java.util.Queue) pendingClasspathUpdatesField.get(server)).add("queued");
+        server.subprojectPathToEclipseNameView().put("/workspace/app", "app");
+        server.projectsWithClasspathView().add("app");
+        server.enqueuePendingClasspathUpdateForTest();
 
         server.shutdown().join();
 
-        assertTrue(((java.util.Map<?, ?>) pathMapField.get(server)).isEmpty());
-        assertTrue(((Set<?>) projectsWithClasspathField.get(server)).isEmpty());
-        assertTrue(((java.util.Queue<?>) pendingClasspathUpdatesField.get(server)).isEmpty());
+        assertTrue(server.subprojectPathToEclipseNameView().isEmpty());
+        assertTrue(server.projectsWithClasspathView().isEmpty());
+        assertEquals(0, server.pendingClasspathUpdateCount());
     }
 
     @Test
@@ -472,17 +431,7 @@ class GroovyLanguageServerCoreMethodsTest {
     }
 
     private String invokeNormalizePath(GroovyLanguageServer server, String path) throws Exception {
-        return (String) invoke(
-                server,
-                "normalizePath",
-                new Class<?>[] {String.class},
-                new Object[] {path});
-    }
-
-    private Object invoke(Object target, String methodName, Class<?>[] types, Object[] args) throws Exception {
-        Method method = target.getClass().getDeclaredMethod(methodName, types);
-        method.setAccessible(true);
-        return method.invoke(target, args);
+        return server.normalizePath(path);
     }
 }
 
