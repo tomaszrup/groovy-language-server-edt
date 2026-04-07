@@ -253,6 +253,20 @@ export async function waitForBlockingNotificationsToClear(page: Page, timeout = 
     ).not.toContainEqual(expect.stringMatching(/collect usage data|open the repository/i));
 }
 
+export async function waitForGroovyOutputText(
+    page: Page,
+    text: string | RegExp,
+    timeout = 60_000,
+    closePanel = true
+): Promise<void> {
+    await runCommand(page, 'Groovy: Show Output Channel');
+    await expect(page.getByText(text, { exact: false })).toBeVisible({ timeout });
+
+    if (closePanel) {
+        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+J' : 'Control+J');
+    }
+}
+
 function getExtensionRoot(): string {
     return process.cwd();
 }

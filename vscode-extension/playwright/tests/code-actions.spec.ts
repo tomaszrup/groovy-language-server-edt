@@ -7,6 +7,7 @@ import {
     openFile,
     runCommand,
     waitForBlockingNotificationsToClear,
+    waitForGroovyOutputText,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
 
@@ -104,6 +105,7 @@ test('quick fix creates a missing Groovy class', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForGroovyOutputText(session.page, /Sent usable classpath for \d+\/\d+ project\(s\)/);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/QuickFixScratch.groovy:4:6');
         await applyQuickFix(session.page, "Create class 'Foo'");
