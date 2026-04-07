@@ -5,7 +5,7 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
-    runCommand,
+    waitForSampleClasspathReady,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -43,6 +43,7 @@ test('applies member completion for a Groovy method', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForSampleClasspathReady(session.page, true);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/CompletionScratch.groovy:8:9');
         await session.page.keyboard.press('Control+Space');
@@ -94,7 +95,7 @@ test('applies known-type completion for a workspace class', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page);
+        await waitForSampleClasspathReady(session.page, true);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/KnownTypeCompletionScratch.groovy:3:20');
         await expect(session.page.locator('.tabs-container .tab.active')).toContainText('KnownTypeCompletionScratch.groovy', {
@@ -110,13 +111,6 @@ test('applies known-type completion for a workspace class', async () => {
         workspace.dispose();
     }
 });
-
-async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
-    await runCommand(page, 'Groovy: Show Output Channel');
-    await expect(page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })).toBeVisible({
-        timeout: 60_000,
-    });
-}
 
 async function waitForCompletionSuggestion(
     page: import('@playwright/test').Page,

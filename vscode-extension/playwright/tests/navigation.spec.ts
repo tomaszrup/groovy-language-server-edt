@@ -3,6 +3,7 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
+    waitForSampleClasspathReady,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -15,11 +16,11 @@ test('opens SpringBootTest external library source from a Groovy import', async 
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForSampleClasspathReady(session.page, true);
 
-        await goToDefinitionByCtrlClick(
+        await goToDefinitionFromCursor(
             session.page,
             'src/test/groovy/com/example/sample/SampleApplicationSpec.groovy:3:49',
-            'SpringBootTest',
             'SpringBootTest.java'
         );
 
@@ -41,11 +42,11 @@ test('opens Spring external library source from a Groovy import', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForSampleClasspathReady(session.page, true);
 
-        await goToDefinitionByCtrlClick(
+        await goToDefinitionFromCursor(
             session.page,
             'src/test/groovy/com/example/sample/SampleApplicationSpec.groovy:4:36',
-            'ApplicationContext',
             'ApplicationContext.java'
         );
 
@@ -67,11 +68,11 @@ test('opens Spock external library source from a Groovy import', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
+        await waitForSampleClasspathReady(session.page, true);
 
-        await goToDefinitionByCtrlClick(
+        await goToDefinitionFromCursor(
             session.page,
             'src/test/groovy/com/example/sample/SampleApplicationSpec.groovy:6:19',
-            'Specification',
             'Specification.java'
         );
 
@@ -85,10 +86,9 @@ test('opens Spock external library source from a Groovy import', async () => {
     }
 });
 
-async function goToDefinitionByCtrlClick(
+async function goToDefinitionFromCursor(
     page: import('@playwright/test').Page,
     location: string,
-    symbolText: string,
     expectedTabName: string,
     attempts = 3
 ): Promise<void> {
@@ -96,10 +96,7 @@ async function goToDefinitionByCtrlClick(
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
         await openFile(page, location);
-
-        const symbol = page.getByText(symbolText, { exact: true }).nth(0);
-        await expect(symbol).toBeVisible({ timeout: 30_000 });
-        await symbol.click({ modifiers: [process.platform === 'darwin' ? 'Meta' : 'Control'] });
+        await page.keyboard.press('F12');
 
         try {
             await expect(page.locator('.tabs-container .tab.active')).toContainText(expectedTabName, {

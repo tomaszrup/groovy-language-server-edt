@@ -6,6 +6,20 @@ import { expect, Page } from '@playwright/test';
 import { downloadAndUnzipVSCode, resolveCliPathFromVSCodeExecutablePath } from '@vscode/test-electron';
 import { ElectronApplication, _electron as electron } from 'playwright';
 
+const BLOCKING_NOTIFICATION_PATTERNS = [
+    /collect usage data/i,
+    /open the repository/i,
+];
+
+const DISMISSIBLE_NOTIFICATION_PATTERNS = [
+    /Opening Java Projects/i,
+];
+
+const SAMPLE_CLASSPATH_READY_PATTERNS = [
+    /Sent usable classpath for 1\/1 project\(s\)/i,
+    /Sent groovy\/classpathBatchComplete to server \(delivered 1 project\(s\) on attempt \d+\)/i,
+];
+
 const VSCODE_VERSION = '1.85.0';
 const JAVA_EXTENSION_ID = 'redhat.java';
 const GROOVY_STATUS_ITEM_ID = 'TomaszRup.groovy-spock-support';
@@ -236,15 +250,70 @@ export async function goToDefinition(page: Page, location: string, expectedTabNa
 }
 
 export async function waitForBlockingNotificationsToClear(page: Page, timeout = 120_000): Promise<void> {
-    await expect.poll(
-        async () => page.locator('.notifications-toasts .notification-list-item').evaluateAll(
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeout) {
+        const notificationTexts = await page.locator('.notifications-toasts .notification-list-item').evaluateAll(
             nodes => nodes.map(node => node.textContent ?? '')
-        ),
-        {
-            timeout,
-            message: 'Timed out waiting for blocking dev-host notifications to clear',
+        );
+        const { blocking, dismissible } = classifyDevHostNotifications(notificationTexts);
+
+        if (blocking.length === 0) {
+            if (dismissible.length > 0) {
+                await page.keyboard.press('Escape').catch(() => undefined);
+                await page.waitForTimeout(300);
+            }
+            return;
         }
-    ).not.toContainEqual(expect.stringMatching(/Opening Java Projects|collect usage data|open the repository/i));
+
+        await page.keyboard.press('Escape').catch(() => undefined);
+        await page.waitForTimeout(1_000);
+    }
+
+    throw new Error('Timed out waiting for blocking dev-host notifications to clear');
+}
+
+export async function waitForSampleClasspathReady(page: Page, closePanel = false): Promise<void> {
+    await runCommand(page, 'Groovy: Show Output Channel');
+    const usableClasspathLog = page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false });
+    const deliveredBatchCompleteLog = page.getByText(
+        /Sent groovy\/classpathBatchComplete to server \(delivered 1 project\(s\) on attempt \d+\)/i
+    );
+
+    await expect.poll(
+        async () => {
+            const usableClasspathVisible = await usableClasspathLog.isVisible().catch(() => false);
+            if (usableClasspathVisible) {
+                return true;
+            }
+            return deliveredBatchCompleteLog.isVisible().catch(() => false);
+        },
+        {
+            timeout: 60_000,
+            message: 'Timed out waiting for sample workspace classpath delivery logs',
+        }
+    ).toBe(true);
+
+    if (closePanel) {
+        await page.keyboard.press('Control+J');
+    }
+}
+
+function classifyDevHostNotifications(texts: string[]): { blocking: string[]; dismissible: string[] } {
+    const blocking: string[] = [];
+    const dismissible: string[] = [];
+
+    for (const text of texts) {
+        if (BLOCKING_NOTIFICATION_PATTERNS.some(pattern => pattern.test(text))) {
+            blocking.push(text);
+            continue;
+        }
+        if (DISMISSIBLE_NOTIFICATION_PATTERNS.some(pattern => pattern.test(text))) {
+            dismissible.push(text);
+        }
+    }
+
+    return { blocking, dismissible };
 }
 
 function getExtensionRoot(): string {

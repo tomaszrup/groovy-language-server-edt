@@ -3,7 +3,7 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
-    runCommand,
+    waitForSampleClasspathReady,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -15,10 +15,10 @@ test('opens the references peek from a Groovy symbol', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page);
+        await waitForSampleClasspathReady(session.page, true);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/OthererName.groovy:3:9');
-        await runCommand(session.page, 'Peek References');
+        await openReferencesPeek(session.page);
 
         const peek = session.page.locator('.peekview-widget');
         await expect(peek).toBeVisible({ timeout: 30_000 });
@@ -30,10 +30,22 @@ test('opens the references peek from a Groovy symbol', async () => {
     }
 });
 
-async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
-    await runCommand(page, 'Groovy: Show Output Channel');
-    await expect(page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })).toBeVisible({
-        timeout: 60_000,
-    });
-    await page.keyboard.press('Control+J');
+async function openReferencesPeek(page: import('@playwright/test').Page, attempts = 6): Promise<void> {
+    const peek = page.locator('.peekview-widget');
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        await page.keyboard.press('Shift+F12');
+
+        try {
+            await expect(peek).toBeVisible({ timeout: attempt === attempts ? 30_000 : 10_000 });
+            return;
+        } catch (error) {
+            if (attempt === attempts) {
+                throw error;
+            }
+
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(1_500);
+        }
+    }
 }
