@@ -16,7 +16,7 @@ const WORKSPACE_CLEANUP_OPTIONS = {
     force: true,
     maxRetries: 8,
     retryDelay: 250,
-} satisfies fs.RmSyncOptions;
+} satisfies fs.RmOptions;
 
 type UserSettingValue = string | boolean | number;
 
@@ -194,11 +194,9 @@ export async function runCommand(page: Page, commandLabel: string): Promise<void
     await expect(quickInput).toBeVisible({ timeout: 30_000 });
     await quickInput.fill(`>${commandLabel}`);
 
-    const firstPick = page.locator('.quick-input-list .monaco-list-row').first();
-    await expect(firstPick).toBeVisible({ timeout: 30_000 });
-    await expect(firstPick).toHaveAttribute('aria-label', new RegExp(escapeRegex(commandLabel)));
-
-    await page.keyboard.press('Enter');
+    const matchingPick = page.locator(getExactQuickInputRowSelector(commandLabel)).first();
+    await expect(matchingPick).toBeVisible({ timeout: 30_000 });
+    await matchingPick.click();
     await expect(quickInput).toBeHidden({ timeout: 30_000 });
 }
 
@@ -317,6 +315,18 @@ function copyGradleWrapper(workspacePath: string): void {
 function getGroovyStatusSelector(): string {
     const escapedId = GROOVY_STATUS_ITEM_ID.replace('.', String.raw`\.`);
     return `#${escapedId}`;
+}
+
+function getExactQuickInputRowSelector(label: string): string {
+    const escapedLabel = escapeAttributeValue(label);
+    return [
+        `.quick-input-list .monaco-list-row[aria-label="${escapedLabel}"]`,
+        `.quick-input-list .monaco-list-row[aria-label^="${escapedLabel},"]`,
+    ].join(', ');
+}
+
+function escapeAttributeValue(value: string): string {
+    return value.replace(/\\/g, String.raw`\\`).replace(/"/g, String.raw`\"`);
 }
 
 function escapeRegex(value: string): string {

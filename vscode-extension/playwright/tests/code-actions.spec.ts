@@ -128,6 +128,7 @@ async function applyQuickFix(
     const quickFixRow = page.locator('.context-view .monaco-list-row', {
         hasText: title,
     }).first();
+    let lastError: unknown;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
         await page.keyboard.press('Control+.');
@@ -137,12 +138,26 @@ async function applyQuickFix(
             await quickFixRow.click();
             return;
         } catch (error) {
+            lastError = error;
+            await page.keyboard.press('Escape');
+
+            try {
+                await runCommand(page, 'Quick Fix...');
+                await expect(quickFixRow).toBeVisible({ timeout: 10_000 });
+                await quickFixRow.click();
+                return;
+            } catch (fallbackError) {
+                lastError = fallbackError;
+            }
+
             if (attempt === attempts) {
-                throw error;
+                throw lastError;
             }
 
             await page.keyboard.press('Escape');
             await page.waitForTimeout(1_500);
         }
     }
+
+    throw lastError;
 }
