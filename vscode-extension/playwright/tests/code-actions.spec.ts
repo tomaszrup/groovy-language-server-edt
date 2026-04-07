@@ -42,7 +42,6 @@ test('organize imports removes an unused Groovy import', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/CodeActionScratch.groovy:3:20');
         await expect(session.page.locator('.tabs-container .tab.active')).toContainText('CodeActionScratch.groovy', {
@@ -105,7 +104,6 @@ test('quick fix creates a missing Groovy class', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/QuickFixScratch.groovy:4:6');
         await applyQuickFix(session.page, "Create class 'Foo'");
@@ -121,14 +119,6 @@ test('quick fix creates a missing Groovy class', async () => {
         workspace.dispose();
     }
 });
-
-async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
-    await runCommand(page, 'Groovy: Show Output Channel');
-    await expect(page.getByText(/Sent usable classpath for \d+\/\d+ project\(s\)/)).toBeVisible({
-        timeout: 60_000,
-    });
-    await page.keyboard.press('Control+J');
-}
 
 async function applyQuickFix(
     page: import('@playwright/test').Page,

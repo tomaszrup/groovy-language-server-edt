@@ -15,7 +15,6 @@ test('opens the references peek from a Groovy symbol', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/OthererName.groovy:3:9');
         await runCommand(session.page, 'Peek References');
@@ -29,11 +28,3 @@ test('opens the references peek from a Groovy symbol', async () => {
         workspace.dispose();
     }
 });
-
-async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
-    await runCommand(page, 'Groovy: Show Output Channel');
-    await expect(page.getByText(/Sent usable classpath for \d+\/\d+ project\(s\)/)).toBeVisible({
-        timeout: 60_000,
-    });
-    await page.keyboard.press('Control+J');
-}

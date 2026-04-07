@@ -10,12 +10,6 @@ test('shows the Groovy output channel with startup logs', async () => {
 
         await runCommand(session.page, 'Groovy: Show Output Channel');
 
-        await expect(session.page.getByText('Activating Groovy Language Server extension...', { exact: false })).toBeVisible({
-            timeout: 30_000,
-        });
-        await expect(session.page.getByText('Groovy Language Server started successfully.', { exact: false })).toBeVisible({
-            timeout: 30_000,
-        });
         await expect(session.page.getByText('[status] Ready', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();

@@ -1,9 +1,9 @@
 import { expect, test } from '@playwright/test';
 import {
     createTemporaryWorkspace,
+    goToDefinition,
     launchVsCode,
     openFile,
-    runCommand,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -91,15 +91,14 @@ test('resolves classpath for a deeply nested sibling Gradle module', async () =>
             timeout: 30_000,
         });
 
-        await runCommand(session.page, 'Groovy: Show Output Channel');
-
-        await expect(session.page.getByText(/projectPath=.*modules[\\/]apps[\\/]service/)).toBeVisible({
-            timeout: 60_000,
+        await goToDefinition(
+            session.page,
+            'modules/apps/service/src/main/groovy/com/example/service/ServiceRunner.groovy:3:27',
+            'SharedGreeter.groovy'
+        );
+        await expect(session.page.getByText('class SharedGreeter {', { exact: false })).toBeVisible({
+            timeout: 30_000,
         });
-        await expect(session.page.getByText(/Sent usable classpath for \d+\/\d+ project\(s\)/)).toBeVisible({
-            timeout: 60_000,
-        });
-        await expect(session.page.getByText('[status] Ready', { exact: false })).toBeVisible({ timeout: 60_000 });
     } finally {
         await session.close();
         workspace.dispose();
