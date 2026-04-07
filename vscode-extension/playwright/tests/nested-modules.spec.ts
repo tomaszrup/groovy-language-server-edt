@@ -6,7 +6,7 @@ import {
     launchVsCode,
     openFile,
     waitForBlockingNotificationsToClear,
-    waitForGroovyOutputText,
+    waitForGroovyProjectPath,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
 
@@ -84,11 +84,9 @@ test('resolves classpath for a deeply nested sibling Gradle module', async () =>
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForGroovyOutputText(
+        await waitForGroovyProjectPath(
             session.page,
-            new RegExp(
-                `projectPath=${escapeRegex(path.join(workspace.workspacePath, 'modules', 'platform', 'shared'))}`
-            )
+            path.join(workspace.workspacePath, 'modules', 'platform', 'shared')
         );
 
         await openFile(
@@ -112,7 +110,3 @@ test('resolves classpath for a deeply nested sibling Gradle module', async () =>
         workspace.dispose();
     }
 });
-
-function escapeRegex(value: string): string {
-    return value.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
-}

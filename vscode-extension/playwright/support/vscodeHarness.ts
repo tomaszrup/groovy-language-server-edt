@@ -267,6 +267,14 @@ export async function waitForGroovyOutputText(
     }
 }
 
+export async function waitForUsableClasspath(page: Page, timeout = 60_000): Promise<void> {
+    await waitForGroovyOutputText(page, /Sent usable classpath for \d+\/\d+ project\(s\)/, timeout);
+}
+
+export async function waitForGroovyProjectPath(page: Page, projectPath: string, timeout = 60_000): Promise<void> {
+    await waitForGroovyOutputText(page, new RegExp(`projectPath=${escapeRegex(projectPath)}`), timeout);
+}
+
 function getExtensionRoot(): string {
     return process.cwd();
 }
