@@ -31,7 +31,7 @@ jobs:
       - name: Build & Test with Coverage
         run: ./gradlew :org.eclipse.groovy.ls.core:test :org.eclipse.groovy.ls.core:jacocoTestReport
 
-      - name: Generate GLS Coverage Badge
+      - name: Generate Java Coverage Badge
         id: jacoco
         uses: cicirello/jacoco-badge-generator@v2
         with:
@@ -40,10 +40,10 @@ jobs:
           coverage-badge-filename: gls-coverage.svg
           branches-badge-filename: gls-branches.svg
           generate-branches-badge: true
-          coverage-label: GLS Coverage
-          branches-label: GLS Branches
+          coverage-label: Java coverage
+          branches-label: Java branches
 
-      - name: Generate GLS Coverage JSON for shields.io
+      - name: Generate Java Coverage JSON for shields.io
         run: |
           RAW_COVERAGE=$(echo "${{ steps.jacoco.outputs.coverage }}" | sed 's/%//')
           if (( $(echo "$RAW_COVERAGE <= 1" | bc -l) )); then
@@ -60,7 +60,7 @@ jobs:
           cat > .badges/gls-coverage.json << EOF
           {
             "schemaVersion": 1,
-            "label": "GLS Coverage",
+            "label": "Java coverage",
             "message": "${COVERAGE}%",
             "color": "${COLOR}"
           }
@@ -119,12 +119,63 @@ jobs:
         working-directory: vscode-extension
         run: npm run test:coverage
 
+      - name: Generate TypeScript coverage JSON for shields.io
+        working-directory: vscode-extension
+        run: |
+          mkdir -p .badges
+          node <<'EOF'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const summaryPath = path.join(process.cwd(), 'coverage', 'coverage-summary.json');
+          const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+          const coverage = Number(summary.total.lines.pct ?? 0).toFixed(2);
+          const numericCoverage = Number(coverage);
+          let color = 'red';
+
+          if (numericCoverage >= 90) {
+            color = 'brightgreen';
+          } else if (numericCoverage >= 80) {
+            color = 'green';
+          } else if (numericCoverage >= 70) {
+            color = 'yellowgreen';
+          } else if (numericCoverage >= 60) {
+            color = 'yellow';
+          } else if (numericCoverage >= 50) {
+            color = 'orange';
+          }
+
+          fs.writeFileSync(
+            path.join(process.cwd(), '.badges', 'typescript-coverage.json'),
+            JSON.stringify(
+              {
+                schemaVersion: 1,
+                label: 'TypeScript coverage',
+                message: `${coverage}%`,
+                color,
+              },
+              null,
+              2
+            ) + '\n'
+          );
+          EOF
+
       - name: Upload Extension coverage
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: extension-coverage
           path: vscode-extension/coverage/
+          if-no-files-found: error
+
+      - name: Verify TypeScript badge exists
+        run: test -f vscode-extension/.badges/typescript-coverage.json
+
+      - name: Upload TypeScript badge
+        uses: actions/upload-artifact@v4
+        with:
+          name: badges-typescript
+          path: vscode-extension/.badges/typescript-coverage.json
           if-no-files-found: error
 
       - name: Run Playwright tests
@@ -148,7 +199,7 @@ jobs:
 
   update-badges:
     name: Update Coverage Badges
-    needs: [gls]
+    needs: [gls, extension]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     steps:
@@ -169,10 +220,19 @@ jobs:
           path: .badges/
         continue-on-error: false
 
+      - name: Download TypeScript badge
+        uses: actions/download-artifact@v4
+        with:
+          name: badges-typescript
+          path: .badges/
+        continue-on-error: false
+
       - name: Verify downloaded badges
         run: |
           echo "Listing downloaded badges..."
           ls -la .badges/
+          test -f .badges/gls-coverage.json
+          test -f .badges/typescript-coverage.json
           echo "Badge files downloaded successfully"
 
       - name: Push badges
