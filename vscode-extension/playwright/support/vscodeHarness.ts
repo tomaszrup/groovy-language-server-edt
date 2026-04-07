@@ -9,6 +9,14 @@ import { ElectronApplication, _electron as electron } from 'playwright';
 const VSCODE_VERSION = '1.85.0';
 const JAVA_EXTENSION_ID = 'redhat.java';
 const GROOVY_STATUS_ITEM_ID = 'TomaszRup.groovy-spock-support';
+// Gradle and VS Code background processes can keep temporary workspace files open
+// briefly after the Electron app exits, especially under CI load.
+const WORKSPACE_CLEANUP_OPTIONS = {
+    recursive: true,
+    force: true,
+    maxRetries: 8,
+    retryDelay: 250,
+} as const;
 
 type UserSettingValue = string | boolean | number;
 
@@ -68,7 +76,7 @@ export function createWorkspaceCopy(sourceWorkspacePath = getSampleWorkspacePath
             copyGradleWrapper(workspacePath);
         },
         dispose(): void {
-            fs.rmSync(workspacePath, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
+            fs.rmSync(workspacePath, WORKSPACE_CLEANUP_OPTIONS);
         },
     };
 }
@@ -88,7 +96,7 @@ export function createTemporaryWorkspace(): TemporaryWorkspaceCopy {
             copyGradleWrapper(workspacePath);
         },
         dispose(): void {
-            fs.rmSync(workspacePath, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
+            fs.rmSync(workspacePath, WORKSPACE_CLEANUP_OPTIONS);
         },
     };
 }
