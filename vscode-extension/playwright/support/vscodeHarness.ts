@@ -260,10 +260,49 @@ export async function waitForGroovyOutputText(
     closePanel = true
 ): Promise<void> {
     await runCommand(page, 'Groovy: Show Output Channel');
-    await expect(page.getByText(text, { exact: false })).toBeVisible({ timeout });
+
+    // VS Code's output channel is a Monaco editor with virtual rendering —
+    // only lines currently in the viewport are materialized in the DOM.
+    // Scroll from the top of the output so every portion enters the viewport
+    // and page.getByText() can match it.
+    const textLocator = page.getByText(text, { exact: false });
+    const toggleKey = process.platform === 'darwin' ? 'Meta' : 'Control';
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+        // Quick check at current scroll position (covers the common case
+        // where the output is short enough for everything to be in the DOM).
+        if (await textLocator.count() > 0) {
+            break;
+        }
+
+        // Scroll to top and scan page-by-page.
+        await page.keyboard.press(`${toggleKey}+Home`);
+        await page.waitForTimeout(150);
+
+        let found = false;
+        for (let i = 0; i < 100; i++) {
+            if (await textLocator.count() > 0) {
+                found = true;
+                break;
+            }
+            await page.keyboard.press('PageDown');
+            await page.waitForTimeout(50);
+        }
+
+        if (found) {
+            break;
+        }
+
+        // Text not found yet — wait briefly for more output to arrive.
+        await page.waitForTimeout(2_000);
+    }
+
+    // Final assertion so Playwright reports the original locator on failure.
+    await expect(textLocator).toBeVisible({ timeout: Math.max(deadline - Date.now(), 5_000) });
 
     if (closePanel) {
-        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+J' : 'Control+J');
+        await page.keyboard.press(`${toggleKey}+J`);
     }
 }
 
