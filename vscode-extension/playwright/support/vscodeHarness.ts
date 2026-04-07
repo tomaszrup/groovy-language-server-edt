@@ -16,7 +16,7 @@ const WORKSPACE_CLEANUP_OPTIONS = {
     force: true,
     maxRetries: 8,
     retryDelay: 250,
-} as const;
+} satisfies fs.RmSyncOptions;
 
 type UserSettingValue = string | boolean | number;
 
