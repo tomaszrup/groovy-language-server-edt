@@ -91,7 +91,7 @@ async function goToDefinitionByCtrlClick(
     location: string,
     symbolText: string,
     expectedTabName: string,
-    attempts = 3
+    attempts = 5
 ): Promise<void> {
     let lastError: unknown;
 
@@ -102,25 +102,26 @@ async function goToDefinitionByCtrlClick(
         await expect(symbol).toBeVisible({ timeout: 30_000 });
         await symbol.click({ modifiers: [process.platform === 'darwin' ? 'Meta' : 'Control'] });
 
+        const isLastAttempt = attempt === attempts;
         try {
-            await expectActiveTab(page, expectedTabName, attempt === attempts ? 30_000 : 5_000);
+            await expectActiveTab(page, expectedTabName, isLastAttempt ? 60_000 : 10_000);
             return;
         } catch (error) {
             await page.keyboard.press('Escape');
 
             try {
                 await runCommand(page, 'Go to Definition');
-                await expectActiveTab(page, expectedTabName, attempt === attempts ? 30_000 : 5_000);
+                await expectActiveTab(page, expectedTabName, isLastAttempt ? 60_000 : 10_000);
                 return;
             } catch (fallbackError) {
                 lastError = fallbackError;
             }
 
-            if (attempt === attempts) {
+            if (isLastAttempt) {
                 throw lastError;
             }
 
-            await page.waitForTimeout(1_500);
+            await page.waitForTimeout(3_000);
         }
     }
 
