@@ -154,10 +154,7 @@ async function applyQuickFix(
                 throw lastError;
             }
 
-            await page.keyboard.press('Escape');
             await page.waitForTimeout(1_500);
         }
     }
-
-    throw lastError;
 }
