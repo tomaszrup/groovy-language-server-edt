@@ -1,7 +1,8 @@
 # Language Support for Groovy
 
 [![CI](https://github.com/tomaszrup/groovy-language-server-edt/actions/workflows/ci.yml/badge.svg)](https://github.com/tomaszrup/groovy-language-server-edt/actions/workflows/ci.yml)
-[![GLS Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tomaszrup/groovy-language-server-edt/badges/.badges/gls-coverage.json)](https://github.com/tomaszrup/groovy-language-server-edt)
+[![Java coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tomaszrup/groovy-language-server-edt/badges/.badges/gls-coverage.json)](https://github.com/tomaszrup/groovy-language-server-edt)
+[![TypeScript coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/tomaszrup/groovy-language-server-edt/badges/.badges/typescript-coverage.json)](https://github.com/tomaszrup/groovy-language-server-edt)
 
 A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) implementation for [Groovy](http://groovy-lang.org/), powered by [Eclipse JDT](https://www.eclipse.org/jdt/) and [groovy-eclipse](https://github.com/groovy/groovy-eclipse).
 
