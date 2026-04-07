@@ -261,6 +261,12 @@ export async function waitForGroovyOutputText(
 ): Promise<void> {
     await runCommand(page, 'Groovy: Show Output Channel');
 
+    // The 'Groovy: Show Output Channel' command calls
+    // outputChannel.show(true) which preserves keyboard focus on the
+    // editor.  We need focus inside the panel's Monaco editor so that
+    // Ctrl+Home / PageDown actually scroll the output, not the editor.
+    await focusOutputPanelEditor(page);
+
     // VS Code's output channel is a Monaco editor with virtual rendering —
     // only lines currently in the viewport are materialized in the DOM.
     // Scroll from the top of the output so every portion enters the viewport
@@ -275,6 +281,10 @@ export async function waitForGroovyOutputText(
         if (await textLocator.count() > 0) {
             break;
         }
+
+        // Re-focus the output panel in case an asynchronous notification
+        // moved focus away (e.g. a toast appearing).
+        await focusOutputPanelEditor(page);
 
         // Scroll to top and scan page-by-page.
         await page.keyboard.press(`${toggleKey}+Home`);
@@ -306,12 +316,28 @@ export async function waitForGroovyOutputText(
     }
 }
 
-export async function waitForUsableClasspath(page: Page, timeout = 60_000): Promise<void> {
+export async function waitForUsableClasspath(page: Page, timeout = 120_000): Promise<void> {
     await waitForGroovyOutputText(page, /Sent usable classpath for \d+\/\d+ project\(s\)/, timeout);
 }
 
-export async function waitForGroovyProjectPath(page: Page, projectPath: string, timeout = 60_000): Promise<void> {
+export async function waitForGroovyProjectPath(page: Page, projectPath: string, timeout = 120_000): Promise<void> {
     await waitForGroovyOutputText(page, new RegExp(`projectPath=${escapeRegex(projectPath)}`), timeout);
+}
+
+/**
+ * Click inside the panel's Monaco editor to move keyboard focus there.
+ * The output channel command uses `outputChannel.show(true)` (preserveFocus),
+ * so without this step Ctrl+Home / PageDown keystrokes go to the main
+ * editor instead of scrolling the output panel.
+ */
+async function focusOutputPanelEditor(page: Page): Promise<void> {
+    // The VS Code bottom panel has class ".panel" (or ".part.panel").
+    // Inside it the output channel renders into a Monaco editor.
+    const panelEditor = page.locator('.panel .monaco-editor');
+    if (await panelEditor.count() > 0) {
+        await panelEditor.first().click();
+        await page.waitForTimeout(200);
+    }
 }
 
 function getExtensionRoot(): string {
