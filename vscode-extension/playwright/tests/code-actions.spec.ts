@@ -5,6 +5,7 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
+    runCommand,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -47,7 +48,8 @@ test('organize imports removes an unused Groovy import', async () => {
             timeout: 30_000,
         });
 
-        await session.page.keyboard.press('Shift+Alt+KeyO');
+        await focusEditorText(session.page, 'import java.time.LocalDate');
+        await runCommand(session.page, 'Organize Imports');
         await session.page.keyboard.press('Control+S');
 
         await expect.poll(() => fs.readFileSync(scratchFilePath, 'utf8'), {
@@ -95,7 +97,7 @@ test('quick fix creates a missing Groovy class', async () => {
         await waitForBlockingNotificationsToClear(session.page);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/QuickFixScratch.groovy:4:6');
-        await applyQuickFix(session.page, "Create class 'Foo'");
+        await applyQuickFix(session.page, 'Foo', "Create class 'Foo'");
 
         let createdFilePath: string | undefined;
         await expect.poll(() => {
@@ -109,6 +111,7 @@ test('quick fix creates a missing Groovy class', async () => {
             message: 'Timed out waiting for Create class quick fix to create Foo.groovy',
         }).toContain('class Foo');
 
+        expect(createdFilePath).toBeDefined();
         expect(fs.readFileSync(createdFilePath, 'utf8')).toContain('class Foo');
     } finally {
         await session.close();
@@ -118,6 +121,7 @@ test('quick fix creates a missing Groovy class', async () => {
 
 async function applyQuickFix(
     page: import('@playwright/test').Page,
+    symbolText: string,
     title: string,
     attempts = 6
 ): Promise<void> {
@@ -127,6 +131,7 @@ async function applyQuickFix(
     }).first();
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        await focusEditorText(page, symbolText);
         await page.keyboard.press('Control+.');
 
         try {
@@ -144,6 +149,15 @@ async function applyQuickFix(
             await page.waitForTimeout(1_500);
         }
     }
+}
+
+async function focusEditorText(
+    page: import('@playwright/test').Page,
+    text: string
+): Promise<void> {
+    const locator = page.locator('.view-lines').getByText(text, { exact: false }).first();
+    await expect(locator).toBeVisible({ timeout: 30_000 });
+    await locator.click();
 }
 
 function findWorkspaceFile(rootPath: string, fileName: string): string | undefined {
