@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "label": "GLS Coverage",
+  "label": "Java coverage",
   "message": "80.00%",
   "color": "green"
 }
