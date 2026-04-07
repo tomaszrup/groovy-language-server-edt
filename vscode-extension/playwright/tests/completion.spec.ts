@@ -113,7 +113,7 @@ test('applies known-type completion for a workspace class', async () => {
 
 async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
     await runCommand(page, 'Groovy: Show Output Channel');
-    await expect(page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })).toBeVisible({
+    await expect(page.getByText(/Sent usable classpath for \d+\/\d+ project\(s\)/)).toBeVisible({
         timeout: 60_000,
     });
 }

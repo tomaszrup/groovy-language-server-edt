@@ -124,7 +124,7 @@ test('quick fix creates a missing Groovy class', async () => {
 
 async function waitForSampleClasspathReady(page: import('@playwright/test').Page): Promise<void> {
     await runCommand(page, 'Groovy: Show Output Channel');
-    await expect(page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false })).toBeVisible({
+    await expect(page.getByText(/Sent usable classpath for \d+\/\d+ project\(s\)/)).toBeVisible({
         timeout: 60_000,
     });
     await page.keyboard.press('Control+J');

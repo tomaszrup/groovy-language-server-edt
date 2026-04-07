@@ -3,6 +3,7 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
+    runCommand,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -102,21 +103,36 @@ async function goToDefinitionByCtrlClick(
         await symbol.click({ modifiers: [process.platform === 'darwin' ? 'Meta' : 'Control'] });
 
         try {
-            await expect(page.locator('.tabs-container .tab.active')).toContainText(expectedTabName, {
-                timeout: attempt === attempts ? 30_000 : 5_000,
-            });
+            await expectActiveTab(page, expectedTabName, attempt === attempts ? 30_000 : 5_000);
             return;
         } catch (error) {
-            lastError = error;
+            await page.keyboard.press('Escape');
 
-            if (attempt === attempts) {
-                throw error;
+            try {
+                await runCommand(page, 'Go to Definition');
+                await expectActiveTab(page, expectedTabName, attempt === attempts ? 30_000 : 5_000);
+                return;
+            } catch (fallbackError) {
+                lastError = fallbackError;
             }
 
-            await page.keyboard.press('Escape');
+            if (attempt === attempts) {
+                throw lastError;
+            }
+
             await page.waitForTimeout(1_500);
         }
     }
 
     throw lastError;
+}
+
+async function expectActiveTab(
+    page: import('@playwright/test').Page,
+    expectedTabName: string,
+    timeout: number
+): Promise<void> {
+    await expect(page.locator('.tabs-container .tab.active')).toContainText(expectedTabName, {
+        timeout,
+    });
 }

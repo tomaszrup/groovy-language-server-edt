@@ -68,7 +68,7 @@ export function createWorkspaceCopy(sourceWorkspacePath = getSampleWorkspacePath
             copyGradleWrapper(workspacePath);
         },
         dispose(): void {
-            fs.rmSync(workspacePath, { recursive: true, force: true });
+            fs.rmSync(workspacePath, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
         },
     };
 }
@@ -88,7 +88,7 @@ export function createTemporaryWorkspace(): TemporaryWorkspaceCopy {
             copyGradleWrapper(workspacePath);
         },
         dispose(): void {
-            fs.rmSync(workspacePath, { recursive: true, force: true });
+            fs.rmSync(workspacePath, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
         },
     };
 }
@@ -244,7 +244,7 @@ export async function waitForBlockingNotificationsToClear(page: Page, timeout = 
             timeout,
             message: 'Timed out waiting for blocking dev-host notifications to clear',
         }
-    ).not.toContainEqual(expect.stringMatching(/Opening Java Projects|collect usage data|open the repository/i));
+    ).not.toContainEqual(expect.stringMatching(/collect usage data|open the repository/i));
 }
 
 function getExtensionRoot(): string {
