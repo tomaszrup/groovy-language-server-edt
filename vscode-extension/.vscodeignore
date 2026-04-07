@@ -3,10 +3,18 @@
 src/**
 out/**
 node_modules/**
+playwright/**
+scripts/**
+.playwright-cache/**
+playwright.config.ts
+.vscode-test/**
+coverage/**
+playwright-results/**
 tsconfig.json
 webpack.config.js
 *.map
 .gitignore
+*.vsix
 
 # Exclude OSGi runtime cache (regenerated on first launch)
 server/**/org.eclipse.osgi/**
