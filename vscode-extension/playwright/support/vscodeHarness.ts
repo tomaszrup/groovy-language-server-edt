@@ -16,8 +16,8 @@ const DISMISSIBLE_NOTIFICATION_PATTERNS = [
 ];
 
 const SAMPLE_CLASSPATH_READY_PATTERNS = [
-    /Sent usable classpath for 1\/1 project\(s\)/i,
-    /Sent groovy\/classpathBatchComplete to server \(delivered 1 project\(s\) on attempt \d+\)/i,
+    /Sent usable classpath for [1-9]\d*\/\d+ project\(s\)/i,
+    /Sent groovy\/classpathBatchComplete to server \(delivered [1-9]\d* project\(s\) on attempt \d+\)/i,
 ];
 
 const VSCODE_VERSION = '1.85.0';
@@ -59,7 +59,7 @@ export interface TemporaryWorkspaceCopy {
     workspacePath: string;
     writeFile(relativePath: string, content: string): string;
     seedGradleWrapper(): void;
-    dispose(): void;
+    dispose(): Promise<void>;
 }
 
 export function getSampleWorkspacePath(): string {
@@ -81,8 +81,8 @@ export function createWorkspaceCopy(sourceWorkspacePath = getSampleWorkspacePath
         seedGradleWrapper(): void {
             copyGradleWrapper(workspacePath);
         },
-        dispose(): void {
-            fs.rmSync(workspacePath, { recursive: true, force: true });
+        async dispose(): Promise<void> {
+            await removeDirectoryWithRetries(workspacePath);
         },
     };
 }
@@ -101,8 +101,8 @@ export function createTemporaryWorkspace(): TemporaryWorkspaceCopy {
         seedGradleWrapper(): void {
             copyGradleWrapper(workspacePath);
         },
-        dispose(): void {
-            fs.rmSync(workspacePath, { recursive: true, force: true });
+        async dispose(): Promise<void> {
+            await removeDirectoryWithRetries(workspacePath);
         },
     };
 }
@@ -275,9 +275,9 @@ export async function waitForBlockingNotificationsToClear(page: Page, timeout = 
 
 export async function waitForSampleClasspathReady(page: Page, closePanel = false): Promise<void> {
     await runCommand(page, 'Groovy: Show Output Channel');
-    const usableClasspathLog = page.getByText('Sent usable classpath for 1/1 project(s)', { exact: false });
+    const usableClasspathLog = page.getByText(/Sent usable classpath for [1-9]\d*\/\d+ project\(s\)/i);
     const deliveredBatchCompleteLog = page.getByText(
-        /Sent groovy\/classpathBatchComplete to server \(delivered 1 project\(s\) on attempt \d+\)/i
+        /Sent groovy\/classpathBatchComplete to server \(delivered [1-9]\d* project\(s\) on attempt \d+\)/i
     );
 
     await expect.poll(

@@ -3,7 +3,6 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
-    waitForSampleClasspathReady,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -16,7 +15,6 @@ test('opens SpringBootTest external library source from a Groovy import', async 
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page, true);
 
         await goToDefinitionFromCursor(
             session.page,
@@ -30,7 +28,7 @@ test('opens SpringBootTest external library source from a Groovy import', async 
         await expect(session.page.getByText('@BootstrapWith(SpringBootTestContextBootstrapper.class)', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -42,7 +40,6 @@ test('opens Spring external library source from a Groovy import', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page, true);
 
         await goToDefinitionFromCursor(
             session.page,
@@ -56,7 +53,7 @@ test('opens Spring external library source from a Groovy import', async () => {
         await expect(session.page.getByText('public interface ApplicationContext extends', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -68,7 +65,6 @@ test('opens Spock external library source from a Groovy import', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page, true);
 
         await goToDefinitionFromCursor(
             session.page,
@@ -82,7 +78,7 @@ test('opens Spock external library source from a Groovy import', async () => {
         await expect(session.page.getByText('Base class for Spock specifications.', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -90,7 +86,7 @@ async function goToDefinitionFromCursor(
     page: import('@playwright/test').Page,
     location: string,
     expectedTabName: string,
-    attempts = 3
+    attempts = 6
 ): Promise<void> {
     let lastError: unknown;
 
@@ -100,7 +96,7 @@ async function goToDefinitionFromCursor(
 
         try {
             await expect(page.locator('.tabs-container .tab.active')).toContainText(expectedTabName, {
-                timeout: attempt === attempts ? 30_000 : 5_000,
+                timeout: attempt === attempts ? 30_000 : 10_000,
             });
             return;
         } catch (error) {

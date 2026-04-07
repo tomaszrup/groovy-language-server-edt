@@ -20,7 +20,7 @@ test.describe('Groovy extension lifecycle', () => {
             expect(statusLabel).toContain('Groovy Language Server is ready');
         } finally {
             await session.close();
-            workspace.dispose();
+            await workspace.dispose();
         }
     });
 
@@ -41,7 +41,7 @@ test.describe('Groovy extension lifecycle', () => {
             expect(await getGroovyStatusAriaLabel(session.page)).toContain('Groovy Language Server is ready');
         } finally {
             await session.close();
-            workspace.dispose();
+            await workspace.dispose();
         }
     });
 });

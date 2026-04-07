@@ -32,6 +32,13 @@ describe('playwrightReadiness', () => {
         );
     });
 
+    it('accepts non-sample usable classpath summary output when at least one project was delivered', () => {
+        assert.equal(
+            hasSampleClasspathReadyOutput('[java-ext] Sent usable classpath for 2/2 project(s) (2 fully resolved, 0 still awaiting initial delivery)'),
+            true
+        );
+    });
+
     it('accepts the delivered classpath batch complete output', () => {
         assert.equal(
             hasSampleClasspathReadyOutput('[java-ext] Sent groovy/classpathBatchComplete to server (delivered 1 project(s) on attempt 2).'),
@@ -42,6 +49,13 @@ describe('playwrightReadiness', () => {
     it('rejects max-attempts fallback output for sample classpath readiness', () => {
         assert.equal(
             hasSampleClasspathReadyOutput('[java-ext] Sent groovy/classpathBatchComplete to server (max attempts reached (6)).'),
+            false
+        );
+    });
+
+    it('rejects usable classpath output when no project was delivered', () => {
+        assert.equal(
+            hasSampleClasspathReadyOutput('[java-ext] Sent usable classpath for 0/1 project(s) (0 fully resolved, 1 still awaiting initial delivery)'),
             false
         );
     });

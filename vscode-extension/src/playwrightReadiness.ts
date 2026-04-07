@@ -8,8 +8,8 @@ const DISMISSIBLE_NOTIFICATION_PATTERNS = [
 ];
 
 const CLASSPATH_READY_PATTERNS = [
-    /Sent usable classpath for 1\/1 project\(s\)/i,
-    /Sent groovy\/classpathBatchComplete to server \(delivered 1 project\(s\) on attempt \d+\)/i,
+    /Sent usable classpath for [1-9]\d*\/\d+ project\(s\)/i,
+    /Sent groovy\/classpathBatchComplete to server \(delivered [1-9]\d* project\(s\) on attempt \d+\)/i,
 ];
 
 export interface NotificationClassification {

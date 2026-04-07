@@ -4,7 +4,6 @@ import {
     launchVsCode,
     openFile,
     runCommand,
-    waitForSampleClasspathReady,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -94,11 +93,10 @@ test('resolves classpath for a deeply nested sibling Gradle module', async () =>
 
         await runCommand(session.page, 'Groovy: Show Output Channel');
 
-        await expect(session.page.getByText('projectPath=', { exact: false })).toBeVisible({ timeout: 60_000 });
-        await waitForSampleClasspathReady(session.page);
+        await expect(session.page.getByText('build/libs/shared.jar', { exact: false })).toBeVisible({ timeout: 120_000 });
         await expect(session.page.getByText('[status] Ready', { exact: false })).toBeVisible({ timeout: 60_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });

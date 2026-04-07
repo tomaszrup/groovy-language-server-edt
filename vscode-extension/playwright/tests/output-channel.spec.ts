@@ -14,7 +14,7 @@ test('shows the Groovy output channel with startup logs', async () => {
         await expect(session.page.getByText('[status] Ready', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -30,6 +30,6 @@ test('opens the Groovy output channel from the status bar item', async () => {
         await expect(session.page.getByText('[status] Ready', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });

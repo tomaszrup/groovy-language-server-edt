@@ -62,7 +62,7 @@ test.describe('semantic highlighting fixture coverage', () => {
 
     test.afterAll(async () => {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     });
 
     test('highlights declaration keywords separately from type names', async () => {
@@ -161,7 +161,7 @@ test('keeps parentheses inside quoted Spock feature names as a single string tok
         await assertFeatureNameRendering(session.page, 'def "abc loads()"() {', '"abc loads()"');
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -182,7 +182,7 @@ test('keeps unmatched opening parentheses inside quoted Spock feature names as a
         await assertFeatureNameRendering(session.page, 'def "abc loads("() {', '"abc loads("');
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -203,7 +203,7 @@ test('keeps nested parentheses text inside quoted Spock feature names as a singl
         await assertFeatureNameRendering(session.page, 'def "abc loads(Asas)"() {', '"abc loads(Asas)"');
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 

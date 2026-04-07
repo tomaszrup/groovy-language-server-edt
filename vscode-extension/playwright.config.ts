@@ -1,6 +1,6 @@
 import { defineConfig } from '@playwright/test';
 
-const configuredWorkers = Number(process.env.PLAYWRIGHT_WORKERS ?? '2');
+const configuredWorkers = Number(process.env.PLAYWRIGHT_WORKERS ?? '1');
 const workers = Number.isFinite(configuredWorkers) && configuredWorkers > 0
     ? Math.floor(configuredWorkers)
     : 1;

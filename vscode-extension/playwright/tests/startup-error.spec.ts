@@ -18,7 +18,7 @@ test('shows an error status when no Java runtime is available', async () => {
         expect(statusLabel).toContain('JDK not found');
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -41,6 +41,6 @@ test('opens the output channel from the error status bar item', async () => {
         await expect(session.page.getByText('classpath delegation enabled', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });

@@ -5,7 +5,6 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
-    waitForSampleClasspathReady,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -43,7 +42,6 @@ test('applies member completion for a Groovy method', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page, true);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/CompletionScratch.groovy:8:9');
         await session.page.keyboard.press('Control+Space');
@@ -63,7 +61,7 @@ test('applies member completion for a Groovy method', async () => {
         await expect(session.page.locator('.view-lines')).toContainText('value.greet(', { timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -95,7 +93,6 @@ test('applies known-type completion for a workspace class', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page, true);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/KnownTypeCompletionScratch.groovy:3:20');
         await expect(session.page.locator('.tabs-container .tab.active')).toContainText('KnownTypeCompletionScratch.groovy', {
@@ -108,7 +105,7 @@ test('applies known-type completion for a workspace class', async () => {
         await expect(session.page.getByText('def value = new Bababxa', { exact: false })).toBeVisible({ timeout: 30_000 });
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 

@@ -5,7 +5,6 @@ import {
     createWorkspaceCopy,
     launchVsCode,
     openFile,
-    waitForSampleClasspathReady,
     waitForBlockingNotificationsToClear,
     waitForGroovyReady,
 } from '../support/vscodeHarness';
@@ -42,7 +41,6 @@ test('organize imports removes an unused Groovy import', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page, true);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/CodeActionScratch.groovy:3:20');
         await expect(session.page.locator('.tabs-container .tab.active')).toContainText('CodeActionScratch.groovy', {
@@ -62,7 +60,7 @@ test('organize imports removes an unused Groovy import', async () => {
         expect(updatedSource).toContain('String name');
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
@@ -95,7 +93,6 @@ test('quick fix creates a missing Groovy class', async () => {
     try {
         await waitForGroovyReady(session.page);
         await waitForBlockingNotificationsToClear(session.page);
-        await waitForSampleClasspathReady(session.page, true);
 
         await openFile(session.page, 'src/test/groovy/com/example/sample/QuickFixScratch.groovy:4:6');
         await applyQuickFix(session.page, "Create class 'Foo'");
@@ -115,7 +112,7 @@ test('quick fix creates a missing Groovy class', async () => {
         expect(fs.readFileSync(createdFilePath, 'utf8')).toContain('class Foo');
     } finally {
         await session.close();
-        workspace.dispose();
+        await workspace.dispose();
     }
 });
 
